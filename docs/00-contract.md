@@ -62,8 +62,16 @@
 | `mentions` 为空，且是群聊 | 目标 Bot = `default_bot_id`；`addressed = "mention"`（大哥默认接话；若 Bot 自身发言，`addressed` 省略） |
 | `mentions` 全是未知 id | 目标 Bot = `default_bot_id`，并在 `meta` 记 `unknown_mentions` |
 
-> **待拍板**：群聊无人 @ 时，大哥是「先应一声再决定」还是「只在有人叫或命中 rule 时才开口」。
-> 建议前者（体验像队伍），但必须配后台 `observe` 模式兜底，避免话痨。
+### 已定：群聊无人 @ 时，大哥接话
+
+选「大哥默认接话」，不选「只在有人叫时才开口」。理由是后者要人多打一个 `@` 才能说上一句话，
+那就不像一个队伍，像一个命令行。代价是可能话痨，用两条已有的东西兜住：
+
+- Policy 的 `eval.mode` 默认 `observe`，它不主动多说话；
+- 每条回复都署名，话痨一眼看得出来是谁；点一下芯片就能换人。
+
+极端情况下想让它闭嘴，把 `source:team` 的 `default_bot_id` 指到一个只会简短应答的 Bot 即可，
+不需要改代码。
 
 ### 映射到后台 Trigger
 

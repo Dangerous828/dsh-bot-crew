@@ -21,6 +21,13 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `docs/03-host-wiring.md` | **怎么接进宿主**：复制哪些文件、注册点、提示词小节、宿主自带的两条文档测试 |
 | `docs/04-verified.md` | 已经验证到哪、还没验证什么 |
 | `docs/05-running.md` | **怎么跑起来**：后端、网关、名录、模型、一条真消息、手机 APK |
+
+## 两条命令
+
+```sh
+python3 scripts/configure.py   # 配名册、Policy、角色模型（幂等）
+./scripts/doctor.sh            # 只读自检全链路
+```
 | `src/contract/types.ts` | 契约的 TS 类型（表层） |
 | `src/crew/directory.ts` | Bot 名录：一个大哥 + 成员，以及名录必须守的规则 |
 | `src/crew/route.ts` | 确定性路由：这条消息该谁露面；话题串 id |

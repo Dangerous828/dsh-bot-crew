@@ -93,3 +93,37 @@ their memory is not yours to read.
 | `{text, request_id}`（无 `mentions` 字段） | 200，工单归 `lead` |
 
 手机端 `MuseClient.send` 只在有人被 @ 时才写 `mentions` 字段，与后端「缺省即无人被 @」的语义一致。
+
+## 一条命令配好 / 一条命令自检（2026-11-09）
+
+```sh
+python3 scripts/configure.py   # 写名录、Policy、钉死角色模型；幂等
+./scripts/doctor.sh            # 只读检查全链路
+```
+
+`doctor.sh` 的实际输出：
+
+```
+orchestrator :3082                         node pid 91664
+mobile gateway :8788                       Python pid 9317
+  crew Source  ready     0 messages, 0 unreadable
+eval model                                 {"provider": "magpie", "model": "openconsole/deepseek-v4.1-flash"}
+executor model                             {"provider": "magpie", "model": "openconsole/deepseek-v4.1-flash"}
+crew roster                                3 bots (lead=大哥, scribbler=写手, coder=码农), default lead
+
+crew path looks healthy
+```
+
+两个脚本都踩到同一个坑并已修好：**后端绑在局域网地址时，loopback 根本连不上**。所以脚本先探测本机所有 IPv4，选那个真正应答的。`doctor.sh` 读 roster 走的是手机时间线，因为它验证的是「手机实际拿到什么」，而不是「数据库里写了什么」。
+
+## Bot 芯片能解释自己
+
+名录现在带 `persona`，手机端长按芯片在下方显示这个 Bot 负责什么：
+
+```
+lead       大哥   [default] 简练，先应一声再决定。能转派就转派，拿不准就先问一句。
+scribbler  写手   [member ] 中文文案。克制，不堆词，先给一版再改。
+coder      码农   [member ] 写代码先看现有约定，改动小步、可回退，交付前自己跑一遍验证。
+```
+
+Material3 的 `Surface` 没有 `onLongClick`，用 `combinedClickable` 补的（需要 `@OptIn(ExperimentalFoundationApi)`）。

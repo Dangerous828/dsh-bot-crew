@@ -191,6 +191,11 @@ APK 在 Android 15 模拟器（arm64-v8a）里**安装并运行成功**：
 
 截图在 `~/Desktop/dsh-crew/evidence/`。
 
+### 断线与恢复
+
+把后端停掉，App 标题下变成 **`Reconnecting…`**；`start` 回来之后自己回到 **`Connected`**，
+不用手动重连、不用重登。
+
 ### 小插曲（不是缺陷）
 
 用 `adb shell input text` 敲字时，空格、点号、斜杠会被吞，所以文件名从 `crew-phone.txt` 变成了

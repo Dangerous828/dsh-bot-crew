@@ -75,6 +75,24 @@ cd ~/Code/dsh-bot-crew && ./scripts/doctor.sh
 只读检查：两个端口在不在、各组件健康态、`eval`/`executor` 模型钉没钉、手机实际拿到的 Bot 名录对不对。
 全对时最后一行是 `crew path looks healthy`，退出码 0。
 
+## 四点七、手机连不上时
+
+APK 在 `~/Desktop/dsh-crew/dsh-crew.apk`。装好后在连接页选 **Local network**，填：
+
+| 字段 | 值 |
+| --- | --- |
+| Host address | 后端绑的那个地址，`ipconfig getifaddr en0` 可查 |
+| Port | `3082` |
+
+也可以直接把启动日志里那行 `http://<ip>:3082/?token=<...>` 整个粘进 Host address——它带 token，
+会顺带完成登录。
+
+连接页对几种失败给了具体原因，按提示处理即可：
+
+- **「不在本机网段」**：手机和电脑不在同一个 Wi-Fi。
+- **「refused」**：电脑上没有进程在听那个端口，或端口填错。
+- **「unexpected end of stream」**：连上了但被挡回来，多半是 `--trusted-host` 没包含你访问的那个地址。
+
 ## 五、验证一条真消息
 
 ```sh

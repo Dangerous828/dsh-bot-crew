@@ -21,7 +21,16 @@ nohup python3 tools/mobilegw > .artifacts/mobilegw.log 2>&1 &
 curl -s http://127.0.0.1:8788/health    # {"ok": true}
 ```
 
-## 三、Bot 名录
+## 三、Bot 名录（一条命令）
+
+```sh
+cd ~/Code/dsh-bot-crew && python3 scripts/configure.py
+```
+
+脚本会自己找到后端（loopback 或本机局域网地址都试）、写好名录与 Policy、把 `eval` / `executor`
+的模型钉死，遇到 revision 冲突自动重试。改名册或改模型就改脚本里的常量再跑一遍——它是幂等的。
+
+手动做的版本在下面，理解了再改脚本：
 
 存在后端 settings 的 `source:team` 块里，通过管理 API 写入（要带同源头）：
 

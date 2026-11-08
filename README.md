@@ -18,9 +18,13 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `docs/00-contract.md` | **阶段 0**：消息面契约（消息 → Trigger 映射、@ 与默认大哥、回执、错误码） |
 | `docs/01-architecture.md` | 两层分工、三条硬约束、为什么不合并内核 |
 | `docs/02-memory-bridge.md` | 记忆桥：本地小本本 → `dsh-auto-memory` 格式 → 中枢 Hub |
+| `docs/03-host-wiring.md` | **怎么接进宿主**：复制哪些文件、注册点、提示词小节、宿主自带的两条文档测试 |
+| `docs/04-verified.md` | 已经验证到哪、还没验证什么 |
 | `src/contract/types.ts` | 契约的 TS 类型（表层） |
-| `src/sources/team.ts` | **阶段 2**：`team` SourceKind 骨架 |
-| `src/memory/adapter.ts` | **阶段 3**：记忆读写适配层骨架 |
+| `src/crew/directory.ts` | Bot 名录：一个大哥 + 成员，以及名录必须守的规则 |
+| `src/crew/route.ts` | 确定性路由：这条消息该谁露面；话题串 id |
+| `src/sources/team.ts` | **完整**的 `team` SourceKind（放进宿主编译，见 docs/03） |
+| `src/memory/adapter.ts` | 记忆读写适配层（渲染、路径、注入规则已测；落盘由宿主实现） |
 
 ## 起步顺序
 
@@ -38,7 +42,12 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 
 ## 状态
 
-骨架 + 契约，尚未接通后台运行时。
+- 契约、名录、路由、`team` Source、记忆适配层**已实现并通过类型检查**。
+- 在宿主 `~/Code/dsh-superagent` 里已验证：`tsc` 0 错、1213 个测试全绿、构建通过。
+- 尚未接通完整闭环（消息 → Trigger → Eval → Ticket → worker 回话），需要配模型、开 Source、配名录。
+- 前台 UI 尚未从 Tobs 搬运。
+
+详见 `docs/04-verified.md`。
 
 ## 许可
 

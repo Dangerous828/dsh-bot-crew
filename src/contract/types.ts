@@ -2,28 +2,14 @@
  * 消息面契约的表层类型。
  *
  * 只描述前后台之间线上跑的字节；状态主体在后台 Ticket。
- * 字段形状参照 BotHarness/DeepSeekBot (MIT) 的消息面表层，不含其 Assignment / Inbox 状态。
+ * 字段形状参照 BotHarness/DeepSeekBot (MIT) 的消息面表层，不含其 Assignment / Inbox 状态字段。
  */
+import type { BotCard, BotDirectory } from '../crew/directory.ts'
 
-export type BotRole = 'default' | 'member'
-
-export interface BotCard {
-  /** 稳定 id，[a-z0-9-]。被 Ticket 引用过之后不可复用。 */
-  bot_id: string
-  name: string
-  /** 全表有且只有一个 default —— 大哥。 */
-  role: BotRole
-  persona?: string
-  avatar?: string
-  color?: string
-  /** 记忆桥的 namespace，约定 bot/<bot_id>。 */
-  memory_namespace: string
-}
-
-export interface BotDirectory {
-  bots: BotCard[]
-  default_bot_id: string
-}
+export type { BotCard, BotDirectory, BotRole } from '../crew/directory.ts'
+export { BOT_ID, defaultBot, namespaceOf, validateDirectory } from '../crew/directory.ts'
+export type { RouteDecision, RouteInput } from '../crew/route.ts'
+export { routeBot, threadOf } from '../crew/route.ts'
 
 export interface Sender {
   id: string
@@ -87,41 +73,17 @@ export interface TeamTriggerMeta {
   mentions: string[]
   unknown_mentions?: string[]
   conversation: string
+  messageId: string
   root: string
 }
 
-/** 确定性路由判定，不由模型决定。见 docs/00-contract.md §3。 */
-export interface RouteDecision {
-  bot_id: string
-  addressed?: 'mention' | 'direct'
-  unknown_mentions?: string[]
-}
-
-export function validateDirectory(dir: BotDirectory): void {
-  const defaults = dir.bots.filter((b) => b.role === 'default')
-  if (defaults.length !== 1) throw new Error('BotDirectory: exactly one default bot is required')
-  if (defaults[0].bot_id !== dir.default_bot_id) throw new Error('BotDirectory: default_bot_id mismatch')
-  const ids = new Set<string>()
-  for (const b of dir.bots) {
-    if (!/^[a-z0-9-]+$/.test(b.bot_id)) throw new Error(`BotDirectory: bad bot_id ${b.bot_id}`)
-    if (ids.has(b.bot_id)) throw new Error(`BotDirectory: duplicate bot_id ${b.bot_id}`)
-    ids.add(b.bot_id)
-  }
-}
-
-/** 群聊无人 @ → 大哥；私聊无人 @ → 大哥 + direct。 */
-export function routeBot(req: SendRequest, dir: BotDirectory, isDirect: boolean): RouteDecision {
-  validateDirectory(dir)
-  const known = new Set(dir.bots.map((b) => b.bot_id))
-  const hits = req.mentions.filter((m) => known.has(m))
-  if (hits.length > 0) {
-    const unknown = req.mentions.filter((m) => !known.has(m))
-    return { bot_id: hits[0], addressed: 'mention', ...(unknown.length ? { unknown_mentions: unknown } : {}) }
-  }
-  const unknown = req.mentions.length ? { unknown_mentions: req.mentions } : {}
-  return {
-    bot_id: dir.default_bot_id,
-    addressed: isDirect ? 'direct' : 'mention',
-    ...unknown,
-  }
+/** 供界面直接用的 Bot 名单（只读投影）。 */
+export function botCards(dir: BotDirectory): BotCard[] {
+  return dir.bots.map(({ bot_id, name, role, persona, avatar, color, memory_namespace }) => ({
+    bot_id, name, role,
+    ...(persona ? { persona } : {}),
+    ...(avatar ? { avatar } : {}),
+    ...(color ? { color } : {}),
+    memory_namespace,
+  }))
 }

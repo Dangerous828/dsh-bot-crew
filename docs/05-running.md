@@ -66,6 +66,15 @@ curl -s -X PUT $H http://127.0.0.1:3082/orchestrator/api/settings/eval -d '{
 
 **这个坑值得单独记**：模型的 `provider`/`model` 必须能在该 profile 的 `llm-pi-ai.providers` 里找到。写了一个不存在的组合，症状不是报错，而是 Eval 静默卡死。
 
+## 四点半、先自检
+
+```sh
+cd ~/Code/dsh-bot-crew && ./scripts/doctor.sh
+```
+
+只读检查：两个端口在不在、各组件健康态、`eval`/`executor` 模型钉没钉、手机实际拿到的 Bot 名录对不对。
+全对时最后一行是 `crew path looks healthy`，退出码 0。
+
 ## 五、验证一条真消息
 
 ```sh

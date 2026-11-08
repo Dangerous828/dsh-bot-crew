@@ -59,3 +59,37 @@
 2. **原来的 `registerHttp` 断言绑定必须是 loopback**，一旦改绑定，整个 `dsh-superagent` 插件启动失败——连带 `team` / `github` 都 `pending`，而 `/api/mobile` 也一起没了（因为它在同一个插件的 `apply` 里注册）。那条断言已改为按请求校验：`sameOrigin` 只接受 `Host: 127.0.0.1:<port>`，所以绑定地址放宽不影响管理面的保护强度。
 
 对应的测试也从「绑定必须是 loopback」改成「绑在局域网地址上时，局域网来的管理请求仍是 403，本机面板仍可用」——这才是真正要守的性质。
+
+## 团队意识与署名（2026-11-09）
+
+worker 现在知道自己在一个队伍里，而不只是一个孤立的人格：
+
+```
+The rest of the crew is scribbler=写手, coder=码农. Say plainly when something belongs
+to one of them rather than answering as if it were yours; you cannot speak for them and
+their memory is not yours to read.
+```
+
+实测问「队里还有谁」，大哥答「就两位：写手和码农」。这条信息来自新增的环境变量 `DSH_SUPERAGENT_CREW_TEAM`，内容是**除自己以外**的 `id=名字` 列表。
+
+## 署名打通到手机
+
+`mobilegw` 的 timeline 原来不带 `bot_id`（只有 `mobileq` 的 `thread`/`outbox` 带），所以手机拿到的时间线里所有回复都显示不出是谁说的。补上之后：
+
+| 条目 | 内容 |
+| --- | --- |
+| `r24` | `bot_id=coder` — 码农说的 |
+| `r25` | `bot_id=lead` — 大哥说的 |
+| `m21` | `mentions=[scribbler]` — 发给了写手 |
+| `m22` | `mentions=[]` — 没指名，大哥接 |
+
+## 客户端契约对齐
+
+用 Kotlin 客户端产出的精确请求体对运行中的后端做了验证：
+
+| 请求体 | 结果 |
+| --- | --- |
+| `{text, request_id, mentions:["scribbler"]}` | 200，落库，工单归 `scribbler` |
+| `{text, request_id}`（无 `mentions` 字段） | 200，工单归 `lead` |
+
+手机端 `MuseClient.send` 只在有人被 @ 时才写 `mentions` 字段，与后端「缺省即无人被 @」的语义一致。

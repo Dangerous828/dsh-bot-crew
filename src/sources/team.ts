@@ -210,10 +210,14 @@ export const teamKind: SourceKind<TeamConfig> = {
       { key: 'DSH_SUPERAGENT_CREW_CONVERSATION', description: {
         zh: '工单来源的对话；工单不是从这个来源来的时为空',
         en: 'The conversation that started the ticket; empty when the ticket did not come from this Source' } },
+      { key: 'DSH_SUPERAGENT_CREW_TEAM', description: {
+        zh: '同队其他 Bot 的 id 与名字，形如 id=名字，逗号分隔；用来知道能找谁',
+        en: 'The other bots in the crew as id=name pairs, comma separated, so this bot knows whom it may hand work to' } },
     ],
     values: ({ config, trigger }) => {
       if (trigger?.source !== SOURCE) {
-        return { DSH_SUPERAGENT_CREW_BOT: '', DSH_SUPERAGENT_CREW_PERSONA: '', DSH_SUPERAGENT_CREW_MEMORY: '', DSH_SUPERAGENT_CREW_CONVERSATION: '' }
+        return { DSH_SUPERAGENT_CREW_BOT: '', DSH_SUPERAGENT_CREW_PERSONA: '', DSH_SUPERAGENT_CREW_MEMORY: '',
+          DSH_SUPERAGENT_CREW_CONVERSATION: '', DSH_SUPERAGENT_CREW_TEAM: '' }
       }
       const botId = String(trigger.meta.bot_id ?? '')
       let persona = ''
@@ -222,11 +226,17 @@ export const teamKind: SourceKind<TeamConfig> = {
         const named = config.bots.find(bot => bot.bot_id === botId)
         if (named) persona = named.persona ?? ''
       } catch { persona = '' }
+      // Who else is on the crew, so a bot can name a teammate instead of answering outside its own remit.
+      const team = (config.bots ?? [])
+        .filter(bot => bot.bot_id !== botId)
+        .map(bot => `${bot.bot_id}=${bot.name}`)
+        .join(', ')
       return {
         DSH_SUPERAGENT_CREW_BOT: botId,
         DSH_SUPERAGENT_CREW_PERSONA: persona,
         DSH_SUPERAGENT_CREW_MEMORY: botId ? `bot/${botId}` : '',
         DSH_SUPERAGENT_CREW_CONVERSATION: String(trigger.meta.conversation ?? ''),
+        DSH_SUPERAGENT_CREW_TEAM: team,
       }
     },
   },

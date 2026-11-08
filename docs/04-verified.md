@@ -185,6 +185,10 @@ APK 在 Android 15 模拟器（arm64-v8a）里**安装并运行成功**：
 | 执行结果 | 码农回报「已建好：`/Users/cpuser/Desktop/crewphone`，内容 `hello`」 |
 | 磁盘核对 | 文件真的存在，内容就是 `hello` |
 
+芯片还有个长按：按住不放，下方显示这个 Bot 的职责——
+
+> 写手：中文文案。克制，不堆词，先给一版再改。
+
 截图在 `~/Desktop/dsh-crew/evidence/`。
 
 ### 小插曲（不是缺陷）

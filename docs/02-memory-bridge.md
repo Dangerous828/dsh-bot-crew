@@ -96,3 +96,32 @@ updated: 2026-11-08
 - 提示词里同时写了**什么不该记**：临时闲聊、一次性措辞、用户要求忘掉的。
 
 `docs/02` 前面几节的分流策略（Bot 的留本地、团队的才上 Hub）仍然成立，这里只是把「谁来写」落实了。
+
+## 一个必须说清的边界：记忆隔离是约定，不是强制（2026-11-09）
+
+实测发现并确认：**写手能读到码农的记忆文件。** 过程是让写手去翻 `bot/coder/`，它照做并把内容念了出来。
+
+原因在宿主自己的注释里就写着：
+
+```
+Provides default-path guardrails rather than an OS-level security boundary,
+as workers run under the operator's OS user.
+```
+
+所有 worker 都以**操作者本人的 OS 用户**运行，`chmod 700` 对同一个用户没有意义。所以「每个 Bot 的记忆
+彼此不可见」在文件系统层面**不成立**。
+
+提示词因此改成如实表述，而不是声称一个不存在的隔离：
+
+> Stay out of their memory directories: nothing stops you reading them, and that is exactly
+> why the rule is yours to keep.
+
+### 真要强制隔离，需要什么
+
+| 手段 | 代价 | 备注 |
+| --- | --- | --- |
+| 每个 Bot 一个 OS 用户 | 要给每个用户配 DSH 身份、密钥、workspace 权限 | 最彻底，运维负担也最大 |
+| `sandbox-exec` 包住每个 worker | 改执行器：per-ticket 生成 profile | macOS 专用（`sandbox-exec` 已废弃但可用），Linux 要换 `bwrap`/`nsjail` |
+| 记忆不落普通文件，改成一个只暴露自己 namespace 的服务 | 要新写一个带鉴权的读写接口 | 与「借用现有 memory 插件」的初衷冲突 |
+
+原型阶段选了「如实告知 + 约定」，因为它不引入新的失败模式。要做到强制隔离，上表第一条是正路。

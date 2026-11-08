@@ -56,3 +56,43 @@ $DSH_HOME/memory/  ← 插件 + 30 分钟定时兜底都在这读写，照旧
 ## 状态
 
 骨架（`src/memory/adapter.ts`），尚未接线。第一阶段先跑通「本地小本本 + 按格式落盘」，Hub 上行等第一条稳定事实跑通再接。
+
+## 实测：记忆真的能写、能读（2026-11-09）
+
+之前这一层只是「渲染 + 路径」的纯函数，真正落盘由宿主实现。现在把路径直接告诉 worker
+（它有 `danger-full-access` 的 bash），它自己读写：
+
+**第一单**：「记住一条：文案基调是克制、不堆词，写进你的记忆，告诉我路径。」
+
+```
+[scribbler] 写手已存好，路径：`/Users/cpuser/.dsh/memory/bot/scribbler/bot-scribbler-tone-concise-no-padding.md`
+```
+
+文件真的出现了，格式正确：
+
+```markdown
+---
+name: bot-scribbler-tone-concise-no-padding
+title: 文案基调：克制、不堆词
+description: "写手的固定文案基调 =「克制、不堆词」…"
+type: feedback
+updated: 2026-11-08
+---
+
+（正文：用户原话、这条为什么是长期标准、具体怎么执行）
+```
+
+**第二单**（全新工单、新 worker 会话）：「你的记忆里有关于文案基调的东西吗？」
+
+```
+[scribbler] 有：「克制、不堆词」。不加情绪渲染，不堆形容词；先交一版可用稿，再按反馈收。
+```
+
+跨工单召回成立。关键点：
+
+- `name` 以 `bot-<id>-` 开头，所以文件跑出 namespace 也能看出属于谁；
+- 一条事实一个文件，frontmatter 带 `description` 与 `type`，与 `dsh-auto-memory` 的格式一致，
+  现有上行链路可以直接搬去 Hub，不需要 fork 插件；
+- 提示词里同时写了**什么不该记**：临时闲聊、一次性措辞、用户要求忘掉的。
+
+`docs/02` 前面几节的分流策略（Bot 的留本地、团队的才上 Hub）仍然成立，这里只是把「谁来写」落实了。

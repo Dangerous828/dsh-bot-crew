@@ -20,6 +20,7 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `docs/02-memory-bridge.md` | 记忆桥：本地小本本 → `dsh-auto-memory` 格式 → 中枢 Hub |
 | `docs/03-host-wiring.md` | **怎么接进宿主**：复制哪些文件、注册点、提示词小节、宿主自带的两条文档测试 |
 | `docs/04-verified.md` | 已经验证到哪、还没验证什么 |
+| `docs/05-running.md` | **怎么跑起来**：后端、网关、名录、模型、一条真消息、手机 APK |
 | `src/contract/types.ts` | 契约的 TS 类型（表层） |
 | `src/crew/directory.ts` | Bot 名录：一个大哥 + 成员，以及名录必须守的规则 |
 | `src/crew/route.ts` | 确定性路由：这条消息该谁露面；话题串 id |
@@ -44,10 +45,12 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 
 - 契约、名录、路由、`team` Source、记忆适配层**已实现并通过类型检查**。
 - 在宿主 `~/Code/dsh-superagent` 里已验证：`tsc` 0 错、1213 个测试全绿、构建通过。
-- 尚未接通完整闭环（消息 → Trigger → Eval → Ticket → worker 回话），需要配模型、开 Source、配名录。
-- 前台 UI 尚未从 Tobs 搬运。
+- **完整闭环已跑通**：手机/队列消息 → Trigger → Eval → Ticket → worker 执行 → 回话，实测建了文件并两段回复。
+- **@ 路由已验证**：@写手 → 归 `scribbler`；无人 @ → 归 `lead`；回话按 `bot_id` 署名。
+- 手机端已加 Bot 芯片与署名，APK 可构建。
+- 前台还没做 Tobs 那套多会话/群组视图；现在是「一个对话 + 一排 Bot」。
 
-详见 `docs/04-verified.md`。
+详见 `docs/04-verified.md` 与 `docs/05-running.md`。
 
 ## 许可
 

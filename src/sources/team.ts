@@ -233,10 +233,12 @@ export const teamKind: SourceKind<TeamConfig> = {
 }
 
 export async function sendTeam(host: { commands: SourceContext['commands'] }, message: OutboundMessage): Promise<'sent' | 'gone'> {
-  const { conversation, message: to } = message.channel.address
+  const { conversation, message: to, bot_id } = message.channel.address
   if (!conversation || !to) throw new Error('Missing team reply target')
   try {
-    await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text])
+    // Sign the reply with the Bot that answered, so the phone can show who spoke.
+    await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text,
+      ...(typeof bot_id === 'string' && bot_id ? ['--bot', bot_id] : [])])
     return 'sent'
   } catch (error) {
     if (error instanceof CliError && error.code === 410) return 'gone'

@@ -40,3 +40,22 @@
 - 记忆落盘与 Hub 上行：适配层是纯函数 + 计划对象，真正的原子写与 `recall` 由宿主实现，尚未接。
 - 前台还没做 Tobs 那套多会话/群组视图；现在是「一个对话 + 一排 Bot 芯片」。
 - 真机安装：本机没有连着的设备，APK 只做了构建验证。
+
+## 手机走局域网（2026-11-09）
+
+后端默认只绑 `127.0.0.1`，手机连不上。改成绑本机局域网地址后，手机可以直连：
+
+| 项 | 结果 |
+| --- | --- |
+| 绑定 | `host: 192.168.31.127`，监听在该地址 |
+| 登录 | `?token=` 换到的 cookie authority 是 `192.168.31.127:3082`，与访问地址一致 |
+| `/api/mobile/timeline` | 返回三个 Bot 与 `default_bot_id` |
+| `/api/mobile/send` + `mentions` | `@写手` → `scribbler`，`@码农` → `coder`，无人 @ → `lead` |
+| 管理 API 从局域网 | **403**，`sameOrigin` 只认 `127.0.0.1` 的 Host |
+
+### 绑定非 loopback 时的两处坑
+
+1. **`host: 0.0.0.0` 会被拒绝。** DSH 的 webserver 明确不允许通配地址（`binding every interface would expose remote code execution to the network`），必须写一个具体的本机地址。
+2. **原来的 `registerHttp` 断言绑定必须是 loopback**，一旦改绑定，整个 `dsh-superagent` 插件启动失败——连带 `team` / `github` 都 `pending`，而 `/api/mobile` 也一起没了（因为它在同一个插件的 `apply` 里注册）。那条断言已改为按请求校验：`sameOrigin` 只接受 `Host: 127.0.0.1:<port>`，所以绑定地址放宽不影响管理面的保护强度。
+
+对应的测试也从「绑定必须是 loopback」改成「绑在局域网地址上时，局域网来的管理请求仍是 403，本机面板仍可用」——这才是真正要守的性质。

@@ -47,7 +47,7 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 - 在宿主 `~/Code/dsh-superagent` 里已验证：`tsc` 0 错、1213 个测试全绿、构建通过。
 - **完整闭环已跑通**：手机/队列消息 → Trigger → Eval → Ticket → worker 执行 → 回话，实测建了文件并两段回复。
 - **@ 路由已验证**：@写手 → 归 `scribbler`；无人 @ → 归 `lead`；回话按 `bot_id` 署名。
-- 手机端已加 Bot 芯片与署名，APK 可构建。
+- 手机端已加 Bot 芯片与署名，APK 可构建；后端已绑局域网地址，手机可直连。
 - 前台还没做 Tobs 那套多会话/群组视图；现在是「一个对话 + 一排 Bot」。
 
 详见 `docs/04-verified.md` 与 `docs/05-running.md`。

@@ -3,8 +3,9 @@
 ## 一、后端
 
 ```sh
-cd ~/Code/dsh-superagent
+cd backend
 ./node_modules/.bin/tsdown                 # 构建到 lib/
+../dsh-bridge/up.sh --profile crew          # 装 + 起，报地址；等价于下面两条手工步骤
 python3 scripts/dsh-superagent start       # 起在 127.0.0.1:3082
 python3 scripts/dsh-superagent status      # 看健康
 ```
@@ -16,7 +17,7 @@ python3 scripts/dsh-superagent status      # 看健康
 手机不直连 3082，走 `/api/mobile/*` → `mobilegw`（8788）→ `mobileq` 队列：
 
 ```sh
-cd ~/Code/dsh-superagent
+cd backend
 nohup python3 tools/mobilegw > .artifacts/mobilegw.log 2>&1 &
 curl -s http://127.0.0.1:8788/health    # {"ok": true}
 ```
@@ -113,18 +114,29 @@ worker 的提示词里还会有 `## Bot you are`、这个 Bot 的人格、以及
 ## 六、手机
 
 ```sh
-cd ~/Code/dsh-mobile-app
+cd app
 export JAVA_HOME=/opt/homebrew/Cellar/openjdk@21/21.0.9/libexec/openjdk.jdk/Contents/Home
 export ANDROID_HOME=$HOME/Library/Android/sdk
 echo "sdk.dir=$ANDROID_HOME" > local.properties
-./gradlew :app:assembleDebug
+./gradlew assembleDebug -PcrewToken=$(cat ~/.dsh/state/superagent-web/mobilegw.token)
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-装好后在 App 里连到 `http://<Mac 局域网 IP>:3082`，用后端启动日志里的 `?token=` 登录。
+App 连的是队伍自己的 gateway，不是后端面板：
 
-界面上：输入框上方一排 Bot 芯片，点一下就是 @ 它（再点取消，回到大哥）；对方回话左上方会署名谁说的。
+- 模拟器：`http://10.0.2.2:18882`（`10.0.2.2` 是模拟器眼里的宿主机）
+- 真机：`http://<Mac 局域网 IP>:18882`
 
-## 七、一处必须知道的互斥
+端口由后端的状态目录决定（`stateDir` 的哈希）；默认目录用 8788，另起的队伍换个端口，实际值看
+`backend/scripts/dsh-superagent` 的 `state_dir_identity`。
 
-`team` 与 `mobile` 两个 Source 读的是**同一条队列**。同时开会让每条消息被处理两次、回两遍。所以 `cordis.patch.yml` 里 mobile 是 `disabled: true`，只留 team。手机端的 `/api/mobile/*` 不受影响——它走的是网关，与 Source 开关无关。
+token 在 `<stateDir>/mobilegw.token`，用 `-PcrewToken=` 传进构建，别写进仓库。
+
+## 七、桌面端
+
+```sh
+cd desktop
+go run .
+```
+
+同样认 `DSH_GW` 与 `DSH_TOKEN` 两个环境变量，缺省连 `http://127.0.0.1:18882`。

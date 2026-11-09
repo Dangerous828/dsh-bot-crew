@@ -1,0 +1,66 @@
+# GLOSSARY
+
+这个仓库里的词，只在这一个地方定义。代码、文档、提交信息都用这里的说法。
+
+## 四个块
+
+**backend**
+superagent 后端。原来的 dsh-superagent，现在住在本仓 `backend/`。它在 dsh 进程里跑（是 dsh 的 bundle 插件），不是独立服务。
+它持有唯一的工作状态账（Ticket），并对外提供两套 HTTP 面：管理面与消息面。
+
+**dsh-bridge**
+dsh 侧的配置层。放 profile 补丁、worker/router 两个 preset 的定义、启动脚本。
+它**不是**一个插件工程，也不重新实现 dsh 的会话接口——那些调用发生在 dsh 进程内，不经过网络。
+
+**desktop**
+macOS 桌面端。Go + mygo（`github.com/egoist/mygo`），原生 UI，不用 webview。
+
+**app**
+Android 客户端。Kotlin + Compose 原生重写。旧仓 `~/Code/dsh-mobile-app` 已不再被引用。
+
+## 两套 HTTP 面
+
+**管理面（management surface）**
+`/orchestrator/api/*`，后端在 dsh 的 webServer 上注册的一层。
+给配置与排障用：settings、sources、prompts、executor。
+外部客户端**不接这一层**，原因是它的同源围栏要求 Host 头严格等于 `127.0.0.1:<port>`。
+
+**消息面（message surface）**
+`/api/mobile/send` 与 `/api/mobile/timeline`，经 DSH Connection 鉴权。
+这是人跟 Bot 说话的唯一入口。桌面端与 App 都只接这一层。
+
+## 对话
+
+**conversation**
+一段人与人、Bot 之间的消息流。当前只有一段，id 恒为 `main`。
+
+**Bot 队伍（crew）**
+一组 Bot 在同一段 conversation 里接话。Bot 靠 `@bot_id` 被点名；没人点名时由 default 那个接。
+
+**BotCard**
+Bot 的名片：`bot_id`、`name`、`role`（default 或 member）、`persona`、`memory_namespace`。
+Bot 是身份与呈现，**不是** Agent，也不持有任何任务状态。
+
+**mention**
+消息里 `@<bot_id>` 的引用。只决定谁接话，不构成任何授权。
+
+## 工作
+
+**Ticket**
+一件活的状态主体，也是唯一的真源。开→干→结束，可以重开。
+前端看到的 `ticket_ref`、`tasks[]` 都只是 Ticket 的只读投影，**不得**据此维护自己的状态机。
+
+**worker**
+一个 Ticket 对应一个 dsh Session，id 恒为 `worker-<ticketId>`。
+
+**attention**
+Bot 卡在某个问题上等人回答的状态。表现为 Ticket 上的一条 question。
+
+## 网关与队列
+
+**gateway / mobilegw**
+`backend/tools/mobilegw`，一个本机小服务（默认 `127.0.0.1:8788`），只认 `X-GW-Token`。
+它把消息面翻译成队列读写。
+
+**queue / mobileq**
+`<stateDir>/mobileq.db`（SQLite）。gateway 与 backend 之间的传输层，人看不到。

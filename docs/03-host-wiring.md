@@ -5,7 +5,7 @@
 ## 1. 复制文件
 
 ```sh
-HOST=~/Code/dsh-superagent
+HOST=./backend
 cp src/crew/directory.ts  "$HOST/src/crew/directory.ts"
 cp src/crew/route.ts      "$HOST/src/crew/route.ts"
 cp src/sources/team.ts    "$HOST/src/sources/team.ts"

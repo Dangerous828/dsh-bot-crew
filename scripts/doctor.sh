@@ -61,7 +61,7 @@ done
 
 # 5. The roster the phone actually receives, read through the same timeline the app uses. It must name
 #    exactly one default Bot, or routing has no fallback for a message that mentions nobody.
-token=$(grep -ho 'token=[A-Za-z0-9_-]*' ~/Code/dsh-superagent/.artifacts/dsh-superagent-superagent-*.log 2>/dev/null | tail -1 | cut -d= -f2)
+token=$(grep -ho 'token=[A-Za-z0-9_-]*' backend/.artifacts/dsh-superagent-superagent-*.log 2>/dev/null | tail -1 | cut -d= -f2)
 origin=$(lsof -nP -iTCP:3082 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{split($9,a,":"); print a[1]}')
 if [ -z "$token" ] || [ -z "$origin" ]; then
   bad "crew roster" "cannot read the login token or the bound address"

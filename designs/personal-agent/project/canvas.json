@@ -1,0 +1,34 @@
+{
+  "v": 3,
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-11-09T13:42:42Z"
+  },
+  "title": "Personal Agent",
+  "launch": {
+    "view": "canvas"
+  },
+  "pages": [],
+  "boards": {
+    "Desktop.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 主界面"
+    },
+    "Mobile.dc.html": {
+      "x": 1560,
+      "y": 0,
+      "w": 390,
+      "h": 844,
+      "title": "手机 · 对话"
+    }
+  },
+  "order": [
+    "Desktop.dc.html",
+    "Mobile.dc.html"
+  ],
+  "notes": {},
+  "designSystems": []
+}

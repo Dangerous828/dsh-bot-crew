@@ -1,0 +1,29 @@
+# dsh-bridge —— 拷进 $DSH_HOME/profiles/<profile>/cordis.patch.yml
+#
+# 三处必须替换成你自己的绝对路径：
+#   <state-dir>   后端的状态目录：工单库、消息队列、worker 的工作目录都在这里
+#   <backend-dir> 本仓库 backend/ 的绝对路径
+#
+# 其余内容一般不用动。字段含义见 backend/docs/006-deployment.md。
+
+- id: webserver
+  config:
+    # 只监听回环。管理面有同源围栏（Host 必须正好是 127.0.0.1:<port>），绑到局域网地址也救不了它，
+    # 反而会让面板从网络里可访问却调不通。
+    host: 127.0.0.1
+    port: 3082
+
+- id: dsh-superagent
+  config:
+    stateDir: <state-dir>
+
+# 下面三个 Source 默认不开，按需取消 disabled：
+#   github  需要 gh-agent 那个 CLI 签好 agent 账号
+#   feishu  需要 lark-cli 与自建应用
+#   mobile  与 team 抢同一个队列，同时开会让消息被消费两次，一般只留 team
+# - id: dsh-superagent-github
+#   disabled: false
+# - id: dsh-superagent-feishu
+#   disabled: false
+# - id: dsh-superagent-mobile
+#   disabled: false

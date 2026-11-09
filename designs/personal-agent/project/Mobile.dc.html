@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Personal Agent · 手机</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 844px; box-sizing: border-box; display: flex; flex-direction: column; background: #F4F4F6; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; color: #1A1A1E; position: relative; overflow: hidden">
+
+  <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 24px 8px; font-size: 12px; font-weight: 600; color: #1A1A1E">
+    <span>9:41</span>
+    <span style="display: flex; align-items: center; gap: 5px" aria-hidden="true">
+      <svg width="16" height="11" viewBox="0 0 16 11" fill="currentColor"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="2.5" height="11" rx="1" opacity=".35"/></svg>
+      <svg width="22" height="11" viewBox="0 0 22 11" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="0.6" y="0.6" width="18" height="9.8" rx="2.6"/><rect x="2.2" y="2.2" width="13" height="6.6" rx="1.4" fill="currentColor" stroke="none"/><path d="M20.2 4v3" stroke-linecap="round" stroke-width="1.8"/></svg>
+    </span>
+  </div>
+
+  <!-- 顶栏：一位 Bot 的身份与状态，也是回到花名册的入口 -->
+  <header style="display: flex; align-items: center; gap: 11px; padding: 8px 16px 14px; background: #FFFFFF; border-bottom: 1px solid #E6E6EA">
+    <button type="button" aria-label="回到花名册" style="flex: none; width: 32px; height: 32px; border-radius: 9px; border: none; background: #F4F4F6; color: #1A1A1E; cursor: pointer; display: flex; align-items: center; justify-content: center">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <span style="flex: none; width: 36px; height: 36px; border-radius: 11px; background: #5B4BE0; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 14.5px; font-weight: 650">林</span>
+    <div style="display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1">
+      <span style="font-size: 14.5px; font-weight: 650">林 · 前端</span>
+      <span style="font-size: 12px; color: #6B6B75; display: flex; align-items: center; gap: 5px">
+        <span style="width: 5px; height: 5px; border-radius: 50%; background: #5B4BE0; display: inline-block"></span>
+        正在工作 · 3 分钟
+      </span>
+    </div>
+    <!-- 手机上没有常驻右栏，这个按钮就是工作区唯一的门 -->
+    <button type="button" aria-label="看它的屏幕" style="flex: none; width: 34px; height: 34px; border-radius: 9px; border: 1px solid #E6E6EA; background: #FFFFFF; color: #5B4BE0; cursor: pointer; display: flex; align-items: center; justify-content: center">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8"/></svg>
+    </button>
+  </header>
+
+  <main style="flex: 1; overflow-y: auto; padding: 22px 16px 18px; display: flex; flex-direction: column; gap: 18px">
+
+    <div style="display: flex; justify-content: flex-end">
+      <div style="max-width: 84%; background: #1A1A1E; color: #FFFFFF; border-radius: 15px 15px 4px 15px; padding: 11px 14px; font-size: 14.5px; line-height: 1.55">登录页在手机上输入框太挤，帮我把间距调开一点</div>
+    </div>
+
+    <div style="display: flex; gap: 9px; align-items: flex-start">
+      <span style="flex: none; width: 26px; height: 26px; border-radius: 8px; background: #5B4BE0; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 11.5px; font-weight: 650">林</span>
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 84%">
+        <div style="font-size: 14.5px; line-height: 1.6">看了下，输入框之间是 12px，按钮又贴着底部。我把竖向间距改成 16px，按钮下面留 24px 安全区。</div>
+
+        <div style="border: 1px solid #E6E6EA; border-radius: 11px; background: #FFFFFF; overflow: hidden">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #E6E6EA; font-size: 11.5px; color: #6B6B75">
+            <span>login.tsx</span>
+            <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace">+8 −4</span>
+          </div>
+          <!-- 窄屏只留改了什么，删掉源文件的其余行；要看全可以点开 -->
+          <div style="padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.8">
+            <div style="color: #6B6B75">gap: <span style="color: #A8562A">12px</span></div>
+            <div style="background: #E8F3EC; color: #1F7A4C; border-radius: 4px; padding: 0 4px; margin: 0 -4px">gap: 16px</div>
+            <div style="color: #6B6B75">padding-bottom: <span style="color: #A8562A">0</span></div>
+            <div style="background: #E8F3EC; color: #1F7A4C; border-radius: 4px; padding: 0 4px; margin: 0 -4px">padding-bottom: 24px</div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 8px">
+          <button type="button" style="flex: 1; padding: 10px; border-radius: 10px; border: none; background: #5B4BE0; color: #FFFFFF; font-size: 13.5px; font-weight: 550; cursor: pointer">采用</button>
+          <button type="button" style="flex: 1; padding: 10px; border-radius: 10px; border: 1px solid #E6E6EA; background: #FFFFFF; color: #1A1A1E; font-size: 13.5px; cursor: pointer">看效果</button>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: flex; justify-content: flex-end">
+      <div style="max-width: 84%; background: #1A1A1E; color: #FFFFFF; border-radius: 15px 15px 4px 15px; padding: 11px 14px; font-size: 14.5px; line-height: 1.55">按这个改</div>
+    </div>
+
+    <div style="display: flex; gap: 9px; align-items: flex-start">
+      <span style="flex: none; width: 26px; height: 26px; border-radius: 8px; background: #5B4BE0; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 11.5px; font-weight: 650">林</span>
+      <div style="display: flex; flex-direction: column; gap: 8px; max-width: 84%">
+        <div style="font-size: 14.5px; line-height: 1.6">改完了，在 375 和 390 两个宽度下都过了一遍。</div>
+        <button type="button" style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid #E6E6EA; border-radius: 10px; background: #FFFFFF; font-size: 12.5px; color: #4A4A55; cursor: pointer; text-align: left">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#1F7A4C" stroke-width="2.2" style="flex:none" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          两张截图已放进产出
+        </button>
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 9px; align-items: center">
+      <span style="flex: none; width: 26px; height: 26px; border-radius: 8px; background: #5B4BE0; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 11.5px; font-weight: 650">林</span>
+      <div style="display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: #6B6B75">
+        <span style="display: flex; gap: 3px" aria-hidden="true">
+          <span style="width: 5px; height: 5px; border-radius: 50%; background: #5B4BE0"></span>
+          <span style="width: 5px; height: 5px; border-radius: 50%; background: #B6AEF2"></span>
+          <span style="width: 5px; height: 5px; border-radius: 50%; background: #DCD8F7"></span>
+        </span>
+        正在跑第二遍视觉回归
+      </div>
+    </div>
+  </main>
+
+  <div style="padding: 10px 16px 26px; background: #FFFFFF; border-top: 1px solid #E6E6EA">
+    <div style="display: flex; align-items: flex-end; gap: 9px; background: #F4F4F6; border-radius: 13px; padding: 8px 8px 8px 14px">
+      <span style="flex: 1; font-size: 14.5px; color: #9A9AA5; padding: 6px 0">跟林说点什么</span>
+      <button type="button" aria-label="发送" style="flex: none; width: 32px; height: 32px; border-radius: 9px; border: none; background: #5B4BE0; color: #FFFFFF; cursor: pointer; display: flex; align-items: center; justify-content: center">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7-7"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#5B4BE0"},"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#5B4BE0' };
+  }
+}
+</script>
+</body>
+</html>

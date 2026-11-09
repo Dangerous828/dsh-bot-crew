@@ -30,6 +30,34 @@ describe('renderMarkdown', () => {
     expect(text).toContain('description: "a: b # c"')
   })
 
+  it('quotes values YAML would otherwise retype', () => {
+    // 裸 `yes` 读回来是布尔 true，裸 `123` 是数字，行尾空格会被当成续行；都得引起来。
+    expect(renderMarkdown({ ...record, description: 'yes' })).toContain('description: "yes"')
+    expect(renderMarkdown({ ...record, description: '123' })).toContain('description: "123"')
+    expect(renderMarkdown({ ...record, description: 'null' })).toContain('description: "null"')
+    expect(renderMarkdown({ ...record, description: 'a ' })).toContain('description: "a "')
+    expect(renderMarkdown({ ...record, description: '@at' })).toContain('description: "@at"')
+    // 普通中文短句保持裸写，别把每行都变成引号噪音。
+    expect(renderMarkdown({ ...record, description: '中文描述' })).toContain('description: 中文描述')
+  })
+
+  it('renders the optional title line, in plugin field order', () => {
+    const text = renderMarkdown({ ...record, title: '基调: 克制' })
+    // ASCII 冒号要引号；全角「：」不是 YAML 的键分隔符，保持裸写。
+    expect(text).toContain('title: "基调: 克制"')
+    expect(renderMarkdown({ ...record, title: '文案基调：克制' })).toContain('title: 文案基调：克制')
+    expect(text.indexOf('name:')).toBeLessThan(text.indexOf('title:'))
+    expect(text.indexOf('title:')).toBeLessThan(text.indexOf('description:'))
+    expect(renderMarkdown(record)).not.toContain('title:')
+    expect(() => renderMarkdown({ ...record, title: 'a\nb' })).toThrow(/title must be a single line/)
+  })
+
+  it('can express the statuses the injection rule rejects', () => {
+    // 类型上必须写得出 disputed / superseded，否则 injectable 的那两个分支永远走不到。
+    const text = renderMarkdown({ ...record, status: 'superseded' })
+    expect(text).toContain('status: superseded')
+  })
+
   it('rejects multi-line descriptions, empty bodies and missing dedupe keys', () => {
     expect(() => renderMarkdown({ ...record, description: 'a\nb' })).toThrow(/single line/)
     expect(() => renderMarkdown({ ...record, body: '   ' })).toThrow(/must not be empty/)
@@ -66,7 +94,9 @@ describe('injection rules', () => {
   it('skips disabled, disputed and superseded records only', () => {
     expect(injectable({})).toBe(true)
     expect(injectable({ status: 'candidate' })).toBe(true)
+    expect(injectable({ status: 'verified' })).toBe(true)
     expect(injectable({ disabled: true })).toBe(false)
+    expect(injectable({ status: 'disabled' })).toBe(false)
     expect(injectable({ status: 'disputed' })).toBe(false)
     expect(injectable({ status: 'superseded' })).toBe(false)
   })

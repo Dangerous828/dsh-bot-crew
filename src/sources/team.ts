@@ -32,6 +32,9 @@ const BotSchema = z.object({
   name: z.string().min(1),
   role: z.enum(['default', 'member']),
   persona: z.string().optional(),
+  // 契约（docs/00 §2）里有这两个字段，前台拿它画头像与配色；缺了它们界面只能回退到默认样式。
+  avatar: z.string().optional(),
+  color: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).optional(),
   memory_namespace: z.string(),
 }).strict()
 
@@ -72,6 +75,8 @@ export function directoryOf(config: TeamConfig): BotDirectory {
       name: bot.name,
       role: bot.role,
       ...(bot.persona ? { persona: bot.persona } : {}),
+      ...(bot.avatar ? { avatar: bot.avatar } : {}),
+      ...(bot.color ? { color: bot.color } : {}),
       memory_namespace: bot.memory_namespace,
     })),
   }
@@ -135,6 +140,8 @@ export const teamKind: SourceKind<TeamConfig> = {
       { key: 'persona', type: 'text', label: { zh: '人格', en: 'Persona' }, optional: true },
       { key: 'memory_namespace', type: 'text', label: { zh: '记忆命名空间', en: 'Memory namespace' }, pattern: 'bot/[a-z0-9-]+' },
     ] },
+    // 头像与配色不在面板里编辑：它们是给前台画的素材，不是运行时该改的东西。
+    // 但 schema 必须收，否则从 settings 写进去的 avatar/color 会在这一步被 strict 拒掉。
     { key: 'conversations', type: 'rows', label: { zh: '接收的对话', en: 'Conversations' }, columns: [
       { key: 'id', type: 'text', label: { zh: '对话', en: 'Conversation' }, pattern: '[a-z0-9-]+' },
       { key: 'listen', type: 'select', label: { zh: '接收', en: 'Receive' }, options: [

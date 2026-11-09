@@ -15,19 +15,75 @@
       "y": 0,
       "w": 1440,
       "h": 900,
-      "title": "桌面 · 主界面"
+      "title": "桌面 · 亮色"
     },
-    "Mobile.dc.html": {
+    "Desktop-dark.dc.html": {
       "x": 1560,
       "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 暗色"
+    },
+    "Desktop-empty.dc.html": {
+      "x": 0,
+      "y": 1020,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 空态"
+    },
+    "Desktop-offline.dc.html": {
+      "x": 1560,
+      "y": 1020,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 断连"
+    },
+    "Mobile.dc.html": {
+      "x": 0,
+      "y": 2040,
       "w": 390,
       "h": 844,
       "title": "手机 · 对话"
+    },
+    "Mobile-dark.dc.html": {
+      "x": 510,
+      "y": 2040,
+      "w": 390,
+      "h": 844,
+      "title": "手机 · 暗色"
+    },
+    "Mobile-roster.dc.html": {
+      "x": 1020,
+      "y": 2040,
+      "w": 390,
+      "h": 844,
+      "title": "手机 · 队伍（空态）"
+    },
+    "Mobile-card.dc.html": {
+      "x": 1530,
+      "y": 2040,
+      "w": 390,
+      "h": 844,
+      "title": "手机 · 名片"
+    },
+    "Mobile-workspace.dc.html": {
+      "x": 2040,
+      "y": 2040,
+      "w": 390,
+      "h": 844,
+      "title": "手机 · 工作区"
     }
   },
   "order": [
     "Desktop.dc.html",
-    "Mobile.dc.html"
+    "Desktop-dark.dc.html",
+    "Desktop-empty.dc.html",
+    "Desktop-offline.dc.html",
+    "Mobile.dc.html",
+    "Mobile-dark.dc.html",
+    "Mobile-roster.dc.html",
+    "Mobile-card.dc.html",
+    "Mobile-workspace.dc.html"
   ],
   "notes": {},
   "designSystems": []

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Personal Agent · 名片</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+</style>
+</helmet>
+<!-- 名片：长按花名册里的一行就弹这个。BotCard 有四个字段，界面上一直没露全 -->
+<div style="width: 100%; min-height: 844px; box-sizing: border-box; display: flex; flex-direction: column; background: #FBF9F6; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; color: #1F1D1A; position: relative; overflow: hidden">
+
+  <!-- 背后是暗下去的花名册，说明名片是浮在队伍之上的 -->
+  <div style="position: absolute; inset: 0; background: #FBF9F6; opacity: .55"></div>
+
+  <div style="position: relative; display: flex; align-items: center; justify-content: space-between; padding: 13px 22px 6px; font-size: 12px; font-weight: 600; color: #A9A294">
+    <span>9:41</span>
+  </div>
+
+  <div style="position: relative; flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px">
+    <div style="width: 100%; max-width: 330px; border-radius: 18px; background: #FFFFFF; border: 1px solid #EDE8E1; box-shadow: 0 18px 40px rgba(31,29,26,.16); overflow: hidden">
+
+      <div style="display: flex; align-items: flex-start; gap: 13px; padding: 22px 20px 16px">
+        <span style="flex: none; width: 56px; height: 56px; border-radius: 17px; background: #3E6B62; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 22px; font-weight: 620">林</span>
+        <div style="display: flex; flex-direction: column; gap: 3px; min-width: 0; padding-top: 4px">
+          <span style="font-size: 18px; font-weight: 660; letter-spacing: -0.01em">林</span>
+          <span style="font-size: 12.5px; color: #8A8377">前端 · 队里的默认接话人</span>
+        </div>
+      </div>
+
+      <div style="padding: 0 20px 16px">
+        <div style="font-size: 11px; font-weight: 600; color: #8A8377; letter-spacing: 0.05em; margin-bottom: 7px">人设</div>
+        <div style="font-size: 13.5px; line-height: 1.65; color: #1F1D1A">话少，先验再说。改东西前会自己跑一遍，报结论不报过程。拿不准的时候会直接说拿不准，不会糊过去。</div>
+      </div>
+
+      <div style="padding: 0 20px 16px; display: flex; flex-direction: column; gap: 9px">
+        <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 10px">
+          <span style="font-size: 11.5px; color: #8A8377">他的记忆</span>
+          <span style="font-size: 11.5px; color: #57524A; font-family: ui-monospace, SFMono-Regular, Menlo, monospace">bot/lin</span>
+        </div>
+        <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 10px">
+          <span style="font-size: 11.5px; color: #8A8377">最近的活</span>
+          <span style="font-size: 11.5px; color: #57524A">4 张 · 1 在跑</span>
+        </div>
+        <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 10px">
+          <span style="font-size: 11.5px; color: #8A8377">认识多久</span>
+          <span style="font-size: 11.5px; color: #57524A">从 2026-09-14 起</span>
+        </div>
+      </div>
+
+      <div style="padding: 0 20px 20px; display: flex; flex-direction: column; gap: 7px">
+        <button type="button" style="padding: 11px; border-radius: 10px; border: none; background: #3E6B62; color: #FFFFFF; font-size: 13.5px; font-weight: 550; cursor: pointer">跟他说话</button>
+        <div style="display: flex; gap: 7px">
+          <button type="button" style="flex: 1; padding: 9px; border-radius: 10px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #1F1D1A; font-size: 12.5px; cursor: pointer">改人设</button>
+          <button type="button" style="flex: 1; padding: 9px; border-radius: 10px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #1F1D1A; font-size: 12.5px; cursor: pointer">看他的记忆</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic { renderVals() { return {}; } }
+</script>
+</body>
+</html>

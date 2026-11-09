@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""mobileq — local message queue CLI for the dsh-superagent `mobile` Source.
+
+Contract (mirrors docs/008-cookbook.md's `hookq` example):
+  mobileq pull   --after <n> --json        -> {"me": "agent", "items": [...], "next": <n>}
+  mobileq reply  --conversation <c> --to <msgId> --key <key> --text <t>
+  mobileq thread --conversation <c> --root <msgId> --json [--after <cursor>]
+  mobileq inject --conversation <c> --sender <s> --text <t> [--mentions-me] [--mention <bot>]... [--thread <msgId>] [--bot]
+  mobileq outbox --conversation <c> [--after <n>] --json   -> replies the agent wrote back
+
+DB lives at $DSH_HOME/state/superagent/mobileq.db (override with --db).
+This is the transport seam only; it knows nothing about dsh-superagent internals.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+
+ME = "agent"
+
+
+def db_path(args):
+    if getattr(args, "db", None):
+        return args.db
+    home = os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+    d = os.path.join(home, "state", "superagent")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "mobileq.db")
+
+
+def conn(p):
+    c = sqlite3.connect(p)
+    c.row_factory = sqlite3.Row
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation TEXT NOT NULL,
+            thread INTEGER,
+            sender TEXT NOT NULL,
+            bot INTEGER DEFAULT 0,
+            mentions_me INTEGER DEFAULT 0,
+            text TEXT NOT NULL,
+            at TEXT NOT NULL,
+            url TEXT,
+            reply_to INTEGER,
+            mentions TEXT
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS replies(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation TEXT NOT NULL,
+            to_msg INTEGER,
+            rkey TEXT UNIQUE,
+            text TEXT NOT NULL,
+            at TEXT NOT NULL,
+            bot_id TEXT
+        )"""
+    )
+    if 'request_id' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+        c.execute('ALTER TABLE messages ADD COLUMN request_id TEXT')
+    if 'mentions' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+        c.execute('ALTER TABLE messages ADD COLUMN mentions TEXT')
+    if 'bot_id' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
+        c.execute('ALTER TABLE replies ADD COLUMN bot_id TEXT')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS messages_request_id ON messages(conversation, request_id)')
+    c.commit()
+    return c
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def msg_json(r):
+    return {
+        "id": r["id"],
+        "conversation": r["conversation"],
+        "thread": r["thread"] if r["thread"] is not None else r["id"],
+        "sender": {"id": r["sender"], "bot": bool(r["bot"])},
+        "mentions_me": bool(r["mentions_me"]),
+        "mentions": [m for m in ((r["mentions"] or "").split(",") if r["mentions"] else []) if m],
+        "text": r["text"],
+        "at": r["at"],
+        "url": r["url"] or "",
+        "reply_to": r["reply_to"],
+    }
+
+
+def cmd_pull(c, args):
+    after = int(args.after or 0)
+    rows = c.execute(
+        "SELECT * FROM messages WHERE id > ? ORDER BY id ASC", (after,)
+    ).fetchall()
+    items = [msg_json(r) for r in rows]
+    nxt = items[-1]["id"] if items else after
+    out = {"me": ME, "items": items, "next": nxt}
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def reply_target(value):
+    """The message a reply hangs under, as the column stores it.
+
+    Plain messages are numbered, so the usual case stays an integer and every existing query keeps working.
+    A handoff between bots opens a turn under a text id, and SQLite stores that fine in this INTEGER column
+    (it is not strictly typed); coercing it to int only crashed the write and lost the reply.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def cmd_reply(c, args):
+    if not args.conversation or not args.to or not args.key or args.text is None:
+        print("missing reply target", file=sys.stderr)
+        return 2
+    try:
+        c.execute(
+            "INSERT INTO replies(conversation,to_msg,rkey,text,at,bot_id) VALUES(?,?,?,?,?,?)",
+            (args.conversation, reply_target(args.to), args.key, args.text, now(), getattr(args, 'bot', None)),
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        # idempotent: same key already delivered
+        pass
+    print(json.dumps({"ok": True, "key": args.key}, ensure_ascii=False))
+    return 0
+
+
+def cmd_thread(c, args):
+    root = int(args.root)
+    conv = args.conversation
+    # Keep dispatch ownership per request, while giving the assessor the actual
+    # preceding conversation (including bot replies). Never expose later human
+    # requests as evidence for an earlier Trigger.
+    rows = c.execute(
+        'SELECT * FROM (SELECT * FROM messages WHERE conversation=? AND id<=? ORDER BY id DESC LIMIT 100) ORDER BY id',
+        (conv, root),
+    ).fetchall()
+    ids = {r['id'] for r in rows}
+    replies = c.execute('SELECT * FROM replies WHERE conversation=? ORDER BY id', (conv,)).fetchall()
+    # Sort within each exchange, independent of second-resolution timestamps.
+    entries = [(r['id'], 0, r['id'], msg_json(r)) for r in rows]
+    entries += [(r['to_msg'], 1, r['id'], {
+        'id': 'r%s' % r['id'], 'conversation': conv, 'thread': root,
+        'sender': {'id': ME, 'bot': True}, 'mentions_me': False,
+        'text': r['text'], 'at': r['at'],
+        **({'bot_id': r['bot_id']} if r['bot_id'] else {}),
+    }) for r in replies if r['to_msg'] in ids]
+    entries.sort(key=lambda item: item[:3])
+    items = [item[3] for item in entries]
+    if args.after:
+        position = next((i for i, item in enumerate(items) if str(item['id']) == args.after), None)
+        if position is not None:
+            items = items[position + 1:]
+    print(json.dumps({"items": items, "next": ""}, ensure_ascii=False))
+    return 0
+
+
+def cmd_inject(c, args):
+    c.execute(
+        "INSERT INTO messages(conversation,thread,sender,bot,mentions_me,mentions,text,at,reply_to) VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            args.conversation,
+            int(args.thread) if args.thread else None,
+            args.sender,
+            1 if args.bot else 0,
+            1 if args.mentions_me else 0,
+            ",".join(args.mention or []),
+            args.text,
+            now(),
+            int(args.thread) if args.thread else None,
+        ),
+    )
+    c.commit()
+    mid = c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    print(json.dumps({"ok": True, "id": mid}, ensure_ascii=False))
+    return 0
+
+
+def cmd_outbox(c, args):
+    after = int(args.after or 0)
+    q = "SELECT * FROM replies WHERE id > ?"
+    params = [after]
+    if args.conversation:
+        q += " AND conversation = ?"
+        params.append(args.conversation)
+    q += " ORDER BY id ASC"
+    rows = c.execute(q, params).fetchall()
+    items = [
+        {"id": r["id"], "conversation": r["conversation"], "to_msg": r["to_msg"],
+         "key": r["rkey"], "text": r["text"], "at": r["at"],
+         **({"bot_id": r["bot_id"]} if r["bot_id"] else {})}
+        for r in rows
+    ]
+    nxt = items[-1]["id"] if items else after
+    print(json.dumps({"items": items, "next": nxt}, ensure_ascii=False))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mobileq")
+    ap.add_argument("--db", default=None)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("pull")
+    p.add_argument("--db", default=None)
+    p.add_argument("--after", default="0")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("reply")
+    p.add_argument("--db", default=None)
+    p.add_argument("--conversation", required=True)
+    p.add_argument("--to", required=True)
+    p.add_argument("--key", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--bot", default=None, help="bot id that signs this reply (team Source)")
+    p.set_defaults(func=cmd_reply)
+
+    p = sub.add_parser("thread")
+    p.add_argument("--db", default=None)
+    p.add_argument("--conversation", required=True)
+    p.add_argument("--root", required=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--after", default=None)
+    p.set_defaults(func=cmd_thread)
+
+    p = sub.add_parser("inject")
+    p.add_argument("--conversation", required=True)
+    p.add_argument("--sender", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--thread", default=None)
+    p.add_argument("--mentions-me", action="store_true")
+    p.add_argument("--mention", action="append", default=[],
+                   help="bot id this message @-mentions; repeatable (team Source)")
+    p.add_argument("--bot", action="store_true")
+    p.set_defaults(func=cmd_inject)
+
+    p = sub.add_parser("outbox")
+    p.add_argument("--conversation", default=None)
+    p.add_argument("--after", default="0")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_outbox)
+
+    args = ap.parse_args()
+    c = conn(db_path(args))
+    rc = args.func(c, args)
+    c.close()
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

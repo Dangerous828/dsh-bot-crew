@@ -1,0 +1,58 @@
+"""Bridge 127.0.0.1:3082 to the LAN address the harness binds.
+
+The harness binds one concrete address because it refuses a wildcard, and a phone that is not on this
+machine's own network cannot reach that address. The Android emulator is exactly that case: it sits on
+10.0.2.0/24 with `10.0.2.2` as its alias for the host's loopback, and the app refuses any address it
+does not share a subnet with. So the way in is the host's loopback, which nothing listens on.
+
+This forwards that loopback port to the real one. It is a plain bidirectional pipe: the protocol is HTTP
+over TCP, so no parsing is needed, and half-close is propagated so a streamed response ends properly.
+"""
+import socket
+import sys
+import threading
+
+LISTEN = ('127.0.0.1', 3082)
+TARGET = (sys.argv[1] if len(sys.argv) > 1 else '192.168.111.168', 3082)
+
+
+def pipe(src, dst):
+    try:
+        while True:
+            chunk = src.recv(65536)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        # Half-close so the other direction drains instead of resetting an in-flight response.
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def serve(client):
+    try:
+        upstream = socket.create_connection(TARGET, timeout=10)
+    except OSError:
+        client.close()
+        return
+    threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+    threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+
+
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(LISTEN)
+    server.listen(64)
+    print('loopproxy on %s:%d -> %s:%d' % (LISTEN[0], LISTEN[1], TARGET[0], TARGET[1]), flush=True)
+    while True:
+        client, _ = server.accept()
+        threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+
+if __name__ == '__main__':
+    main()

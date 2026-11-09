@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Manage a local dsh-superagent service (one DSH profile, default `superagent`) without affecting other tmux sessions.
+
+`status`, `start`, and `restart` exit 0 while the service runs normally; 1 when it is stopped, duplicated, unreachable, or
+reporting a runtime error, which `restart` may fix; 2 when it runs while a component such as a Source reports an error;
+and 3 when it runs and waits for setup. A restart fixes neither 2 nor 3: they need a person.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+
+def lan_address():
+    """This machine's primary LAN IPv4, or None when it is on none.
+
+    The backend binds one concrete address because DSH refuses a wildcard, so this has to follow the network
+    the laptop is on rather than be pinned to whatever it was on the day it was set up.
+
+    Read from the interface list rather than from a connect() probe: a proxy or VPN tunnel answers those with
+    its own utun address (198.18.0.1 here), which no phone on the Wi-Fi can reach and which then binds the
+    backend into a hole where nothing can talk to it.
+    """
+    import subprocess
+    try:
+        listing = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Only interfaces a device on the same network can reach: wired, Wi-Fi, hotspot. Tunnels (utun, gif),
+    # bridges and the loopback are excluded by name, and the address itself by range.
+    usable = ('en', 'ap')
+    current = None
+    for line in listing.splitlines():
+        if line and not line[0].isspace():
+            current = line.split(':', 1)[0]
+            continue
+        stripped = line.strip()
+        if not stripped.startswith('inet ') or current is None:
+            continue
+        if not current.startswith(usable):
+            continue
+        address = stripped.split()[1]
+        if address.startswith(('127.', '169.254.', '0.')):
+            continue
+        return address
+    return None
+
+
+def profile_state_dir(profile: str):
+    """Return the stateDir this profile's dsh-superagent entry configures, if it names one.
+
+    The gateway is launched from here, not by the plugin, so it cannot ask the backend where the queue lives. Reading the
+    same patch the backend reads keeps the two in step: a profile with its own stateDir gets its own queue and token.
+    """
+    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    if not patch.exists():
+        return None
+    text = patch.read_text()
+    match = re.search(r'(?ms)^- id: dsh-superagent\n(?:.*?\n)*?\s+stateDir: (\S+)', text)
+    return Path(match.group(1)).expanduser() if match else None
+
+def sync_bind_address(address: str, profile: str) -> None:
+    """Point the profile's webserver host at `address`, leaving the file untouched when it already matches."""
+    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    if not patch.exists():
+        return
+    text = patch.read_text()
+    updated = re.sub(r'(?m)^(    host: )([0-9a-fA-F:.]+)$', lambda m: m.group(1) + address, text, count=1)
+    if updated != text:
+        patch.write_text(updated)
+        print(f'bind address -> {address}', flush=True)
+
+ARTIFACTS = ROOT / '.artifacts'
+CONTROL = ARTIFACTS / 'control'
+KEEP_LOGS = 20
+
+
+def control(profile):
+    """Return the control directory for `profile`, creating it if needed."""
+    directory = CONTROL / 'profiles' / profile
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def stopped(profile):
+    """Return whether `profile` was intentionally stopped."""
+    return (control(profile) / 'manually-stopped').exists()
+
+
+def serves(args, profile):
+    """Return whether command-line arguments belong to the main DSH service process for `profile`."""
+    words, matched, value = [], False, False
+    for word in args[1:]:
+        if value:
+            matched, value = matched or word == profile, False
+        elif word == '--profile':
+            value = True
+        elif word == '--profile=' + profile:
+            matched = True
+        elif not word.startswith('-'):
+            words.append(word)
+    return matched and 'plugin' not in words
+
+
+def ps(*options, check=False):
+    """Yield `(pid, comm, args)` tuples from `ps`; arguments are split on whitespace, so paths with spaces become several words and only `--profile` and subcommands are inspected."""
+    result = subprocess.run(['ps', '-ww', *options, '-o', 'pid=,ucomm=,args='], check=check, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            yield int(parts[0]), parts[1], parts[2].split()
+
+
+def running(pid, profile):
+    """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
+    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
+
+
+def processes(profile):
+    """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
+    found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
+    try:
+        pid = int((control(profile) / 'service.pid').read_text())
+    except (OSError, ValueError):
+        return found
+    return found + [pid] if pid not in found and running(pid, profile) else found
+
+
+def state(url):
+    """Fetch health and setup status from the management API, or return None if unreachable."""
+    request = urllib.request.Request(url.rstrip('/') + '/orchestrator/api/state',
+                                     headers={'x-orchestrator-request': '1'})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            value = json.load(response)
+        # Keys omitted by another version read as empty so the service is not mistaken for unreachable.
+        health, setup = value.get('health') or {}, value.get('setup') or {}
+        entries = {name: entry if isinstance(entry, dict) else {} for name, entry in health.items()}
+        return {'health': {name: entry.get('state') for name, entry in entries.items()},
+                'errors': {name: str(entry.get('detail', '')) for name, entry in entries.items() if entry.get('state') == 'error'},
+                'setup': setup.get('problem'), 'feishu': setup.get('feishuProblem')}
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+PART_ERROR = 2
+SETUP_WAITS = 3
+
+
+def runtime_up(current):
+    """Return whether the runtime is ready or paused awaiting operator action; a component still starting (such as history recovery) does not hold this up."""
+    return current is not None and current['health'].get('runtime') in ('ready', 'paused')
+
+
+def part_errors(current):
+    """Return non-runtime components that are in an error state."""
+    return {name: detail for name, detail in sorted(current['errors'].items()) if name != 'runtime'}
+
+
+def outcome(pids, current):
+    """Compute the CLI exit code from running PIDs and management API state."""
+    if len(pids) != 1 or not runtime_up(current):
+        return 1
+    if current['setup']:
+        return SETUP_WAITS
+    # A component's lasting error, unlike a Feishu bot check that failed during setup, requires operator action.
+    return PART_ERROR if part_errors(current) else 0
+
+
+def status(args):
+    pids = processes(args.profile)
+    current = state(args.url) if pids else None
+    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
+                      'manually_stopped': stopped(args.profile), 'health': current and current['health'],
+                      'errors': current and current['errors'], 'setup': current and current['setup'],
+                      'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
+    return outcome(pids, current)
+
+
+def stop(args, intentional=True):
+    """Stop the service gracefully, recording a manual stop marker when `intentional` is True."""
+    pids = processes(args.profile)
+    if len(pids) > 1:
+        raise RuntimeError('Multiple dsh-superagent processes found; refusing to choose one.')
+    # Write the stop marker before waiting so monitors respect the intentional stop even if graceful shutdown times out.
+    if intentional:
+        (control(args.profile) / 'manually-stopped').write_text(time.strftime('%Y-%m-%dT%H:%M:%S%z') + '\n')
+    for pid in pids:
+        os.kill(pid, signal.SIGINT)
+    deadline = time.monotonic() + args.stop_timeout
+    while any(running(pid, args.profile) for pid in pids):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Graceful stop timed out; no forced kill was sent. Check status.')
+        time.sleep(0.5)
+    (control(args.profile) / 'service.pid').unlink(missing_ok=True)
+    print('dsh-superagent stopped. Automatic recovery is paused until start/restart.' if intentional else 'dsh-superagent stopped.')
+
+
+def prune_logs(profile):
+    """Retain only the newest `KEEP_LOGS` log files for `profile`."""
+    name = re.compile(re.escape(f'dsh-superagent-{profile}-') + r'\d{8}-\d{6}-\d+\.log')
+    logs = sorted((path for path in ARTIFACTS.iterdir() if name.fullmatch(path.name)), key=lambda path: path.stat().st_mtime)
+    for path in logs[:-KEEP_LOGS]:
+        path.unlink(missing_ok=True)
+
+
+def ensure_loopproxy(address):
+    """Bridge this machine's loopback to the address the backend binds.
+
+    The backend refuses a wildcard, so it listens on one LAN address. A client that is not on this machine's
+    network cannot reach that address, and the Android emulator never is: it lives on 10.0.2.0/24 and reaches
+    the host only as 10.0.2.2, which is the host's loopback. Nothing listens there, so the app cannot connect
+    even though the network itself is fine. This forwards that port.
+    """
+    proxy = ROOT / 'tools' / 'loopproxy'
+    if not proxy.exists() or not address:
+        return
+    subprocess.run(['pkill', '-f', str(proxy)], capture_output=True)
+    time.sleep(0.3)
+    log = ARTIFACTS / 'loopproxy.log'
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    with open(log, 'ab') as handle:
+        process = subprocess.Popen([sys.executable, str(proxy), address], cwd=str(ROOT),
+                                   stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    time.sleep(0.5)
+    if process.poll() is not None:
+        raise RuntimeError(f'loopback proxy exited immediately; see {log}')
+
+
+def state_dir_identity(state_dir):
+    """Return a gateway port that is stable for a state directory and differs between them.
+
+    Two crews on one machine mean two queues, and a queue needs its own gateway. Deriving the port from the directory
+    keeps it the same on every restart (so nothing has to remember it) while a second crew lands somewhere else.
+    8788 stays what it has always been, so a profile on the default state directory does not move.
+    """
+    if Path(state_dir).resolve() == (Path.home() / '.dsh' / 'state' / 'superagent').resolve():
+        return 8788
+    digest = sum(ord(character) for character in str(Path(state_dir).resolve()))
+    return 18800 + digest % 100
+
+
+def ensure_gateway(profile=None):
+    """Keep the mobile gateway running on the source that is already on disk.
+
+    The gateway is a separate long-lived process (tools/mobilegw) that the backend shells out to for the phone's
+    timeline, so restarting the backend alone leaves the old code running there. That produced a silent failure
+    mode: the gateway kept answering the protocol from weeks-old code, the phone showed an empty stream, and
+    nothing on either side said why. Restart it whenever this script starts the service, so a code change takes
+    effect the same way it does for the backend.
+    """
+    gateway = ROOT / 'tools' / 'mobilegw'
+    if not gateway.exists():
+        return
+    subprocess.run(['pkill', '-f', str(gateway)], capture_output=True)
+    time.sleep(0.5)
+    log = ARTIFACTS / 'mobilegw.log'
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    # A profile may keep its crew in its own stateDir; the gateway has to read the same one or the two sides talk past
+    # each other. Not configured means the historical default, which the gateway still resolves on its own.
+    environment = dict(os.environ)
+    state_dir = profile_state_dir(profile) if profile else None
+    if state_dir:
+        # 队列与 token 跟着 profile 的 stateDir 走，两套队伍各有各的一份。
+        environment['MOBILEGW_STATE'] = str(state_dir)
+        # 端口也必须分开：同一个端口上两个 gateway 只有一个能绑住，另一个会以 Errno 48 退出。
+        environment.setdefault('MOBILEGW_PORT', str(state_dir_identity(state_dir)))
+    with open(log, 'ab') as handle:
+        process = subprocess.Popen([sys.executable, str(gateway)], cwd=str(ROOT), env=environment,
+                                   stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    # Give it a moment to bind, so a crash on startup is reported here rather than as a phone that cannot connect.
+    time.sleep(1.0)
+    if process.poll() is not None:
+        raise RuntimeError(f'mobile gateway exited immediately; see {log}')
+
+
+def start(args):
+    session = 'dsh-' + args.profile
+    pids = processes(args.profile)
+    if len(pids) > 1:
+        raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
+    if not pids:
+        dsh = shutil.which('dsh')
+        if not dsh or not shutil.which('tmux'):
+            raise RuntimeError('Both dsh and tmux must be on PATH.')
+        # The backend binds one concrete address, which changes whenever this machine joins another network.
+        # Re-point the profile at the current one before starting, so a moved laptop starts instead of failing
+        # with EADDRNOTAVAIL against an address it no longer holds.
+        lan = lan_address()
+        if lan:
+            sync_bind_address(lan, args.profile)
+        exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
+                                capture_output=True).returncode == 0
+        if state(args.url) is not None:
+            raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
+        log.touch()
+        prune_logs(args.profile)
+        # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
+        # The Host fence compares the whole authority, so a client that dials with the port in its Host header is
+        # refused unless that exact `host:port` is named. Phones and the emulator both do, so every form the backend
+        # can be reached under is listed here rather than only the bare address.
+        fences = []
+        for port in (3082, 9082):
+            if lan:
+                fences += ['--trusted-host', f'{lan}:{port}']
+            fences += ['--trusted-host', f'127.0.0.1:{port}']
+            # The emulator reaches this machine's loopback as 10.0.2.2 and sends that name, so the fence has to
+            # know it too; without it every request from the emulator is refused after the connection succeeds.
+            fences += ['--trusted-host', f'10.0.2.2:{port}']
+        command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open',
+                 *([ '--trusted-host', lan ] if lan else []), *fences,
+                 '--trusted-host', 'muse.kentonnie.top'])
+                   + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
+        # Reuse an existing tmux session without disturbing other windows.
+        target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
+        pane = subprocess.run(['tmux', *target, '-d', '-P', '-F', '#{pane_pid}', '-n', 'server', '-c', str(ROOT), command],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        if pane.isdigit():
+            (control(args.profile) / 'service.pid').write_text(pane + '\n')
+        print('Log: ' + str(log), flush=True)
+    else:
+        (control(args.profile) / 'service.pid').write_text(f'{pids[0]}\n')
+        print(f'dsh-superagent already running (PID {pids[0]}); no duplicate started.', flush=True)
+    (control(args.profile) / 'manually-stopped').unlink(missing_ok=True)
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        current = state(args.url)
+        if processes(args.profile) and runtime_up(current):
+            code = status(args)
+            if current['setup']:
+                print('dsh-superagent is waiting for setup: ' + str(current['setup'].get('detail', '')))
+                print('Open the URL DSH printed in the log, then the dsh-superagent overview.')
+            if current['feishu']:
+                print('dsh-superagent runs without Feishu: ' + str(current['feishu'].get('detail', '')))
+                print('Fix it on the Feishu card of the Source settings.')
+            for name, detail in part_errors(current).items():
+                print(f'{name} reports an error, which a restart does not fix: {detail}')
+            return code
+        time.sleep(1)
+    status(args)
+    raise RuntimeError('Startup health check timed out; inspect the log. Any running process was left intact.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status'])
+    parser.add_argument('--profile', default=os.environ.get('DSH_SUPERAGENT_PROFILE') or 'superagent',
+                        help='DSH profile that loads dsh-superagent; its tmux session is dsh-<profile>.')
+    parser.add_argument('--url', default=os.environ.get('DSH_SUPERAGENT_URL') or 'http://127.0.0.1:3082',
+                        help='Health-check URL; override after changing the profile port.')
+    parser.add_argument('--timeout', type=float, default=60, help='Startup timeout in seconds.')
+    parser.add_argument('--stop-timeout', type=float, default=300,
+                        help='Graceful shutdown timeout in seconds; running Executor Sessions finish their step first.')
+    parser.add_argument('--respect-stop', action='store_true',
+                        help='For monitoring: never start/restart after an intentional stop.')
+    args = parser.parse_args()
+    if args.timeout <= 0 or args.stop_timeout <= 0:
+        parser.error('--timeout and --stop-timeout must be positive')
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', args.profile):
+        parser.error('--profile must be a DSH profile name')
+    os.umask(0o077)
+    with (control(args.profile) / 'operation.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another dsh-superagent control operation is in progress.') from None
+        if args.respect_stop and args.action in ('start', 'restart') and stopped(args.profile):
+            print('Intentional stop is active; automatic recovery skipped.')
+            return 0
+        if args.action == 'status':
+            return status(args)
+        if args.action in ('stop', 'restart'):
+            # Only a stop keeps automatic recovery off; a restart whose stop timed out leaves it on.
+            stop(args, intentional=args.action == 'stop')
+        if args.action in ('start', 'restart'):
+            code = start(args)
+            # After the backend, so the token file it publishes already exists when the gateway reads it.
+            if code == 0:
+                ensure_gateway(args.profile)
+                # After the backend, so the address it actually binds is the one bridged.
+                ensure_loopproxy(lan_address())
+            return code
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

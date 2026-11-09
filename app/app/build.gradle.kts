@@ -16,7 +16,7 @@ android {
         versionName = "0.1.0"
 
         // 队伍地址与 token 从本地配置读，不进仓库；没配时指向模拟器里的宿主机。
-        val gateway = providers.gradleProperty("crewGateway").getOrElse("http://10.0.2.2:18882")
+        val gateway = providers.gradleProperty("crewGateway").getOrElse("http://10.0.2.2:8788")
         val gatewayToken = providers.gradleProperty("crewToken").getOrElse("")
         buildConfigField("String", "GW_BASE", "\"$gateway\"")
         buildConfigField("String", "GW_TOKEN", "\"$gatewayToken\"")

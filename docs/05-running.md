@@ -124,11 +124,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 App 连的是队伍自己的 gateway，不是后端面板：
 
-- 模拟器：`http://10.0.2.2:18882`（`10.0.2.2` 是模拟器眼里的宿主机）
-- 真机：`http://<Mac 局域网 IP>:18882`
+- 模拟器：`http://10.0.2.2:<端口>`（`10.0.2.2` 是模拟器眼里的宿主机）
+- 真机：`http://<Mac 局域网 IP>:<端口>`
 
-端口由后端的状态目录决定（`stateDir` 的哈希）；默认目录用 8788，另起的队伍换个端口，实际值看
-`backend/scripts/dsh-superagent` 的 `state_dir_identity`。
+端口由后端的状态目录推出来，不是固定值：默认目录 `~/.dsh/state/superagent` 是 8788，
+其余目录按 `18800 + 路径字符和 % 100` 计算。`dsh-bridge/up.sh` 会直接把算好的值打出来，
+别在这里猜。
 
 token 在 `<stateDir>/mobilegw.token`，用 `-PcrewToken=` 传进构建，别写进仓库。
 
@@ -139,4 +140,4 @@ cd desktop
 go run .
 ```
 
-同样认 `DSH_GW` 与 `DSH_TOKEN` 两个环境变量，缺省连 `http://127.0.0.1:18882`。
+同样认 `DSH_GW` 与 `DSH_TOKEN` 两个环境变量；不设就连 `http://127.0.0.1:8788`（默认队伍）。

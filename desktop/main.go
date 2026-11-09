@@ -13,7 +13,7 @@ func main() {
 	// 队伍地址与凭据来自环境：一个进程连一段对话，换段对话就换环境。
 	base := os.Getenv("DSH_GW")
 	if base == "" {
-		base = "http://127.0.0.1:18882"
+		base = "http://127.0.0.1:8788"
 	}
 	token := os.Getenv("DSH_TOKEN")
 

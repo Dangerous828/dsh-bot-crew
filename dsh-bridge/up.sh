@@ -34,6 +34,14 @@ done
 DSH_HOME=${DSH_HOME:-$HOME/.dsh}
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE"
 STATE_DIR=${STATE_DIR:-$DSH_HOME/state/$PROFILE}
+
+# gateway 的端口由状态目录推出来，不是写死的。规则与 backend/scripts/dsh-superagent 的
+# state_dir_identity 一致：默认目录仍是 8788，换一个目录就换一个端口，重启不变。
+if [ "$(cd "$STATE_DIR" 2>/dev/null && pwd)" = "$HOME/.dsh/state/superagent" ]; then
+  GATEWAY_PORT=8788
+else
+  GATEWAY_PORT=$(( 18800 + $(printf '%s' "$STATE_DIR" | od -An -tuC -v | tr -s ' ' '\n' | awk 'NF{s+=$1} END{print s+0}') % 100 ))
+fi
 TOKEN_FILE="$STATE_DIR/mobilegw.token"
 
 say() { printf '%s\n' "$*"; }
@@ -86,7 +94,7 @@ say ""
 say "profile   $PROFILE"
 say "state     $STATE_DIR"
 if [ -f "$TOKEN_FILE" ]; then
-  say "gateway   http://127.0.0.1:8788  token $TOKEN_FILE"
+  say "gateway   http://127.0.0.1:$GATEWAY_PORT  token $TOKEN_FILE"
 else
   say "gateway   还没写 token —— 它由 gateway 首次启动时生成，确认 backend/scripts/dsh-superagent 的 ensure_gateway 跑过"
 fi

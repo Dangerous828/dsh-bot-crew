@@ -10,3 +10,15 @@
 
 - 客户端拿不到 settings、prompts、executor 这些配置能力。第一版不需要；要改配置就回面板。
 - 消息面返回 `tasks[]` 只是 Ticket 的只读投影，客户端不得据此维护任务状态机（见 `GLOSSARY.md` 的 Ticket 条）。
+
+## 已知偏离（2026-11-09）
+
+第一版客户端（`desktop/`、`app/`）连的是消息面之外的 gateway，不是本 ADR 说的消息面。
+查证后确认这不是随手绕开，因为消息面挂在 DSH Connection 的 Fetch 分发器上（`mobile-http.ts` 的
+`ctx.inject(['connection'])`），由 Connection 校验 Host、Origin、签名凭据和 owner；独立进程拿不到这套凭据，
+硬接只会得到 401。gateway 则只认自己状态目录里的 `mobilegw.token`。
+
+代价是具体的：消息面在 gateway 的 `items` 之上补了 `bots`/`default_bot_id`、`tasks`、`status` 三样，
+而 gateway 只看队列、不读 settings，它的 `bots` 恒为空。所以第一版客户端显示不出 Bot 名录。
+
+要把这条偏离收回去，先得回答"客户端怎么合法拿到 Connection 凭据"。那是设计问题，不是改接线。

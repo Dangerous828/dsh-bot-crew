@@ -18,9 +18,10 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `docs/00-contract.md` | **阶段 0**：消息面契约（消息 → Trigger 映射、@ 与默认大哥、回执、错误码） |
 | `docs/01-architecture.md` | 两层分工、三条硬约束、为什么不合并内核 |
 | `docs/02-memory-bridge.md` | 记忆桥：本地小本本 → `dsh-auto-memory` 格式 → 中枢 Hub |
-| `docs/03-host-wiring.md` | **怎么接进宿主**：复制哪些文件、注册点、提示词小节、宿主自带的两条文档测试 |
+| `docs/03-host-wiring.md` | **怎么接进宿主**：复制哪些文件、注册点、提示词小节、宿主自带的三个文档测试 |
 | `docs/04-verified.md` | 已经验证到哪、还没验证什么 |
 | `docs/05-running.md` | **怎么跑起来**：后端、网关、名录、模型、一条真消息、手机 APK |
+| `docs/06-evaluation.md` | **评估结论**：设计判断、已修问题、仍未解决的问题、下一步优先级 |
 | `src/contract/types.ts` | 契约的 TS 类型（表层） |
 | `src/crew/directory.ts` | Bot 名录：一个大哥 + 成员，以及名录必须守的规则 |
 | `src/crew/route.ts` | 确定性路由：这条消息该谁露面；话题串 id |

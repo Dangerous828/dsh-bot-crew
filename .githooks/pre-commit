@@ -1,0 +1,55 @@
+#!/bin/sh
+# 提交前把三个块的检查跑一遍。装法：git config core.hooksPath .githooks
+# 单独跳过某次：SKIP_CHECK=1 git commit ...
+set -e
+
+if [ "${SKIP_CHECK:-0}" = "1" ]; then
+  echo "pre-commit: SKIP_CHECK=1，跳过检查"
+  exit 0
+fi
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
+# 只检查这次真的动到的块，没动的块跑一遍是白花时间。
+changed() { git diff --cached --name-only --diff-filter=ACMR | grep -q "^$1/"; }
+
+failed=""
+
+if changed backend || changed scripts; then
+  echo "pre-commit: backend 检查（typecheck + 测试 + 构建）"
+  # tests/runtime.spec.ts 断言 worker 的环境被完整还原，前提是宿主本身没带这些变量。
+  # 在 dsh 会话里 GIT_CONFIG_GLOBAL 是设着的，不摘掉会让这两项假失败。
+  if ! ( cd backend && env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM pnpm check ); then
+    failed="$failed backend"
+  fi
+fi
+
+if changed desktop; then
+  echo "pre-commit: desktop 检查（vet + 测试）"
+  if ! ( cd desktop && go vet ./... && go test ./... ); then
+    failed="$failed desktop"
+  fi
+fi
+
+if changed app; then
+  echo "pre-commit: app 检查（单元测试）"
+  # 本机 JDK 25 跑不动 Gradle 8.11，构建脚本固定用 21；没有就跳过而不是卡住提交。
+  if [ -x /opt/homebrew/Cellar/openjdk@21/21.0.9/libexec/openjdk.jdk/Contents/Home/bin/java ]; then
+    if ! ( cd app && JAVA_HOME=/opt/homebrew/Cellar/openjdk@21/21.0.9/libexec/openjdk.jdk/Contents/Home \
+           ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}" \
+           ./gradlew testDebugUnitTest --no-daemon -q ); then
+      failed="$failed app"
+    fi
+  else
+    echo "pre-commit: 没找到 JDK 21，跳过 app 检查"
+  fi
+fi
+
+if [ -n "$failed" ]; then
+  echo "pre-commit: 检查未通过 ——$failed"
+  echo "  修好再提交；确实要跳过用 SKIP_CHECK=1 git commit ..."
+  exit 1
+fi
+
+echo "pre-commit: 通过"

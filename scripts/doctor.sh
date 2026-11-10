@@ -8,26 +8,62 @@ bad() { say "$1" "$2"; fail=1; }
 
 port_pid() { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" pid "$2}'; }
 
+# Which profile runs, and on what ports. None of it is fixed: the Web port comes from the profile's patch
+# file, and the phone listener and gateway are derived from its state directory, so two crews on one machine
+# each get their own. Hard-coding 3082/8788 only ever describes the first one.
+# Which profile to inspect: an explicit DSH_PROFILE wins, otherwise the one whose service is actually running,
+# otherwise `superagent` — the deployment the README documents. Guessing wrong produces a page of false alarms.
+running_profile() {
+  # Only a real dsh process counts: a shell or `grep` whose arguments happen to contain the same words would
+  # otherwise win the race and answer for a profile that is not running. `pgrep -x node` finds the candidates by
+  # executable name, and LC_ALL=C keeps the argument scan byte-wise — the process table holds non-ASCII names,
+  # which makes awk fail on multibyte input in the default locale.
+  for pid in $(pgrep -x node 2>/dev/null); do
+    LC_ALL=C ps -p "$pid" -o args= 2>/dev/null \
+      | LC_ALL=C awk '{for (i = 1; i < NF; i++) if ($i == "--profile") {print $(i + 1); exit}}'
+  done | head -1
+}
+PROFILE="${DSH_PROFILE:-$(running_profile)}"; PROFILE="${PROFILE:-superagent}"
+PATCH="$HOME/.dsh/profiles/$PROFILE/cordis.patch.yml"
+web_port() { awk '/^- id: webserver/{f=1} f && /^ +port:/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$PATCH" 2>/dev/null; }
+state_dir() { awk '/^- id: dsh-superagent/{f=1} f && /stateDir:/{print $2; exit}' "$PATCH" 2>/dev/null; }
+STATE="${DSH_STATE_DIR:-$(state_dir)}"
+# A profile with no `webserver` block takes dsh's own default, and the only honest way to learn it is to look at
+# what the process bound. The patch file is the first choice because it is readable while the service is down.
+listening_web_port() {
+  LC_ALL=C lsof -nP -iTCP -sTCP:LISTEN -a -p "$${1:-0}" 2>/dev/null | LC_ALL=C awk 'NR > 1 && $9 !~ /:/ || 1 {split($9, a, ":"); if (a[2] + 0 > 1024 && a[2] + 0 < 20000) {print a[2]; exit}}'
+}
+WEB_PORT="${DSH_WEB_PORT:-$(web_port)}"
+[ -z "$WEB_PORT" ] && [ -n "${orch_pid:-}" ] && WEB_PORT=$(listening_web_port "$orch_pid")
+[ -z "$WEB_PORT" ] && [ -n "$(port_pid 3080)" ] && WEB_PORT=3080
+WEB_PORT="${WEB_PORT:-3082}"
+GATEWAY_PORT="${DSH_GATEWAY_PORT:-$( [ -n "$STATE" ] && python3 "$(dirname "$0")/portcheck.py" gateway "$STATE" )}"
+LAN_PORT="${DSH_LAN_PORT:-$( [ -n "$STATE" ] && python3 "$(dirname "$0")/portcheck.py" lan "$STATE" )}"
+
 # The backend may bind the loopback or a LAN address, so find which one answers. The Host header stays
 # on loopback either way, because that is the authority the management fence accepts.
 api() {
   local path="$1" url
-  for url in "http://127.0.0.1:3082" "http://$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1):3082"; do
+  for url in "http://127.0.0.1:$WEB_PORT" "http://$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1):$WEB_PORT"; do
     local body
-    body=$(curl -s --max-time 5 -H 'Host: 127.0.0.1:3082' -H 'x-orchestrator-request: 1' "$url/orchestrator/api$path" 2>/dev/null)
+    body=$(curl -s --max-time 5 -H "Host: 127.0.0.1:$WEB_PORT" -H 'x-orchestrator-request: 1' "$url/orchestrator/api$path" 2>/dev/null)
     if [ -n "$body" ]; then printf '%s' "$body"; return 0; fi
   done
   return 1
 }
 
 # 1. The orchestrator's Web server, on whichever address it bound.
-orch=$(port_pid 3082)
-[ -n "$orch" ] && say "orchestrator :3082" "$orch" || bad "orchestrator :3082" "not listening — run scripts/dsh-superagent start"
+orch=$(port_pid "$WEB_PORT")
+[ -n "$orch" ] && say "orchestrator :$WEB_PORT ($PROFILE)" "$orch" || bad "orchestrator :$WEB_PORT" "not listening — run scripts/dsh-superagent start --profile $PROFILE"
 
 # 2. The phone gateway, which the /api/mobile routes forward to.
-gw=$(port_pid 8788)
-if [ -n "$gw" ]; then say "mobile gateway :8788" "$gw"
-else bad "mobile gateway :8788" "not listening — launchctl load ~/Library/LaunchAgents/com.cpuser.dsh-mobilegw.plist"; fi
+gw=$(port_pid "$GATEWAY_PORT")
+if [ -n "$gw" ]; then say "mobile gateway :$GATEWAY_PORT" "$gw"
+else bad "mobile gateway :$GATEWAY_PORT" "not listening — it starts with the service (state $STATE)"; fi
+
+# The listener the phone actually dials. Its port is derived from the state directory, never chosen.
+phone=$(port_pid "$LAN_PORT")
+[ -n "$phone" ] && say "phone listener :$LAN_PORT" "$phone" || bad "phone listener :$LAN_PORT" "not listening — the Source binds it when it starts"
 
 # 3. Health of every orchestrator component, through the loopback Host the fence accepts.
 health=$(api "/state")
@@ -54,23 +90,25 @@ for block in eval executor; do
   value=$(api "/settings" \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['blocks']['$block']['value'].get('model')))" 2>/dev/null)
   case "$value" in
-    null|"") bad "$block model" "unset — run scripts/configure.py (a bad host default stalls every Eval)" ;;
+    # Unset is not a fault: `initializeRoleModel` returns without seeding, so the session takes the host's own
+    # default and work still gets done. It is worth knowing, because nothing on screen says which model that is.
+    null|"") say "$block model" "unset — the host default answers; pin one with scripts/configure.py" ;;
     *) say "$block model" "$value" ;;
   esac
 done
 
 # 5. The roster the phone actually receives, read through the same timeline the app uses. It must name
 #    exactly one default Bot, or routing has no fallback for a message that mentions nobody.
-token=$(grep -ho 'token=[A-Za-z0-9_-]*' backend/.artifacts/dsh-superagent-superagent-*.log 2>/dev/null | tail -1 | cut -d= -f2)
-origin=$(lsof -nP -iTCP:3082 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{split($9,a,":"); print a[1]}')
-if [ -z "$token" ] || [ -z "$origin" ]; then
-  bad "crew roster" "cannot read the login token or the bound address"
+# The roster the phone actually receives, read through the same listener and credential the app uses. A
+# browser cookie is no good here: the message surface is guarded by a paired-device credential, so a cookie
+# read answers 401 and the roster looks empty when it is not.
+if [ -z "${DSH_DEVICE_CREDENTIAL:-}" ]; then
+  say "crew roster" "skipped — set DSH_DEVICE_CREDENTIAL (and DSH_DEVICE) to check it"
 else
-  cookie=$(curl -s -i --max-time 5 "http://$origin:3082/?token=$token" 2>/dev/null \
-    | grep -i '^set-cookie:' | sed 's/^[Ss]et-[Cc]ookie: //' | cut -d';' -f1)
-  roster=$(curl -s --max-time 5 -H "Cookie: $cookie" "http://$origin:3082/api/mobile/timeline" 2>/dev/null)
+  roster=$(curl -s --max-time 5 -H "x-crew-device: ${DSH_DEVICE:-crew-desktop}" \
+    -H "x-crew-credential: $DSH_DEVICE_CREDENTIAL" "http://127.0.0.1:$LAN_PORT/api/mobile/timeline" 2>/dev/null)
   if [ -z "$roster" ]; then
-    bad "crew roster" "the phone timeline did not answer"
+    bad "crew roster" "the phone timeline did not answer on :$LAN_PORT"
   else
     printf '%s' "$roster" | python3 -c '
 import json, sys

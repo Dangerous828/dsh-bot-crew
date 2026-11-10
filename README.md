@@ -67,3 +67,5 @@ python3 scripts/configure.py   # 配名册、Policy、角色模型（幂等）
 ## 许可
 
 本项目 MIT，见 `LICENSE`。抄来的表层契约与后续 UI 归原作者，见 `THIRD_PARTY_NOTICES.md`。
+
+验证完成

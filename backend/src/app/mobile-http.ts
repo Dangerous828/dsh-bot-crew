@@ -1,6 +1,7 @@
 /** Phone endpoints on DSH's authenticated Fetch carrier; queue admission remains owned by the mobile Source. */
 import type { Context } from '@deepseek-ai/cordis'
 import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { HttpHost } from './http.ts'
 import { ticketStage } from '../core/index.ts'
@@ -66,10 +67,27 @@ function crewRoster(settings: Settings, since: (botId: string) => string = () =>
   return { bots: roster, default_bot_id: typeof named === 'string' && named ? named : fallback }
 }
 
+/**
+ * The gateway port a state directory owns. Same rule as `scripts/dsh-superagent`'s `state_dir_identity`:
+ * the default state directory keeps 8788, every other one derives its own port from the path.
+ *
+ * They have to agree. The script starts the gateway and the handler has to find it; a profile that keeps its
+ * own `stateDir` (a second crew on the same machine) would otherwise forward to the first crew's gateway and
+ * come back 401, which reads as a credential problem but is a port mismatch.
+ */
+function gatewayPortFor(stateDir: string | undefined): string | undefined {
+  if (!stateDir) return undefined
+  const resolve = (value: string): string => value.replace(/\/+$/, '')
+  if (resolve(stateDir) === resolve(`${homedir()}/.dsh/state/superagent`)) return '8788'
+  let digest = 0
+  for (const character of resolve(stateDir)) digest = (digest + character.charCodeAt(0)) % 100
+  return String(18800 + digest)
+}
+
 /** The gateway the message surface forwards to; a profile that keeps its own gateway overrides it by environment. */
-function gatewayOrigin(): string {
+function gatewayOrigin(stateDir?: string): string {
   const host = process.env.MOBILEGW_HOST?.trim() || '127.0.0.1'
-  const port = process.env.MOBILEGW_PORT?.trim() || '8788'
+  const port = process.env.MOBILEGW_PORT?.trim() || gatewayPortFor(stateDir) || '8788'
   return `${process.env.MOBILEGW_SECURE === '1' ? 'https' : 'http'}://${host}:${port}`
 }
 
@@ -85,7 +103,7 @@ const OPERATIONS = {
 } as const
 type Operation = keyof typeof OPERATIONS
 
-export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(), request = fetch) {
+export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime.machine.stateDir), request = fetch) {
   return async (incoming: Request): Promise<Response> => {
     const url = new URL(incoming.url)
     const name = url.pathname.split('/').at(-1) as Operation | undefined

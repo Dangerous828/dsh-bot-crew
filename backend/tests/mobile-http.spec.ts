@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { phoneHandler, registerMobileHttp } from '../src/app/mobile-http.ts'
 import type { HttpHost } from '../src/app/http.ts'
@@ -95,4 +95,32 @@ it('lists the models a person can switch to, with the one in use and the provide
     failures: [{ id: 'broken', name: 'Broken' }] })
   // 失败原因里可能带内网地址和密钥，不往设备上送。
   expect(JSON.stringify(body)).not.toContain('10.0.0.1')
+})
+
+it('forwards to the gateway the state directory owns, not to the first crew on the machine', async () => {
+  // A profile that keeps its own stateDir gets its own gateway on a derived port. Using one fixed default
+  // sends a second crew's timeline to the first crew's gateway, which answers 401 and reads as a credential
+  // problem. The rule has to match scripts/dsh-superagent's state_dir_identity.
+  const seen: string[] = []
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-gateway-')); directories.push(stateDir)
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  const runtime = { ready: Promise.resolve(), machine: { stateDir },
+    store: { settings: () => ({ paused: false }), tickets: { list: () => [] } } } as unknown as HttpHost
+  const answer = phoneHandler(runtime, undefined, async input => {
+    seen.push(String(input))
+    return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  })
+  await answer(new Request('http://dsh/api/mobile/timeline'))
+  let digest = 0
+  for (const character of stateDir) digest = (digest + character.charCodeAt(0)) % 100
+  expect(seen[0]).toContain(`:${18800 + digest}/timeline`)
+  expect(seen[0]).not.toContain(':8788/')
+
+  // The default state directory keeps the port it has always had.
+  const defaultDir = join(homedir(), '.dsh', 'state', 'superagent')
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  const quiet = phoneHandler({ ...runtime, machine: { stateDir: defaultDir } } as unknown as HttpHost, undefined,
+    async input => { seen.push(String(input)); return new Response('{"items":[]}', { status: 200 }) })
+  await quiet(new Request('http://dsh/api/mobile/timeline'))
+  expect(seen.at(-1)).toContain(':8788/timeline')
 })

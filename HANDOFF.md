@@ -1,6 +1,6 @@
 # 交接：dsh-bot-crew 当前状态
 
-> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `dc76379`，**工作区干净**。
+> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `82c8a0d`，**工作区干净**。
 > 本文只写当前状态与下一步，不写新旧对比。
 
 ## 一、这是什么
@@ -188,3 +188,43 @@ sh .githooks/pre-commit    # 上面几项串起来，应输出「pre-commit: 通
 当前实现在这一点上与基准一致。**不要把深色留白当塌陷**，判读要先开基准图对一遍。
 
 仍未验证的是画板 5（手机暗色）与画板 2、3（空态 / 断连）。
+
+
+---
+
+## 十一、2026-11-10 12:40：桌面端已连上真实数据
+
+抓图 `scripts/shot-window.swift`，进程为 `DSH_GW=http://127.0.0.1:38162` + 配对凭据，
+稳定运行后截取。左栏花名册（大哥 / 写手 / 码农）、中栏五条真实消息、右栏分段控件全部与画板一致。
+
+### 这一轮修掉的三处后端缺陷
+
+1. **配对面收不到请求体**（`http.ts`）：`readBody()` 解出对象，回填条件却写 `typeof payload === 'string'`，
+   对象永远为假，body 被整个丢掉 —— 出码与兑换一律 400 `deviceId is required`。手机配对与撤销设备一直不可用。
+2. **消息面网关端口写死 8788**（`mobile-http.ts`）：`gatewayOrigin()` 的默认值没有跟随 `stateDir`，
+   而 `scripts/dsh-superagent` 早已按目录推导端口。第二套队伍（自己的 stateDir）的 timeline 被转发到
+   第一套的网关，回来 401，界面上显示成「凭据不匹配」，实际是端口错配。已改走同一套规则。
+3. 两处都补了回归测试，并实测「移除修复后确实红」。
+
+### 桌面端
+
+- `client.go`：有 token 就必发 `x-crew-device` + `x-crew-credential`，device 缺省 `crew-desktop`。
+  原先 device 为空时连 credential 都不发，后端 `presented()` 要求两者都在，于是每次都 401。
+- `main.go`：token 取 `DSH_TOKEN` → `~/.dsh/state/<profile>/mobilegw.token`，启动打印来源路径（不打印凭据）。
+- 六处 `OnClick` 全部配上 `Cursor(CursorPointer)`；页签按画板重做成分段控件（轨道 32 / 圆角 8 / 胶囊 115×26）。
+
+### 连法
+
+```sh
+# 配对一次，拿到凭据（token 与 digest 都在下面这个文件里）
+curl -X POST http://127.0.0.1:3080/api/remote/pairing \
+  -H "Host: 127.0.0.1:3080" -H "x-orchestrator-request: 1" \
+  -H "content-type: application/json" --data-binary '{"deviceId":"crew-desktop"}'
+
+# 桌面端连局域网消息面（端口 = 20000 + hash(stateDir) % 40000）
+cd desktop && go build -o /tmp/crew-desktop .
+DSH_GW=http://127.0.0.1:38162 DSH_DEVICE=crew-desktop \
+  DSH_TOKEN=<上一步的 token> /tmp/crew-desktop
+```
+
+`38162` 是 `superagent-web` 这个 stateDir 的 lan 端口；换 profile 就换端口，用 `lsof -nP -p <dsh pid>` 认。

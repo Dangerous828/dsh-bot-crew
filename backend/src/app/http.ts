@@ -277,10 +277,15 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!pairingFence(req, ctx.webServer.port)) { json(res, 403, { error: 'Local origin required' }); return }
       // 策略从这里读，配对面才不会变成一个永远放行的假开关。
       const remote = pairingHandler(devicesOf(runtime))
+      // readBody 解出来的是对象，不是字符串。原先只在 payload 是字符串时才放 body，
+      // 于是对象被整个丢掉，配对面永远收不到字段（出码与兑换都报 deviceId is required）。
+      // 这里原样回填：对象重新序列化，字符串直接给，解不出来就当作没有 body。
       const payload = req.method === 'GET' ? undefined : await readBody(req, 64 * 1024).catch(() => '')
-      const reply = await remote(new Request(`http://dsh${req.url}`, {
-        method: req.method, ...(typeof payload === 'string' ? { body: payload } : {}),
-      }))
+      const body = payload === undefined ? {}
+        : typeof payload === 'string' ? { body: payload }
+        : payload === null ? {}
+        : { body: JSON.stringify(payload) }
+      const reply = await remote(new Request(`http://dsh${req.url}`, { method: req.method, ...body }))
       json(res, reply.status, await reply.json())
     } }),
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {

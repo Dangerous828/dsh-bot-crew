@@ -102,3 +102,28 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
 })
+
+it('hands the pairing routes their body, parsed or raw', async () => {
+  // /api/remote 前缀把请求体交给配对面。readBody 解出来的是对象，
+  // 早先只在它是字符串时才回填，于是字段被整个丢掉、出码与兑换一律 400。
+  let handler: Handler = async () => {}
+  const ctx = { webServer: { host: '127.0.0.1', protocol: 'http:', port: 3082,
+    register: (route: { path?: string, handler: Handler }) => { if (route.path === '/api/remote') handler = route.handler; return () => {} } } }
+  registerHttp(ctx as never, { ready: Promise.resolve(), machine: { stateDir: '/tmp/unused-pairing-state' },
+    store: { settings: () => ({}) } } as unknown as HttpHost)
+  const call = async (body: string) => {
+    let status = 0, text = ''
+    const req = { method: 'POST', url: '/api/remote/pairing', headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(body) } }
+    await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
+    return { status, body: JSON.parse(text) as Record<string, unknown> }
+  }
+  const issued = await call(JSON.stringify({ deviceId: 'crew-desktop' }))
+  expect(issued.status).toBe(200)
+  expect(typeof issued.body.code).toBe('string')
+  expect((issued.body.code as string)).toMatch(/^\d{6}$/)
+  // 没给 deviceId 时仍要报 400：修的是「带了的看不见」，不是把校验放宽。
+  const missing = await call(JSON.stringify({}))
+  expect(missing.status).toBe(400)
+  expect(missing.body.error).toBe('deviceId is required')
+})

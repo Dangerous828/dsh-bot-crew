@@ -1,6 +1,6 @@
 # dsh-bot-crew
 
-**一句话**：后台只留一本账，前台摆一排工牌。
+**一句话**：后台一本账，前台一排工牌。
 
 后台是 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)：
 Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ticket 是唯一的工作状态主体。

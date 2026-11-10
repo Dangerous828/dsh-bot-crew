@@ -1,5 +1,6 @@
 package com.dsh.botcrew
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -44,11 +45,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
@@ -64,6 +74,10 @@ data class CrewPalette(
     val line: Color,
     // 比 faint 更淡的一档：占位、极弱说明。
     val hint: Color,
+    // 空态那一块虚线框与里面的人形。画板里是两种暖灰，和 hint 不是同一个值。
+    val emptyEdge: Color, val emptyGlyph: Color,
+    // 分段切换的底（画板的 #EFEBE5：比 surface 深、比 line 浅）。
+    val segment: Color,
 )
 
 val LightPalette = CrewPalette(
@@ -72,6 +86,7 @@ val LightPalette = CrewPalette(
     accent = Color(0xFF3E6B62), warn = Color(0xFF96603A), danger = Color(0xFFB45252),
     userBubble = Color(0xFF2C2A26), userInk = Color(0xFFFBF9F6),
     accentSoft = Color(0xFFEAF1EC), line = Color(0xFFEDE8E1), hint = Color(0xFFA9A294),
+    emptyEdge = Color(0xFFD9D3C9), emptyGlyph = Color(0xFFB8B1A5), segment = Color(0xFFEFEBE5),
 )
 
 val DarkPalette = CrewPalette(
@@ -80,6 +95,8 @@ val DarkPalette = CrewPalette(
     accent = Color(0xFF5FBFA8), warn = Color(0xFFE0A574), danger = Color(0xFFE58A80),
     userBubble = Color(0xFF3B3942), userInk = Color(0xFFF2EFEA),
     accentSoft = Color(0xFF1E3A34), line = Color(0xFF33313A), hint = Color(0xFF6E6860),
+    // 暗盘里没有对应的暖灰：虚线框落到分隔色，人形落到弱字色；分段底用抬起层。
+    emptyEdge = Color(0xFF33313A), emptyGlyph = Color(0xFF928C82), segment = Color(0xFF1D1C21),
 )
 
 /**
@@ -158,18 +175,132 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     }
 }
 
+/**
+ * 全空的队伍：虚线框里一个人形，一句标题，一句正文，一个主按钮。
+ *
+ * 画板（Mobile-roster 第 6 张）底下还有一枚「队伍 / 后台」的分段切换，
+ * 它和主按钮一样没有对应的创建接口 —— 按下去只把缺什么说出来，不摆一块按了没反应的形状。
+ * 空态判定只看 bots：消息留着而 Bot 没了的情况（名字读不出来）也归这里。
+ */
 @Composable
-private fun EmptyState(palette: CrewPalette) {
+private fun EmptyState(
+    palette: CrewPalette,
+    onBackend: () -> Unit,
+) {
+    // 按过哪个按钮、它缺什么。null 表示还没按过；按过就一直写着，不闪一下就没。
+    var touched by remember { mutableStateOf<String?>(null) }
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("队伍还是空的", color = palette.muted, fontWeight = FontWeight.SemiBold)
+        // 虚线方框 64、圆角 20，里面一个人形。用 Canvas 画：画板是 stroke 不是填充。
+        Canvas(modifier = Modifier.size(64.dp)) {
+            val corner = CornerRadius(20.dp.toPx())
+            val inset = 0.5.dp.toPx()
+            drawRoundRect(
+                color = palette.emptyEdge,
+                topLeft = Offset(inset, inset),
+                size = Size(size.width - inset * 2, size.height - inset * 2),
+                cornerRadius = corner,
+                style = Stroke(
+                    width = 1.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 3.dp.toPx())),
+                ),
+            )
+            // 26 的人形按 24 的画布缩放：圆头 r3.4 在 (12,8)，肩线从 y=20 起。
+            val scale = (26.dp.toPx() / 24f)
+            val origin = Offset((size.width - 24f * scale) / 2f, (size.height - 24f * scale) / 2f)
+            fun at(x: Float, y: Float) = Offset(origin.x + x * scale, origin.y + y * scale)
+            val pen = Stroke(width = 1.6.dp.toPx() * scale, cap = StrokeCap.Round)
+            drawCircle(palette.emptyGlyph, radius = 3.4f * scale, center = at(12f, 8f), style = pen)
+            val shoulders = Path().apply {
+                moveTo(at(5f, 20f).x, at(5f, 20f).y)
+                cubicTo(
+                    at(5f, 16.1f).x, at(5f, 16.1f).y,
+                    at(8.1f, 13f).x, at(8.1f, 13f).y,
+                    at(12f, 13f).x, at(12f, 13f).y,
+                )
+                cubicTo(
+                    at(15.9f, 13f).x, at(15.9f, 13f).y,
+                    at(19f, 16.1f).x, at(19f, 16.1f).y,
+                    at(19f, 20f).x, at(19f, 20f).y,
+                )
+            }
+            drawPath(shoulders, palette.emptyGlyph, style = pen)
+        }
+        // gap 13：方框到标题、标题到正文都是这一段。
         Text(
-            "加一位 Bot，他从今天起会记住你们的对话。",
-            color = palette.faint,
-            modifier = Modifier.padding(top = 6.dp),
+            "队伍还是空的",
+            fontSize = 15.sp,
+            fontWeight = FontWeight(600),
+            color = palette.muted,
+            modifier = Modifier.padding(top = 13.dp),
+        )
+        // 画板里这一句是写死两行的（中间一个 br）。行高 1.65。
+        Text(
+            "加一位 Bot，他从今天起会记住\n你们的每一次对话。",
+            fontSize = 13.sp,
+            lineHeight = 21.sp,
+            color = palette.hint,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(top = 13.dp),
+        )
+        Box(
+            modifier = Modifier
+                // 画板：margin-top 4，加上 gap 13 就是 17。
+                .padding(top = 17.dp)
+                .background(palette.accent, RoundedCornerShape(11.dp))
+                .clickable { touched = EmptyCopy.NO_CREATE_API }
+                .padding(horizontal = 26.dp, vertical = 11.dp),
+        ) {
+            Text("加第一位", fontSize = 14.sp, fontWeight = FontWeight(550), color = palette.surface)
+        }
+        // 按过之后把「差什么」写在原地说一遍：闪一下就消失的提示等于没写。
+        touched?.let {
+            Text(
+                it,
+                fontSize = 11.sp,
+                color = palette.warn,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 9.dp),
+            )
+        }
+        // 分段切换：200 宽、3 的内边距、圆角 10。它在这里是个摆件 ——
+        // 「后台」按下去只是换个标签，因为队列页在没 Bot 时没有可看的东西，也没接口读。
+        Row(
+            modifier = Modifier
+                .padding(top = 18.dp)
+                .width(200.dp)
+                .background(palette.segment, RoundedCornerShape(10.dp))
+                .padding(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            SegmentChip("队伍", selected = true, palette, onClick = {})
+            // 后台页要的是队列；没 Bot 就没有队列，所以按下去只说这句话，不跳一个空页。
+            SegmentChip("后台", selected = false, palette, onClick = { touched = EmptyCopy.NO_BACKEND_YET })
+        }
+    }
+}
+
+// SegmentChip 是空态底部那枚两格切换里的一格。
+@Composable
+private fun RowScope.SegmentChip(label: String, selected: Boolean, palette: CrewPalette, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .weight(1f)
+            .clip(RoundedCornerShape(7.dp))
+            .background(if (selected) palette.card else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight(600) else FontWeight.Normal,
+            color = if (selected) palette.ink else palette.faint,
+            textAlign = TextAlign.Center,
         )
     }
 }
@@ -195,11 +326,21 @@ private fun CrewScreen(
     val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(palette.card)
+                // 画板页头：padding 10 18 14，白底 + 下边线 1。边线就是这一层底的最下面一条。
+                .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 手机画板的标题是 15sp / 640 字重，不是 20sp 粗体 —— 后者在 390 宽上喧宾夺主。
-            Text("我的队伍", fontSize = 15.sp, fontWeight = FontWeight(640), color = palette.ink)
+            // 画板第 6 张（手机花名册）的页头标题是 20sp / 660 / 字距 -0.02em。
+            Text(
+                "我的队伍",
+                fontSize = 20.sp,
+                fontWeight = FontWeight(660),
+                letterSpacing = (-0.02f).em,
+                color = palette.ink,
+            )
             Spacer(Modifier.weight(1f))
             // 画板 Mobile 的顶栏在这里放的是「看它的屏幕」那个小方块。后端还没这条接口，
             // 所以按下去说一句实话，不跳到一个空页面 —— 空页面比没反应更像出了故障。
@@ -211,17 +352,14 @@ private fun CrewScreen(
             )
             TextButton(onClick = onBackend) { Text("后台", color = palette.accent) }
         }
+        // 页头那 1 的下边线。画板把它画在页头这一块上，不画在内容上。
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
         val shown = conversation
         if (shown != null) {
             when {
-                shown.messages.isEmpty() && shown.bots.isEmpty() ->
-                    EmptyState(palette)
+                // 只按 bots 判：消息可能是「名字读不出来」的残留，那也还是没人的队伍。
                 shown.bots.isEmpty() ->
-                    Text(
-                        "队伍里还没有 Bot。",
-                        color = palette.faint,
-                        modifier = Modifier.padding(16.dp),
-                    )
+                    EmptyState(palette, onBackend)
                 else -> {
                     // 花名册横排：头像块 + 名字。设计稿里头像 32dp、圆角 10。
                     // 裸文字按钮看不出「这是一个人」，头像块才看得出来。
@@ -266,7 +404,8 @@ private fun CrewScreen(
                         modifier = Modifier.weight(1f),
                         // 消息贴底：聊天的内容总是从下面往上长，空的地方应该在上面。
                         // 设计稿这里用的是 flex-end。
-                        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Bottom),
+                        // 间距不设在这里：画板是组间 16、组内 9，得逐条算，见下面那一行。
+                        verticalArrangement = Arrangement.Bottom,
                     ) {
                         itemsIndexed(shown.messages, key = { _, m -> m.id }) { index, message ->
                             // 与上一条是同一个人就连着排，不再重复标名字。
@@ -274,7 +413,12 @@ private fun CrewScreen(
                             val sameSpeaker = previous != null &&
                                 previous.fromBot == message.fromBot &&
                                 previous.botId == message.botId
-                            MessageRow(message, shown.bots, palette, showName = !sameSpeaker)
+                            MessageRow(
+                                message, shown.bots, palette,
+                                showName = !sameSpeaker,
+                                // 组内 9、换人 16。第一条上面不留白，否则贴底时首条离底边会多一截。
+                                topGap = if (previous == null) 0.dp else if (sameSpeaker) 9.dp else 16.dp,
+                            )
                         }
                         if (shown.tickets.isNotEmpty()) {
                             item { TicketStrip(shown, palette) }
@@ -891,7 +1035,13 @@ private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
 }
 
 @Composable
-private fun MessageRow(message: Message, bots: List<BotCard>, palette: CrewPalette, showName: Boolean = true) {
+private fun MessageRow(
+    message: Message,
+    bots: List<BotCard>,
+    palette: CrewPalette,
+    showName: Boolean = true,
+    topGap: Dp = 0.dp,
+) {
     val fromBot = message.fromBot
     val name = when {
         !fromBot -> "我"
@@ -900,7 +1050,7 @@ private fun MessageRow(message: Message, bots: List<BotCard>, palette: CrewPalet
     // 手机上一行就是一条消息：左对齐的是 Bot，右对齐的是自己。
     // 设计稿里自己发的那个气泡右下角收成 4dp，指向说话人那一侧。
     Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = topGap),
         horizontalAlignment = if (fromBot) Alignment.Start else Alignment.End,
     ) {
         // 自己发的话不标名字：靠右对齐已经说明是谁了。
@@ -917,7 +1067,8 @@ private fun MessageRow(message: Message, bots: List<BotCard>, palette: CrewPalet
         }
         Box(
             modifier = Modifier
-                .widthIn(max = 300.dp)
+                // 画板：气泡最宽 84%，不是写死的 300dp —— 390 宽上 300 太窄、更宽的屏又太短。
+                .fillMaxWidth(0.84f)
                 .clip(
                     if (fromBot) RoundedCornerShape(14.dp)
                     else RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp)
@@ -927,7 +1078,9 @@ private fun MessageRow(message: Message, bots: List<BotCard>, palette: CrewPalet
         ) {
             Text(
                 message.text,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
+                // 自己发的是 1.55，Bot 的话是 1.6：后者通常更长，行距松一点好读。
+                lineHeight = if (fromBot) 22.5.sp else 21.75.sp,
                 color = if (fromBot) palette.ink else palette.userInk,
             )
         }

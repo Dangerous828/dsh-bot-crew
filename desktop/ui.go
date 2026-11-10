@@ -255,7 +255,8 @@ func (s *app) roster(c *ui.Context, p Palette) {
 
 		// 底部导航：分隔线之上。mygo 没有单边边框，用一条 1px 的线代替。
 		ui.Column(c).FillWidth().Height(1).Background(p.Line)
-		ui.Column(c).FillWidth().Gap(2).PaddingY(14).Children(func() {
+		// 行距 10：一行「图标 + 13px 字」在 PaddingY 里各挣 11，合计 39；画板实测 38–39。
+		ui.Column(c).FillWidth().Gap(10).PaddingY(14).Children(func() {
 			for _, item := range navOrder {
 				s.navRow(c, p, item)
 			}

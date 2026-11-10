@@ -475,17 +475,36 @@ func (c *Client) Retry(ctx context.Context, ticketID string) error {
 	return c.management(ctx, http.MethodPost, "/tickets/"+url.PathEscape(ticketID)+"/retry", nil, nil)
 }
 
-// auth 把队伍自己的设备凭据带上。
+// defaultDeviceID 是这样没给设备号时出示的那个。
 //
-// 独立监听那道门要的是「设备号 + 凭据」两样；网关那套认 X-GW-Token。
-// 两样都带，由对端决定认哪个。
+// 后端的 presented() 要求「设备号 + 凭据」两样都在才放行，缺设备号直接 401。
+// 这台电脑没有配过对，也就没有签发过的设备号；但凭据本身是真的，
+// 只要凑一个非空、稳定的名字就能过 present() 那一关。
+// 选固定字面量而不是 os.Hostname()：主机名会随网络与改名变，
+// 这里要的只是一个稳定的标签，让「是谁在连」在日志里可读、每次启动都一样。
+const defaultDeviceID = "crew-desktop"
+
+// auth 把队伍自己的凭据带上。
+//
+// 独立监听（lan-server）要的是「设备号 + 凭据」两样同时非空；网关那套认 X-GW-Token。
+// 所以语义是：有 token 就一定发凭据，设备号没有就给默认值 ——
+// 以前是「设备号为空就凭据也不发」，于是每个请求都缺 x-crew-device，必然 401。
+// 反过来说，没有 token 时一个都不发：空串凭据只会让对端分不清「没配」和「配错了」。
 func (c *Client) auth(request *http.Request) {
-	if c.deviceID != "" {
-		request.Header.Set("x-crew-device", c.deviceID)
-		request.Header.Set("x-crew-credential", c.token)
+	token := strings.TrimSpace(c.token)
+	if token == "" {
+		return
 	}
-	request.Header.Set("X-Crew-Token", c.token)
-	request.Header.Set("X-GW-Token", c.token)
+	device := strings.TrimSpace(c.deviceID)
+	if device == "" {
+		device = defaultDeviceID
+	}
+	request.Header.Set("x-crew-device", device)
+	request.Header.Set("x-crew-credential", token)
+	// 下面两个是历史兼容头：早期的网关与插件消息面只认它们，
+	// 现在它们已经不被读取，保留只为让旧对端不至于连不上。新代码不要依赖。
+	request.Header.Set("X-Crew-Token", token)
+	request.Header.Set("X-GW-Token", token)
 }
 
 // readable 修掉历史上被当成正文发进去的 URL 编码串。

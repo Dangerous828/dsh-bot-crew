@@ -336,8 +336,46 @@ func TestSendsTheDeviceCredentialTheListenerChecks(t *testing.T) {
 	}
 }
 
-// 没给设备号时不要发那两个头：网关那套不认它们，多发只会让人以为配过。
-func TestOmitsTheDeviceHeadersWhenThereIsNoDevice(t *testing.T) {
+// 没给设备号时也要发凭据：后端的 presented() 要「设备号 + 凭据」两样同时非空，
+// 缺设备号直接 401。以前这里发的是空串设备号加空凭据，中栏那条棕色横幅就是这么来的。
+//
+// 这里把后端 lan-server.ts 的 presented() 与 devices.allows() 按同一套判定复刻一遍：
+// 两个头都非空且都等于期望值才 200，否则 401 —— 断言就落在这条真契约上。
+func TestFillsADeviceWhenOnlyTheTokenIsKnown(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		presented := func(name string) (string, bool) {
+			value := strings.TrimSpace(r.Header.Get(name))
+			return value, value != ""
+		}
+		deviceID, hasDevice := presented("x-crew-device")
+		credential, hasCredential := presented("x-crew-credential")
+		if !hasDevice || !hasCredential || deviceID != defaultDeviceID || credential != "the-credential" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"Not paired"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[],"bots":[],"tasks":[]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	if _, err := New(server.URL, "the-credential", "").Timeline(context.Background()); err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	if got.Get("x-crew-device") != defaultDeviceID {
+		t.Errorf("device header = %q, want the default %q", got.Get("x-crew-device"), defaultDeviceID)
+	}
+	if got.Get("x-crew-credential") != "the-credential" {
+		t.Errorf("credential header = %q, want the token", got.Get("x-crew-credential"))
+	}
+	// 证据：这是真发出去的那组头（X-Crew-Token / X-GW-Token 是兼容头，也一起带）。
+	t.Logf("request headers = device:%q credential:%q X-Crew-Token:%q X-GW-Token:%q",
+		got.Get("x-crew-device"), got.Get("x-crew-credential"), got.Get("X-Crew-Token"), got.Get("X-GW-Token"))
+}
+
+// 没 token 就一个凭据头都不发：空串凭据只会让对端分不清「没配」和「配错了」。
+func TestSendsNoCredentialWhenThereIsNoToken(t *testing.T) {
 	var got http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Clone()
@@ -345,12 +383,16 @@ func TestOmitsTheDeviceHeadersWhenThereIsNoDevice(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	if _, err := New(server.URL, "t", "").Timeline(context.Background()); err != nil {
+	if _, err := New(server.URL, "", "").Timeline(context.Background()); err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
-	if got.Get("x-crew-device") != "" || got.Get("x-crew-credential") != "" {
-		t.Errorf("device headers should be absent, got %v", got)
+	for _, name := range []string{"x-crew-credential", "x-crew-device", "X-Crew-Token", "X-GW-Token"} {
+		if value := got.Get(name); value != "" {
+			t.Errorf("%s should be absent without a token, got %q", name, value)
+		}
 	}
+	t.Logf("request headers without a token = device:%q credential:%q",
+		got.Get("x-crew-device"), got.Get("x-crew-credential"))
 }
 
 // 真实数据里有一条正文就是 URL 编码串，桌面端和手机都得把它解回人话。

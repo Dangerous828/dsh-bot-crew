@@ -442,18 +442,21 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 			if !s.screenReady {
 				screenTint = p.Hint
 			}
+			// 指针换手、点击接线都挂在这一层 Row 上：mygo 里 Cursor 与 OnClick 都是
+			// Element 上的方法，包着字的容器挂一次就够，里面那几个字不用再接一遍。
 			ui.Row(c).PaddingX(13).PaddingY(7).Radius(RadiusButton).Background(p.Card).
-				BorderWidth(1).BorderColor(p.Line).Children(func() {
-				ui.Text(c, "▭ 看它的屏幕").FontSize(FontBodyWide).TextColor(screenTint).OnClick(func() {
-					if s.screenReady {
-						return
-					}
-					s.failed <- "还看不到它的屏幕：这一步还没接上"
-				})
+				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, "▭ 看它的屏幕").FontSize(FontBodyWide).TextColor(screenTint)
+			}).OnClick(func() {
+				if s.screenReady {
+					return
+				}
+				s.failed <- "还看不到它的屏幕：这一步还没接上"
 			})
-			ui.Row(c).PaddingX(9).PaddingY(7).Radius(RadiusButton).Children(func() {
-				ui.Text(c, "···").FontSize(FontBodyWide).TextColor(p.Faint).OnClick(s.refresh)
-			})
+			ui.Row(c).PaddingX(9).PaddingY(7).Radius(RadiusButton).
+				Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, "···").FontSize(FontBodyWide).TextColor(p.Faint)
+			}).OnClick(s.refresh)
 		})
 		// 画板的 header 带一条 border-bottom。mygo 没有单边边框，用 1px 的线代替 ——
 		// 少了这条，标题栏和消息区会糊成一片，暗色下尤其像「整块空的」。
@@ -738,16 +741,15 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 		}
 	})
 
-	// 标签：进行中 / 待你。设计稿靠这两个把「在做的」和「等你的」分开。
-	ui.Row(c).Gap(18).Children(func() {
+	// 标签：进行中 / 待你 / 已完成。画板里它是一条分段控件：
+	// 轨道 360×32、底色 Track、圆角 8；里面三个胶囊各 115×26、圆角 6、间隔 4，
+	// 选中的那个抬成白底（暗色按画板用 Card），没选中的透明。
+	// 坐标见 designs/personal-agent/桌面亮色-坐标.md「右栏」。
+	ui.Row(c).FillWidth().Height(TabHeight).Padding(TabBarInset).Gap(TabGap).
+		AlignItems(ui.Center).Radius(RadiusItem).Background(p.Track).Children(func() {
 		for i, label := range []string{"进行中", "待你", "已完成"} {
 			index := i
-			active := s.backendTab == index
-			tint := p.Faint
-			if active {
-				tint = p.Ink
-			}
-			ui.Text(c, label).FontSize(FontLabel).FontWeight(WeightLabel).TextColor(tint).OnClick(func() {
+			s.backendTabCell(c, p, label, s.backendTab == index, func() {
 				s.backendTab = index
 			})
 		}
@@ -755,7 +757,13 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 
 	tasks := s.shownTasks()
 	if len(tasks) == 0 {
-		ui.Text(c, "这一栏还是空的。").FontSize(FontBody).TextColor(p.Faint)
+		// 空和读不到是两件事：断连时列表同样是空的，那时候写「这一栏还是空的」
+		// 等于告诉人「没有工单」，可数据根本还没回来。分清楚再说。
+		if s.problem != "" {
+			ui.Text(c, "还没连上，读不到工单").FontSize(FontBody).TextColor(p.Faint)
+		} else {
+			ui.Text(c, "这一栏还是空的。").FontSize(FontBody).TextColor(p.Faint)
+		}
 	} else {
 		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
 			ui.Column(c).Gap(9).Children(func() {
@@ -775,6 +783,32 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 			})
 		})
 	}
+}
+
+// backendTabCell 是分段控件里的一个页签。
+//
+// 它外层是一层 Row：mygo 的指针命中只落在自己接了点击的元素上，而 Cursor 只在
+// 这一层生效 —— 之前把 OnClick 挂在里面的 Text 上，悬停时指针不变手，
+// 看上去就是「这三个字不能点」。现在两者挂在同一层上，按下去另有底色回应。
+//
+// 画板给的数：胶囊 115×26、圆角 6、选中白底、未选中透明、字 11.5。
+func (s *app) backendTabCell(c *ui.Context, p Palette, label string, active bool, press func()) {
+	cell := ui.Row(c).Width(TabWidth).Height(TabHeight).Radius(RadiusChip).
+		Center().Cursor(ui.CursorPointer)
+	// 底色：选中抬一层，按下去再压一层；没选中的平时透明，按住才浮起一点。
+	soft, tint := ui.Transparent, p.Faint
+	weight := WeightName
+	switch {
+	case active && cell.Pressed():
+		soft, tint, weight = p.Pressed, p.Ink, WeightLabel
+	case active:
+		soft, tint, weight = p.Card, p.Ink, WeightLabel
+	case cell.Pressed():
+		soft = p.PressedSoft
+	}
+	cell.Background(soft).Children(func() {
+		ui.Text(c, label).FontSize(FontSmall).FontWeight(weight).TextColor(tint)
+	}).OnClick(press)
 }
 
 // modelPane 是「模型」那一栏：现在用的是谁，以及能换成谁。

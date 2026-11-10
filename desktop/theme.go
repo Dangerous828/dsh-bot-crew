@@ -43,6 +43,13 @@ type Palette struct {
 	WarnEdge    ui.Color
 	DangerEdge  ui.Color
 	Footer      ui.Color
+	// Track 是分段控件那条轨的底色：右栏那三个页签（进行中 / 待你 / 已完成）坐在里面，
+	// 选中的那个抬起一层。画板亮色 `#EFEBE5`、暗色 `#2A2830`，见 桌面亮色-坐标.md 的「标签栏（整条）」。
+	Track ui.Color
+	// Pressed 是选中项被按住时的底色：比抬起那一层再压深一点，按下就有回音。
+	Pressed ui.Color
+	// PressedSoft 是没选中的页签被按住时的底：轨道里浮起一层很淡的色，别压过选中项。
+	PressedSoft ui.Color
 }
 
 // LightPalette 是暖白底的一套。
@@ -59,6 +66,11 @@ var LightPalette = Palette{
 	DangerSoft: ui.Hex("#FDF6F6"), // 失败卡的底
 	Raised:     ui.Hex("#F8F5F1"), // 比 Card 浅一点的那层
 	InkStrong:  ui.Hex("#171717"), // 标题那种更实的黑
+	// 分段控件的三段：轨道照画板；按住时的两层画板上没有，取同一族里深一档，
+	// 让「按下去」看得出来，又不抢过选中那个白胶囊。
+	Track:       ui.Hex("#EFEBE5"), // 页签条整条（画板 Desktop.dc.html:252）
+	Pressed:     ui.Hex("#E3DED6"), // 选中项被按住
+	PressedSoft: ui.Hex("#E7E3DC"), // 未选中项被按住
 }
 
 // DarkPalette 是深墨底的一套。强调色提亮一档，否则它和底色糊在一起。
@@ -72,6 +84,11 @@ var DarkPalette = Palette{
 	Code: ui.Hex("#1E1D23"),
 	Hint: ui.Hex("#6E6960"), DangerSoft: ui.Hex("#2A2022"), Raised: ui.Hex("#1B1A1F"),
 	InkStrong: ui.Hex("#FFFFFF"),
+	// 暗色：轨道与选中项照画板（Desktop-dark.dc.html:252 的 #2A2830 / #232228），
+	// 按住的两层按同族取，选中项比卡片再深一点才分得出来。
+	Track:       ui.Hex("#2A2830"),
+	Pressed:     ui.Hex("#1B1A20"),
+	PressedSoft: ui.Hex("#35333B"),
 }
 
 // PaletteFor 按是否深色返回对应的一套。
@@ -124,7 +141,7 @@ const (
 	WeightTitle  = 640 // 栏标题「我的队伍」
 	WeightName   = 600 // 花名册里的名字
 	WeightCard   = 550 // 工单标题
-	WeightLabel  = 600 // 标签页选中的那个
+	WeightLabel  = 600 // 标签页选中的那个（画板里未选中 400，实现统一用这一档）
 	WeightFigure = 620 // 头像里那个字
 )
 
@@ -136,4 +153,12 @@ const (
 	AvatarHdr    = 38  // 标题栏头像（画板实测）
 	ContentMax   = 718 // 中栏（画板实测）
 	ContentInset = 75  // 中栏内容左边距（404 − 329）
+
+	// 右栏那条分段控件。数字全来自 designs/personal-agent/桌面亮色-坐标.md「右栏」：
+	// 标签栏（整条）下内边距 3（52 − 49）、高 32（95 − 49 − 12 的余量即 32）、
+	// 每个页签 115×26（1067 与 1186 之间隔 4：1186 − (1067 + 115)）。
+	TabHeight   = 32  // 整条轨道
+	TabWidth    = 115 // 一个页签
+	TabGap      = 4   // 页签之间
+	TabBarInset = 3   // 轨道与页签的上下留白（32 − 26 = 6，两边各 3）
 )

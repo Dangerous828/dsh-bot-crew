@@ -56,8 +56,11 @@ export class DeviceStore {
     if (!existsSync(this.file)) return []
     try {
       const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as unknown
+      // 摘要也必须是字符串：一条缺 digest 的记录会让 allows() 里的 Buffer.from(undefined) 抛错，
+      // 而那个异常没有人接，会把整个进程带走。设备表坏了就当没配过，宁可重配。
       return Array.isArray(parsed) ? parsed.filter((entry): entry is PairedDevice =>
-        !!entry && typeof entry === 'object' && typeof (entry as PairedDevice).deviceId === 'string') : []
+        !!entry && typeof entry === 'object' && typeof (entry as PairedDevice).deviceId === 'string'
+        && typeof (entry as PairedDevice).digest === 'string') : []
     } catch { return [] }
   }
 
@@ -111,14 +114,16 @@ export class DeviceStore {
   redeem(input: { code: string; deviceId: string; name: string; platform: string }): PairedCredential | undefined {
     if (this.policy === 'deny') return undefined
     const claimable = this.pending.get('')
-    const pending = this.pending.get(input.deviceId)
-      ?? (claimable && claimable.code === input.code ? claimable : undefined)
+    const own = this.pending.get(input.deviceId)
+    const pending = own ?? (claimable && claimable.code === input.code ? claimable : undefined)
     if (!pending || pending.expiresAt < Date.now()) return undefined
     // 比对失败不烧码：打错一次键盘不该让人重新生成。
     const presented = Buffer.from(input.code), expected = Buffer.from(pending.code)
     if (presented.length !== expected.length || !timingSafeEqual(presented, expected)) return undefined
-    this.pending.delete(input.deviceId)
-    this.pending.delete('')
+    // 只销毁真正被兑换的那一支。另一支可能属于另一台设备（比如同时发了一支认领码），
+    // 无条件清空会把还等着被兑换的码一起作废。
+    if (own && own.code === pending.code) this.pending.delete(input.deviceId)
+    if (claimable && claimable.code === pending.code) this.pending.delete('')
 
     const token = randomBytes(32).toString('base64url')
     const device: PairedDevice = {

@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createPairingThrottle } from './pairing-throttle.ts'
+import { presentedDevice } from './phone-gate.ts'
 
 /**
  * 手机走的那条路。
@@ -20,6 +22,11 @@ export interface LanServerOptions {
   devices: LanDevices
   /** 凭据验过之后把请求交给谁；返回值原样写回手机。 */
   forward(request: { method: string; url: string; headers: IncomingMessage['headers']; body: string }): Promise<Response>
+  /**
+   * 配对尝试的限速判定。由调用方传进来，是为了与中转隧道那条路共用同一份计数：
+   * 各自 new 一个的话，同一台机器在两条路上各拿一份额度。
+   */
+  pairingAllowed?: (address: string | undefined) => boolean
 }
 
 export interface LanServer {
@@ -30,17 +37,6 @@ export interface LanServer {
 }
 
 const MAX_BODY_BYTES = 256 * 1024
-
-/** 手机出示的凭据与设备号。取不到就是没有，不给默认值。 */
-function presented(headers: IncomingMessage['headers']): { deviceId: string; token: string } | undefined {
-  const device = headers['x-crew-device']
-  const token = headers['x-crew-credential']
-  const deviceId = Array.isArray(device) ? device[0] : device
-  const credential = Array.isArray(token) ? token[0] : token
-  if (typeof deviceId !== 'string' || !deviceId.trim()) return undefined
-  if (typeof credential !== 'string' || !credential.trim()) return undefined
-  return { deviceId: deviceId.trim(), token: credential.trim() }
-}
 
 async function readBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
@@ -65,6 +61,9 @@ export function createLanServer(options: LanServerOptions): LanServer {
   // 关得比听得快时（启动即失败、热重载），把「关」记下来，等 listen 落地再执行。
   let closing: Promise<void> | undefined
   let pending: Promise<void> | undefined
+  // 首次配对的放行把「凭据」换成了「一支 6 位码」：100 万种、5 分钟。没有次数限制的话，
+  // 局域网里一台机器可以在一分钟内穷举完。按来源网段限速，让猜码变得不划算。
+  const pairingAllowed = options.pairingAllowed ?? createPairingThrottle()
 
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     // 这条路只服务手机消息面。别的路径一律不接：将来消息面若长了非手机用途的接口，
@@ -75,9 +74,18 @@ export function createLanServer(options: LanServerOptions): LanServer {
       response.end(JSON.stringify({ error: 'Not found' }))
       return
     }
-    const said = presented(request.headers)
+    // 首次配对是个死锁：这台设备还没有凭据，而这条路又要求凭据。所以只有「交一支码」这一跳放行，
+    // 码本身就是它的凭据（6 位、5 分钟、兑换即作废，配对策略为 deny 时一律拒绝）。
+    // 别的路径不受影响 —— 放行的是一支码，不是整个消息面。
+    const pairing = path === '/api/mobile/pair' && request.method === 'POST'
+    if (pairing && !pairingAllowed(request.socket.remoteAddress)) {
+      response.writeHead(429, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: 'Too many pairing attempts' }))
+      return
+    }
+    const said = presentedDevice(request.headers)
     // 验不过就说 401，不区分「设备不对」和「凭据不对」：那是在帮尝试者筛选。
-    if (!said || !devices.allows(said.deviceId, said.token)) {
+    if (!pairing && (!said || !devices.allows(said.deviceId, said.token))) {
       response.writeHead(401, { 'content-type': 'application/json' })
       response.end(JSON.stringify({ error: 'Not paired' }))
       return
@@ -142,29 +150,41 @@ export function createLanServer(options: LanServerOptions): LanServer {
       return typeof address === 'object' && address ? address.port : port
     },
     async listenAll(port, hosts) {
-      const bound: string[] = []
-      for (const host of hosts) {
-        const own = createServer((request, response) => { void handle(request, response) })
-        const sockets = new Set<import('node:net').Socket>()
-        own.on('connection', socket => {
-          sockets.add(socket)
-          socket.on('close', () => sockets.delete(socket))
-        })
-        try {
-          await new Promise<void>((resolve, reject) => {
-            own.once('error', reject)
-            own.listen(port, host, () => { own.off('error', reject); resolve() })
+      const work = (async (): Promise<string[]> => {
+        const bound: string[] = []
+        for (const host of hosts) {
+          // 已经开始关就不再绑新地址：否则一个还没完成的 listen 会在 close 之后落地，
+          // 留下一个没人关闭的监听，端口被它占住，新实例再也绑不上。
+          if (closing) break
+          const own = createServer((request, response) => { void handle(request, response) })
+          const sockets = new Set<import('node:net').Socket>()
+          own.on('connection', socket => {
+            sockets.add(socket)
+            socket.on('close', () => sockets.delete(socket))
           })
-        } catch {
-          // 一个地址绑不上不该让别的地址也起不来：网卡掉线、端口被占都是可能的。
-          own.close()
-          continue
+          try {
+            await new Promise<void>((resolve, reject) => {
+              own.once('error', reject)
+              own.listen(port, host, () => { own.off('error', reject); resolve() })
+            })
+          } catch {
+            // 一个地址绑不上不该让别的地址也起不来：网卡掉线、端口被占都是可能的。
+            own.close()
+            continue
+          }
+          if (closing) {
+            own.close()
+            break
+          }
+          servers.set(host, own)
+          socketsFor.set(own, sockets)
+          bound.push(host)
         }
-        servers.set(host, own)
-        socketsFor.set(own, sockets)
-        bound.push(host)
-      }
-      return bound
+        return bound
+      })()
+      // close() 要能等到这批绑定落地，再把它们一个个关掉。
+      pending = work.then(() => undefined, () => undefined)
+      return work
     },
     async close() {
       closing = closeServer()

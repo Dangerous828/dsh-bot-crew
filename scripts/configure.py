@@ -101,15 +101,27 @@ def call(method, path, body=None):
     return value
 
 
-def save(block, value, attempts=4):
-    # The settings overview does not list every block (a Source block included), so start from 0 and let a
-    # conflict report the live revision instead of guessing.
-    revision = 0
+def live_revision(block):
+    """Read the block's current revision. Blindly incrementing from 0 fails once a block has been saved 4 times."""
+    settings = call('GET', 'settings')
+    if block.startswith('source:'):
+        for source in settings.get('sources', []):
+            if source.get('id') == block[len('source:'):]:
+                return source.get('revision')
+        return None
+    entry = (settings.get('blocks') or {}).get(block)
+    return entry.get('revision') if isinstance(entry, dict) else None
+
+
+def save(block, value, attempts=6):
+    revision = live_revision(block) or 0
     for _ in range(attempts):
         result = call('PUT', 'settings/' + block, {'value': value, 'revision': revision})
         if not result.get('conflict'):
             return result
-        revision += 1
+        # 409 说明别人（面板、另一个脚本）刚改过：重新读当前 revision，而不是从 0 盲加。
+        live = live_revision(block)
+        revision = live if isinstance(live, int) and live != revision else revision + 1
     raise SystemExit('could not save settings block ' + block)
 
 

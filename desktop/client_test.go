@@ -298,7 +298,7 @@ func TestWorkReportsHowATicketWasDone(t *testing.T) {
 	}
 }
 
-func TestRetryAsksTheManagementSurface(t *testing.T) {
+func TestRetryAsksThePhoneSurface(t *testing.T) {
 	var path string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
@@ -309,8 +309,8 @@ func TestRetryAsksTheManagementSurface(t *testing.T) {
 	if err := New(server.URL, "secret", "").Retry(context.Background(), "tk9"); err != nil {
 		t.Fatalf("Retry: %v", err)
 	}
-	// 重试是管理动作，走 /orchestrator/api，不是消息面。
-	if path != "/orchestrator/api/tickets/tk9/retry" {
+	// 手机面到不了管理面（要求本机同源），重试也必须走 /api/mobile/retry。
+	if path != "/api/mobile/retry" {
 		t.Errorf("asked %q", path)
 	}
 }
@@ -411,5 +411,26 @@ func TestLeavesOrdinaryTextAlone(t *testing.T) {
 		if got := readable(raw); got != raw {
 			t.Errorf("readable(%q) = %q, should be unchanged", raw, got)
 		}
+	}
+}
+
+// 屏幕接口：带票号去问，回来的 unavailable + reason 原样读出来。
+func TestScreenAsksForTheTicketAndReadsTheReason(t *testing.T) {
+	var path, query string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, query = r.URL.Path, r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"state":"unavailable","reason":"后端还没有画面源，worker 不跑浏览器"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	view, err := New(server.URL, "secret", "").Screen(context.Background(), "tk 9")
+	if err != nil {
+		t.Fatalf("Screen: %v", err)
+	}
+	if path != "/api/mobile/screen" || query != "ticket=tk+9" {
+		t.Errorf("asked %q?%s", path, query)
+	}
+	if view.State != "unavailable" || view.Reason != "后端还没有画面源，worker 不跑浏览器" {
+		t.Errorf("view = %+v", view)
 	}
 }

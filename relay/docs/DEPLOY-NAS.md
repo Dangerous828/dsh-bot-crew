@@ -3,8 +3,52 @@
 目标：NAS（`192.168.31.152`，极空间 Z4，已有 Docker）跑一个 `crew-relay` 容器，宿主在外面
 主动连它，手机从任何地方连它。
 
+## 零、2026-11-10 实际部署记录（照这份做，不要再走 relay.kentonnie.top）
+
+- **目录**：`/tmp/zfsv3/nvme11/15916258010/data/Jarvis/crew_relay/`
+- **构建路线**：`Dockerfile.nas`（Mac 上 `npm run build` 出 `dist/`，与 `package.json` 一起打包，
+  NAS `docker build -f Dockerfile.nas`）。NAS 上多阶段构建不稳，别用 `Dockerfile`。
+- **宿主端口**：`192.168.31.152:18800`（容器内 8787；宿主 8787 被 devgame-act 占用）。
+- **公网入口**：`relay.kentonnie.top` **已被 AI-HUB 的 `dsh-relay` 占用**，不要覆盖。本服务改走
+  既有域名的子路径，不需要改 Cloudflare 面板：
+
+  ```
+  https://jarvis.kentonnie.top/crew-relay/health
+  wss://jarvis.kentonnie.top/crew-relay/tunnel
+  https://jarvis.kentonnie.top/crew-relay/i/<instanceId>/api/mobile/...
+  ```
+
+- **Caddy 段**（`jarvis-caddy`，插在 `http://jarvis.kentonnie.top` 的兜底 `handle {` 之前）：
+
+  ```
+  handle_path /crew-relay/* {
+      reverse_proxy 192.168.31.152:18800 {
+          flush_interval -1
+      }
+  }
+  ```
+
+  改完 `caddy validate` → `caddy reload`。备份在容器内
+  `/etc/caddy/Caddyfile.bak-20261110-crewrelay`。
+  限流按来源地址计数；这条链路是 Cloudflare → Caddy → relay，所以 relay 优先读
+  `CF-Connecting-IP`（Caddy 会原样转过去）。如果换掉 Cloudflare，要确认反代把真实客户端地址
+  追加到 `X-Forwarded-For` 的最右段，否则所有手机在中转眼里会是同一个来源。
+- **宿主（Mac）**：Electron 由 Finder 启动，不读 shell 环境，所以走 `launchctl setenv`：
+
+  ```sh
+  launchctl setenv CREW_RELAY_URLS "wss://jarvis.kentonnie.top/crew-relay/tunnel"
+  launchctl setenv CREW_RELAY_SECRET "<.env 里的 CREW_RELAY_SECRET>"
+  launchctl setenv CREW_RELAY_INSTANCE "kenton-mac"
+  ```
+
+  然后重启 Electron。密钥与 `relay/.env` 必须一致。
+- **验收（已实测）**：`/health?detail=1` 返回 `tunnels:1`、`instances:[{instanceId:"kenton-mac"}]`；
+  `GET https://jarvis.kentonnie.top/crew-relay/i/kenton-mac/api/mobile/timeline` 带设备凭据返回 200。
+
+手机把地址填成 `https://jarvis.kentonnie.top/crew-relay/i/kenton-mac` 即可在外网使用。
+
 ```
-手机 ──https──► Cloudflare / Caddy ──http──► 127.0.0.1:8787 (crew-relay) ◄──wss── 宿主（任意网络）
+手机 ──https──► Cloudflare / Caddy ──http──► 192.168.31.152:18800 (crew-relay) ◄──wss── 宿主（任意网络）
 ```
 
 中转自己**不做 TLS**，只监听回环。公网那一段交给已经在家里的 Cloudflare Tunnel 或 Caddy。
@@ -100,6 +144,11 @@ curl -s -H "Authorization: Bearer $CREW_RELAY_ADMIN_TOKEN" "http://127.0.0.1:878
 ---
 
 ## 四、把公网那一段接上
+
+> **先读这一条。** 以下是「独立域名 + 回环端口 8787」的通用变体。2026-11-10 的实际部署不是这个形状：
+> `relay.kentonnie.top` 已被 AI-HUB 占用，本服务挂在 `https://jarvis.kentonnie.top/crew-relay/`
+> 子路径下，宿主端口是 `18800`。照 §0 做；本节只在换一台没有域名冲突的机器时参考，
+> 不要把它里面的 `relay.kentonnie.top { ... }` 直接贴到线上 Caddy。
 
 两种现成的做法，选一个。
 

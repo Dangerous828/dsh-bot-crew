@@ -20,7 +20,9 @@ export interface BotDirectory {
   default_bot_id: string
 }
 
-export const BOT_ID = /^[a-z0-9-]+$/
+// 手机「加第一位 Bot」按同一形状校验（见 app/mobile-http.ts 的 bots 接口），所以下划线在这里也是合法字符：
+// 两端各写一份正则迟早会分叉，允许什么就该在一处定义。
+export const BOT_ID = /^[a-z0-9_-]+$/
 
 export function validateDirectory(dir: BotDirectory): void {
   if (!Array.isArray(dir.bots) || dir.bots.length === 0) {

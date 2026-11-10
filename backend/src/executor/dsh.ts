@@ -243,7 +243,15 @@ export class DshExecutor implements Executor {
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
+    return { ...ticket, execution: { ...ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir), prepared: false } }
+  }
+
+  /** Records whether the workspace's prepare command finished, so a retry knows to run it again. */
+  private markPrepared(ticketId: string, prepared: boolean): void {
+    const stored = this.host.store.tickets.get(ticketId)
+    if (!stored?.execution) return
+    stored.execution = { ...stored.execution, prepared }
+    this.host.store.tickets.save(stored)
   }
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
@@ -438,9 +446,13 @@ export class DshExecutor implements Executor {
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
-    // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
-    if (!await stat(workspace).then(() => true, () => false)) {
+    // Prepare the workspace once. An existing directory counts as prepared for tickets from before
+    // `prepared` existed, but a ticket whose prepare command failed keeps `prepared: false` and must
+    // run it again — the command may have left a half-built worktree behind.
+    const exists = await stat(workspace).then(() => true, () => false)
+    if (!exists || ticket.execution?.prepared === false) {
       await this.prepareDirectory(ticket)
+      this.markPrepared(ticket.id, true)
       if (!current()) return
     }
     if (!current()) return

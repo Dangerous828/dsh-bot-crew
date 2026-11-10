@@ -60,13 +60,13 @@ bug 会出现在最难复现的那个组合里（某一条路某一种时序）�
 隧道的重连本来就是「失败 → 退避 → 再连」，切换只是在这个循环里多走一步：
 
 ```
-连 wss://relay.kentonnie.top  ── 失败 ──► 换 wss://relay-b.example
+连 wss://jarvis.kentonnie.top/crew-relay/tunnel ── 失败 ──► 换 wss://relay-b.example
                                             │
                                     连上了（registered）
                                             │
                                     钉在这里，直到它也断了
                                             │
-                              ── 失败 ──► 回到 wss://relay.kentonnie.top
+             ── 失败 ──► 回到 wss://jarvis.kentonnie.top/crew-relay/tunnel
 ```
 
 - **轮转是固定顺序**，不是在运行时重新排序。第 1 条只是暂时不通，它优先是有原因的。

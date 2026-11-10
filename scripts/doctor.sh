@@ -118,7 +118,7 @@ else
   if [ -z "$roster" ]; then
     bad "crew roster" "the phone timeline did not answer on :$LAN_PORT"
   else
-    printf '%s' "$roster" | python3 -c '
+    output=$(printf '%s' "$roster" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -132,8 +132,9 @@ ok = len(bots) > 0 and len(defaults) == 1 and named == defaults[0].get("id")
 names = ", ".join(f"{bot.get(chr(105)+chr(100))}={bot.get(chr(110)+chr(97)+chr(109)+chr(101))}" for bot in bots)
 print(f"{len(bots)} bots ({names}), default {named or chr(45)}" + ("" if ok else " NEEDS FIX"))
 sys.exit(0 if ok else 1)
-' > /tmp/crew-roster-check 2>&1 || fail=1
-    say "crew roster" "$(cat /tmp/crew-roster-check)"
+' 2>&1) || fail=1
+    # 不落盘到可预测的 /tmp 路径：别的用户能预放符号链接，doctor 会以你的权限写穿它。
+    say "crew roster" "$output"
   fi
 fi
 

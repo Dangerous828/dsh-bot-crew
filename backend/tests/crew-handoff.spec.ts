@@ -18,6 +18,11 @@ describe('a worker handing work to a teammate', () => {
     expect(splitHandoff('好，转给码农。\n@handoff CODER').handoffs).toEqual([{ bot_id: 'coder', note: '' }])
   })
 
+  it('keeps an underscored bot id whole', () => {
+    // BOT_ID 允许下划线，这里截断会把工作交给一个不存在的 `coder`。
+    expect(splitHandoff('@handoff coder_1: 改这段').handoffs).toEqual([{ bot_id: 'coder_1', note: '改这段' }])
+  })
+
   it('collects several handoffs and keeps the rest of the reply', () => {
     const { text, handoffs } = splitHandoff('拆两半。\n@handoff scribbler: 文案\n中间一句\n@handoff coder: 代码')
     expect(handoffs.map(h => h.bot_id)).toEqual(['scribbler', 'coder'])

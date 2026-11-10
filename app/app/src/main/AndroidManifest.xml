@@ -5,6 +5,7 @@
 
     <application
         android:label="Bot 队伍"
+        android:allowBackup="false"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.BotCrew">
         <activity

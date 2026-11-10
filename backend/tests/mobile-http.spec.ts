@@ -26,6 +26,11 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered' },
   ])
 })
 it('injects only the server credential and refuses malformed sends before enqueue', async () => {
@@ -70,7 +75,7 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(7)
+  expect(registered.length).toBe(12)
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -146,4 +151,127 @@ it('names the messages the crew read and left, so the phone can tell it apart fr
   const now = Date.parse('2026-11-10T04:00:45.000Z')
   const declined = declinedRequests(items as never, decisions as never, now, 90_000)
   expect(declined).toEqual([{ request_id: 'r1', reason: '只是寒暄，不必开票' }])
+})
+
+// 工作区三个控件与花名册。假宿主只给这一条会用到的那部分能力：真 Runtime 上它们都在，
+// 但测试不必为了一个 stopTicket 把整个引擎搭起来。
+function controlHost(options: { tickets?: Record<string, unknown>; engine?: unknown; settingsControl?: unknown
+  storeSettings?: () => unknown; saveSettings?: (value: unknown) => void } = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(stateDir)
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  const runtime = {
+    ready: Promise.resolve(), machine: { stateDir }, health: {},
+    store: {
+      settings: options.storeSettings ?? (() => ({ paused: false, sources: {} })),
+      tickets: { list: () => [], get: (id: string) => options.tickets?.[id] },
+      ...options.saveSettings ? { saveSettings: options.saveSettings } : {},
+    },
+  } as Record<string, unknown>
+  if (options.engine) runtime.engine = options.engine
+  if (options.settingsControl) runtime.settings = options.settingsControl
+  return runtime as unknown as HttpHost
+}
+
+it('says the screen source is missing instead of pretending there is one', async () => {
+  const handler = phoneHandler(controlHost(), undefined, vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/screen?ticket=t1'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toEqual({ state: 'unavailable', reason: '后端还没有画面源，worker 不跑浏览器' })
+})
+
+it('takes over exactly the ticket it names, and refuses an unknown one', async () => {
+  const engine = { stopTicket: vi.fn() }
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1' } }, engine }), undefined,
+    vi.fn() as unknown as typeof fetch)
+  const taken = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST', body: '{"ticket":"t1"}' }))
+  expect(taken.status).toBe(200)
+  expect(await taken.json()).toEqual({ ok: true, stopped: true })
+  expect(engine.stopTicket).toHaveBeenCalledWith('t1')
+  const missing = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST', body: '{"ticket":"t9"}' }))
+  expect(missing.status).toBe(404)
+  expect(await missing.json()).toEqual({ error: 'No such ticket' })
+  expect(engine.stopTicket).toHaveBeenCalledTimes(1)
+})
+
+it('pauses the executor and says so, because no per-ticket pause exists', async () => {
+  const pauseControl = { pause: vi.fn(async () => ({ paused: true })) }
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1' } }, settingsControl: pauseControl }), undefined,
+    vi.fn() as unknown as typeof fetch)
+  const paused = await handler(new Request('http://dsh/api/mobile/pause', { method: 'POST', body: '{"ticket":"t1"}' }))
+  expect(paused.status).toBe(200)
+  // scope 说「executor」而不是「ticket」：停的是整台执行器，手机界面据此去解释恢复在哪。
+  expect(await paused.json()).toEqual({ ok: true, scope: 'executor' })
+  expect(pauseControl.pause).toHaveBeenCalledWith(true, 'panel')
+  const missing = await handler(new Request('http://dsh/api/mobile/pause', { method: 'POST', body: '{"ticket":"t9"}' }))
+  expect(missing.status).toBe(404)
+  expect(pauseControl.pause).toHaveBeenCalledTimes(1)
+})
+
+it('reads the crew roster and adds a bot under the same rules the directory enforces', async () => {
+  const saved: unknown[] = []
+  // 一份真实的花名册：恰好一个 default，其余 member。
+  const store = () => ({ paused: false, sources: { team: { enabled: true, config: {
+    bots: [{ bot_id: 'scribe', name: '写手', role: 'default', memory_namespace: 'bot/scribe' }], default_bot_id: 'scribe' } } } })
+  const handler = phoneHandler(controlHost({ storeSettings: store, saveSettings: value => { saved.push(value) } }), undefined,
+    vi.fn() as unknown as typeof fetch)
+  const list = await handler(new Request('http://dsh/api/mobile/bots'))
+  expect(await list.json()).toEqual({ bots: [{ bot_id: 'scribe', name: '写手', role: 'default' }] })
+
+  const added = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'coder_1', name: '码农', persona: '写代码' }) }))
+  expect(added.status).toBe(200)
+  expect(await added.json()).toEqual({ ok: true })
+  expect(saved[0]).toMatchObject({ sources: { team: { config: { bots: [
+    { bot_id: 'scribe' },
+    { bot_id: 'coder_1', name: '码农', role: 'member', persona: '写代码', memory_namespace: 'bot/coder_1' },
+  ], default_bot_id: 'scribe' } } } })
+
+  const duplicate = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'scribe', name: '另一个' }) }))
+  expect(duplicate.status).toBe(400)
+  expect(await duplicate.json()).toEqual({ error: 'Bot already exists' })
+  const bad = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'Bad Id', name: 'x' }) }))
+  expect(bad.status).toBe(400)
+  expect(await bad.json()).toEqual({ error: 'Invalid bot id' })
+  expect(saved).toHaveLength(1)
+})
+
+it('adds a bot without flipping a team Source the owner turned off', async () => {
+  const saved: unknown[] = []
+  const handler = phoneHandler(controlHost({
+    storeSettings: () => ({ paused: false, sources: { team: { enabled: false, config: { bots: [
+      { bot_id: 'lead', name: '大哥', role: 'default', memory_namespace: 'bot/lead' }], default_bot_id: 'lead' } } } }),
+    saveSettings: value => { saved.push(value) },
+  }), undefined, vi.fn() as unknown as typeof fetch)
+  const added = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'coder', name: '码农' }) }))
+  expect(added.status).toBe(200)
+  // 只改 config：停用的来源不该因为手机加了一个人而重新开始工作。
+  expect(saved[0]).toMatchObject({ sources: { team: { enabled: false } } })
+})
+
+it('promotes the new bot when the crew has none default, so a broken roster can heal', async () => {
+  const saved: unknown[] = []
+  const handler = phoneHandler(controlHost({
+    storeSettings: () => ({ paused: false, sources: { team: { enabled: true, config: { bots: [
+      { bot_id: 'ghost', name: '幽灵', role: 'member', memory_namespace: 'bot/ghost' }], default_bot_id: 'ghost' } } } }),
+    saveSettings: value => { saved.push(value) },
+  }), undefined, vi.fn() as unknown as typeof fetch)
+  const added = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'lead', name: '大哥' }) }))
+  expect(added.status).toBe(200)
+  expect(saved[0]).toMatchObject({ sources: { team: { config: { bots: [
+    { bot_id: 'ghost' }, { bot_id: 'lead', role: 'default' }], default_bot_id: 'lead' } } } })
+})
+
+it('makes the first bot the default one, since a directory without a default cannot be read back', async () => {
+  const saved: unknown[] = []
+  const handler = phoneHandler(controlHost({ saveSettings: value => { saved.push(value) } }), undefined,
+    vi.fn() as unknown as typeof fetch)
+  const added = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ bot_id: 'lead', name: '大哥' }) }))
+  expect(added.status).toBe(200)
+  expect(saved[0]).toMatchObject({ sources: { team: { config: {
+    bots: [{ bot_id: 'lead', name: '大哥', role: 'default', memory_namespace: 'bot/lead' }], default_bot_id: 'lead' } } } })
 })

@@ -1,8 +1,10 @@
 # 构建上下文里不需要的东西。
-# 注意：node_modules 与 dist 都要排除 —— 镜像里的 dist 是构建阶段现场编出来的，
-# 把一个 macOS 上编的 dist 拷进去，在 Linux 上会因为路径与二进制差异出怪问题。
+# node_modules 与 tests 不进镜像。dist 在 Dockerfile（多阶段）里由构建阶段现场编出来，
+# 但 Dockerfile.nas 的路线是「本机先 build 好 dist，再 COPY 进去」—— 所以这里必须放行 dist，
+# 否则那条路线在 relay/ 整个目录做上下文时会报 COPY source not found。
 node_modules
 dist
+!dist
 tests
 .scratch
 *.log

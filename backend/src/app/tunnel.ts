@@ -192,7 +192,21 @@ export function createTunnel(options: TunnelOptions): Tunnel {
   async function connect(): Promise<void> {
     if (stopped) return
     setState(state === 'idle' ? 'connecting' : 'reconnecting')
-    const opened = new WebSocket(addresses[cursor % addresses.length]!)
+    let opened: WebSocket
+    try {
+      opened = new WebSocket(addresses[cursor % addresses.length]!)
+    } catch (error) {
+      // 地址本身不合法（例如配置里写成了 `wss://`）时构造会同步抛。这条错误如果逃出
+      // `void connect()` 就是未处理的 rejection，Node 会直接结束进程 —— 一条打错的
+      // 环境变量不该让整个后端起不来。
+      lastError = String(error)
+      log(`tunnel ${options.instanceId}: bad relay address: ${lastError}`)
+      settle?.(false)
+      settle = undefined
+      attempt += 1
+      scheduleReconnect()
+      return
+    }
     socket = opened
     opened.binaryType = 'arraybuffer'
 
@@ -218,6 +232,9 @@ export function createTunnel(options: TunnelOptions): Tunnel {
       log(`tunnel ${options.instanceId}: socket error: ${lastError}`)
     })
     opened.addEventListener('close', event => {
+      // 旧 socket 的 close 可能晚于新的连接：心跳超时会先把它置空并立刻重连。
+      // 这时它既不该停掉新连接的心跳，也不该打断新连接上的在途请求。
+      if (socket !== opened) return
       stopHeartbeat()
       // 断开时的清理：所有在途请求都在一条已经没人接的路上等，必须立刻失败。
       for (const [id, entry] of inflight) {

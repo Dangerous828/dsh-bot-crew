@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { phoneHandler, queuedRequests, registerMobileHttp } from '../src/app/mobile-http.ts'
 import { workOf } from '../src/app/work.ts'
 import { DeviceStore, issuePairingCode } from '../src/app/remote.ts'
+import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 
 const directories: string[] = []
@@ -40,8 +41,20 @@ it('registers the work routes on the same authenticated carrier as the rest', ()
   registerMobileHttp(ctx as never, host())
   expect(registered.map(route => route.path)).toEqual([
     '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models',
-    '/api/mobile/model', '/api/mobile/pair',
+    '/api/mobile/model', '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/takeover', '/api/mobile/retry',
+    '/api/mobile/pause', '/api/mobile/bots',
   ])
+})
+
+it('retries a ticket through the phone surface', async () => {
+  const retried: string[] = []
+  const runtimeHost = { ...host(), engine: { stopTicket: () => {}, retryTicket: (id: string) => { retried.push(id) } } } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+  const response = await handler(new Request('http://dsh/api/mobile/retry?ticket=tk1', { method: 'POST' }))
+  expect(response.status).toBe(200)
+  expect(retried).toEqual(['tk1'])
+  // 不存在的票是 404，而不是悄悄成功。
+  expect((await handler(new Request('http://dsh/api/mobile/retry?ticket=none', { method: 'POST' }))).status).toBe(404)
 })
 
 it('returns how one ticket was worked, in order', async () => {
@@ -106,9 +119,11 @@ it('switches the model for the crew and reports what it switched to', async () =
   const store = {
     settings: () => ({ paused: false, executor: { model: { provider: 'deepseek', model: 'deepseek-v3' }, maxWorkers: 3, directory: '', prepare: '', blockedCommands: [] } }),
     saveSettings: (next: { executor?: { model?: unknown } }) => { saved = next },
+    blockRevision: () => 0,
     tickets: { list: () => [], get: () => undefined },
   }
-  const runtimeHost = { ...host(), store } as unknown as HttpHost
+  // 模型切换必须走 Settings.save（它会先 resolveRoleModel）；这里只验证路由把值交对了。
+  const runtimeHost = { ...host(), store, settings: { save: async (_block: string, value: { model?: unknown }) => { saved = { executor: value } } } } as unknown as HttpHost
   const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
 
   const response = await handler(new Request('http://dsh/api/mobile/model', {
@@ -117,6 +132,19 @@ it('switches the model for the crew and reports what it switched to', async () =
   expect(response.status).toBe(200)
   expect(await response.json()).toMatchObject({ ok: true, model: { provider: 'deepseek', model: 'deepseek-v4' } })
   expect(saved?.executor?.model).toMatchObject({ provider: 'deepseek', model: 'deepseek-v4' })
+})
+
+it('reports a stale revision as 409 and an unusable model as 400', async () => {
+  const settings = { paused: false, executor: { model: { provider: 'deepseek', model: 'deepseek-v3' }, maxWorkers: 3, directory: '', prepare: '', blockedCommands: [] } }
+  const store = { settings: () => settings, blockRevision: () => 3, tickets: { list: () => [], get: () => undefined } }
+  const answer = async (error: Error) => {
+    const handler = phoneHandler({ ...host(), store, settings: { save: async () => { throw error } } } as unknown as HttpHost,
+      'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+    return handler(new Request('http://dsh/api/mobile/model', { method: 'POST',
+      body: JSON.stringify({ provider: 'deepseek', model: 'deepseek-v4' }) }))
+  }
+  expect((await answer(new SettingsConflict('Settings changed.'))).status).toBe(409)
+  expect((await answer(new Error('modelUnavailable'))).status).toBe(400)
 })
 
 it('refuses a model change with no model named', async () => {

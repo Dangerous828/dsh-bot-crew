@@ -110,9 +110,12 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, onPaired: (PairedCrew)
                 trouble = null
                 scope.launch {
                     try {
-                        val client = PairingClient(address.trimEnd('/'))
+                        // 人最常输的是 192.168.31.127:43499 这种不带协议的形式；不补 scheme，
+                        // URL 构造会直接抛 MalformedURLException，配对永远不成立。
+                        val base = CrewPairing.normalize(address)
+                        val client = PairingClient(base)
                         val credential = client.pair(code, deviceId, deviceName(), "android")
-                        onPaired(PairedCrew(credential.deviceId, credential.token, address.trimEnd('/')))
+                        onPaired(PairedCrew(credential.deviceId, credential.token, base))
                     } catch (error: Exception) {
                         trouble = error.message ?: "配对被拒绝"
                     } finally {

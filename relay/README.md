@@ -24,7 +24,7 @@
 
 ```sh
 pnpm install
-pnpm test          # 50 条
+pnpm test          # 55 条
 pnpm typecheck
 pnpm build && node dist/main.js
 ```

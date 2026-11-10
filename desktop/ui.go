@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -24,23 +25,46 @@ type app struct {
 	// 后台线程把结果放这里，主线程在下一帧取走，避免跨线程碰同一份状态。
 	arrived chan *Conversation
 	failed  chan string
+	// sent 把「这次发出去的原文」带回主线程：只有输入框里还是这句时才清空，
+	// 否则会把用户刚打的新内容抹掉。
+	sent chan string
 	tree    chan []AgentNode
-	paired  chan string
+	paired  chan Credential
+	// 配对失败单独一条：它不该写成「连不上队伍」，那是连接问题，不是配对问题。
+	pairFailed chan string
 	steps   chan workResult
 	// modelList 是模型目录回来了；modelSwitched 是换成功了。
 	// 两份分开：读失败和换失败要说的不是一句话。
 	modelList     chan *ModelCatalog
 	modelSwitched chan ModelChoice
+	// modelError 与 failed 分开：模型目录/切换失败只该写在模型栏里。
+	modelError chan string
+	// screenNoteCh 是屏幕接口的返回：它是「暂时没有」，不是断连。
+	screenNoteCh chan string
+	// 重试失败也一样：只影响这张票，不冒充断连。
+	retryErrorCh chan string
+	retryError   string
 
 	// agents 是第一张工单下的代理树。读不到就空着，不挡住对话。
 	agents []AgentNode
 
-	// 配对：主人点一下拿码，念给手机听。码只在这台机器上出现过。
-	pairingCode string
+	// 配对：主人点一下，本机出码、本机兑换，凭据写进 ~/.config 后下次启动直接用。
 	pairingNote string
+	// target 是自动发现到的队伍（端口与 profile）；配对要用它的出码与兑换端口。
+	target crewTarget
+	// endpoint 是这次实际连的地址，断连横幅要把它说出来 —— 「连不上」三个字不告诉人连的是哪。
+	endpoint string
 
 	// 打开的那张工单和它的过程。过程带着票号回来，所以点开 A 之后又点 B，A 的结果不会冒充成 B 的。
 	openTicket string
+	// screenNote 是「看它的屏幕」给出的实话（后端还没有画面源），与连接故障分开显示。
+	screenNote string
+	// selectedBot 是左栏点中的那位。点它既是选人，也是回到对话主界面。
+	selectedBot string
+	// sidebarClosed 是左栏收起。零值 false = 默认展开，和以前一样。
+	sidebarClosed bool
+	// services 是 mygo 的窗口服务，后台 goroutine 靠它请求重画。
+	services ui.Services
 	// screenReady 是「看它的屏幕」能不能用。后端还没有这条路，先摆着。
 	screenReady bool
 	// backendTab 是右栏「后台」那一档里当前在看哪一页：进行中 / 待你 / 已完成。
@@ -68,6 +92,10 @@ type workResult struct {
 	err    error
 }
 
+// wake 让窗口尽快画下一帧。后台 goroutine 把一个结果放进通道之后必须调用：
+// 不调的话通道里的结果要等到用户碰一下窗口才被 drain 收走，界面就停在「正在读…」。
+func (s *app) wake() { s.services.Invalidate() }
+
 func (s *app) refresh() {
 	if s.client == nil || s.refreshing {
 		return
@@ -80,6 +108,7 @@ func (s *app) refresh() {
 		conversation, err := s.client.Timeline(ctx)
 		if err != nil {
 			s.failed <- err.Error()
+			s.wake()
 			return
 		}
 		// 树跟着第一次刷新一起读。读失败不算错：对话照样能用，只是这一栏空着。
@@ -89,6 +118,7 @@ func (s *app) refresh() {
 			}
 		}
 		s.arrived <- conversation
+		s.wake()
 	}()
 }
 
@@ -105,9 +135,12 @@ func (s *app) send() {
 		defer cancel()
 		if _, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation)); err != nil {
 			s.failed <- err.Error()
+			s.wake()
 			return
 		}
+		s.sent <- text // 主线程确认这句真的发出去了，再清输入框
 		s.arrived <- nil // 只用来触发一次重读，让刚发的话尽快出现
+		s.wake()
 		s.refresh()
 	}()
 }
@@ -120,8 +153,23 @@ func mentionsIn(text string, conversation *Conversation) []string {
 	var found []string
 	for _, bot := range conversation.Bots {
 		for _, needle := range []string{"@" + bot.ID, "@" + bot.Name} {
-			if len(needle) > 1 && strings.Contains(text, needle) {
-				found = append(found, bot.ID)
+			if len(needle) <= 1 {
+				continue
+			}
+			// 必须命中到词的边界：队里有 a 和 ab 时，@ab 不能同时点名 a。
+			for offset := 0; ; {
+				index := strings.Index(text[offset:], needle)
+				if index < 0 {
+					break
+				}
+				start := offset + index
+				if !continuesName(text[start+len(needle):]) {
+					found = append(found, bot.ID)
+					break
+				}
+				offset = start + 1
+			}
+			if len(found) > 0 && found[len(found)-1] == bot.ID {
 				break
 			}
 		}
@@ -129,7 +177,17 @@ func mentionsIn(text string, conversation *Conversation) []string {
 	return found
 }
 
+// continuesName 判断 @ 后面的这个位置是否还在同一个名字里。是的话，刚才那次命中是前缀，不算。
+func continuesName(rest string) bool {
+	for _, r := range rest {
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-'
+	}
+	return false
+}
+
 func (s *app) view(c *ui.Context) {
+	// 后台 goroutine 靠这个句柄请求下一帧；只拿到 view 里不行，它们不在 UI 线程上。
+	s.services = c.Services()
 	s.drain(c)
 	p := ThemeColors(c.Theme())
 	// 根容器必须自己上底色：不上就是 mygo 的默认深色，亮色主题下顶上会漏出一条黑边。
@@ -156,9 +214,24 @@ func (s *app) drain(c *ui.Context) {
 		case tree := <-s.tree:
 			s.agents = tree
 			c.Invalidate()
-		case code := <-s.paired:
-			s.pairingCode, s.pairingNote = code, ""
+		case message := <-s.pairFailed:
+			// 配对失败写在配对那一块，不冒充连接故障。
+			s.pairingNote = "配对没成功：" + message
 			c.Invalidate()
+		case credential := <-s.paired:
+			// 配对成功：先把凭据落到本机，再换上新的 client。存不下来也要说清楚 ——
+			// 这一次能连、下次启动又要重配，是两件不同的事。
+			if err := saveCredential(credentialPath(), credential); err != nil {
+				s.pairingNote = "配上了，但凭据存不下来：" + err.Error()
+			} else {
+				s.pairingNote = "已配对，下次启动免配置直连"
+			}
+			s.client = New(credential.Base, credential.Token, credential.DeviceID)
+			// 横幅要跟着换：连的是新地址了，再失败时不能还报旧的那个。
+			s.endpoint = credential.Base
+			s.problem = ""
+			c.Invalidate()
+			s.refresh()
 		case result := <-s.steps:
 			// 只有回来的正是当前打开的那张票才显示，否则写的是别人的经过。
 			if result.ticket != s.openTicket {
@@ -174,9 +247,24 @@ func (s *app) drain(c *ui.Context) {
 		case catalog := <-s.modelList:
 			s.models, s.modelsError, s.modelNote = catalog, "", ""
 			c.Invalidate()
+		case message := <-s.modelError:
+			s.modelsError, s.modelNote = message, ""
+			c.Invalidate()
+		case message := <-s.retryErrorCh:
+			s.retryError = message
+			c.Invalidate()
+		case note := <-s.screenNoteCh:
+			s.screenNote = note
+			c.Invalidate()
 		case choice := <-s.modelSwitched:
 			// 换成了：目录里记下新的这一个，左栏和右栏都跟着改，不用等人再点一次刷新。
 			s.applyModel(choice)
+			c.Invalidate()
+		case text := <-s.sent:
+			// 只清掉「刚发出去的那一句」；用户在这期间又打了字就留着。
+			if s.input == text {
+				s.input = ""
+			}
 			c.Invalidate()
 		case message := <-s.failed:
 			s.problem = message
@@ -192,13 +280,31 @@ func (s *app) drain(c *ui.Context) {
 
 // roster 是左栏：谁在这个队伍里，他此刻在干什么。
 func (s *app) roster(c *ui.Context, p Palette) {
+	if s.sidebarClosed {
+		// 左栏收起后留一条窄边，点它展开。中间的对话会自己长满。
+		ui.Row(c).Width(30).FillHeight().Background(p.Card).Cursor(ui.CursorPointer).
+			AlignItems(ui.Center).OnClick(func() { s.sidebarClosed = false }).Children(func() {
+			ui.Column(c).Gap(4).Children(func() {
+				ui.Text(c, "»").FontSize(FontBodyWide).TextColor(p.Faint)
+				ui.Text(c, "队").FontSize(FontTiny).TextColor(p.Faint)
+				ui.Text(c, "伍").FontSize(FontTiny).TextColor(p.Faint)
+			})
+		})
+		return
+	}
 	// 只给 Width，不给 FillWidth：两个一起写是互相打架的（一个说「父容器多宽我多宽」），
 	// 定宽栏要的是 Width 这一条。
 	ui.Column(c).Width(SidebarWidth).FillHeight().PaddingX(14).PaddingY(22).Gap(18).Background(p.Card).Children(func() {
-		// 标题行：图标 + 名字 + 新增。设计稿的图标是虚线圆环里一个实心点。
+		// 标题行：图标 + 名字 + 收起。
 		ui.Row(c).FillWidth().AlignItems(ui.Center).PaddingX(8).Children(func() {
 			ui.Text(c, "◎").FontSize(FontIcon).TextColor(p.Ink)
 			ui.Text(c, "我的队伍").FontSize(FontTitle).FontWeight(WeightTitle).LetterSpacing(-0.15).TextColor(p.Ink)
+			ui.Row(c).Grow(1)
+			// 一个「«」字太小，不好点：给它一圈 padding，点击挂在整块上。
+			ui.Row(c).Padding(6).Radius(RadiusButton).Background(p.Card).Cursor(ui.CursorPointer).
+				OnClick(func() { s.sidebarClosed = true }).Children(func() {
+				ui.Text(c, "«").FontSize(FontBodyWide).TextColor(p.Faint)
+			})
 		})
 
 		ui.Column(c).FillWidth().Gap(2).Children(func() {
@@ -209,11 +315,18 @@ func (s *app) roster(c *ui.Context, p Palette) {
 			for i, bot := range s.conversation.Bots {
 				bot := bot
 				// 选中态用底色分层，不加边框：设计稿靠色块而不是线。
-				selected := i == 0
-				item := ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).Padding(11).Radius(RadiusPane)
+				selected := s.selectedBot == bot.ID || (s.selectedBot == "" && i == 0)
+				item := ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).Padding(11).Radius(RadiusPane).
+					Cursor(ui.CursorPointer)
 				if selected {
 					item = item.Background(p.SelectedAlt)
 				}
+				// 点人 = 选他 + 回到对话主界面。右栏收起，中间那栏自己长满。
+				// 之前这一行没有点击，点了没反应，看起来像「回不到主界面」。
+				item = item.OnClick(func() {
+					s.selectedBot = bot.ID
+					s.backendOpen = false
+				})
 				item.Children(func() {
 					// 36px 头像块，圆角 11：取名字首字。强调色与警告色交替，让人一眼分得开。
 					soft, tint := p.AccentSoft2, p.Accent
@@ -281,12 +394,13 @@ func (s *app) stateColor(p Palette, botID string) ui.Color {
 		if task.BotID != botID {
 			continue
 		}
+		// NeedsPerson 的值就是等待的原因（failed/blocked/…），失败优先于普通「等你」。
 		switch {
-		case task.State == "failed":
+		case task.NeedsPerson == "failed":
 			return p.Danger
 		case task.NeedsPerson != "":
 			return p.Warn
-		case task.State == "work":
+		case task.Open:
 			return p.Accent
 		}
 	}
@@ -300,11 +414,16 @@ func (s *app) handover() string {
 	}
 	running, waiting := "", 0
 	for _, task := range s.conversation.Tasks {
-		if task.State == "work" && running == "" {
-			running = s.nameOf(task.BotID)
-		} else {
-			waiting++
+		if !task.Open {
+			continue
 		}
+		if task.NeedsPerson == "" {
+			if running == "" {
+				running = s.nameOf(task.BotID)
+			}
+			continue
+		}
+		waiting++
 	}
 	if running == "" {
 		if waiting == 0 {
@@ -377,7 +496,7 @@ func (s *app) openCount() int {
 	}
 	n := 0
 	for _, task := range s.conversation.Tasks {
-		if task.State != "done" {
+		if task.Open {
 			n++
 		}
 	}
@@ -398,12 +517,26 @@ func (s *app) stateOf(botID string) string {
 
 func stateWord(state string) string {
 	switch state {
-	case "work":
+	// 进行中：后端给的是 stage（working / person / idle）。
+	case "work", "working":
 		return "在做"
 	case "person":
 		return "等你"
+	case "idle":
+		return "闲着"
 	case "failed":
 		return "失败"
+	// 终态：ticket.ended.outcome 有五种。
+	case "completed":
+		return "已完成"
+	case "merged":
+		return "已合并"
+	case "closed":
+		return "已关闭"
+	case "dropped":
+		return "已放弃"
+	case "stopped":
+		return "已停止"
 	case "done":
 		return "已完成"
 	default:
@@ -417,9 +550,22 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 	// 那个值能到八九百。窗口缩窄时两侧定宽的栏就守不住了。地板给 0，缩窄由这一栏让。
 	ui.Column(c).Grow(1).MinWidth(0).FillWidth().FillHeight().Gap(0).Background(p.Surface).Children(func() {
 		if s.problem != "" {
-			// 断连时先把话说清楚，别让人对着空白猜。
-			ui.Row(c).FillWidth().PaddingX(22).PaddingY(8).Background(p.WarnSoft).Children(func() {
-				ui.Text(c, "连不上队伍："+s.problem).FontSize(FontBody).TextColor(p.Danger)
+			// 断连时先把话说清楚，别让人对着空白猜。横幅要能指路：
+			// 连的是哪一支、机器上到底有没有队伍，以及下一步该点哪儿。
+			ui.Column(c).FillWidth().PaddingX(22).PaddingY(8).Background(p.WarnSoft).Gap(2).Children(func() {
+				where := s.endpoint
+				if where == "" {
+					ui.Text(c, "没找到在跑的队伍").FontSize(FontBody).TextColor(p.Danger)
+				} else {
+					// 连的是哪一支要说出来：保存的凭据或环境变量可能指向别处，
+					// 光说「没找到在跑的队伍」会让人以为连的是本机那个。
+					ui.Text(c, "连不上 "+where+"："+s.problem).FontSize(FontBody).TextColor(p.Danger)
+				}
+				hint := "右栏「配对手机」可以重新配一次"
+				if where != "" && !s.target.Found {
+					hint = "这台机器上没发现正在跑的队伍；" + hint
+				}
+				ui.Text(c, hint).FontSize(FontMini).TextColor(p.Muted)
 			})
 		}
 		// 标题栏：头像 + 名字·职能 + 刷新。画板里是 718×75 的白色带，上下留白 18。
@@ -432,6 +578,9 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 			ui.Column(c).Gap(2).Children(func() {
 				ui.Text(c, s.title()).FontSize(FontHeader).FontWeight(WeightTitle).TextColor(p.Ink)
 				ui.Text(c, s.subtitle()).FontSize(FontBody).TextColor(p.Faint)
+				if s.screenNote != "" {
+					ui.Text(c, s.screenNote).FontSize(FontMini).TextColor(p.Faint)
+				}
 			})
 			ui.Row(c).Grow(1)
 			// 「看它的屏幕」：画板 109×31、圆角 9、白底细边。
@@ -451,7 +600,27 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 				if s.screenReady {
 					return
 				}
-				s.failed <- "还看不到它的屏幕：这一步还没接上"
+				// 去问后端，而不是自己编一句「还没接上」。后端会如实回答
+				// {state:"unavailable", reason:"后端还没有画面源，worker 不跑浏览器"}；
+				// 这是一条功能说明，不是连接故障，绝不能写进 s.problem。
+				ticketID := ""
+				if s.conversation != nil && len(s.conversation.Tasks) > 0 {
+					ticketID = s.conversation.Tasks[0].ID
+				}
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					view, err := s.client.Screen(ctx, ticketID)
+					switch {
+					case err != nil:
+						s.screenNoteCh <- "读不到屏幕：" + err.Error()
+					case view.State == "unavailable" && view.Reason != "":
+						s.screenNoteCh <- view.Reason
+					default:
+						s.screenNoteCh <- "屏幕暂时只有状态：" + view.State
+					}
+					s.wake()
+				}()
 			})
 			ui.Row(c).PaddingX(9).PaddingY(7).Radius(RadiusButton).
 				Cursor(ui.CursorPointer).Children(func() {
@@ -474,7 +643,11 @@ func (s *app) subtitle() string {
 	if len(s.conversation.Bots) == 0 {
 		return "队伍里还没有 Bot"
 	}
-	return "和 " + s.nameOf(s.conversation.DefaultBotID) + " 说话"
+	who := s.selectedBot
+	if who == "" {
+		who = s.conversation.DefaultBotID
+	}
+	return "和 " + s.nameOf(who) + " 说话"
 }
 
 func (s *app) title() string {
@@ -490,10 +663,13 @@ func (s *app) title() string {
 func (s *app) stream(c *ui.Context, p Palette) {
 	switch {
 	case s.conversation == nil:
-		ui.Row(c).PaddingX(ContentInset).PaddingY(16).Children(func() { ui.Text(c, "正在读对话…").FontSize(FontBody).TextColor(p.Faint) })
+		// Grow(1)：空态/加载态也要占住剩余高度，否则输入框会贴在标题下面，
+		// 下面留一大片空白 —— 看起来像布局坏了。
+		ui.Column(c).Grow(1).FillWidth().PaddingX(ContentInset).PaddingY(16).
+			Children(func() { ui.Text(c, "正在读对话…").FontSize(FontBody).TextColor(p.Faint) })
 	case len(s.conversation.Messages) == 0:
 		// 空态：还没人说话。
-		ui.Row(c).PaddingX(ContentInset).PaddingY(16).Children(func() {
+		ui.Column(c).Grow(1).FillWidth().PaddingX(ContentInset).PaddingY(16).Children(func() {
 			ui.Text(c, "还没有人说话。在下面写一句试试。").FontSize(FontBody).TextColor(p.Faint)
 		})
 	default:
@@ -514,15 +690,10 @@ func (s *app) stream(c *ui.Context, p Palette) {
 
 // subagentCard 是「这一段拆给几个分身」那张卡：表头一行、分隔线、每个分身一行。
 func (s *app) subagentCard(c *ui.Context, p Palette, tree []AgentNode) {
-	running, done := 0, 0
 	total := countAgents(tree)
-	for _, node := range tree {
-		if node.State == "running" || node.State == "work" {
-			running++
-		} else {
-			done++
-		}
-	}
+	// 递归数：嵌套的子代理也算，否则「已完成」把还在跑的层级也吞进去。
+	running := countRunning(tree)
+	done := total - running
 	ui.Row(c).FillWidth().PaddingX(ContentInset).Children(func() {
 		ui.Column(c).MaxWidth(ContentMax).FillWidth().Radius(RadiusPane).
 			Background(p.Card).BorderWidth(1).BorderColor(p.Line).Children(func() {
@@ -547,7 +718,7 @@ func (s *app) subagentCard(c *ui.Context, p Palette, tree []AgentNode) {
 
 // subagentRow 是卡里的一行：状态点 + 名字 + 右侧的状态与耗时。
 func (s *app) subagentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
-	working := node.State == "running" || node.State == "work"
+	working := !agentDone(node.State)
 	mark, tint := "○", p.Muted
 	if !working {
 		mark, tint = "✓", p.Faint
@@ -571,6 +742,27 @@ func (s *app) subagentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 }
 
 // countAgents 数整棵树有多少个分身。
+// agentDone 是一个子代理是不是已经收工。后端目前只发 working，这个集合为将来的终态留位置。
+func agentDone(state string) bool {
+	switch state {
+	case "done", "ended", "completed", "failed", "stopped":
+		return true
+	}
+	return false
+}
+
+// countRunning 数整棵树里还在跑的分身。
+func countRunning(nodes []AgentNode) int {
+	n := 0
+	for _, node := range nodes {
+		if !agentDone(node.State) {
+			n++
+		}
+		n += countRunning(node.Children)
+	}
+	return n
+}
+
 func countAgents(tree []AgentNode) int {
 	n := 0
 	var walk func(nodes []AgentNode)
@@ -722,10 +914,24 @@ func (s *app) composer(c *ui.Context, p Palette) {
 // 明说的空态。每一项都画得出来，没有一项按下去是空的。
 func (s *app) backendPane(c *ui.Context, p Palette) {
 	if !s.backendOpen {
-		// 收起来了就整条不画：中间的对话会自己长满。
+		// 收起来不是消失：留一条窄边，点它就能再展开。
+		// 只靠「再按一次后台」不够——人不知道那一格是开关。
+		ui.Row(c).Width(30).FillHeight().Background(p.Card).Cursor(ui.CursorPointer).
+			AlignItems(ui.Center).OnClick(func() { s.backendOpen = true; s.backendTab = 0 }).Children(func() {
+			ui.Column(c).Gap(4).Children(func() {
+				ui.Text(c, "‹").FontSize(FontBodyWide).TextColor(p.Faint)
+				ui.Text(c, "后").FontSize(FontTiny).TextColor(p.Faint)
+				ui.Text(c, "台").FontSize(FontTiny).TextColor(p.Faint)
+			})
+		})
 		return
 	}
 	ui.Column(c).Width(BackendWidth).FillHeight().PaddingX(16).PaddingY(22).Gap(14).Background(p.Surface).Children(func() {
+		ui.Row(c).FillWidth().Children(func() {
+			ui.Row(c).Grow(1)
+			ui.Text(c, "收起 ›").FontSize(FontTiny).TextColor(p.Faint).Cursor(ui.CursorPointer).
+				OnClick(func() { s.backendOpen = false })
+		})
 		switch s.navTab {
 		case navModel:
 			s.modelPane(c, p)
@@ -762,6 +968,10 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 			})
 		}
 	})
+
+	if s.retryError != "" {
+		ui.Text(c, "重试没成功："+s.retryError).FontSize(FontTiny).TextColor(p.Danger)
+	}
 
 	tasks := s.shownTasks()
 	if len(tasks) == 0 {
@@ -945,7 +1155,7 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 	switch {
 	case task.NeedsPerson != "":
 		soft, tint, edge = p.WarnSoft, p.Warn, p.WarnEdge
-	case task.State == "failed":
+	case task.NeedsPerson == "failed":
 		soft, tint, edge = p.DangerSoft, p.Danger, p.DangerEdge
 	}
 	// 整张卡就是入口：按在标题、状态行、空白处都算按在这一张上。
@@ -986,7 +1196,7 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 				ui.Text(c, "卡在等你 · 等你 "+waited).FontSize(FontHairline).TextColor(p.Warn)
 			}
 		}
-		if task.State == "failed" {
+		if task.Retryable {
 			// 失败的票得有一条出路，否则只能干看着。
 			ticketID := task.ID
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
@@ -996,10 +1206,13 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 						defer cancel()
 						if err := s.client.Retry(ctx, ticketID); err != nil {
-							s.failed <- err.Error()
+							// 重试失败只影响这张票，不能写成全局断连把发送也锁住。
+							s.retryErrorCh <- err.Error()
+							s.wake()
 							return
 						}
 						s.arrived <- nil
+						s.wake()
 						s.refresh()
 					}()
 				})
@@ -1044,6 +1257,7 @@ func (s *app) openWork(ticketID string) {
 		defer cancel()
 		steps, err := s.client.Work(ctx, ticketID)
 		s.steps <- workResult{ticket: ticketID, steps: steps, err: err}
+		s.wake()
 	}()
 }
 
@@ -1058,10 +1272,13 @@ func (s *app) loadModels() {
 		defer cancel()
 		catalog, err := s.client.Models(ctx)
 		if err != nil {
-			s.failed <- "读不到模型目录：" + err.Error()
+			// 模型目录读不到不是连接故障：不能写进 s.problem，那会把发送也一起锁死。
+			s.modelError <- "读不到模型目录：" + err.Error()
+			s.wake()
 			return
 		}
 		s.modelList <- catalog
+		s.wake()
 	}()
 }
 
@@ -1075,10 +1292,13 @@ func (s *app) switchTo(choice ModelChoice) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := s.client.SwitchModel(ctx, choice); err != nil {
-			s.failed <- err.Error()
+			// 换模型失败只影响模型栏，不该冒充断连、更不该锁住输入框。
+			s.modelError <- err.Error()
+			s.wake()
 			return
 		}
 		s.modelSwitched <- choice
+		s.wake()
 	}()
 }
 
@@ -1110,13 +1330,13 @@ func (s *app) shownTasks() []Task {
 			}
 			continue
 		case 2: // 已完成
-			if task.State == "done" {
+			if !task.Open {
 				out = append(out, task)
 			}
 			continue
 		}
 		// 进行中：还没结束，且不是「等你决定」的。
-		if task.State != "done" && !needsPerson {
+		if task.Open && !needsPerson {
 			out = append(out, task)
 		}
 	}
@@ -1177,7 +1397,7 @@ func (s *app) agentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 	}
 	mark := "·"
 	tint := p.Ink
-	if node.State == "done" {
+	if agentDone(node.State) {
 		mark, tint = "✓", p.Faint
 	}
 	// 有标签就用标签：`a1-1` 这种内部编号对人没有意义。
@@ -1191,28 +1411,37 @@ func (s *app) agentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 	}
 }
 
-// pairing 是后台栏底下那一块：手机怎么连进来，以及怎么把丢了的手机踢出去。
+// pairing 是后台栏底下那一块：这台电脑连上队伍，之后手机也能连。
+//
+// 点一下全自动：本机出一支码，立刻用码换凭据，凭据写进 ~/.config 后下次启动直接读。
+// 不再要求人去别处看图念数字，也不再要求先设三个环境变量。
 func (s *app) pairing(c *ui.Context, p Palette) {
 	ui.Text(c, "手机").FontSize(FontHairline).Bold().TextColor(p.Muted)
-	if s.pairingCode != "" {
-		// 码要大：人得隔着桌子念给手机听。
-		ui.Text(c, s.pairingCode).FontSize(FontCode).TextColor(p.Accent).Bold()
-		ui.Text(c, "五分钟内有效，只能换一台设备").FontSize(FontMini).TextColor(p.Faint)
-		return
-	}
+	ui.Text(c, "这一台与队伍配一次，之后两边都免配置。").FontSize(FontMini).TextColor(p.Faint)
 	// 默认主色是系统蓝，和队伍配色不是一套。
 	if ui.PrimaryButton(c, "配对手机").Background(p.Accent).Clicked() {
-		s.pairingNote = "正在取码…"
+		if s.target.LanPort == 0 {
+			s.pairingNote = "没找到在跑的队伍：先把它启动起来再点"
+			return
+		}
+		s.pairingNote = "正在配对…"
+		// 目标在启动时定下、之后不再改，goroutine 里读它是安全的。
+		target := s.target
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			// 不指定设备：这台电脑还不知道手机会自报什么名字，谁先拿码来换就归谁。
-			code, err := s.client.PairingCode(ctx, "")
+			// Electron 内置 dsh 的网页端口是启动时随机分配的，profile 里没有；
+			// 从 lan 端口的进程反查它，找不到才用 profile 里写的那个。
+			target.WebPort = webPortNear(target.LanPort, target.WebPort)
+			credential, err := pairDevice(ctx, target, defaultDeviceID, "crew-desktop", "macos", nil)
 			if err != nil {
-				s.failed <- err.Error()
+				// 配对失败的原因（码过期、策略拒绝、队伍没起来）原样交回去，不吞成一个「失败」。
+				s.pairFailed <- err.Error()
+				s.wake()
 				return
 			}
-			s.paired <- code
+			s.paired <- credential
+			s.wake()
 		}()
 	}
 	if s.pairingNote != "" {
@@ -1269,6 +1498,11 @@ func (s *app) workRow(c *ui.Context, p Palette, step WorkStep) {
 
 // clockOf 把 ISO 时刻压成 HH:MM。读经过时看的是先后顺序，日期在这里是噪音。
 func clockOf(at string) string {
+	// 后端时间戳是 UTC 的 toISOString；直接截字符串会在东八区差出 8 小时。
+	// 与消息时间用同一个解析、同一个本地化。
+	if shown := shortTime(at); shown != "" {
+		return shown
+	}
 	if i := strings.IndexByte(at, 'T'); i >= 0 && len(at) >= i+6 {
 		return at[i+1 : i+6]
 	}

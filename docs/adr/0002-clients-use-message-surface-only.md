@@ -1,5 +1,8 @@
 # 客户端只接消息面，不接管理面
 
+> 2026-11-10 修订：[0003](0003-client-pairing-and-roster-writes.md) 放开了两处——本机出码可以打一条管理面路由，
+> 手机可以写花名册。下面「只接消息面」与「要改配置就回面板」按 0003 理解。
+
 两套 HTTP 面并存：管理面 `/orchestrator/api/*` 给配置与排障，消息面 `/api/mobile/*` 给人跟 Bot 说话。
 
 管理面的同源围栏（`backend/src/app/http.ts:75-79`）要求 Host 头严格等于 `127.0.0.1:<port>`，并要求 `x-orchestrator-request: 1`。浏览器发不出这个头——这正是「去 team 回答」按钮点开是 401 的根本原因。Android 的 OkHttp 与 Go 的 http.Client 能覆盖 Host，但那是绕过围栏，不是接入。

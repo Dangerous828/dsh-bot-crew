@@ -20,10 +20,10 @@
  *
  * 协议细节见 relay-protocol.ts 与 docs/PROTOCOL.md。
  */
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, validateHeaderName, validateHeaderValue, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
 import type { Duplex } from 'node:stream'
-import { T, encodeFrame, frameDecoder, jsonFrame, parseJson, type Frame } from './relay-protocol.ts'
+import { DEFAULT_MAX_FRAME_BYTES, T, encodeFrame, frameDecoder, jsonFrame, parseJson, type Frame } from './relay-protocol.ts'
 import { upgradeToWebSocket, type WebSocketConnection } from './websocket.ts'
 
 /**
@@ -83,8 +83,19 @@ export interface RelayOptions {
   maxFrameBytes?: number
   /** 一个手机请求体的上限。宿主那边也有自己的 256KiB 上限，这里先挡在公网侧。 */
   maxRequestBodyBytes?: number
+  /** 收完一个请求体的最长时间。公网上「发一个字节然后挂着」是免费的，没有它就等于不设防。 */
+  bodyTimeoutMs?: number
+  /** 同时收着请求体的连接数上限，防止大量慢请求各占一小块内存。 */
+  maxPendingBodies?: number
+  /** 同时挂着、还没注册的隧道连接上限。 */
+  maxPendingRegistrations?: number
   /** 一个实例同时在跑的请求上限。 */
   maxInflightPerInstance?: number
+  /**
+   * 单个响应在手机这一侧最多堆多少未发字节。手机读得慢时写缓冲会长，
+   * 没有上限的话一个挂着的流能把中转内存吃完。
+   */
+  maxResponseBufferBytes?: number
   /** 同一个来源地址在窗口内失败多少次之后开始挡。 */
   authFailureLimit?: number
   /** 失败计数的窗口。 */
@@ -103,6 +114,20 @@ export interface Relay {
   instances(): string[]
   /** 某条隧道的状态。没有就返回 undefined。 */
   status(instanceId: string): { instanceId: string; name: string; connectedAt: number; inflight: number; lastPong: number } | undefined
+}
+
+/**
+ * 对端是不是「本机或内网」。
+ *
+ * 反代（Caddy）与中转在同一个 docker 网络里，看到的是 172.16/12 这类私有地址；
+ * 公网直连的客户端则是公网地址。前者才允许用 X-Forwarded-For。
+ */
+function isPrivatePeer(address: string): boolean {
+  if (address === '::1' || address.startsWith('fc') || address.startsWith('fd') || address.startsWith('fe80:')) return true
+  const v4 = /^(\d+)\.(\d+)\./.exec(address)
+  if (!v4) return false
+  const first = Number(v4[1]), second = Number(v4[2])
+  return first === 10 || first === 127 || (first === 192 && second === 168) || (first === 172 && second >= 16 && second <= 31)
 }
 
 /** 32 字节恒比。长度不同直接 false，不抛 —— timingSafeEqual 长度不等会抛。 */
@@ -134,9 +159,15 @@ export function createRelay(options: RelayOptions = {}): Relay {
   const pongTimeoutMs = options.pongTimeoutMs ?? 60_000
   const registerTimeoutMs = options.registerTimeoutMs ?? 10_000
   const responseTimeoutMs = options.responseTimeoutMs ?? 120_000
-  const maxFrameBytes = options.maxFrameBytes ?? 64 * 1024 * 1024
+  const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES
   const maxRequestBodyBytes = options.maxRequestBodyBytes ?? 256 * 1024
+  const bodyTimeoutMs = options.bodyTimeoutMs ?? 30_000
+  const maxPendingBodies = options.maxPendingBodies ?? 64
+  const maxPendingRegistrations = options.maxPendingRegistrations ?? 128
+  let pendingBodies = 0
+  let pendingRegistrations = 0
   const maxInflightPerInstance = options.maxInflightPerInstance ?? 64
+  const maxResponseBufferBytes = options.maxResponseBufferBytes ?? 4 * 1024 * 1024
   const authFailureLimit = options.authFailureLimit ?? 20
   const authFailureWindowMs = options.authFailureWindowMs ?? 60_000
   const authBlockMs = options.authBlockMs ?? 60_000
@@ -184,10 +215,24 @@ export function createRelay(options: RelayOptions = {}): Relay {
     strikes.set(address, strike)
   }
 
-  /** 来源地址。反代后面用 X-Forwarded-For 的最左段 —— 那是原始客户端。 */
+  /**
+   * 来源地址。取 X-Forwarded-For 的最右段，不取最左。
+   *
+   * 最左段是客户端自己写的，可以每次换一个值，于是每请求都是「新地址」，按地址的
+   * 失败计数与封禁就被绕过了。最右段是最近一跳反代（Caddy）追加的，客户端改不到。
+   * 没有反代时直接用 socket 地址。
+   */
   function sourceOf(request: IncomingMessage): string {
-    const forwarded = String(request.headers['x-forwarded-for'] ?? '').split(',')[0]?.trim()
-    return forwarded || request.socket.remoteAddress || 'unknown'
+    const peer = request.socket.remoteAddress ?? 'unknown'
+    // 只有直连方是本机/内网（也就是反代）时，转发头才可信。公网直连的客户端
+    // 可以随手写这些头；信它等于把限流的 key 交给攻击者，每个请求换一个值就永远不被挡。
+    if (!isPrivatePeer(peer)) return peer
+    // Cloudflare → Caddy → relay：Caddy 的直接对端是 cloudflared，XFF 最右段是它的地址，
+    // 所有手机都会塌缩成同一个 key。CF-Connecting-IP 才是真实手机。
+    const connecting = String(request.headers['cf-connecting-ip'] ?? '').trim()
+    if (connecting) return connecting
+    const forwarded = String(request.headers['x-forwarded-for'] ?? '').split(',').at(-1)?.trim()
+    return forwarded || peer
   }
 
   // ── 隧道生命周期 ───────────────────────────────────────────────────
@@ -307,7 +352,19 @@ export function createRelay(options: RelayOptions = {}): Relay {
         // （设备表在宿主那边），所以它只能靠宿主的回答计数 —— 但这就是暴力尝试在网线上的样子。
         // 不在这里记，公网上就没有任何东西在数「同一个地址试了多少次」。
         if (status === 401 || status === 403) recordFailure(pending.address)
-        pending.response.writeHead(status, headers)
+        // 就算逐项校验过，Node 仍可能因为重复的 content-length 之类拒绝写头。
+        // 这一层是最后兜底：一个坏响应只能废掉这一个请求，不能带走整条隧道。
+        try {
+          pending.response.writeHead(status, headers)
+        } catch {
+          pending.done = true
+          if (pending.timer) clearTimeout(pending.timer)
+          tunnel.requests.delete(frame.id)
+          tunnel.inflight = Math.max(0, tunnel.inflight - 1)
+          tunnel.connection.sendBinary(encodeFrame(T.httpCancel, frame.id, null))
+          pending.response.destroy()
+          return
+        }
         // 头到了就撤掉「等头」的超时：之后是流式的，慢是正常的（SSE 可以挂很久）。
         if (pending.timer) { clearTimeout(pending.timer); pending.timer = undefined }
         return
@@ -315,8 +372,20 @@ export function createRelay(options: RelayOptions = {}): Relay {
       case T.httpChunk: {
         const pending = tunnel.requests.get(frame.id)
         if (!pending || pending.done || !pending.headSent || pending.response.writableEnded) return
-        // 手机读得慢时 write 会返回 false，但我们不等 drain：待发队列按字节封顶，
-        // 超了就断开这个请求，而不是无限缓存（见 finish 的封顶判定）。
+        // 手机读得慢时 write 会返回 false，写缓冲就一直长。不等 drain 是可以的，
+        // 但必须封顶：超了就断掉这一个请求，而不是让一条慢流把中转的内存吃完。
+        // writableLength 是还没交给内核的字节数，比我们自己记账更准。
+        if (pending.response.writableLength > maxResponseBufferBytes) {
+          pending.done = true
+          if (pending.timer) clearTimeout(pending.timer)
+          tunnel.requests.delete(frame.id)
+          tunnel.inflight = Math.max(0, tunnel.inflight - 1)
+          tunnel.connection.sendBinary(encodeFrame(T.httpCancel, frame.id, null))
+          // 已经发过头了，状态码改不了：直接断，手机看到流断开会重试。
+          pending.response.destroy()
+          log({ level: 'warn', message: 'response buffer limit hit', detail: { instanceId: tunnel.instanceId, id: frame.id } })
+          return
+        }
         pending.response.write(frame.payload)
         return
       }
@@ -358,9 +427,15 @@ export function createRelay(options: RelayOptions = {}): Relay {
     for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
       const lower = name.toLowerCase()
       if (HOP_BY_HOP.has(lower)) continue
-      if (typeof value === 'string') pairs[name] = value
-      else if (Array.isArray(value)) pairs[name] = value.filter(item => typeof item === 'string').join(', ')
-      else if (typeof value === 'number') pairs[name] = String(value)
+      let text: string
+      if (typeof value === 'string') text = value
+      else if (Array.isArray(value)) text = value.filter(item => typeof item === 'string').join(', ')
+      else if (typeof value === 'number') text = String(value)
+      else continue
+      // 非法的头名/头值会让 writeHead 抛 ERR_INVALID_CHAR；那个异常在 WS 回调里没人接，
+      // 会变成 uncaughtException 把整个中转带走。宿主的响应头不可信，逐项校验后丢弃坏的。
+      try { validateHeaderName(name); validateHeaderValue(name, text) } catch { continue }
+      pairs[name] = text
     }
     return pairs
   }
@@ -401,12 +476,22 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
 
     // 请求体：先读，边读边判上限。超了当场回 413，一个字节都不往隧道里送。
+    // 慢请求另外封顶：收体的连接不占 inflight，不数的话几十条就能把内存与 fd 占住。
+    if (pendingBodies >= maxPendingBodies) {
+      request.resume()
+      writeJson(response, 503, { error: 'Too many requests in progress' }, { 'retry-after': '1' })
+      return
+    }
+    pendingBodies += 1
     let body: Buffer
     try {
-      body = await readBody(request, maxRequestBodyBytes)
-    } catch {
-      writeJson(response, 413, { error: 'Request too large' })
+      body = await readBody(request, maxRequestBodyBytes, bodyTimeoutMs)
+    } catch (error) {
+      const timedOut = error instanceof Error && error.message === 'body timeout'
+      writeJson(response, timedOut ? 408 : 413, { error: timedOut ? 'Request body timed out' : 'Request too large' })
       return
+    } finally {
+      pendingBodies -= 1
     }
 
     const id = tunnel.nextId++
@@ -438,12 +523,30 @@ export function createRelay(options: RelayOptions = {}): Relay {
     headers['x-relay-instance'] = instanceId
 
     const path = rest + url.search
-    tunnel.connection.sendBinary(jsonFrame(T.httpRequest, id, { method: request.method ?? 'GET', path, headers }))
+    // sendBinary 返回 false 表示这条隧道现在已经写不进去了（断了或积压超限）。
+    // 不检查的话请求会一直挂在 requests 里，直到 504 超时，内存和 inflight 都白占着。
+    const abandon = (): void => {
+      pending.done = true
+      tunnel.requests.delete(id)
+      tunnel.inflight = Math.max(0, tunnel.inflight - 1)
+      tunnel.connection.sendBinary(encodeFrame(T.httpCancel, id, null))
+      writeJson(response, 503, { error: 'Host tunnel is not accepting data' })
+    }
+    if (!tunnel.connection.sendBinary(jsonFrame(T.httpRequest, id, { method: request.method ?? 'GET', path, headers }))) {
+      abandon()
+      return
+    }
     // 正文按 64KiB 分块：一个 WS 消息塞 256KiB 会让宿主那边的解码缓冲一次吃下一整块。
     for (let offset = 0; offset < body.length; offset += BODY_CHUNK_BYTES) {
-      tunnel.connection.sendBinary(encodeFrame(T.httpBody, id, body.subarray(offset, offset + BODY_CHUNK_BYTES)))
+      if (!tunnel.connection.sendBinary(encodeFrame(T.httpBody, id, body.subarray(offset, offset + BODY_CHUNK_BYTES)))) {
+        abandon()
+        return
+      }
     }
-    tunnel.connection.sendBinary(encodeFrame(T.httpBody, id, Buffer.alloc(0)))
+    if (!tunnel.connection.sendBinary(encodeFrame(T.httpBody, id, Buffer.alloc(0)))) {
+      abandon()
+      return
+    }
 
     // 宿主迟迟不给响应头：回 504 并取消。给了头之后就不再计时（长流是正常的）。
     pending.timer = setTimeout(() => {
@@ -489,6 +592,19 @@ export function createRelay(options: RelayOptions = {}): Relay {
       socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }
+    // 连上却不注册是很便宜的攻击：每条只活 10 秒，但可以一直重开。给「还没注册」的连接
+    // 一个总数上限，让重开也拿不到新位置。
+    if (pendingRegistrations >= maxPendingRegistrations) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      return
+    }
+    pendingRegistrations += 1
+    let slotReleased = false
+    const releaseSlot = (): void => {
+      if (slotReleased) return
+      slotReleased = true
+      pendingRegistrations -= 1
+    }
     const handshakeSecret = bearerOf(request)
     let instance = ''
     let registered = false
@@ -510,6 +626,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
         const tunnel = tunnels.get(instance)
         if (tunnel && tunnel.connection === connection) {
           registered = true
+          releaseSlot()
           if (registrationTimer) { clearTimeout(registrationTimer); registrationTimer = undefined }
         }
         return
@@ -530,12 +647,13 @@ export function createRelay(options: RelayOptions = {}): Relay {
       maxFrameBytes,
       onMessage: (_current, payload) => { pipeline(payload) },
       onClose: () => {
+        releaseSlot()
         if (registrationTimer) { clearTimeout(registrationTimer); registrationTimer = undefined }
         const tunnel = tunnels.get(instance)
         if (tunnel && tunnel.connection === connection) dropTunnel(tunnel, 'host closed')
       },
     })
-    if (!opened) return
+    if (!opened) { releaseSlot(); return }
     connection = opened
 
     // 连上了却不注册：不占位。公网暴露面上最便宜的攻击就是「连上然后什么都不说」。
@@ -604,25 +722,40 @@ export function createRelay(options: RelayOptions = {}): Relay {
     },
   }
 
-  function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
+  function readBody(request: IncomingMessage, limit: number, timeoutMs: number): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       // Fast path：声明的长度就超了，一个字节都不读。
       const declared = Number(request.headers['content-length'] ?? 0)
       if (Number.isFinite(declared) && declared > limit) { request.resume(); reject(new Error('body too large')); return }
       const chunks: Buffer[] = []
       let size = 0
+      let settled = false
+      const finish = (error?: Error, body?: Buffer): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (error) reject(error)
+        else resolve(body!)
+      }
+      // 公网上慢慢发一个字节是免费的：没有截止时间，一条连接可以永久占着内存。
+      const timer = setTimeout(() => {
+        request.destroy()
+        finish(new Error('body timeout'))
+      }, timeoutMs)
+      timer.unref?.()
       request.on('data', (chunk: Buffer) => {
         size += chunk.length
         if (size > limit) {
           // 超了就停止接收：继续读只会把内存吃掉，而手机那边早就不该发这么多了。
           request.destroy()
-          reject(new Error('body too large'))
+          finish(new Error('body too large'))
           return
         }
         chunks.push(chunk)
       })
-      request.on('end', () => resolve(Buffer.concat(chunks)))
-      request.on('error', reject)
+      request.on('end', () => finish(undefined, Buffer.concat(chunks)))
+      request.on('error', error => finish(error))
+      request.on('close', () => { if (!request.readableEnded) finish(new Error('body aborted')) })
     })
   }
 }

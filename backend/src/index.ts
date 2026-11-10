@@ -6,6 +6,8 @@ import { phoneHandler, registerMobileHttp } from './app/mobile-http.ts'
 import { deviceStoreOf } from './app/remote.ts'
 import { bindCandidates, createLanServer, lanPort } from './app/lan-server.ts'
 import { createTunnel } from './app/tunnel.ts'
+import { phoneGate } from './app/phone-gate.ts'
+import { createPairingThrottle } from './app/pairing-throttle.ts'
 import { parseRelayCandidates } from './app/relay-chain.ts'
 import { createHash } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
@@ -36,6 +38,8 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   })()
   const devices = deviceStoreOf(machine.stateDir, pairing)
   const phone = Object.assign(runtime, { remote: devices })
+  // 两条入口共用一个限速实例：分开数等于给同一台机器双倍额度。
+  const pairingThrottle = createPairingThrottle()
   registerMobileHttp(ctx, phone)
 
   // 手机那条独立的路。Connection 认的是进程启动的 launch token（给浏览器换 cookie 用的），
@@ -54,6 +58,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     }))
   const lan = createLanServer({
     devices,
+    pairingAllowed: pairingThrottle,
     // 凭据已经验过了，直接交给消息面处理器：它不依赖 Connection，所以这条路上 Connection 那一关不参与。
     forward: request => ask(request, request.body),
   })
@@ -84,15 +89,24 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
       name: process.env.CREW_RELAY_NAME?.trim() || undefined,
       // 注册密钥走帧，不走 URL：URL 会进反代的 access log。
       registerSecret: process.env.CREW_RELAY_SECRET?.trim() || undefined,
-      // 中转发来的 path 由手机决定，所以这条路自己要挡一道：隧道只服务消息面。
-      // 判的是 `new Request` 规范化**之后**的路径 —— `/api/mobile/../../orchestrator/...`
-      // 按前缀看是合规的，规范化之后才露出真面目。局域网那条路由 lan-server 挡，
-      // 它判的是原始路径，所以这里不能照抄它的写法。
+      // 中转发来的 path 由手机决定，所以这条路自己要挡两道：只服务消息面，而且要验设备凭据。
+      // 只判路径前缀是不够的 —— 中转不持有设备表，它把请求原样转过来，公网上知道 instanceId
+      // 的人就能直接读时间线。凭据这道门必须在这里，和局域网那条路是同一份判定。
+      // 判的是 `new Request` 规范化**之后**的路径：`/api/mobile/../../orchestrator/...`
+      // 按原始前缀看是合规的，规范化之后才露出真面目。
       forward: (request, signal) => {
         const { pathname } = new URL(`http://dsh${request.url}`)
-        if (!pathname.startsWith('/api/mobile/')) {
-          return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: { 'content-type': 'application/json' } })
+        const pairing = pathname === '/api/mobile/pair' && request.method === 'POST'
+        if (pairing) {
+          // 中转已经按来源地址限过一次，但那条链路上的地址来自请求头；宿主自己再数一遍，
+          // 两边用同一套窗口，不依赖中转是否被换掉。
+          const address = request.headers['x-forwarded-for'] ?? request.headers['x-real-ip']
+          if (!pairingThrottle(typeof address === 'string' ? address.split(',').at(-1)?.trim() : undefined)) {
+            return new Response(JSON.stringify({ error: 'Too many pairing attempts' }), { status: 429, headers: { 'content-type': 'application/json' } })
+          }
         }
+        const denied = phoneGate({ pathname, method: request.method, headers: request.headers, devices })
+        if (denied) return denied
         return ask(request, request.body, signal)
       },
       onLog: line => ctx.logger.info('%s', line),

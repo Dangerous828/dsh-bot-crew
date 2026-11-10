@@ -17,7 +17,7 @@
 {
   "bots": [
     {
-      "bot_id": "lead",                 // 稳定 id，[a-z0-9-]
+      "bot_id": "lead",                 // 稳定 id，[a-z0-9_-]
       "name": "大哥",
       "role": "default",               // default | member
       "persona": "简练、先应一声、能转派就转派",
@@ -34,6 +34,9 @@
 - 全表**有且只有一个** `role: "default"`；启动时校验，重复或缺失直接拒绝加载。
 - Bot 是身份与呈现，**不是 Agent**：一个 Bot 不对应一个 Orchestrator Session，不持有任务状态。
 - 增删 Bot 不改变任何 Ticket；`bot_id` 一旦被 Ticket 引用过就不可复用（改名可以，换 id 不行）。
+- 手机面可以读写花名册：`GET /api/mobile/bots` 返回 `{bots:[{bot_id,name,role}]}`；
+  `POST /api/mobile/bots` 接收 `{bot_id,name,role?,persona?}`。队里没有 default 时，新加的这位顶上，
+  这样一份「有 Bot 没 default」的坏配置能在手机上自愈。
 
 ## 3. 入站：`POST /send`
 
@@ -149,9 +152,16 @@
 
 `request_id` 相同且内容相同的重发直接返回首次结果（幂等），不入队第二次。
 
+实现里的错误体是 `{ "error": "<可读文本>" }`，上表是它按语义应归的类；客户端只展示文本，不解析码。
+
 ## 7. 认证边界
 
 - `/api` 下挂宿主已认证入口，复用宿主登录 / relay 身份；**不新增无鉴权路由**。
+- **唯一的例外是首次配对**：`POST /api/mobile/pair` 在设备还没有凭据时放行，凭据就是那支
+  5 分钟有效的配对码；按来源网段限速（IPv4 /24、IPv6 /64，每 60 秒 20 次），超过返回 429。
+  其余 `/api/mobile/*` 一律要设备凭据。
+- **局域网与中转隧道是同一道门**：两条入口都调用 `phone-gate.ts` 的判定。中转本身不持有设备表，
+  它转来的请求也必须带 `x-crew-device` + `x-crew-credential`，否则宿主返回 401。
 - 不把网关凭据当宿主凭据，不把凭据下发给任何 Bot。
 
 ## 8. 表层来源

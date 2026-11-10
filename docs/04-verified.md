@@ -41,6 +41,19 @@
 - 前台还没做 Tobs 那套多会话/群组视图；现在是「一个对话 + 一排 Bot 芯片」。
 - 真机安装：本机没有连着的设备，APK 只做了构建验证。
 
+## 手机面扩展与外网通道（2026-11-10）
+
+| 项 | 结果 |
+| --- | --- |
+| `GET /api/mobile/bots` | 返回 `大哥 / 写手 / 码农` 与各自的 role |
+| `GET /api/mobile/screen` | `{"state":"unavailable","reason":"后端还没有画面源，worker 不跑浏览器"}` |
+| `POST /api/mobile/takeover` | 不存在的票 → 404 `No such ticket`；存在的票 → 停止并回 `{"ok":true,"stopped":true}` |
+| `POST /api/mobile/pause` | 全局暂停并如实回 `scope: "executor"`；恢复走管理面 |
+| 空队伍建 Bot | 手机表单提交后花名册即时出现，第一位自动成为 default，配置落盘 |
+| 外网读 | `GET https://jarvis.kentonnie.top/crew-relay/i/kenton-mac/api/mobile/timeline` → 200 |
+| 外网写 | 手机发一条消息 → 界面「1 条排队中」，后端 `queued` 出现该request_id |
+| 首次配对 | 出码 → 兑换 → 凭据落盘 `~/.config/crew-desktop/credential.json`（0600） |
+
 ## 手机走局域网（2026-11-09）
 
 后端默认只绑 `127.0.0.1`，手机连不上。改成绑本机局域网地址后，手机可以直连：

@@ -77,7 +77,21 @@ def sync_bind_address(address: str, profile: str) -> None:
     if not patch.exists():
         return
     text = patch.read_text()
-    updated = re.sub(r'(?m)^(    host: )([0-9a-fA-F:.]+)$', lambda m: m.group(1) + address, text, count=1)
+    lines = text.splitlines(keepends=True)
+    # 只改 webserver 那一段里的 host。全文替换第一个 4 空格缩进的 host 会静默改到别的块
+    # （某个 Source / 连接配置），换网后症状是「后端起不来」而且没有任何解释。
+    in_webserver = False
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith('- id:'):
+            in_webserver = stripped[len('- id:'):].strip().strip('"\'') == 'webserver'
+            continue
+        match = re.match(r'^(\s{4}host:\s*)(\S+)(\s*)$', line.rstrip('\n'))
+        if in_webserver and match:
+            ending = '\n' if line.endswith('\n') else ''
+            lines[index] = match.group(1) + address + match.group(3) + ending
+            break
+    updated = ''.join(lines)
     if updated != text:
         patch.write_text(updated)
         print(f'bind address -> {address}', flush=True)
@@ -252,6 +266,31 @@ def state_dir_identity(state_dir):
     return 18800 + digest % 100
 
 
+def process_args(pid):
+    """Command line of a PID, or '' when it cannot be read."""
+    try:
+        return subprocess.run(['ps', '-p', str(pid), '-o', 'args='],
+                              capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return ''
+
+
+def listener_pids(port):
+    """PIDs listening on a TCP port. macOS has lsof; Linux has ss."""
+    try:
+        found = subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'],
+                               capture_output=True, text=True, check=False)
+        return [int(line) for line in found.stdout.split() if line.isdigit()]
+    except FileNotFoundError:
+        pass
+    try:
+        found = subprocess.run(['ss', '-ltnp', f'sport = :{port}'],
+                               capture_output=True, text=True, check=False)
+        return [int(pid) for pid in re.findall(r'pid=(\d+)', found.stdout)]
+    except FileNotFoundError:
+        return []
+
+
 def ensure_gateway(profile=None):
     """Keep the mobile gateway running on the source that is already on disk.
 
@@ -264,10 +303,6 @@ def ensure_gateway(profile=None):
     gateway = ROOT / 'tools' / 'mobilegw'
     if not gateway.exists():
         return
-    subprocess.run(['pkill', '-f', str(gateway)], capture_output=True)
-    time.sleep(0.5)
-    log = ARTIFACTS / 'mobilegw.log'
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
     # A profile may keep its crew in its own stateDir; the gateway has to read the same one or the two sides talk past
     # each other. Not configured means the historical default, which the gateway still resolves on its own.
     environment = dict(os.environ)
@@ -277,6 +312,21 @@ def ensure_gateway(profile=None):
         environment['MOBILEGW_STATE'] = str(state_dir)
         # 端口也必须分开：同一个端口上两个 gateway 只有一个能绑住，另一个会以 Errno 48 退出。
         environment.setdefault('MOBILEGW_PORT', str(state_dir_identity(state_dir)))
+    # 按端口杀，不按路径：两套队伍各有一个 gateway，按路径 pkill 会把另一套也杀掉，
+    # 那边的手机会一直连不上，直到它自己的脚本再跑一次。端口是每套队伍独有的。
+    port = int(environment.get('MOBILEGW_PORT', '8788'))
+    for pid in listener_pids(port):
+        # 端口不是身份证明：先确认命令行确实是网关，别把碰巧用同一端口的东西杀掉。
+        args = process_args(pid)
+        if 'mobilegw' not in args:
+            raise RuntimeError(f'port {port} is held by PID {pid}, not the mobile gateway: {args.strip()}')
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.5)
+    log = ARTIFACTS / 'mobilegw.log'
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
     with open(log, 'ab') as handle:
         process = subprocess.Popen([sys.executable, str(gateway)], cwd=str(ROOT), env=environment,
                                    stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
@@ -301,6 +351,10 @@ def start(args):
         lan = lan_address()
         if lan:
             sync_bind_address(lan, args.profile)
+            # 后端绑的是 LAN 地址，本机回环由 loopproxy 桥接。健康检查（默认 127.0.0.1:3082）
+            # 与模拟器都走回环，所以代理必须在启动之前就起来 —— 等健康检查成功再拉，
+            # 首次启动必然在回环上等满 60 秒后误报超时。
+            ensure_loopproxy(lan)
         exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
                                 capture_output=True).returncode == 0
         if state(args.url) is not None:
@@ -391,8 +445,6 @@ def main():
             # After the backend, so the token file it publishes already exists when the gateway reads it.
             if code == 0:
                 ensure_gateway(args.profile)
-                # After the backend, so the address it actually binds is the one bridged.
-                ensure_loopproxy(lan_address())
             return code
     return 0
 

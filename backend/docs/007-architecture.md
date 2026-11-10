@@ -347,6 +347,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
+| `src/app/phone-gate.ts` | The shared gate of the phone API: only `/api/mobile/*`, the pairing POST alone is anonymous, every other request must present a paired device credential. Used by both the LAN listener and the relay tunnel, so neither entry is looser than the other |
+| `src/app/pairing-throttle.ts` | Attempts allowed on the anonymous pairing hop: twenty a minute, aggregated by IPv4 /24 or IPv6 /64 so changing address buys nothing |
 | `src/app/relay-protocol.ts` | Tunnel protocol v2 on the wire: `[type][id][length][payload]` frames, the 28 frame codes, the streaming decoder with its size cap, close codes and UTF-8-safe truncation. Byte-for-byte parity with the AI-HUB reference is pinned by `tests/relay-protocol.spec.ts`; `relay/` keeps a copy that `relay/sync-protocol.sh` refreshes |
 | `src/app/tunnel.ts` | The outbound tunnel: dials the relay, registers by instance id, hands the relay's requests to the phone handler through `forward`, streams the response back, keeps the heartbeat, and reconnects with exponential backoff (jittered, ceilinged). Chosen by a record rather than by patching the LAN listener |
 | `src/app/relay-chain.ts` | The ladder it walks when the phone is not on this network: LAN first, then the self-hosted relay, then relays elsewhere (`parseRelayCandidates` reads `CREW_RELAY_URLS`). A probe has its own timeout, so one hanging hop cannot stall the ladder |
@@ -455,6 +457,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation |
 | `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
 | `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, port reporting, forwarding after the gate |
+| `tests/phone-gate.spec.ts` | The shared phone gate on both entries, and the pairing throttle's window and address aggregation |
 | `tests/relay-protocol.spec.ts` | The wire format against the AI-HUB reference implementation, both directions: every frame code, every id width, byte-identical encoding, chunked decoding, the frame-size cap, close codes that survive Chinese reasons |
 | `tests/tunnel.spec.ts` | The outbound tunnel against a real relay: registering, serving a request, streaming, reconnect with backoff, heartbeat both ways, cancellation, upstream failures that stay off the phone |
 | `tests/relay-chain.spec.ts` | The ladder's order and its fall-through, a hanging probe that cannot stall it, the chosen route being remembered, and the environment's relay list including what it refuses |

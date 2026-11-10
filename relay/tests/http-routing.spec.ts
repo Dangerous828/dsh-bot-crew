@@ -246,6 +246,37 @@ it('counts repeated failed authentications from one address and stops serving it
   expect(statuses.at(-1)).toBe(429)
 })
 
+it('keys the auth strike on the proxy-appended hop, not the client-supplied leftmost one', async () => {
+  // 客户端可以把最左段写成任意值。按最左段计数，每请求都是「新地址」，封禁永远不生效。
+  const relay = createRelay({ authFailureLimit: 3, heartbeatIntervalMs: 60_000, pongTimeoutMs: 120_000 })
+  const port = await relay.listen(0, '127.0.0.1')
+  const clients: RelayClient[] = []
+  running.push({ relay, clients })
+  const host = await connectTunnel({ port }); clients.push(host)
+  host.json(T.register, 0, { instanceId: 'box' })
+  await host.next(frame => frame.type === T.registered)
+  const answered = new Set<number>()
+  const pump = setInterval(() => {
+    for (const frame of host.frames) {
+      if (frame.type !== T.httpRequest || answered.has(frame.id)) continue
+      answered.add(frame.id)
+      host.json(T.httpHead, frame.id, { status: 401, headers: {} })
+      host.send(T.httpEnd, frame.id, null)
+    }
+  }, 5)
+
+  const statuses: number[] = []
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const answer = await fetch(`http://127.0.0.1:${port}/i/box/api/mobile/timeline`, {
+      headers: { 'x-crew-credential': 'wrong', 'x-forwarded-for': `10.0.0.${attempt}, 203.0.113.7` },
+    })
+    statuses.push(answer.status)
+  }
+  clearInterval(pump)
+  expect(statuses.slice(0, 3)).toEqual([401, 401, 401])
+  expect(statuses.at(-1)).toBe(429)
+})
+
 it('serves a probe endpoint the reverse proxy can point at', async () => {
   const { base } = await paired()
   const answer = await fetch(new URL('/health', base))

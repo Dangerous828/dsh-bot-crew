@@ -120,7 +120,8 @@ export function upgradeToWebSocket(request: IncomingMessage, socket: Duplex, opt
     '',
   ].join('\r\n'))
 
-  const maxFrameBytes = options.maxFrameBytes ?? 64 * 1024 * 1024
+  // 与 relay-protocol 的上限一致：一个帧不需要 64MB，声明大了只会拖垮单线程。
+  const maxFrameBytes = options.maxFrameBytes ?? 1024 * 1024
   const maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES
   let buffer: Buffer = Buffer.alloc(0)
   let closed = false

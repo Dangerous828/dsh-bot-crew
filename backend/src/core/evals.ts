@@ -152,7 +152,9 @@ export class Evals extends EnginePart {
     if (outcome.kind === 'accept' && evaluation.strength !== 'explicit' && !this.policy().admitsInferred(outcome.rules ?? [])) {
       throw new UserError('notExplicit')
     }
-    return this.decideEval(thread, evaluation, outcome)
+    // 把「是谁发起的这次决定」带下去：stop 必须由那条消息自己的 gate 说了算，
+    // 而不是同批里最强的那条（那可能是另一个人的消息）。
+    return this.decideEval(thread, evaluation, outcome, triggerId)
   }
   /**
    * Queue a stored Trigger for a fresh Eval on its primary Thread and emit `trigger.requeued`; returns false while an Eval holds it.
@@ -279,7 +281,7 @@ export class Evals extends EnginePart {
       strength: gate.strength, actor: trigger.actor, basis: gate.basis, policyVersion: policy.version, startedAt: at, deadline: at }
   }
   /** Apply an outcome to an Eval of a Thread: the one in progress, or a gate-only one. */
-  private decideEval(thread: Thread, evaluation: Evaluation, outcome: AssessmentOutcome): Decision {
+  private decideEval(thread: Thread, evaluation: Evaluation, outcome: AssessmentOutcome, decidingTriggerId?: string): Decision {
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     // Requeue if Policy changed without a live policyChanged call (such as across an upgrade or restart).
     if (this.policy().version !== evaluation.policyVersion) {
@@ -294,7 +296,14 @@ export class Evals extends EnginePart {
       const ticket = this.repo.tickets.get(outcome.ticketId)
       if (!ticket || !liveTicket(ticket)) return this.finish(thread, evaluation, { kind: 'ignore', reason: [{ code: 'stopUnknown' }],
         ...audit })
-      if (evaluation.strength !== 'explicit') return this.finish(thread, evaluation, { kind: 'ignore',
+      // 强度要看下这条 stop 的那个 trigger 自己，而不是整批评估的强度：同一批里可能既有
+      // 成员的 explicit 消息、又有访客的 stop。访客那条在 gate 里 inadmissible，却会借
+      // 整批的 strength 把工单停掉。所以对「发起决定的那个 trigger」重跑 gate；
+      // legacy 记录没有 primary 时取最后一个，与 Tickets.create 的约定一致。
+      const originId = decidingTriggerId ?? evaluation.primary ?? evaluation.triggerIds.at(-1)
+      const origin = originId === undefined ? undefined : this.repo.triggers.get(originId)
+      const gate = origin ? this.policy().gate(origin, thread, this.ticketsOnThread(thread)) : undefined
+      if (!gate?.admissible || gate.strength !== 'explicit') return this.finish(thread, evaluation, { kind: 'ignore',
         reason: [{ code: 'stopNotExplicit' }], ...audit })
       const decision = this.finish(thread, evaluation, { kind: 'stop', reason: reasonOf(outcome.reason), ticketId: ticket.id, ...audit })
       this.tickets.end(ticket.id, 'human', 'stopped', this.now(), typeof outcome.reason === 'string' ? outcome.reason : undefined)

@@ -7,8 +7,8 @@ import org.junit.Test
 /**
  * 工作区页的文字。
  *
- * 这一页整个是「后端还没有」的状态下的界面，所以可测的不是布局，而是它对外承诺的话：
- * 没画面时说「画面还没接上」、按了动作时说哪一步没接上、有名字时抬头写对是谁的屏幕。
+ * 这一页现在接真接口，可测的仍然是它对外承诺的话：后端给的没有理由就原样写、
+ * 给不出理由才落到兜底、动作结果按后端回的 scope 说清恢复在哪。
  * 这些话一旦改成「加载中」「请稍候」这种，就等于把「没有」画成了「有」—— 这条测试挡住它。
  */
 class WorkspaceCopyTest {
@@ -16,9 +16,12 @@ class WorkspaceCopyTest {
     private val lin = BotCard(id = "lin", name = "林", role = "default", persona = "")
 
     @Test
-    fun placeholderSaysThereIsNoPictureInsteadOfLoading() {
-        // 灰板上必须写清是「空」而不是「在转」。
-        assertEquals("画面还没接上", WorkspaceCopy.PLACEHOLDER)
+    fun theScreenAreaWritesTheBackendsOwnReason() {
+        // 后端说没有画面源，那一行就写它给的理由，不自己再编一句。
+        assertEquals("后端还没有画面源：worker 不跑浏览器", WorkspaceCopy.screenText("后端还没有画面源：worker 不跑浏览器"))
+        // 没有理由（比如字段缺席）才落到兜底，且兜底说的是「读不到」，不是「没有」。
+        assertEquals("读不到它的画面", WorkspaceCopy.screenText(""))
+        assertEquals("读不到它的画面", WorkspaceCopy.screenText(null))
     }
 
     @Test
@@ -28,16 +31,25 @@ class WorkspaceCopyTest {
     }
 
     @Test
-    fun bothActionsReportThemselvesUnconnectedByName() {
-        // 点了要有反馈，而且反馈里得带上是哪个动作 —— 否则两个按钮说同一句话，人就不知道自己按了哪个。
-        assertEquals(
-            "接手操作这一步还没接上，先别指望它真的动",
-            WorkspaceCopy.actionNote(WorkspaceAction.Takeover),
-        )
-        assertEquals(
-            "让它停一下这一步还没接上，先别指望它真的动",
-            WorkspaceCopy.actionNote(WorkspaceAction.Pause),
-        )
+    fun actionResultsSayWhatActuallyHappened() {
+        assertEquals("已接手，这个工单停了", WorkspaceCopy.TAKEOVER_DONE)
+        assertEquals("它手上没有活儿", WorkspaceCopy.TAKEOVER_IDLE)
+        // 停一下停的是执行器：必须把「恢复要去面板」说出来，别让人在手机上找。
+        assertEquals("已让它停一下（全局执行器，恢复要去面板）", WorkspaceCopy.pauseDone("executor"))
+        assertEquals("已让它停一下", WorkspaceCopy.pauseDone("ticket"))
+        // 失败原话带后端理由，不粉饰；没理由时也不留空。
+        assertEquals("没做成：Bot already exists", WorkspaceCopy.failed("Bot already exists"))
+        assertEquals("没做成：队伍没回话", WorkspaceCopy.failed(null))
+    }
+
+    @Test
+    fun botIdsUseTheSameShapeAsTheBackend() {
+        // 与 crew/directory.ts 的 BOT_ID、TeamConfig 的 schema 同一个正则。
+        assertEquals(true, BotsWire.ID.matches("coder_1"))
+        assertEquals(true, BotsWire.ID.matches("scribe"))
+        assertEquals(false, BotsWire.ID.matches("Bad Id"))
+        assertEquals(false, BotsWire.ID.matches("码农"))
+        assertEquals(false, BotsWire.ID.matches(""))
     }
 
     @Test

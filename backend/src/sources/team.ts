@@ -28,17 +28,18 @@ import { routeBot, threadOf } from '../crew/route.ts'
 const SOURCE = 'team'
 const CURSOR: Key<number> = record<number>('team-cursor')
 
+// 与 crew/directory.ts 的 BOT_ID 同一形状：手机加 Bot 时按它校验，配置读回时也要认。
 const BotSchema = z.object({
-  bot_id: z.string().regex(/^[a-z0-9-]+$/),
+  bot_id: z.string().regex(/^[a-z0-9_-]+$/),
   name: z.string().min(1),
   role: z.enum(['default', 'member']),
   persona: z.string().optional(),
-  memory_namespace: z.string(),
+  memory_namespace: z.string().regex(/^bot\/[a-z0-9_-]+$/),
 }).strict()
 
 const ConfigSchema = z.object({
   bots: z.array(BotSchema).default([]),
-  default_bot_id: z.string().regex(/^[a-z0-9-]+$/).default('lead'),
+  default_bot_id: z.string().regex(/^[a-z0-9_-]+$/).default('lead'),
   conversations: z.array(z.object({
     id: z.string().regex(/^[a-z0-9-]+$/),
     listen: z.enum(['mentions', 'all']),
@@ -158,13 +159,15 @@ export const teamKind: SourceKind<TeamConfig> = {
   schema: ConfigSchema,
   fields: [
     { key: 'bots', type: 'rows', label: { zh: 'Bot 名单', en: 'Bots' }, columns: [
-      { key: 'bot_id', type: 'text', label: { zh: 'id', en: 'id' }, pattern: '[a-z0-9-]+' },
+      { key: 'bot_id', type: 'text', label: { zh: 'id', en: 'id' }, pattern: '[a-z0-9_-]+' },
       { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' } },
       { key: 'role', type: 'select', label: { zh: '角色', en: 'Role' }, options: [
         { value: 'default', label: { zh: '大哥（默认接话，全表只能一个）', en: 'Default (answers when nobody is named; exactly one)' } },
         { value: 'member', label: { zh: '成员', en: 'Member' } }] },
       { key: 'persona', type: 'text', label: { zh: '人格', en: 'Persona' }, optional: true },
-      { key: 'memory_namespace', type: 'text', label: { zh: '记忆命名空间', en: 'Memory namespace' }, pattern: 'bot/[a-z0-9-]+' },
+      // HTML `pattern` 按 v 模式编译，斜杠必须转义；不转义会在浏览器控制台报
+      // 「Invalid character class」，字段本身的校验照常，但控制台不该有这条噪声。
+      { key: 'memory_namespace', type: 'text', label: { zh: '记忆命名空间', en: 'Memory namespace' }, pattern: 'bot\\/[a-z0-9_-]+' },
     ] },
     { key: 'conversations', type: 'rows', label: { zh: '接收的对话', en: 'Conversations' }, columns: [
       { key: 'id', type: 'text', label: { zh: '对话', en: 'Conversation' }, pattern: '[a-z0-9-]+' },

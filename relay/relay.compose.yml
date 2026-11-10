@@ -8,11 +8,18 @@
 # NAS 上的 Caddy 终结。把端口开到 0.0.0.0，等于让明文 ws:// 直接对着公网 —— 手机带着设备
 # 凭据走明文，凭据就在链路上裸奔。
 #
-# NAS 上的实际取值（2026-11-10 首次部署，验收通过）：
+# NAS 上的实际取值（2026-11-10 部署完成，已实测）：
 #   宿主端口 18800（容器内仍是 8787，镜像里写死的 RELAY_PORT 不改）
 #   宿主 127.0.0.1:8787 已被 devgame-act 占用，18800 避开它，也避开 8080/8642/1883
-#   caddy 与 cloudflared 都在本机，它们从 127.0.0.1:18800 取 —— 下面绑的是局域网地址，
-#   回环同样可达，不需要再加一条 127.0.0.1 映射。
+#   这里只绑局域网地址 192.168.31.152；反代在 jarvis-caddy 容器里，它走宿主 LAN 地址进来
+#   （实测可达）。不绑 127.0.0.1 是刻意的：避免明文 ws:// 被当成可用的公网入口。
+#
+#   公网入口（2026-11-10 实测）：relay.kentonnie.top 已被 AI-HUB 的 dsh-relay 占用，不能动；
+#   本服务挂在既有域名的子路径下：
+#     https://jarvis.kentonnie.top/crew-relay/health
+#     wss://jarvis.kentonnie.top/crew-relay/tunnel
+#     https://jarvis.kentonnie.top/crew-relay/i/<instanceId>/api/mobile/...
+#   jarvis-caddy 里对应一条 handle_path /crew-relay/* → http://192.168.31.152:18800。
 services:
   crew-relay:
     image: dsh-bot-crew-relay:0.1.0

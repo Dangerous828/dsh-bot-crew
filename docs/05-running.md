@@ -6,8 +6,8 @@
 cd backend
 ./node_modules/.bin/tsdown                 # 构建到 lib/
 ../dsh-bridge/up.sh --profile crew          # 装 + 起，报地址；等价于下面两条手工步骤
-python3 scripts/dsh-superagent start       # 起在 127.0.0.1:3082
-python3 scripts/dsh-superagent status      # 看健康
+python3 backend/scripts/dsh-superagent start    # 起在 127.0.0.1:3082
+python3 backend/scripts/dsh-superagent status   # 看健康
 ```
 
 健康项里应出现 `"team": "ready"`。
@@ -147,7 +147,7 @@ go run .
 上面那些都是同一个 Wi-Fi 下的用法。不在家的时候，让宿主主动连一个中转：
 
 ```sh
-export CREW_RELAY_URLS="wss://relay.kentonnie.top/tunnel"   # 逗号分隔：第一条自建，其余兜底
+export CREW_RELAY_URLS="wss://jarvis.kentonnie.top/crew-relay/tunnel"  # 逗号分隔：第一条自建，其余兜底
 export CREW_RELAY_SECRET="<中转那边的 RELAY_REGISTER_SECRET>"
 # 可选；不设则由状态目录算出来（同一个目录永远是同一个 id）
 export CREW_RELAY_INSTANCE="kenton-mac"
@@ -155,7 +155,8 @@ export CREW_RELAY_INSTANCE="kenton-mac"
 
 然后重启 dsh。日志里会出现 `tunnel <id>: live`，中转那边 `GET /health?detail=1` 能看到这台。
 
-手机改用 `https://relay.kentonnie.top/i/<instanceId>/api/mobile/...` —— 路径多一段
+手机改用 `https://jarvis.kentonnie.top/crew-relay/i/<instanceId>/api/mobile/...` —— 中转挂在
+既有域名的子路径下（`relay.kentonnie.top` 属于 AI-HUB 的另一个中转，不要占用），路径多一段
 `/i/<instanceId>`，因为一台中转服务多台宿主机。
 
 中转本身怎么部署见 [`relay/docs/DEPLOY-NAS.md`](../relay/docs/DEPLOY-NAS.md)，

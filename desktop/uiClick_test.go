@@ -165,7 +165,7 @@ func TestEveryClickableShowsThePointer(t *testing.T) {
 	withTask := func() *app {
 		s := newApp(New("http://127.0.0.1:1", "t", ""))
 		s.conversation = &Conversation{
-			Tasks: []Task{{ID: "t1", Title: "改样式", State: "failed", BotID: "b1"}},
+			Tasks: []Task{{ID: "t1", Title: "改样式", State: "failed", Open: true, BotID: "b1"}},
 			Bots:  []BotCard{{ID: "b1", Name: "林", Persona: "前端"}},
 		}
 		return s
@@ -239,4 +239,85 @@ func TestEveryClickableShowsThePointer(t *testing.T) {
 			t.Errorf("指针停在模型行上是 %v，应该是手型", cursor)
 		}
 	})
+}
+
+// 左栏点一位：选中他，并且回到对话主界面（右栏收起）。
+func TestClickingABotReturnsToTheConversation(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{
+		Bots: []BotCard{{ID: "lead", Name: "大哥"}, {ID: "scribe", Name: "写手"}},
+		DefaultBotID: "lead",
+	}
+	s.backendOpen = true
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("写手"); err != nil {
+		t.Fatalf("点左栏的「写手」失败：%v", err)
+	}
+	tt.Frame()
+	if s.selectedBot != "scribe" {
+		t.Errorf("选中的人是 %q，应该是 scribe", s.selectedBot)
+	}
+	if s.backendOpen {
+		t.Error("点左栏之后右栏还开着：这样回不到对话主界面")
+	}
+}
+
+// 右栏收起后要留一条能点开的窄边，不能只能靠再按一次「后台」。
+func TestCollapsedBackendHasAWayBack(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	s.backendOpen = false
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("‹"); err != nil {
+		t.Fatalf("收起后找不到能点开的窄边：%v", err)
+	}
+	tt.Frame()
+	if !s.backendOpen {
+		t.Error("点了窄边，右栏没有展开")
+	}
+}
+
+// 「看它的屏幕」的实话显示在标题下面，不能冒充连接故障把发送锁住。
+func TestTheScreenNoteIsNotAConnectionBanner(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{}
+	s.screenNote = "后端还没有画面源，worker 不跑浏览器"
+	p := PaletteFor(false)
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Row(c).Width(718).FillHeight().Background(p.Surface).Children(func() { s.conversationPane(c, p) })
+	}, 718, 600)
+	tt.Frame()
+	if !tt.HasText("后端还没有画面源，worker 不跑浏览器") {
+		t.Errorf("屏幕的说明没画出来；画的是 %v", tt.Texts())
+	}
+	if tt.HasText("连不上") {
+		t.Error("屏幕功能缺失被写成了连接故障")
+	}
+	if s.problem != "" {
+		t.Error("屏幕说明不该写进全局 problem")
+	}
+}
+
+// 左栏也能收起，收起后留一条能点开的窄边。
+func TestTheSidebarCanCollapseAndReopen(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("«"); err != nil {
+		t.Fatalf("找不到左栏收起按钮：%v", err)
+	}
+	tt.Frame()
+	if !s.sidebarClosed {
+		t.Fatal("点了「«」，左栏没有收起")
+	}
+	if err := tt.Click("»"); err != nil {
+		t.Fatalf("收起后找不到能点开的窄边：%v", err)
+	}
+	tt.Frame()
+	if s.sidebarClosed {
+		t.Error("点了窄边，左栏没有展开")
+	}
 }

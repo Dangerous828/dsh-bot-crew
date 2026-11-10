@@ -118,12 +118,52 @@ type BotCard struct {
 	Persona string `json:"persona,omitempty"`
 }
 
+// UnmarshalJSON lets an older backend without the explicit `open` flag still be understood:
+// the ticket is open unless its state is one of the five terminal outcomes.
+func (t *Task) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		State       string `json:"state"`
+		Open        *bool  `json:"open"`
+		Retryable   bool   `json:"retryable"`
+		BotID       string `json:"bot_id,omitempty"`
+		NeedsPerson string `json:"needs_person,omitempty"`
+		CreatedAt   string `json:"created_at,omitempty"`
+		UpdatedAt   string `json:"updated_at,omitempty"`
+		TotalSteps  int    `json:"total_steps,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*t = Task{ID: wire.ID, Title: wire.Title, State: wire.State, Retryable: wire.Retryable,
+		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, CreatedAt: wire.CreatedAt,
+		UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps, Open: !terminalState(wire.State)}
+	if wire.Open != nil {
+		t.Open = *wire.Open
+	}
+	return nil
+}
+
+// terminalState 是 ticket.ended.outcome 的五个取值。没有 open 字段的老后端靠它兜底。
+func terminalState(state string) bool {
+	switch state {
+	case "completed", "merged", "closed", "dropped", "stopped":
+		return true
+	}
+	return false
+}
+
 // Task 是后台工单的只读投影。只拿来显示「谁在干」，不据此维护状态机。
 type Task struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 	State string `json:"state"`
-	BotID string `json:"bot_id,omitempty"`
+	// Open 是「还没结束」。页签与徽标按它判，不要解释 State 的词表（终态有五种）。
+	Open bool `json:"open"`
+	// Retryable 是后端说这张票还能再跑一次（卡在 failed/blocked，或投递失败）。
+	Retryable bool `json:"retryable"`
+	BotID     string `json:"bot_id,omitempty"`
 	// NeedsPerson names what the ticket is waiting for, when it is waiting on a person.
 	NeedsPerson string `json:"needs_person,omitempty"`
 	CreatedAt   string `json:"created_at,omitempty"`
@@ -161,6 +201,26 @@ func (c *Client) Agents(ctx context.Context, ticketID string) ([]AgentNode, erro
 		return nil, err
 	}
 	return payload.Agents, nil
+}
+
+// ScreenView is what the backend says about a ticket's screen right now.
+// Today it answers `unavailable` with the reason it is honest about.
+type ScreenView struct {
+	State  string `json:"state"`
+	Reason string `json:"reason"`
+}
+
+// Screen asks for a ticket's screen; the backend either shows one or says why it cannot.
+func (c *Client) Screen(ctx context.Context, ticketID string) (*ScreenView, error) {
+	path := "/api/mobile/screen"
+	if ticketID != "" {
+		path += "?ticket=" + url.QueryEscape(ticketID)
+	}
+	var view ScreenView
+	if err := c.do(ctx, http.MethodGet, path, nil, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
 }
 
 // BackendStatus is the crew's own health, as the surface reports it.
@@ -229,7 +289,8 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		payload.Items[i].Text = readable(payload.Items[i].Text)
 	}
 	return &Conversation{Messages: payload.Items, Bots: payload.Bots, DefaultBotID: payload.DefaultBotID,
-		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined}, nil
+		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined,
+		Model: payload.Model}, nil
 }
 
 // Send 把一句话送进对话。mentions 里是点名的 bot_id，可以没有。
@@ -480,9 +541,10 @@ func (c *Client) SwitchModel(ctx context.Context, choice ModelChoice) error {
 	return nil
 }
 
-// Retry asks the crew to run a failed ticket again. It is a management action, not a message.
+// Retry asks the crew to run a failed ticket again. It goes through the phone surface: the
+// management routes require a same-origin loopback Host, which this client never has.
 func (c *Client) Retry(ctx context.Context, ticketID string) error {
-	return c.management(ctx, http.MethodPost, "/tickets/"+url.PathEscape(ticketID)+"/retry", nil, nil)
+	return c.do(ctx, http.MethodPost, "/api/mobile/retry?ticket="+url.QueryEscape(ticketID), nil, nil)
 }
 
 // defaultDeviceID 是这样没给设备号时出示的那个。

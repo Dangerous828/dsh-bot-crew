@@ -59,7 +59,11 @@ export const TYPE_NAME: Readonly<Record<number, string>> = Object.fromEntries(
 export const HEADER_LEN = 9
 
 /** 一帧通常这么大。超过它就该走 httpChunk 分片，而不是让一个 WS 消息变成几 MB。 */
-export const DEFAULT_MAX_FRAME_BYTES = 64 * 1024 * 1024
+/**
+ * 单帧载荷上限。请求体上限是 256KB，响应也是按块推回来的，1MB 已经宽出很多；
+ * 64MB 只会让一个声称大帧的连接在拼接上花 O(n²) 的复制，并把内存抬高一个量级。
+ */
+export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024
 
 /** 帧里能放的载荷。`null` / `undefined` 表示「没有载荷」，不是字符串 "null"。 */
 export type FramePayload = Buffer | Uint8Array | string | object | null | undefined

@@ -198,6 +198,8 @@ const TEXT = {
   newestFirst: ['最新在前', 'newest first'],
   openTicket: ['查看工单', 'Open Ticket'],
   tagFiltered: ['已过滤：{reason}', 'Filtered: {reason}'],
+  // 一条被读过、判为不需要动手的消息：时间线上也要留痕，否则分不清「还在想」和「不会回」。
+  tagIgnored: ['判为不需要处理：{reason}', 'Judged not to need action: {reason}'],
   threadDormantShort: ['工单已结束', 'Tickets ended'],
   threadPollFailed: ['轮询失败', 'Polling failed'],
   threadQueued: ['排队 {count}', '{count} queued'],

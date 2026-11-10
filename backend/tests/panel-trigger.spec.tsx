@@ -27,6 +27,32 @@ it('walks a Thread timeline newest first with dispositions as tags and its Decis
   expect(find(zh['threadFilter.subscribed'], '.dt-pill').getAttribute('aria-pressed')).toBe('true')
 })
 
+it('shows the reason a message was read and left alone, so a quiet Thread is not mistaken for one still thinking', async () => {
+  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], earlier: null, context: [],
+    url: undefined, timeline: [trigger('quiet', '2026-09-23T00:00:00Z', { disposition: { decision: { id: 'd1',
+      outcome: 'ignore', ticketId: undefined, reason: [{ code: 'said', values: { text: '只是寒暄，不必动手' } }] } } })] })
+  at({ page: 'trigger', id: 'feishu:oc_1:om_root' })
+  await mount()
+  // 判为不需要处理的理由就写在时间线上，别让人对着一条没有下文的消息猜。
+  expect(text()).toContain('判为不需要处理：只是寒暄，不必动手')
+  await remount(en)
+  expect(text()).toContain('Judged not to need action: 只是寒暄，不必动手')
+})
+
+it('keeps a long ignore reason out of the row itself, leaving the whole text in the tooltip', async () => {
+  const long = '这是一段很长的判定理由'.repeat(12)
+  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], earlier: null, context: [],
+    url: undefined, timeline: [trigger('long', '2026-09-23T00:00:00Z', { disposition: { decision: { id: 'd2',
+      outcome: 'ignore', ticketId: undefined, reason: [{ code: 'said', values: { text: long } }] } } })] })
+  at({ page: 'trigger', id: 'feishu:oc_1:om_root' })
+  await mount()
+  const tag = all('.dt-tag').find(element => element.textContent?.startsWith('判为不需要处理'))
+  expect(tag).toBeTruthy()
+  // 标签里是截断版，title 里是全文：一行不能被一段理由撑开。
+  expect(tag!.textContent!.length).toBeLessThan(long.length)
+  expect(tag!.getAttribute('title')).toContain(long)
+})
+
 it('offers to send a person\'s message that reached a ticket to Eval, for one its worker neither did nor handed back', async () => {
   await mount()
   await click(zh['tab.trigger'])

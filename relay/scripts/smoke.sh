@@ -2,8 +2,11 @@
 # 中转部署后的冒烟检查。只读：不发请求进任何隧道，不改任何状态。
 #
 # 用法：
-#   sh relay/scripts/smoke.sh http://127.0.0.1:8787
-#   CREW_RELAY_ADMIN_TOKEN=... sh relay/scripts/smoke.sh https://relay.kentonnie.top
+#   sh relay/scripts/smoke.sh http://192.168.31.152:18800
+#   CREW_RELAY_ADMIN_TOKEN=... sh relay/scripts/smoke.sh https://jarvis.kentonnie.top/crew-relay
+#
+# 注意别拿 relay.kentonnie.top 测：那是 AI-HUB 的 dsh-relay，/health 形状相近，
+# 打过去会给出「通过」的假阳性。
 #
 # 它回答三个问题：进程活着吗、公开视图是否按预期不泄露、详情视图是否受令牌保护。
 set -u

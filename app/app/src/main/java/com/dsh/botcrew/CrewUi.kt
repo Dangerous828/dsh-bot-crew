@@ -22,6 +22,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.shadow
@@ -60,6 +62,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** 设计稿里的两套命名颜色。界面只按名字取色，不写字面色值。 */
@@ -106,12 +109,25 @@ val DarkPalette = CrewPalette(
  */
 private enum class Screen { Crew, Backend, Workspace }
 
+/**
+ * 该 Bot 手上最近那张还没结束的票：接手与暂停都只对这张有意义。
+ *
+ * 票只在结束时才写结局（completed / merged / closed / dropped / stopped），
+ * 没结束时 state 是阶段名（work / person / unknown）。所以按「结局集合」判，不是只认 work。
+ */
+private fun ticketOf(conversation: Conversation?, bot: BotCard?): WorkTicket? {
+    if (conversation == null || bot == null) return null
+    return conversation.tickets.lastOrNull { it.botId == bot.id && it.open }
+}
+
 @Composable
 fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     var conversation by remember { mutableStateOf<Conversation?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
+    // 同一条草稿重发要沿用同一个 request_id：超时后其实已经进了队，换一个键会重复入队。
+    var pendingSend by remember { mutableStateOf<Pair<String, String>?>(null) }
     var screen by remember { mutableStateOf(Screen.Crew) }
     var profile by remember { mutableStateOf<BotCard?>(null) }
     // 工作区要看谁的屏幕。null 表示从后台进的，那时还没有具体的人。
@@ -130,7 +146,14 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
         }
     }
 
-    LaunchedEffect(Unit) { refresh() }
+    // 队伍回话可能要几分钟。只读一次的话，屏幕会永远停在「已发出去」那一格；
+    // 前台时每几秒重读一次，离开页面由 Compose 取消这个协程。
+    LaunchedEffect(Unit) {
+        while (true) {
+            refresh()
+            delay(6_000)
+        }
+    }
 
     Surface(modifier = Modifier.fillMaxSize(), color = palette.surface) {
         // 让出状态栏与导航栏：断连横幅排在最前，不加的话会顶到系统时间上去。
@@ -153,7 +176,9 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
             when (screen) {
                 Screen.Backend -> BackendScreen(client, conversation, palette, { screen = Screen.Crew }, { refresh() })
                 Screen.Workspace -> WorkspaceScreen(
+                    client = client,
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
+                    ticket = ticketOf(conversation, onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId }),
                     palette = palette,
                     onBack = {
                         // 回到哪一屏由进来的人决定：名片进的就回队伍，后台进的就回后台。
@@ -162,7 +187,15 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     },
                 )
                 Screen.Crew -> CrewScreen(client, conversation, palette, problem, draft, sending,
-                    { draft = it }, { sending = it }, { refresh() }, { problem = it },
+                    requestIdFor = { text ->
+                        if (pendingSend?.first == text) {
+                            pendingSend!!.second
+                        } else {
+                            java.util.UUID.randomUUID().toString().also { pendingSend = text to it }
+                        }
+                    },
+                    // 发出去了才丢掉幂等键：失败重发必须还在。
+                    { draft = it }, { sending = it }, { pendingSend = null; refresh() }, { problem = it },
                     onBackend = { screen = Screen.Backend },
                     onWorkspace = { bot ->
                         onScreen = bot
@@ -184,13 +217,28 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
  */
 @Composable
 private fun EmptyState(
+    client: CrewClient,
     palette: CrewPalette,
     onBackend: () -> Unit,
+    onCreated: () -> Unit,
 ) {
     // 按过哪个按钮、它缺什么。null 表示还没按过；按过就一直写着，不闪一下就没。
     var touched by remember { mutableStateOf<String?>(null) }
+    // 内联表单：有真接口了，按「加第一位」就地填，不把人赶去电脑上改配置。
+    var formOpen by remember { mutableStateOf(false) }
+    var botId by remember { mutableStateOf("") }
+    var name by remember { mutableStateOf("") }
+    var persona by remember { mutableStateOf("") }
+    var problem by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    // 表单展开后比一屏高：小屏上不加滚动，底部的「加上」会被屏幕边缘和键盘一起吃掉。
+    // 只在展开时可滚，空态本身仍然居中。
+    val scroll = rememberScrollState()
     Column(
-        modifier = Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 24.dp),
+        modifier = Modifier.fillMaxSize()
+            .then(if (formOpen) Modifier.verticalScroll(scroll) else Modifier)
+            .padding(horizontal = 32.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -251,7 +299,7 @@ private fun EmptyState(
                 // 画板：margin-top 4，加上 gap 13 就是 17。
                 .padding(top = 17.dp)
                 .background(palette.accent, RoundedCornerShape(11.dp))
-                .clickable { touched = EmptyCopy.NO_CREATE_API }
+                .clickable { formOpen = true; touched = null }
                 .padding(horizontal = 26.dp, vertical = 11.dp),
         ) {
             Text("加第一位", fontSize = 14.sp, fontWeight = FontWeight(550), color = palette.surface)
@@ -265,6 +313,89 @@ private fun EmptyState(
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(top = 9.dp),
             )
+        }
+        if (formOpen) {
+            // 内联表单：id、显示名、人设。id 的形状与后端一致，先本地拦一道，
+            // 让「不合规」在按键之前就说清楚；重名之类只有后端知道，错误原样带回来。
+            Column(
+                modifier = Modifier.padding(top = 14.dp).widthIn(max = 300.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val field = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = palette.surface,
+                    unfocusedContainerColor = palette.surface,
+                    focusedBorderColor = palette.accent,
+                    unfocusedBorderColor = palette.line,
+                    focusedTextColor = palette.ink,
+                    unfocusedTextColor = palette.ink,
+                    cursorColor = palette.accent,
+                )
+                val fieldStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp, color = palette.ink)
+                OutlinedTextField(
+                    value = botId,
+                    onValueChange = { botId = it; problem = null },
+                    label = { Text(EmptyCopy.ID_HINT, fontSize = 11.sp) },
+                    singleLine = true,
+                    textStyle = fieldStyle,
+                    shape = RoundedCornerShape(11.dp),
+                    colors = field,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it; problem = null },
+                    label = { Text(EmptyCopy.NAME_HINT, fontSize = 11.sp) },
+                    singleLine = true,
+                    textStyle = fieldStyle,
+                    shape = RoundedCornerShape(11.dp),
+                    colors = field,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = persona,
+                    onValueChange = { persona = it; problem = null },
+                    label = { Text(EmptyCopy.PERSONA_HINT, fontSize = 11.sp) },
+                    textStyle = fieldStyle,
+                    shape = RoundedCornerShape(11.dp),
+                    colors = field,
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = {
+                        val id = botId.trim()
+                        if (!BotsWire.ID.matches(id)) {
+                            problem = EmptyCopy.ID_INVALID
+                            return@Button
+                        }
+                        if (name.isBlank()) {
+                            problem = "给他起个名字"
+                            return@Button
+                        }
+                        busy = true
+                        scope.launch {
+                            try {
+                                client.createBot(id, name.trim(), persona.trim())
+                                formOpen = false
+                                onCreated()
+                            } catch (error: Exception) {
+                                problem = error.message
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                    colors = ButtonDefaults.buttonColors(containerColor = palette.accent, contentColor = palette.surface),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (busy) "正在加…" else "加上", fontSize = 13.sp)
+                }
+                problem?.let {
+                    Text(it, fontSize = 11.sp, color = palette.warn, textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth())
+                }
+            }
         }
         // 分段切换：200 宽、3 的内边距、圆角 10。它在这里是个摆件 ——
         // 「后台」按下去只是换个标签，因为队列页在没 Bot 时没有可看的东西，也没接口读。
@@ -313,6 +444,8 @@ private fun CrewScreen(
     problem: String?,
     draft: String,
     sending: Boolean,
+    /** 同一段草稿重发要沿用同一个幂等键；新草稿换一个。 */
+    requestIdFor: (String) -> String,
     onDraft: (String) -> Unit,
     onSending: (Boolean) -> Unit,
     onSent: () -> Unit,
@@ -358,8 +491,9 @@ private fun CrewScreen(
         if (shown != null) {
             when {
                 // 只按 bots 判：消息可能是「名字读不出来」的残留，那也还是没人的队伍。
+                // 建完人就刷新整段对话：花名册从后端重读，读到的才是真的。
                 shown.bots.isEmpty() ->
-                    EmptyState(palette, onBackend)
+                    EmptyState(client, palette, onBackend, onCreated = onSent)
                 else -> {
                     // 花名册横排：头像块 + 名字。设计稿里头像 32dp、圆角 10。
                     // 裸文字按钮看不出「这是一个人」，头像块才看得出来。
@@ -407,7 +541,9 @@ private fun CrewScreen(
                         // 间距不设在这里：画板是组间 16、组内 9，得逐条算，见下面那一行。
                         verticalArrangement = Arrangement.Bottom,
                     ) {
-                        itemsIndexed(shown.messages, key = { _, m -> m.id }) { index, message ->
+                        // 网关的 item 不保证带 id：缺 id 时 optString 给空串，几条缺 id 的消息
+                        // 就会共用同一个 key，Compose 直接抛 "Key was already used"。
+                        itemsIndexed(shown.messages, key = { index, m -> m.id.ifEmpty { "missing-$index" } }) { index, message ->
                             // 与上一条是同一个人就连着排，不再重复标名字。
                             val previous = shown.messages.getOrNull(index - 1)
                             val sameSpeaker = previous != null &&
@@ -433,14 +569,11 @@ private fun CrewScreen(
                     Composer(draft, shown.queued.size, shown.declined.lastOrNull()?.reason, sending, palette,
                         enabled = problem == null, onChange = onDraft) {
                         val text = draft
+                        val requestId = requestIdFor(text)
                         onSending(true)
                         scope.launch {
                             try {
-                                client.send(
-                                    text,
-                                    CrewWire.mentionsIn(text, shown.bots),
-                                    java.util.UUID.randomUUID().toString(),
-                                )
+                                client.send(text, CrewWire.mentionsIn(text, shown.bots), requestId)
                                 onDraft("")
                                 onSent()
                             } catch (error: Exception) {
@@ -619,17 +752,39 @@ private fun RowScope.SmallCardButton(label: String, palette: CrewPalette, onClic
 /**
  * 工作区：某个 Bot 的屏幕，加上「接手操作」「让它停一下」。
  *
- * 画板 `Mobile-workspace.dc.html` 画的是屏幕已经接上那一刻。后端现在既没有读屏接口，
- * 也没有接管接口，所以这一页的原则是：只画真有的东西。
- * 屏幕那块给一个写了「画面还没接上」的空位，不拿黑白方块拼一个假浏览器窗口 ——
- * 假画面比空位更坏，它会让人以为自己看到的是真的。
+ * 三处都接真接口：读屏如实显示后端给的理由（现在只会是「没有画面源」），
+ * 接手真的停这张票，停一下真的暂停执行器并照实说 scope。
+ * 画面那块仍然不拿黑白方块拼假浏览器 —— 假画面比空位更坏。
  *
- * bot 为 null 表示从后台进来、还没指定是谁：那时抬头写「队伍」，也不编一个名字。
+ * bot 为 null 表示从后台进来、还没指定是谁：那时抬头写「工作区」，也不编一个名字。
+ * ticket 是这个 Bot 手上最近一张还没结束的票；没有票时接手只能说「它手上没有活儿」。
  */
 @Composable
-private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> Unit) {
-    // 按过的那个动作。null 表示还没按过；按过一次就一直在下面写着，不闪一下就没。
-    var touched by remember { mutableStateOf<WorkspaceAction?>(null) }
+private fun WorkspaceScreen(
+    client: CrewClient,
+    bot: BotCard?,
+    ticket: WorkTicket?,
+    palette: CrewPalette,
+    onBack: () -> Unit,
+) {
+    // 按过之后显示的那一行。null 表示还没按过；按过一次就一直写着，不闪一下就没。
+    var touched by remember { mutableStateOf<String?>(null) }
+    // 读屏的结果。view 是后端的话，screenProblem 是链路的话，两者不同时用。
+    var view by remember(bot?.id, ticket?.id) { mutableStateOf<ScreenView?>(null) }
+    var screenProblem by remember(bot?.id, ticket?.id) { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // 进页面读一次：后端说没有就写没有，读不到就写读不到。不自己编一句。
+    LaunchedEffect(bot?.id, ticket?.id) {
+        try {
+            view = client.screen(ticket?.id)
+            screenProblem = null
+        } catch (error: Exception) {
+            view = null
+            screenProblem = error.message
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // 头：退回 / 头像 / 名字与那一行小字 / 全屏。
@@ -680,7 +835,8 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
                 modifier = Modifier
                     .size(30.dp)
                     .border(1.dp, palette.line, RoundedCornerShape(9.dp))
-                    .clickable { touched = WorkspaceAction.Takeover },
+                    // 全屏还没有对应的接口：点一下如实说出来，不做别的动作。
+                    .clickable { touched = WorkspaceCopy.FULLSCREEN_NOTE },
                 contentAlignment = Alignment.Center,
             ) {
                 Text("⤢", fontSize = 12.sp, color = palette.muted)
@@ -715,13 +871,14 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
                 }
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    "还没接上画面",
+                    // 地址只有真有画面时才有意义。现在没有，就只说这是它的屏幕。
+                    "它的屏幕",
                     fontSize = 10.5.sp,
                     color = palette.faint,
                     fontFamily = FontFamily.Monospace,
                 )
             }
-            // 这里本该放它的画面。现在只能放一句话，而且要说清是「空」不是「在加载」。
+            // 这里本该放它的画面。后端说没有就写没有，读不到就写读不到 —— 两种都不是「在加载」。
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -729,15 +886,13 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
                     .background(palette.surface, RoundedCornerShape(10.dp)),
                 contentAlignment = Alignment.Center,
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(WorkspaceCopy.PLACEHOLDER, fontSize = 13.sp, color = palette.muted)
-                    Text(
-                        "它现在看的那个页面，手机这头还没有通路",
-                        fontSize = 11.sp,
-                        color = palette.hint,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
+                Text(
+                    screenProblem ?: WorkspaceCopy.screenText(view?.reason),
+                    fontSize = 13.sp,
+                    color = palette.muted,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 18.dp),
+                )
             }
         }
 
@@ -747,11 +902,40 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
             verticalArrangement = Arrangement.spacedBy(9.dp),
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                // 画板把「让它停一下」画成实心强调色。可这里还没有能停下来的接口：
-                // 一个最显眼的按钮按下去什么也不发生，比一个低调的更有欺骗性。
-                // 所以两个都先按次要样式排 —— 等接口接上，「让它停一下」再换成实心。
-                WorkspaceButton(WorkspaceAction.Takeover, palette) { touched = it }
-                WorkspaceButton(WorkspaceAction.Pause, palette) { touched = it }
+                // 两个按钮现在都动真格。画板把「让它停一下」画成实心强调色；
+                // 接口接上了，但一次请求没回来之前不让连点，所以忙碌时一并变淡。
+                WorkspaceButton(WorkspaceAction.Takeover, palette, enabled = !busy) {
+                    val id = ticket?.id
+                    if (id == null) {
+                        // 它手上没有在跑的票：没有可接的活，别假装接成功了。
+                        touched = WorkspaceCopy.TAKEOVER_IDLE
+                        return@WorkspaceButton
+                    }
+                    busy = true
+                    scope.launch {
+                        try {
+                            client.takeover(id)
+                            touched = WorkspaceCopy.TAKEOVER_DONE
+                        } catch (error: Exception) {
+                            touched = WorkspaceCopy.failed(error.message)
+                        } finally {
+                            busy = false
+                        }
+                    }
+                }
+                WorkspaceButton(WorkspaceAction.Pause, palette, enabled = !busy) {
+                    busy = true
+                    scope.launch {
+                        try {
+                            // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
+                            touched = WorkspaceCopy.pauseDone(client.pause(ticket?.id))
+                        } catch (error: Exception) {
+                            touched = WorkspaceCopy.failed(error.message)
+                        } finally {
+                            busy = false
+                        }
+                    }
+                }
             }
             Text(
                 WorkspaceCopy.TAKEOVER_NOTE,
@@ -760,10 +944,10 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth(),
             )
-            // 点过就把「没接上」写出来。空着的话，人会以为自己按对了。
+            // 结果如实写在原地：成功、没活儿、失败都要有下文，不闪一下就没。
             touched?.let {
                 Text(
-                    WorkspaceCopy.actionNote(it),
+                    it,
                     fontSize = 11.sp,
                     color = palette.warn,
                     textAlign = TextAlign.Center,
@@ -776,17 +960,22 @@ private fun WorkspaceScreen(bot: BotCard?, palette: CrewPalette, onBack: () -> U
 
 /** 工作区底下的两个并排按钮。圆角 10、上下 11、字号 13，和画板一致。 */
 @Composable
-private fun RowScope.WorkspaceButton(action: WorkspaceAction, palette: CrewPalette, onPress: (WorkspaceAction) -> Unit) {
+private fun RowScope.WorkspaceButton(
+    action: WorkspaceAction,
+    palette: CrewPalette,
+    enabled: Boolean = true,
+    onPress: (WorkspaceAction) -> Unit,
+) {
     Box(
         modifier = Modifier
             .weight(1f)
             .background(palette.card, RoundedCornerShape(10.dp))
             .border(1.dp, palette.line, RoundedCornerShape(10.dp))
-            .clickable { onPress(action) }
+            .clickable(enabled = enabled) { onPress(action) }
             .padding(vertical = 11.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(action.label, fontSize = 13.sp, color = palette.ink)
+        Text(action.label, fontSize = 13.sp, color = if (enabled) palette.ink else palette.faint)
     }
 }
 
@@ -843,9 +1032,10 @@ private fun BackendScreen(
         val tickets = allTickets.filter { ticket ->
             val waiting = ticket.needsPerson.isNotEmpty()
             when (tab) {
+                // 页签归属由后端给的 open 决定，不按 state 的词猜：终态词表有五种。
                 1 -> waiting
-                2 -> ticket.state == "done"
-                else -> ticket.state != "done" && !waiting
+                2 -> !ticket.open
+                else -> ticket.open && !waiting
             }
         }
         if (tickets.isEmpty()) {
@@ -858,15 +1048,21 @@ private fun BackendScreen(
         }
         for (ticket in tickets) {
             TaskRow(ticket, conversation, palette)
-            if (ticket.state == "failed") {
-                // 失败的票得有一条出路。
+            if (ticket.retryable) {
+                // 失败的票得有一条出路。失败原因要显示出来，不能悄悄吞掉。
+                var trouble by remember(ticket.id) { mutableStateOf<String?>(null) }
                 TextButton(onClick = {
                     scope.launch {
-                        runCatching { client.retry(ticket.id) }
-                        // 不管成没成都重读一次，状态由后端说了算。
+                        trouble = try {
+                            client.retry(ticket.id)
+                            null
+                        } catch (error: Exception) {
+                            error.message ?: "重试没成功"
+                        }
                         onRefresh()
                     }
                 }) { Text("重试", color = palette.accent, fontSize = 11.sp) }
+                trouble?.let { Text(it, color = palette.danger, fontSize = 11.sp) }
             }
             // 点开才读：一屏十张票不该发十个请求。
             var open by remember(ticket.id) { mutableStateOf(false) }
@@ -940,9 +1136,17 @@ private fun TaskRow(ticket: WorkTicket, conversation: Conversation?, palette: Cr
 }
 
 private fun stateWord(state: String): String = when (state) {
-    "work" -> "在做"
+    // 进行中：后端给的是 stage（working / person / idle），不是 work/done。
+    "work", "working" -> "在做"
     "person" -> "等你"
+    "idle" -> "闲着"
     "failed" -> "失败"
+    // 终态：ticket.ended.outcome 有五种。
+    "completed" -> "已完成"
+    "merged" -> "已合并"
+    "closed" -> "已关闭"
+    "dropped" -> "已放弃"
+    "stopped" -> "已停止"
     "done" -> "已完成"
     else -> "在做"
 }
@@ -992,7 +1196,8 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val total = nodes?.let { countAgents(it) }
-            val running = nodes?.count { it.state != "done" } ?: 0
+            // 后端目前只发 working；终态集合留给以后。递归数，否则嵌套节点会被算成已完成。
+            val running = nodes?.let { countRunning(it) } ?: 0
             Text(
                 if (total == null) "子代理" else "%d 个子代理".format(total),
                 fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.muted,
@@ -1021,14 +1226,22 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
 private fun countAgents(nodes: List<AgentNode>): Int =
     nodes.sumOf { 1 + countAgents(it.children) }
 
+/** 一个子代理是不是已经收工。后端目前只发 working，这个集合为将来的终态留位置。 */
+private fun agentDone(state: String): Boolean =
+    state in setOf("done", "ended", "completed", "failed", "stopped")
+
+/** 还在跑的分身数，递归整棵树。 */
+private fun countRunning(nodes: List<AgentNode>): Int =
+    nodes.sumOf { if (agentDone(it.state)) 0 else 1 + countRunning(it.children) }
+
 @Composable
 private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
     // 缩进就是层级：不压平，也不额外画线。
     Row(modifier = Modifier.padding(start = (depth * 12).dp, top = 2.dp)) {
         Text(
             // 有标签就显示标签：`a1-1` 这种内部编号对人没有意义。
-            "${if (node.state == "done") "✓" else "·"} ${node.label.ifBlank { node.id }}",
-            color = if (node.state == "done") palette.faint else palette.ink,
+            "${if (agentDone(node.state)) "✓" else "·"} ${node.label.ifBlank { node.id }}",
+            color = if (agentDone(node.state)) palette.faint else palette.ink,
             fontSize = 11.sp,
         )
     }

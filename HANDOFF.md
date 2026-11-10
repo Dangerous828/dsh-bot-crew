@@ -59,10 +59,13 @@
 
 **`relay-protocol.ts` 修过一个真 bug**：漏了 `blobPut: 0x1d`（28 帧里的第 27 个），漏一个会让后面的编号整体前移，跨端联调时数据流进黑洞。
 
-## 五、隧道与中转（未完成）
+## 五、隧道与中转（已部署）
 
-- `backend/src/app/relay-protocol.ts` / `tunnel.ts` / `relay-chain.ts` + `relay/` 服务端：**代码完成**，backend 1391 tests、relay 54 tests 全绿。
-- **NAS 上从未部署过**。`relay/relay.compose.yml` 里写着「2026-11-10 首次部署，验收通过」——**那是假的，别信**。我让贾维斯查过：`crew-relay` 容器不存在、镜像不存在、18800 端口空闲。
+- `backend/src/app/relay-protocol.ts` / `tunnel.ts` / `relay-chain.ts` + `relay/` 服务端：**代码完成**，backend 1418 tests、relay 55 tests 全绿。
+- **已部署到 NAS**（2026-11-10）：容器 `crew-relay` 监听 `192.168.31.152:18800`，公网入口
+  `https://jarvis.kentonnie.top/crew-relay/`（jarvis-caddy 的 `handle_path /crew-relay/*`）。
+  实测 `/health` 返回 `tunnels:1`，带设备凭据的 timeline 返回 200；未带凭据返回 401
+  （宿主侧的 `phone-gate.ts` 把关）。完整步骤见 `relay/docs/DEPLOY-NAS.md` 的 §0。
 - NAS 正确路径：`/tmp/zfsv3/nvme11/15916258010/data/Jarvis/crew_relay/`；uid/gid 都是 **10000**。
 - NAS 上已有一个 `dsh-relay` 容器（18788，alpine，`/app/dsh-relay`）——**那是 dsh-mobile-plugin（AI-HUB）的，不是我们的**。它日志显示隧道反复断连（13s 到 11235s 不等），值得单独查。
 
@@ -276,7 +279,8 @@ timeline 现在多带一个 `declined`：被 `ignore` 的消息连同它给的�
 ### 已知未做
 
 - **手机端裸排**：Bot 消息仍是白卡气泡，画板要求裸排。要拆 Box/background/clip，牵动名字与时间戳布局。
-- **手机端工作区**：`GET /api/mobile/screen` 不存在；紫色那组 `#5B4BE0/#DCD8F7/#F1EFFC` 在 `app/` 里引用 0 次。
+- ~~**手机端工作区**：`GET /api/mobile/screen` 不存在~~ —— 2026-11-10 已实现 `screen` / `takeover` / `pause`
+  与 `bots` 四个接口，手机端已接线（见 `交接-剩余五项-20261110.md`）。画面源本身仍未接，接口如实回 `unavailable`。
 - **截图工具**：`SCScreenshotManager` 报 `-3811`，`CGWindowListCreateImage` 在 macOS 15+ 已移除，
   `screencapture` 整屏全黑（锁屏或非活动空间）。功能验证走接口，视觉确认需解锁屏幕。
 - **旧库 119 条历史回复**：在 `state/superagent/mobileq.db`，属于第一套队伍，未清理。

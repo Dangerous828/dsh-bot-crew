@@ -36,6 +36,59 @@ it('answers only requests carrying a credential the crew issued', async () => {
   }
 })
 
+// 首次配对时这台设备还没有凭据可出示。放行的只有「交一支码」这一跳，别的路径仍然要凭据，
+// 否则整条局域网消息面就对着没有凭据的人敞开了。
+it('lets a code be redeemed without a credential, and nothing else through', async () => {
+  const seen: string[] = []
+  const server = createLanServer({
+    devices: { allows: () => false } as never,
+    forward: async (request) => { seen.push(`${request.method} ${request.url}`); return Response.json({ ok: true }) },
+  })
+  const port = await server.listen(0, '127.0.0.1')
+  try {
+    const base = `http://127.0.0.1:${port}/api/mobile`
+    // 兑换不需要凭据：码就是这一跳的凭据。
+    const paired = await fetch(`${base}/pair`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: '123456', deviceId: 'crew-desktop' }) })
+    expect(paired.status).toBe(200)
+    expect(seen).toEqual(['POST /api/mobile/pair'])
+    // 同一台设备读时间线仍然进不去。
+    const refused = await fetch(`${base}/timeline`)
+    expect(refused.status).toBe(401)
+    // GET 不算兑换：只有 POST 那一下放行。
+    const wrongMethod = await fetch(`${base}/pair`)
+    expect(wrongMethod.status).toBe(401)
+    expect(seen).toHaveLength(1)
+  } finally {
+    await server.close()
+  }
+})
+
+// 放行「交一支码」之后，6 位码就是这条路上唯一的凭据。按来源地址限速，
+// 否则局域网里一台机器可以在几分钟内把它穷举完。
+it('rate-limits pairing attempts from one address', async () => {
+  let forwarded = 0
+  const server = createLanServer({
+    devices: { allows: () => false } as never,
+    forward: async () => { forwarded += 1; return Response.json({ ok: true }) },
+  })
+  const port = await server.listen(0, '127.0.0.1')
+  try {
+    const url = `http://127.0.0.1:${port}/api/mobile/pair`
+    const statuses: number[] = []
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      statuses.push(response.status)
+    }
+    // 前 20 次照常走到处理器，之后一律 429。
+    expect(statuses.slice(0, 20).every(status => status === 200)).toBe(true)
+    expect(statuses.slice(20).every(status => status === 429)).toBe(true)
+    expect(forwarded).toBe(20)
+  } finally {
+    await server.close()
+  }
+})
+
 it('reports a port the OS picked so the caller can advertise it', async () => {
   const server = createLanServer({ devices: blank(), forward: async () => Response.json({}) })
   const port = await server.listen(0, '127.0.0.1')

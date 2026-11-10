@@ -66,8 +66,20 @@ class CrewWireTest {
         )
         assertEquals(listOf("scribbler"), CrewWire.mentionsIn("@写手 你好", bots))
         assertEquals(listOf("scribbler"), CrewWire.mentionsIn("@scribbler 你好", bots))
-        assertEquals(listOf("lead"), CrewWire.mentionsIn("大哥你看看", bots).ifEmpty { listOf("lead") })
+        // 不写 @ 只是提到名字，不是点名。
+        assertTrue(CrewWire.mentionsIn("大哥你看看", bots).isEmpty())
         assertTrue(CrewWire.mentionsIn("随便说一句", bots).isEmpty())
+    }
+
+    @Test
+    fun mentionsStopAtAWordBoundary() {
+        val bots = listOf(
+            BotCard("a", "甲", "member", ""),
+            BotCard("ab", "甲乙", "member", ""),
+        )
+        // @ab 不能同时点名 a：名字是前缀不算命中。
+        assertEquals(listOf("ab"), CrewWire.mentionsIn("@ab 看一下", bots))
+        assertEquals(listOf("a"), CrewWire.mentionsIn("@a 看一下", bots))
     }
 }
 
@@ -197,7 +209,8 @@ class ClientPathTest {
     fun everyOperationGoesThroughThePhoneSurface() {
         // 消息面在 /api/mobile 下面。漏了前缀会得到一个 404，而不是「路径写错」这种明确信息。
         val source = java.io.File("src/main/java/com/dsh/botcrew/CrewClient.kt").readText()
-        val paths = Regex("""open\("(/[^"]*)"""").findAll(source).map { it.groupValues[1] }.toList()
+        // 请求统一走 read(...)；open(...) 只剩底层那一个定义。
+        val paths = Regex("""\b(?:read|open)\("(/[^"]*)"""").findAll(source).map { it.groupValues[1] }.toList()
         assertTrue("CrewClient 里应该有几条路径", paths.isNotEmpty())
         for (path in paths) {
             assertTrue("路径 $path 少了 /api/mobile 前缀", path.startsWith("/api/mobile/"))
@@ -217,6 +230,51 @@ class LiveShapeTest {
         assertEquals(2, timeline.bots.size)
         assertEquals("大哥", timeline.bots[0].name)
         assertEquals("lead", timeline.defaultBotId)
+    }
+
+    // 页签归属与重试入口由后端给的布尔决定，不再让客户端解释 state 的词表。
+    @Test
+    fun readsWhetherATicketIsOpenAndRetryable() {
+        val body = """
+            {"items":[],"bots":[],"default_bot_id":"","tasks":[
+              {"id":"t1","title":"在跑","state":"working","bot_id":"b","open":true,"retryable":false},
+              {"id":"t2","title":"完了","state":"completed","bot_id":"b","open":false,"retryable":true}
+            ],"status":{},"queued":[],"declined":[]}
+        """.trimIndent()
+        val tickets = CrewWire.parseTimeline(body).tickets
+        assertTrue(tickets[0].open)
+        assertFalse(tickets[0].retryable)
+        assertFalse(tickets[1].open)
+        assertTrue(tickets[1].retryable)
+    }
+}
+
+/** 工作区与花名册的新接口。解析宽容：字段缺席时给确定的默认，不崩、不猜。 */
+class ControlSurfaceWireTest {
+    @Test
+    fun readsTheScreenAnswerAsTheBackendWroteIt() {
+        val view = ScreenWire.parse("""{"state":"unavailable","reason":"后端还没有画面源：worker 不跑浏览器"}""")
+        assertEquals("unavailable", view.state)
+        assertEquals("后端还没有画面源：worker 不跑浏览器", view.reason)
+        // 空对象也算「没有」：默认态是 unavailable，不是 live。
+        assertEquals("unavailable", ScreenWire.parse("{}").state)
+    }
+
+    @Test
+    fun buildsACreateBodyWithoutAnEmptyPersona() {
+        val body = JSONObject(BotsWire.createBody("coder_1", "码农", ""))
+        assertEquals("coder_1", body.getString("bot_id"))
+        assertEquals("码农", body.getString("name"))
+        assertFalse(body.has("persona"))
+        assertEquals("写代码", JSONObject(BotsWire.createBody("c", "码农", "写代码")).getString("persona"))
+    }
+
+    @Test
+    fun aTimelineTaskCarriesTheBotItBelongsTo() {
+        // 手机要按 Bot 找「他手上那张票」，所以 tasks 里的 bot_id 必须读得出来。
+        val conversation = CrewWire.parseTimeline("""{"items":[],"bots":[],"default_bot_id":"",
+          "tasks":[{"id":"t1","title":"改一行","state":"work","bot_id":"coder_1"}]}""")
+        assertEquals("coder_1", conversation.tickets.single().botId)
     }
 }
 

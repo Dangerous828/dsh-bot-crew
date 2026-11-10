@@ -8,7 +8,9 @@
  */
 
 /** The marker a worker writes on its own line, naming the bot the work belongs to. */
-const HANDOFF = /^[ \t]*@handoff[ \t]+([a-z0-9-]+)[ \t]*(?::[ \t]*(.*))?$/im
+// Bot id 与 directory.ts 的 BOT_ID 同一形状：下划线也是合法字符，这里漏了会让
+// `@handoff coder_1` 被截成 `coder`，交回落在一个不存在的人身上。
+const HANDOFF = /^[ \t]*@handoff[ \t]+([a-z0-9_-]+)[ \t]*(?::[ \t]*(.*))?$/im
 
 export interface Handoff {
   /** The bot the work should go to, as written. Callers check it against the roster. */

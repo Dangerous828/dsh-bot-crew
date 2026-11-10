@@ -262,7 +262,9 @@ export class Tickets extends EnginePart {
     delete ticket.ended; ticket.updatedAt = at
     const assignment = this.newAssignment(ticket)
     // Prepend the resumed marker so it is delivered ahead of the waiting messages.
-    const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at }
+    // id 带上本次 resumed 的时间：同一 trigger 第二次唤醒时不会撞上一条早已投递过的
+    // RESUMED（AgentDelivery 按 id 判重，撞了就等于 worker 从来没收到唤醒）。
+    const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId, at), kind: 'resumed', triggerId: first.triggerId, at }
     ticket.inputs.push(resumed); ticket.undelivered.unshift(resumed.id)
     this.repo.tickets.save(ticket)
     this.options.executor.start(ticket, assignment)
@@ -353,6 +355,9 @@ export class Tickets extends EnginePart {
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
     // An end dated earlier, such as a PR's merge, does not move the ticket's last change back.
     ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
+    // 已经排进 outbox 的 attention 回复要一起撤回：工单都结束了，人还在回答一个不存在的问题，
+    // 而且那条答复会被 Replies.answer 以 notAttention 拒掉。
+    if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
     delete ticket.attention; delete ticket.delivery
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }

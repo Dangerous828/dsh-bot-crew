@@ -3,9 +3,13 @@ package main
 
 import (
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -27,12 +31,17 @@ func newApp(client *Client) *app {
 		client:  client,
 		arrived: make(chan *Conversation, 4),
 		failed:  make(chan string, 4),
+		sent:    make(chan string, 4),
 		tree:    make(chan []AgentNode, 4),
-		paired:  make(chan string, 4),
+		paired:  make(chan Credential, 4),
+		pairFailed: make(chan string, 4),
 		steps:   make(chan workResult, 4),
 		// 模型那两条也在这里 make：忘掉一条，切模型就会永远停在「正在换…」。
 		modelList:     make(chan *ModelCatalog, 4),
 		modelSwitched: make(chan ModelChoice, 4),
+		modelError:    make(chan string, 4),
+		retryErrorCh:  make(chan string, 4),
+		screenNoteCh:  make(chan string, 4),
 		// 打开窗口先看到「后台」那一栏，它是对外最早能看懂的一块。
 		navTab:      navBackend,
 		backendOpen: true,
@@ -87,27 +96,117 @@ func resolveToken(readFile func(string) ([]byte, error)) (token string, source s
 	return token, path
 }
 
-func main() {
-	// 队伍地址与凭据来自环境：一个进程连一段对话，换段对话就换环境。
-	base := os.Getenv("DSH_GW")
-	if base == "" {
-		base = "http://127.0.0.1:8788"
-	}
-	// 凭据按 环境变量 → profile 状态目录 的顺序取；设备号只认环境变量，没给由 auth() 兜默认值。
-	token, source := resolveToken(os.ReadFile)
+// resolved 是启动这次要连的一组值。
+type resolved struct {
+	Base   string
+	Token  string
+	Device string
+	Target crewTarget
+}
+
+// locate 决定连哪一支队伍：环境变量 → 上次配好的凭据 → 自动发现 → 历史默认。
+//
+// 环境变量仍然最高，那是调试与特殊部署的后门；正常情况下这三样都由发现与配对提供。
+func locate() resolved {
+	base := strings.TrimSpace(os.Getenv("DSH_GW"))
+	token := strings.TrimSpace(os.Getenv("DSH_TOKEN"))
 	device := strings.TrimSpace(os.Getenv("DSH_DEVICE"))
-	if token == "" {
-		// 拿不到就在启动时说一句：等到请求 401 才暴露，人会以为是后端坏了。
-		// 只说路径，不猜内容 —— 凭据本身不进日志。
-		log.Printf("没有找到网关凭据；把 token 放到 %s，或设 DSH_TOKEN。现在照常开窗，队伍连接会失败", source)
+	target := crewTarget{}
+	if live := discover(profilesDir(), dialAlive); len(live) > 0 {
+		target = live[0]
+	}
+	// 上次配对留下的凭据：它能补齐环境变量没给的任何一项。
+	fromSaved := false
+	if saved, ok := loadCredential(credentialPath()); ok {
+		if base == "" {
+			base = saved.Base
+			fromSaved = true
+		}
+		if token == "" {
+			token = saved.Token
+		}
+		if device == "" {
+			device = saved.DeviceID
+		}
+	}
+	// 保存的地址指向一个已经不在的端口（换了 profile、队伍没在跑）时，别抱着旧地址不放：
+	// 发现到的活队伍才是能用的那一支。凭据属于旧队伍，一并清掉，让人重新配对。
+	if fromSaved && target.Found && target.Base != "" && target.Base != base && !reachable(base) {
+		log.Printf("保存的队伍 %s 已经连不上，改用发现的 %s；需要重新配对", base, target.Base)
+		base, token, device = target.Base, "", ""
+	}
+	if base == "" {
+		if target.Found {
+			base = target.Base
+		} else {
+			base = "http://127.0.0.1:8788"
+		}
+	}
+	// 旧的网关部署：token 落在 profile 的状态目录里。它只对网关端口有意义，
+	// 设备凭据是另一套东西，不能拿去敲局域网那道门。
+	if token == "" && base == "http://127.0.0.1:8788" {
+		if legacy, source := resolveToken(os.ReadFile); legacy != "" {
+			token = legacy
+			log.Printf("网关凭据来自 %s", source)
+		}
+	}
+	// 环境变量或上次配好的凭据指向本机另一支队伍时，配对也要打到那一支：
+	// 否则按钮会去配一个窗口根本没在连的队伍，配完还是连不上。
+	if pointed, ok := loopbackTarget(base); ok && pointed.Base != target.Base {
+		target = pointed
+	}
+	return resolved{Base: base, Token: token, Device: device, Target: target}
+}
+
+// reachable 快速探一下 http://host:port 是否有监听。只探明文的本机/局域网地址：
+// 公网 relay 不在这里探，一次启动多等一次网络超时不值得。
+func reachable(base string) bool {
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+		return true
+	}
+	connection, err := net.DialTimeout("tcp", parsed.Host, 400*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	connection.Close()
+	return true
+}
+
+// loopbackTarget 把 http://127.0.0.1:PORT 变成一个配对目标。
+// 网页端口不在这里猜：配对时会按 lan 端口反查同一进程的监听。
+func loopbackTarget(base string) (crewTarget, bool) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return crewTarget{}, false
+	}
+	host := parsed.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return crewTarget{}, false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port <= 0 {
+		return crewTarget{}, false
+	}
+	return crewTarget{Base: base, LanPort: port, Found: true}, true
+}
+
+func main() {
+	located := locate()
+	if located.Target.Found {
+		log.Printf("发现队伍 %s：连 %s（设备号 %s）", located.Target.Profile, located.Base, effectiveDeviceID(located.Device))
 	} else {
-		// 只说来源与设备号，不打印凭据。
-		log.Printf("网关凭据来自 %s；设备号 %s", source, effectiveDeviceID(device))
+		log.Printf("没有发现正在跑的队伍；连 %s。右栏「配对手机」可以在队伍启动后自动配上", located.Base)
+	}
+	if located.Token == "" {
+		log.Printf("还没有这台设备的凭据：窗口照常打开，配对后即可连接")
 	}
 
 	// 所有通道都要 make：nil 通道上的发送会永久阻塞，
 	// 表现就是「数据早到了，界面却一直停在正在读…」。
-	s := newApp(New(base, token, device))
+	s := newApp(New(located.Base, located.Token, located.Device))
+	s.target = located.Target
+	s.endpoint = located.Base
 	mygo.App.WhenReady(func() {
 		mygo.NewWindow(mygo.WindowOptions{
 			Title: "Bot 队伍",

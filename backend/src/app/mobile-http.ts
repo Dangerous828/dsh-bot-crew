@@ -4,12 +4,14 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { HttpHost } from './http.ts'
-import { ticketStage } from '../core/index.ts'
+import { canRetry, ticketStage } from '../core/index.ts'
+import { SettingsConflict } from './settings.ts'
 import type { Settings } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { DeviceStore } from './remote.ts'
+import { BOT_ID } from '../crew/directory.ts'
 
 // Structural contract keeps compatibility with the bundle's alpha development
 // peers; installed rc.2 Connection supplies this authenticated exact-route API.
@@ -21,8 +23,19 @@ interface FetchRegistry {
  * What the phone surface needs from the crew. `remote` is the device table: the phone redeems its pairing code
  * here rather than at the local-only management surface, because this is the one carrier it can already reach.
  */
-type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'models'> & { remote?: DeviceStore }
+type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'models'> & { remote?: DeviceStore
+  /** 工单控制：停下一张票，以及全局暂停。真实 Runtime 两个都有；测试里的假宿主可以只给需要的那个。 */
+  engine?: Pick<HttpHost['engine'], 'stopTicket' | 'retryTicket'>
+  settings?: Pick<HttpHost['settings'], 'pause' | 'save'> }
 const response = (status: number, value: unknown) => Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
+
+/** 读一个 JSON 对象 body。解析失败、数组、null 都当作「没给」，调用方统一回 400。 */
+function askedBody(body: string | undefined): Record<string, unknown> | undefined {
+  try {
+    const value = JSON.parse(body ?? '{}') as unknown
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+  } catch { return undefined }
+}
 
 /**
  * 「认识多久」的出处：这个 Bot 最早那张工单的时间。
@@ -83,6 +96,30 @@ export function declinedRequests(items: TimelineItem[], decisions: readonly { ki
   })
 }
 
+/** 花名册接口的读法：只交出手机上要显示的三样，配置里坏掉的行跳过而不是让整份花名册报错。 */
+function teamBotRows(bots: readonly Record<string, unknown>[]): { bot_id: string; name: string; role: string }[] {
+  return bots.flatMap(bot => {
+    const id = typeof bot.bot_id === 'string' ? bot.bot_id : ''
+    if (!id) return []
+    const name = typeof bot.name === 'string' && bot.name.trim() ? bot.name.trim() : id
+    return [{ bot_id: id, name, role: typeof bot.role === 'string' ? bot.role : 'member' }]
+  })
+}
+
+/**
+ * 这张票是哪个 Bot 接的。
+ *
+ * 票本身不带 Bot 字段：署名在 Channel 的 address 里（team Source 收消息时写进去的）。
+ * 手机要按 Bot 找「他手上那张还没结束的票」，所以这一跳得有一处读得出来。
+ */
+function ticketBot(ticket: { channels: readonly { address?: Record<string, string> }[] }): string {
+  for (const channel of ticket.channels) {
+    const id = channel.address?.bot_id
+    if (typeof id === 'string' && id) return id
+  }
+  return ''
+}
+
 /** The Bot roster the phone offers as mention targets; unreadable settings fall back to no roster. */
 function crewRoster(settings: Settings, since: (botId: string) => string = () => ''): {
   bots: { id: string; name: string; role: string; persona?: string; since?: string }[]
@@ -133,13 +170,21 @@ function gatewayOrigin(stateDir?: string): string {
 
 /** Which operations exist, how they are called, and whether they need a query the surface checks itself. */
 const OPERATIONS = {
-  timeline: { method: 'GET' }, send: { method: 'POST' },
-  work: { method: 'GET', needsTicket: true }, agents: { method: 'GET', needsTicket: true },
+  timeline: { methods: ['GET'] }, send: { methods: ['POST'] },
+  work: { methods: ['GET'], needsTicket: true }, agents: { methods: ['GET'], needsTicket: true },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
-  models: { method: 'GET' },
-  model: { method: 'POST' },
+  models: { methods: ['GET'] },
+  model: { methods: ['POST'] },
   // 手机提交配对码也走这条路：Connection 已经验过来源，这是它唯一到得了的入口。
-  pair: { method: 'POST' },
+  pair: { methods: ['POST'] },
+  // 手机工作区三个控件：看画面、接手、停一下。
+  screen: { methods: ['GET'] },
+  takeover: { methods: ['POST'] },
+  // 失败/卡住的票再跑一次。手机面只到得了这里：管理面的 retry 要求本机同源，手机不满足。
+  retry: { methods: ['POST'], needsTicket: true },
+  pause: { methods: ['POST'] },
+  // 花名册的读写：空态「加第一位 Bot」与手机上要显示的名字。
+  bots: { methods: ['GET', 'POST'] },
 } as const
 type Operation = keyof typeof OPERATIONS
 
@@ -148,7 +193,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     const url = new URL(incoming.url)
     const name = url.pathname.split('/').at(-1) as Operation | undefined
     const operation = name && name in OPERATIONS ? name : undefined
-    if (!operation || incoming.method !== OPERATIONS[operation].method) return response(404, { error: 'Unknown operation' })
+    if (!operation || !(OPERATIONS[operation].methods as readonly string[]).includes(incoming.method)) {
+      return response(404, { error: 'Unknown operation' })
+    }
     // A work or agent lookup without a ticket would ask the gateway to guess; refuse it here instead.
     const ticketId = url.searchParams.get('ticket') ?? ''
     if ('needsTicket' in OPERATIONS[operation] && !ticketId) return response(400, { error: 'ticket is required' })
@@ -169,6 +216,18 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       body = await incoming.text()
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Pairing request too large' })
     }
+    if (operation === 'takeover' || operation === 'pause' || (operation === 'bots' && incoming.method === 'POST')) {
+      // 这三条只带一个 id 或几个短字段，和配对请求同量级；不超过 8KB 就不必再细分。
+      body = await incoming.text()
+      if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
+    }
+    // 重试是执行器上的动作，不经过网关转发，所以放在下面那条转发分支之前。
+    if (operation === 'retry') {
+      if (!runtime.store.tickets.get(ticketId)) return response(404, { error: 'No such ticket' })
+      if (!runtime.engine?.retryTicket) return response(503, { error: 'Ticket control is unavailable' })
+      try { runtime.engine.retryTicket(ticketId) } catch { return response(409, { error: 'Ticket cannot be retried' }) }
+      return response(200, { ok: true, retried: true })
+    }
     if (operation === 'send') {
       body = await incoming.text()
       if (Buffer.byteLength(body) > 64 * 1024) return response(413, { error: 'Message too large' })
@@ -187,8 +246,70 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     }
     // The three work routes read the store and the live session tree, which the gateway does not hold. They answer
     // here, after the same Connection-owned authentication that guards every other route.
-    if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair') {
+    if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
+      || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots') {
       await runtime.ready
+      if (operation === 'screen') {
+        // 画面源还没有：worker 不跑浏览器，没有可传的帧。如实说「没有」，比一个永远转圈的画面诚实。
+        // 文案按手机端已约定的原样给，标点也不改：两端各写一份就会分叉。
+        return response(200, { state: 'unavailable', reason: '后端还没有画面源，worker 不跑浏览器' })
+      }
+      if (operation === 'takeover') {
+        const asked = askedBody(body)
+        if (!asked) return response(400, { error: 'Invalid JSON' })
+        const id = typeof asked.ticket === 'string' ? asked.ticket : ''
+        if (!id) return response(400, { error: 'ticket is required' })
+        if (!runtime.store.tickets.get(id)) return response(404, { error: 'No such ticket' })
+        if (!runtime.engine) return response(503, { error: 'Ticket control is unavailable' })
+        try { runtime.engine.stopTicket(id) } catch { return response(409, { error: 'Ticket cannot be stopped' }) }
+        return response(200, { ok: true, stopped: true })
+      }
+      if (operation === 'pause') {
+        const asked = askedBody(body)
+        if (!asked) return response(400, { error: 'Invalid JSON' })
+        const id = typeof asked.ticket === 'string' ? asked.ticket : ''
+        // 给出了票号就得对得上：一张不存在的票不该让整台执行器停下来。
+        if (id && !runtime.store.tickets.get(id)) return response(404, { error: 'No such ticket' })
+        if (!runtime.settings) return response(503, { error: 'Pause control is unavailable' })
+        await runtime.settings.pause(true, 'panel')
+        // 目前只有执行器这一种暂停。如实写 scope，别让手机以为只停了这一张票。
+        return response(200, { ok: true, scope: 'executor' })
+      }
+      if (operation === 'bots') {
+        const settings = runtime.store.settings()
+        const config = (settings.sources?.team?.config ?? {}) as Record<string, unknown>
+        const bots = Array.isArray(config.bots) ? config.bots as Record<string, unknown>[] : []
+        if (incoming.method === 'GET') return response(200, { bots: teamBotRows(bots) })
+        const asked = askedBody(body)
+        if (!asked) return response(400, { error: 'Invalid JSON' })
+        const botId = typeof asked.bot_id === 'string' ? asked.bot_id.trim() : ''
+        if (!BOT_ID.test(botId)) return response(400, { error: 'Invalid bot id' })
+        const name = typeof asked.name === 'string' ? asked.name.trim() : ''
+        if (!name) return response(400, { error: 'name is required' })
+        if (name.length > 100) return response(400, { error: 'name is too long' })
+        const persona = typeof asked.persona === 'string' ? asked.persona.trim() : ''
+        if (persona.length > 2000) return response(400, { error: 'persona is too long' })
+        if (bots.some(bot => bot.bot_id === botId)) return response(400, { error: 'Bot already exists' })
+        const askedRole = asked.role === 'default' ? 'default' : 'member'
+        const hasDefault = bots.some(bot => bot.role === 'default')
+        if (askedRole === 'default' && hasDefault) {
+          return response(400, { error: 'The crew already has a default bot' })
+        }
+        // 目录要求恰好一个 default。队里没有就由这一位顶上：空队的第一位，或者配置已经坏了
+        // （有 Bot 没 default）时，加一位就能自愈 —— 只看「是不是空队」会留下永远读不回来的配置。
+        const role = hasDefault ? askedRole : 'default'
+        const next = [...bots, { bot_id: botId, name, role, ...(persona ? { persona } : {}), memory_namespace: `bot/${botId}` }]
+        const defaultId = typeof config.default_bot_id === 'string' && config.default_bot_id ? config.default_bot_id : botId
+        // 只改 config，不动 enabled：主人停用 team Source 之后，手机加一个人不该把它悄悄打开。
+        const team = settings.sources?.team
+        // 标明改的是哪个 block：block revision 跟着动，面板手里那份旧值再保存就会被 409 挡住，
+        // 而不是静默把刚加的这个人覆盖掉。
+        runtime.store.saveSettings({ ...settings, sources: { ...settings.sources,
+          team: { ...(team ?? {}), enabled: team?.enabled ?? true,
+            config: { ...config, bots: next, default_bot_id: role === 'default' ? botId : defaultId } } } },
+        { source: 'panel', block: 'source:team', policyVersion: '', policyChanged: false, notified: [] })
+        return response(200, { ok: true })
+      }
       if (operation === 'models') {
         // 只给能真跑的那些：把 `models` 原样交出去，界面就得自己去分辨哪一组根本连不上。
         const catalog = await runtime.models()
@@ -205,8 +326,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (operation === 'pair') {
         const devices = (runtime as unknown as { remote?: DeviceStore }).remote
         if (!devices) return response(503, { error: 'Pairing is unavailable' })
-        let asked: Record<string, unknown>
-        try { asked = JSON.parse(body ?? '{}') as Record<string, unknown> } catch { return response(400, { error: 'Invalid JSON' }) }
+        const asked = askedBody(body)
+        if (!asked) return response(400, { error: 'Invalid JSON' })
         const { code, deviceId, name, platform } = asked
         if (typeof code !== 'string' || typeof deviceId !== 'string' || !code || !deviceId) {
           return response(400, { error: 'code and deviceId are required' })
@@ -223,7 +344,17 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // A provider has to be named: a model name alone does not say where to reach it.
         if (typeof asked.provider !== 'string' || !asked.provider.trim()) return response(400, { error: 'provider is required' })
         const next = switchModel(runtime.store.settings(), { provider: asked.provider, model: asked.model, reasoningEffort: asked.reasoningEffort })
-        runtime.store.saveSettings(next)
+        // 走 Settings.save，而不是直接写 store：它会先 resolveRoleModel 验一遍这条路由。
+        // 直接落盘的话，一个不存在的 provider/model 会被每个新工单在 initializeRoleModel 里
+        // 撞到，launch 全部记 failed，直到面板改回来。
+        if (!runtime.settings?.save) return response(503, { error: 'Model switching is unavailable' })
+        try {
+          await runtime.settings.save('executor', next.executor, runtime.store.blockRevision('executor'), 'panel')
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          // SettingsConflict 是空 extends Error，它的 name 仍是 'Error'，只能按类型判。
+          return response(error instanceof SettingsConflict ? 409 : 400, { error: message || 'Model unavailable' })
+        }
         return response(200, { ok: true, model: next.executor.model })
       }
       if (operation === 'work') return response(200, workOf(runtime.store.tickets.get(ticketId)) ?? response(404, { error: 'No such ticket' }))
@@ -261,8 +392,17 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           // with it: it still belongs on the phone, it just cannot say which stage it is in.
           let stage: { stage?: string; action?: string } = {}
           try { stage = ticketStage(ticket) } catch { stage = {} }
+          // 同一张读不懂的票也不该把整个时间线（以及对话）带下去。
+          let retryable = false
+          try { retryable = canRetry(ticket) } catch { retryable = false }
+          const botId = ticketBot(ticket)
           return { id: ticket.id, title: ticket.title,
+            // `state` 是给人看的词（终态用 outcome，进行中用 stage）；放哪个页签、能不能重试
+            // 由下面两个布尔决定，客户端不再自己解释词表。
             state: ticket.ended?.outcome ?? stage.stage ?? 'unknown', worker_session_id: workerSessionId(ticket.id),
+            ...(botId ? { bot_id: botId } : {}),
+            open: !ticket.ended,
+            retryable,
             // Lets the phone place a task in the conversation by time and say whether it waits for the owner.
             created_at: ticket.createdAt, updated_at: ticket.updatedAt,
             ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}) }
@@ -325,6 +465,13 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // 手机工作区：看画面、接手、停一下。画面现在是「诚实的没有」，另外两条动真格。
+      connection.fetch.register({ path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // 花名册：GET 读，POST 加一位。
+      connection.fetch.register({ path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
     ]
     child.effect(() => async () => { await Promise.all(disposers.map(dispose => dispose())) })
   })

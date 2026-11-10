@@ -141,10 +141,18 @@ export class Store implements Repositories {
     const level = this.depth++
     const name = `orchestrator_atomic_${level}`
     this.committed[level] = []
-    this.db.exec(`SAVEPOINT ${name}`)
     let value: T
-    try { value = operation(); this.db.exec(`RELEASE ${name}`) }
-    catch (error) { this.db.exec(`ROLLBACK TO ${name}`); this.db.exec(`RELEASE ${name}`); throw error }
+    try {
+      // SAVEPOINT 本身也可能抛（磁盘满、连接已关）。放进 try 里，失败时同样走 finally 回退
+      // depth；否则之后每次 atomic 都被当成嵌套事务，afterCommit 的回调永远不执行。
+      this.db.exec(`SAVEPOINT ${name}`)
+      value = operation()
+      this.db.exec(`RELEASE ${name}`)
+    } catch (error) {
+      // 保存点没建起来时 ROLLBACK 也会抛，那一下不该盖住原始错误。
+      try { this.db.exec(`ROLLBACK TO ${name}`); this.db.exec(`RELEASE ${name}`) } catch { /* no savepoint to roll back */ }
+      throw error
+    }
     finally { this.depth-- }
     const actions = this.committed.splice(level)[0]!
     if (level) this.committed[level - 1]!.push(...actions)

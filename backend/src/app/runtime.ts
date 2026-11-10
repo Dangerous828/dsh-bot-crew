@@ -10,6 +10,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
+import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
@@ -263,7 +264,11 @@ export class Runtime extends Service implements SourceHost {
     const originTriggerId = origin?.origin?.triggerId
     const personMessage = originTriggerId === undefined ? undefined
       : String(store.triggers.get(originTriggerId)?.meta?.messageId ?? '') || undefined
-    const messageId = `handoff-${from.id}-${bot_id}`
+    // 同名（同一 ticket、同一 bot）的第二次 handoff 不能撞上第一次的 message id：engine 会把
+    // 它当成重复消息丢掉，工具却回 handed_off:false。文本变了就是新的一次交接；同一段文本
+    // 重发仍然幂等，摘要相同。
+    const digest = createHash('sha256').update(text).digest('hex').slice(0, 8)
+    const messageId = `handoff-${from.id}-${bot_id}-${digest}`
     const thread = `team:handoff:${conversation}:${messageId}`
     const trigger: Trigger = {
       id: key('team', messageId),
@@ -289,7 +294,10 @@ export class Runtime extends Service implements SourceHost {
     try {
       // `true` only when the engine actually took it: a trigger the source is not listening to is stored as
       // `filtered`, and reporting that as a handover would tell the worker the work is moving when it is not.
-      return this.engine.receive(trigger) === 'stored'
+      // A duplicate that was not filtered is the same handover sent again: the first one was taken, so
+      // answering false here told the worker its handover failed when it had already gone through.
+      const result = this.engine.receive(trigger)
+      return result === 'stored' || (result === 'duplicate' && !this.store.triggers.disposition(trigger.id)?.filtered)
     } catch { return false }
   }
   /**

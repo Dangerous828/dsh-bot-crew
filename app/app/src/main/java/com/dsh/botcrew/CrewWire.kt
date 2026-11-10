@@ -97,6 +97,10 @@ object CrewWire {
                     state = task.optString("state"),
                     botId = task.optString("bot_id"),
                     needsPerson = task.optString("needs_person"),
+                    // 老后端没有这两个字段：按终态词表兜底，行为与以前一致。
+                    open = if (task.has("open")) task.optBoolean("open", true)
+                        else task.optString("state") !in setOf("completed", "merged", "closed", "dropped", "stopped"),
+                    retryable = task.optBoolean("retryable", false),
                 ),
             )
         }
@@ -130,13 +134,23 @@ object CrewWire {
     }
 
     /** 从一句话里认出被 @ 的 Bot：名片上的名字和 id 都算。 */
-    fun mentionsIn(text: String, bots: List<BotCard>): List<String> {
-        val found = mutableListOf<String>()
-        for (bot in bots) {
-            val named = text.contains("@${bot.id}") || (bot.name.isNotEmpty() && text.contains("@${bot.name}"))
-            if (named) found.add(bot.id)
+    fun mentionsIn(text: String, bots: List<BotCard>): List<String> =
+        bots.filter { bot ->
+            listOf("@${bot.id}", if (bot.name.isNotEmpty()) "@${bot.name}" else "").any { needle ->
+                needle.length > 1 && named(text, needle)
+            }
+        }.map { it.id }
+
+    /** 命中必须落在词的边界：队里有 a 和 ab 时，@ab 不能同时点名 a。 */
+    private fun named(text: String, needle: String): Boolean {
+        var from = 0
+        while (true) {
+            val at = text.indexOf(needle, from)
+            if (at < 0) return false
+            val next = text.getOrNull(at + needle.length)
+            if (next == null || !(next.isLetterOrDigit() || next == '_' || next == '-')) return true
+            from = at + 1
         }
-        return found
     }
 }
 
@@ -147,6 +161,10 @@ data class WorkTicket(
     val state: String,
     val botId: String,
     val needsPerson: String,
+    /** 还没结束。页签归属看它，不要自己解释 state 的词表。 */
+    val open: Boolean = true,
+    /** 后端说可以重试（卡在 failed/blocked，或投递失败）。 */
+    val retryable: Boolean = false,
 )
 
 /** 队伍自己的健康状况。 */
@@ -302,30 +320,33 @@ data class Workspace(
 )
 
 /**
- * 空态里那两个按钮按下去之后说的话。
+ * 空态里那个主按钮与分段切换的说法。
  *
- * 画板把「加第一位」和底下的分段切换都画成了能按的样子，但队伍自己的接口
- * 里还没有创建入口（队伍接口的 mobile 那一段没有 bot 这个资源），后台队列在没有 Bot 时也没有可读的东西。
- * 按下去只把缺什么说出来 —— 一块按了没反应的形状比一句实话更像出了故障。
+ * 「加第一位」现在有真接口（POST /api/mobile/bots），按下去展开内联表单；
+ * 分段切换的「后台」仍然没有可看的东西：队伍空着就没有队列，按下去只说这一句。
  */
 object EmptyCopy {
-    /** 主按钮「加第一位」。没有创建接口，桌面端也没有 —— 两边都只能改配置。 */
-    const val NO_CREATE_API = "还差一个创建接口：现在得在电脑上改配置，把 Bot 加进队伍"
-
     /** 分段切换的「后台」。 */
     const val NO_BACKEND_YET = "队伍还空着，后台没有可看的队列"
+
+    /** 内联表单上的三句提示。 */
+    const val ID_HINT = "id（小写字母、数字、- 或 _）"
+    const val NAME_HINT = "显示名"
+    const val PERSONA_HINT = "人设（可选）"
+
+    /** id 不合规时的原话。与后端、手机端共用的形状一致：^[a-z0-9_-]+$。 */
+    const val ID_INVALID = "id 只能用 a-z、0-9、- 和 _"
 }
 
 /**
- * 工作区页的文字。画板画的是「屏幕已经接上」那一刻，实际后端还没有这条接口，
- * 所以这些函数的存在意义只有一个：把「现在没有」这件事说成一句人能懂的话，
- * 而不是画一块灰板让人以为在加载。
+ * 工作区页的文字。读屏接口现在如实回「没有画面源」，所以这一页不再自己编一句
+ * 「还没接上」—— 后端说什么就写什么，说不了才落到兜底那句。
  *
  * 纯函数，测试直接钉住每一个断面。
  */
 object WorkspaceCopy {
-    /** 屏幕上还看不到东西时那一行。 */
-    const val PLACEHOLDER = "画面还没接上"
+    /** 读屏接口本身读不到时的兜底：仍然说清是「读不到」，不是「没有」。 */
+    const val SCREEN_UNREAD = "读不到它的画面"
 
     /**
      * 点一下入口时的实话。和桌面端（desktop/ui.go 里 screenReady 为 false 那一支）
@@ -342,13 +363,27 @@ object WorkspaceCopy {
     /** 顶栏的副行。 */
     const val SUBTITLE = "这不是你的屏幕，是它的"
 
+    /** 全屏那个按钮还没有接口：按下去只说实话。 */
+    const val FULLSCREEN_NOTE = "全屏还没接上"
+
+    /** 接手成功。工单真的停了才这么说。 */
+    const val TAKEOVER_DONE = "已接手，这个工单停了"
+
+    /** 它手上没有在跑的票：没有可接的活，别假装接成功了。 */
+    const val TAKEOVER_IDLE = "它手上没有活儿"
+
     /**
-     * 动作按下去之后显示的那一行。
-     *
-     * 两个动作都还没有后端接口，所以一律落到「没接上」；这不等于按钮坏了 ——
-     * 点了没有任何反馈才叫坏了。措辞里带动作名，人点哪个就知道哪件事没做。
+     * 停一下成功。scope 如实来自后端：现在只有执行器的全局暂停，
+     * 恢复要去面板 —— 把这句话说出来，省得人在手机上找恢复按钮。
      */
-    fun actionNote(action: WorkspaceAction): String = "${action.label}这一步还没接上，先别指望它真的动"
+    fun pauseDone(scope: String): String =
+        if (scope == "executor") "已让它停一下（全局执行器，恢复要去面板）" else "已让它停一下"
+
+    /** 动作失败时的原话。detail 来自后端错误体，直译，不粉饰。 */
+    fun failed(detail: String?): String = "没做成：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+
+    /** 画面块里那一行：优先写后端给的理由，没理由才落到兜底。 */
+    fun screenText(reason: String?): String = reason?.takeIf { it.isNotBlank() } ?: SCREEN_UNREAD
 
     /** 标题。「林」加一个空格加「的屏幕」，和画板一致。名字来自线上数据，先去掉两头空白再拼。 */
     fun title(bot: BotCard): String = "${bot.name.trim()} 的屏幕"
@@ -370,6 +405,32 @@ object WorkspaceCopy {
         "" -> null
         // 后端将来加新状态时，界面不该装作认识它。
         else -> null
+    }
+}
+
+/** 读屏接口的回答。live 才有 frames；unavailable 时 reason 就是手机该显示的那句话。 */
+data class ScreenView(val state: String, val reason: String)
+
+object ScreenWire {
+    fun parse(body: String): ScreenView {
+        val root = JSONObject(body)
+        return ScreenView(
+            state = root.optString("state", "unavailable"),
+            reason = root.optString("reason", ""),
+        )
+    }
+}
+
+object BotsWire {
+    /** 与后端 crew/directory.ts 的 BOT_ID、以及 TeamConfig 的 schema 同一形状。 */
+    val ID = Regex("^[a-z0-9_-]+$")
+
+    // 花名册的读走 timeline（它本来就带 bots），这里只负责写：加一位 Bot。
+    fun createBody(botId: String, name: String, persona: String): String {
+        val body = JSONObject().put("bot_id", botId).put("name", name)
+        // 空人设不上送：后端会把空串写成 persona: ""，配置里多一个没用的键。
+        if (persona.isNotBlank()) body.put("persona", persona)
+        return body.toString()
     }
 }
 

@@ -8,16 +8,28 @@ import { DecisionLine, Earlier, TicketLine, automatedRuns } from './rows.tsx'
 import { actorName, errorText, readableMarkers, reasonLabel, valueLabel, when, type T } from './text.ts'
 import { ActionLink, ClampText, ConfirmButton, Hint, LoadState, PageHead, Section, When } from './widgets.tsx'
 
-/** Disposition tags for a Trigger; omits `ignore` (the common case) and suppresses fanout tags when every target Ticket is already listed in `subscribed`. */
+/**
+ * Disposition tags for a Trigger, plus a note for one the crew read and left alone.
+ *
+ * An ignored message used to show nothing at all, so a Thread could not tell "still thinking" from "never going to
+ * answer". The reason it gave is the whole point of recording the decision, so it goes on the tag; a Decision with
+ * no reason still gets its mark rather than silently vanishing. Fanout tags are suppressed when every target Ticket
+ * is already listed in `subscribed`.
+ */
 function triggerTags(t: T, trigger: TriggerRow, subscribed?: Set<string>): ReactNode {
   const d = trigger.disposition
   const tags: ReactNode[] = []
   if (d.queued) tags.push(<Tag key="q" tone="info">{t('dispositionQueued')}</Tag>)
   else if (d.evaluating) tags.push(<Tag key="e" tone="info">{t('dispositionEvaluating')}</Tag>)
   else if (d.filtered) tags.push(<Tag key="f" tone="neutral">{t('tagFiltered', { reason: reasonLabel(t, d.filtered) })}</Tag>)
-  else if (d.decision && d.decision.outcome !== 'ignore') {
+  else if (d.decision) {
     const { tone, label } = decisionMark(t, d.decision.outcome)
-    tags.push(<Tag key="d" tone={tone}>{label}</Tag>)
+    const why = reasonLabel(t, d.decision.reason)
+    // 理由是模型原话，可能很长：标签里截断，全文留在 title。整段塞进一行会把列表撑开。
+    const brief = why.length > 60 ? `${why.slice(0, 60)}…` : why
+    // 忽略时把理由写在标签里；其余判定沿用它们本来的说法（「接单」「停止」等）。
+    tags.push(<Tag key="d" tone={tone} title={why || undefined}>{d.decision.outcome === 'ignore' && brief
+      ? t('tagIgnored', { reason: brief }) : label}</Tag>)
   }
   if (d.delivered) tags.push(<Tag key="o" tone="info" title={t('dispositionDeliveredHint')}>{t('dispositionDelivered')}</Tag>)
   else if (d.fanout.length && !(subscribed && d.fanout.every(id => subscribed.has(id)))) tags.push(<Tag key="o"

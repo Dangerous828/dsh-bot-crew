@@ -26,8 +26,10 @@ Android 客户端。Kotlin + Compose 原生重写。旧仓 `~/Code/dsh-mobile-ap
 外部客户端**不接这一层**，原因是它的同源围栏要求 Host 头严格等于 `127.0.0.1:<port>`。
 
 **消息面（message surface）**
-`/api/mobile/send` 与 `/api/mobile/timeline`，经 DSH Connection 鉴权。
-这是人跟 Bot 说话的唯一入口。桌面端与 App 都只接这一层。
+`/api/mobile/*`。两个入口：浏览器走 DSH Connection（Host/Origin/会话）；桌面端与手机走独立监听
+（`lan-server`），鉴权是设备凭据（`x-crew-device` + `x-crew-credential`）。
+除首次配对那一条外都要凭据，见 [ADR 0003](docs/adr/0003-client-pairing-and-roster-writes.md)。
+这是人跟 Bot 说话的唯一入口。
 
 ## 对话
 

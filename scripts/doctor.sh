@@ -1,6 +1,14 @@
 #!/bin/bash
 # Checks the whole crew path end to end and prints what is wrong, if anything.
 # Read-only: it never sends a message, changes settings, or starts a service it did not find.
+#
+#   scripts/doctor.sh                                   the profile that is running
+#   DSH_PROFILE=crew scripts/doctor.sh                  a named one
+#   DSH_DEVICE=crew-desktop DSH_DEVICE_CREDENTIAL=… \
+#     scripts/doctor.sh                                 also check the roster the phone receives
+#
+# No port is written down: the Web port comes from the profile's patch file (or the one the process bound),
+# and the gateway and phone listener are derived from its state directory by scripts/portcheck.py.
 set -u
 fail=0
 say() { printf '%-42s %s\n' "$1" "$2"; }

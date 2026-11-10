@@ -284,12 +284,13 @@ export async function sendTeam(host: Pick<SourceContext, 'commands' | 'deploymen
   if (!conversation || !to) throw new Error('Missing team reply target')
   try {
     // Sign the reply with the Bot that answered, so the phone can show who spoke.
-    // The outbox hands a Channel only `commands` (see `SourceChannel.send`), so `deployment` arrives undefined here
-    // even though the type says otherwise. Fall back to the CLI's own default rather than read through it: a reply
-    // must not fail because the deployment was not threaded down to this path.
-    const target = host.deployment ? queueFile(host.deployment) : []
+    // `SourceChannel.send` hands a Channel only `commands`, so `deployment` is undefined on the reply path even
+    // though the type says otherwise. `commands.deployment` is the source that is always there, and it has to be
+    // used: the CLI's own default queue is the first crew on the machine, so falling back to it would write this
+    // crew's replies into the other crew's database.
+    const at = host.deployment ?? host.commands.deployment
     await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text,
-      ...target, ...(typeof bot_id === 'string' && bot_id ? ['--bot', bot_id] : [])])
+      ...queueFile(at), ...(typeof bot_id === 'string' && bot_id ? ['--bot', bot_id] : [])])
     return 'sent'
   } catch (error) {
     if (error instanceof CliError && error.code === 410) return 'gone'

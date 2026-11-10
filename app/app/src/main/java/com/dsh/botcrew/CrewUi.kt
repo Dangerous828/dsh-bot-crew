@@ -1066,24 +1066,33 @@ private fun MessageRow(
             )
             Spacer(Modifier.height(3.dp))
         }
-        Box(
-            modifier = Modifier
-                // 画板：气泡最宽 84%，不是写死的 300dp —— 390 宽上 300 太窄、更宽的屏又太短。
-                .fillMaxWidth(0.84f)
-                .clip(
-                    if (fromBot) RoundedCornerShape(14.dp)
-                    else RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp)
-                )
-                .background(if (fromBot) palette.card else palette.userBubble)
-                .padding(horizontal = 13.dp, vertical = 10.dp),
-        ) {
+        if (fromBot) {
+            // Bot 的话裸排：画板里它没有气泡，名字下面直接是正文，左对齐，右侧留出与气泡同样的 84% 宽。
+            // 加个卡片的框会让人以为那是「一张卡片」而不是「他说的一句话」。
             Text(
                 message.text,
                 fontSize = 14.sp,
-                // 自己发的是 1.55，Bot 的话是 1.6：后者通常更长，行距松一点好读。
-                lineHeight = if (fromBot) 22.5.sp else 21.75.sp,
-                color = if (fromBot) palette.ink else palette.userInk,
+                // 比自己发的松一点：Bot 的话通常更长。
+                lineHeight = 22.5.sp,
+                color = palette.ink,
+                modifier = Modifier.fillMaxWidth(0.92f),
             )
+        } else {
+            Box(
+                modifier = Modifier
+                    // 画板：气泡最宽 84%，不是写死的 300dp —— 390 宽上 300 太窄、更宽的屏又太短。
+                    .fillMaxWidth(0.84f)
+                    .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
+                    .background(palette.userBubble)
+                    .padding(horizontal = 13.dp, vertical = 10.dp),
+            ) {
+                Text(
+                    message.text,
+                    fontSize = 14.sp,
+                    lineHeight = 21.75.sp,
+                    color = palette.userInk,
+                )
+            }
         }
     }
 }

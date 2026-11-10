@@ -95,6 +95,13 @@ export const ExecutorConfigSchema = z.object({
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
 }).strict()
+/** 远程连接：配对策略与局域网直连开关。 */
+export const RemoteConfigSchema = z.object({
+  /** `code` 凭配对码放行；`deny` 一律拒绝新设备。已经配过的不受影响。 */
+  pairing: z.enum(['code', 'deny']).default('code'),
+  /** 局域网直连。关掉就只留隧道。 */
+  lan: z.boolean().default(true),
+}).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
   paused: z.boolean().default(false),
@@ -102,6 +109,7 @@ export const SettingsSchema = z.object({
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
+  remote: RemoteConfigSchema.default(() => RemoteConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
 export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`

@@ -1,0 +1,50 @@
+# dsh-bot-crew 中转。放在 relay/ 目录下，与 Dockerfile 同级。
+#
+# 用法（NAS 上）：
+#   docker compose -f relay.compose.yml up -d
+#   docker compose -f relay.compose.yml logs -f
+#
+# 为什么端口只绑局域网地址：这个中转本身不提供 TLS。公网那一段由 Cloudflare Tunnel 或
+# NAS 上的 Caddy 终结。把端口开到 0.0.0.0，等于让明文 ws:// 直接对着公网 —— 手机带着设备
+# 凭据走明文，凭据就在链路上裸奔。
+#
+# NAS 上的实际取值（2026-11-10 首次部署，验收通过）：
+#   宿主端口 18800（容器内仍是 8787，镜像里写死的 RELAY_PORT 不改）
+#   宿主 127.0.0.1:8787 已被 devgame-act 占用，18800 避开它，也避开 8080/8642/1883
+#   caddy 与 cloudflared 都在本机，它们从 127.0.0.1:18800 取 —— 下面绑的是局域网地址，
+#   回环同样可达，不需要再加一条 127.0.0.1 映射。
+services:
+  crew-relay:
+    image: dsh-bot-crew-relay:0.1.0
+    # 想直接在 NAS 上构建就把上面一行换成：
+    # build: .
+    container_name: crew-relay
+    restart: unless-stopped
+    ports:
+      - "192.168.31.152:18800:8787"
+    environment:
+      # 宿主注册时出示的密钥。不设的话任何人都能抢注一个 instanceId。
+      # 轮换方式：改这里 → up -d，然后改宿主那边的 CREW_RELAY_SECRET。
+      RELAY_REGISTER_SECRET: "${CREW_RELAY_SECRET:?set CREW_RELAY_SECRET in .env}"
+      # 健康检查的详细视图（列出谁的机器在线）。不设就只给公开视图。
+      RELAY_ADMIN_TOKEN: "${CREW_RELAY_ADMIN_TOKEN:-}"
+      # 超时与上限。缺省值见 relay/src/main.ts。
+      RELAY_HEARTBEAT_MS: "15000"
+      RELAY_PONG_TIMEOUT_MS: "60000"
+      RELAY_RESPONSE_TIMEOUT_MS: "120000"
+      RELAY_MAX_BODY_BYTES: "262144"
+      RELAY_MAX_INFLIGHT: "64"
+      RELAY_AUTH_FAILURE_LIMIT: "20"
+    # 日志上限：公网暴露面的日志会被试探填满。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # 容器内探测走 8787（镜像里的 RELAY_PORT）；宿主端口只影响外面怎么连，不影响容器里。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

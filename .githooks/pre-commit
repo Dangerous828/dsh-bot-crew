@@ -16,6 +16,23 @@ changed() { git diff --cached --name-only --diff-filter=ACMR | grep -q "^$1/"; }
 
 failed=""
 
+# 设计稿是事实源：字号、圆角、颜色、尺寸偏离了要立刻知道。
+if changed desktop || changed app || changed designs; then
+  echo "pre-commit: 设计稿一致性检查"
+  if ! node scripts/check-design.mjs; then
+    failed="$failed design"
+  fi
+fi
+
+# 两端共用同一套逻辑的地方（消息解码、子代理标签）必须同步改。
+# 这次会话里就是先修了手机、忘了桌面端。
+if changed desktop || changed app; then
+  echo "pre-commit: 两端一致性检查"
+  if ! sh scripts/check-parity.sh; then
+    failed="$failed parity"
+  fi
+fi
+
 if changed backend || changed scripts; then
   echo "pre-commit: backend 检查（typecheck + 测试 + 构建）"
   # tests/runtime.spec.ts 断言 worker 的环境被完整还原，前提是宿主本身没带这些变量。

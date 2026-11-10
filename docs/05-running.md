@@ -141,3 +141,22 @@ go run .
 ```
 
 同样认 `DSH_GW` 与 `DSH_TOKEN` 两个环境变量；不设就连 `http://127.0.0.1:8788`（默认队伍）。
+
+## 八、出门（中转）
+
+上面那些都是同一个 Wi-Fi 下的用法。不在家的时候，让宿主主动连一个中转：
+
+```sh
+export CREW_RELAY_URLS="wss://relay.kentonnie.top/tunnel"   # 逗号分隔：第一条自建，其余兜底
+export CREW_RELAY_SECRET="<中转那边的 RELAY_REGISTER_SECRET>"
+# 可选；不设则由状态目录算出来（同一个目录永远是同一个 id）
+export CREW_RELAY_INSTANCE="kenton-mac"
+```
+
+然后重启 dsh。日志里会出现 `tunnel <id>: live`，中转那边 `GET /health?detail=1` 能看到这台。
+
+手机改用 `https://relay.kentonnie.top/i/<instanceId>/api/mobile/...` —— 路径多一段
+`/i/<instanceId>`，因为一台中转服务多台宿主机。
+
+中转本身怎么部署见 [`relay/docs/DEPLOY-NAS.md`](../relay/docs/DEPLOY-NAS.md)，
+为什么是这几条路见 [`06-relay.md`](06-relay.md)。

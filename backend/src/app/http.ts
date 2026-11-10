@@ -58,7 +58,7 @@ export interface HttpHost {
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
  */
-class RouteError extends Error { constructor(readonly status: 400 | 404, message: string) { super(message) } }
+class RouteError extends Error { constructor(readonly status: 400 | 403 | 404, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
   for await (const chunk of req) {
@@ -159,6 +159,23 @@ function routes(runtime: HttpHost): Routes {
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
+    // 配对从电脑这一侧发起：主人点一下，屏幕上出现码，自己念给自己听。手机从不来要码。
+    'POST remote/pairing': async ({ body }) => {
+      const input = await body(4 * 1024) as { deviceId?: unknown }
+      // deviceId 可选：电脑生码时不知道手机会自报什么名字，空着就是「谁先来归谁」。
+      const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
+      const settings = store.settings() as { remote?: { pairing?: 'code' | 'deny' } }
+      if ((settings.remote?.pairing ?? 'code') === 'deny') throw new RouteError(403, 'Pairing is turned off')
+      return { code: issuePairingCode(devicesOf(runtime), deviceId), deviceId }
+    },
+    'GET remote/devices': () => ({ devices: devicesOf(runtime).list().map(({ digest: _digest, ...rest }) => rest) }),
+    'DELETE remote/devices': async ({ body }) => {
+      const input = await body(4 * 1024) as { deviceId?: unknown; all?: unknown }
+      if (input?.all === true) { devicesOf(runtime).revokeAll(); return { ok: true } }
+      if (typeof input?.deviceId !== 'string' || !input.deviceId) throw new RouteError(400, 'deviceId is required')
+      devicesOf(runtime).revoke(input.deviceId)
+      return { ok: true }
+    },
     'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
     'GET threads': ({ query }) => {
       const { filter, offset, limit } = ThreadsQuery.parse(query)
@@ -227,6 +244,14 @@ function match(table: Routes, method: string, segments: string[]) {
   }
   return undefined
 }
+import { deviceStoreOf, issuePairingCode, pairingFence, pairingHandler } from './remote.ts'
+
+/** 这台机器的设备表。管理面出码、消息面兑码，两边读的必须是同一个实例。 */
+function devicesOf(runtime: HttpHost) {
+  const settings = runtime.store.settings() as { remote?: { pairing?: 'code' | 'deny' } }
+  return deviceStoreOf(runtime.machine.stateDir, settings.remote?.pairing ?? 'code')
+}
+
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
   // The fence is per request, not per bind address: sameOrigin below accepts only a loopback Host header,
   // so a Web server bound to a LAN address for the phone still refuses management calls from the network.
@@ -234,6 +259,30 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
 
   const table = routes(runtime)
   const disposers = [
+    // 配对面：手机还没配好时没有 Connection 凭据可用，所以它走普通 Web 服务，并且和后台管理一样只认回环 Host。
+    // 这是配对唯一的防线，删掉它等于把「谁都能给这台机器配一台设备」放到局域网上。
+    // 手机带凭据进来的入口。它必须挂在配对面之外：配对面只认本机，而这条路正是给局域网用的。
+    // 它自己的门是凭据本身（lanGate），不看 Host。
+    ctx.webServer.register({ kind: 'prefix', path: '/api/remote/enter', handler: async (req, res) => {
+      if (req.method !== 'POST') { json(res, 405, { error: 'POST required' }); return }
+      const payload = await readBody(req, 8 * 1024).catch(() => ({}))
+      const { deviceId, token } = (payload ?? {}) as { deviceId?: unknown; token?: unknown }
+      if (typeof deviceId !== 'string' || typeof token !== 'string') { json(res, 400, { error: 'deviceId and token are required' }); return }
+      const allowed = devicesOf(runtime).allows(deviceId, token)
+      // 不说清是设备不对还是凭据不对：那是在帮尝试者筛选。
+      json(res, allowed ? 200 : 401, allowed ? { ok: true } : { error: 'Not paired' })
+    } }),
+    ctx.webServer.register({ kind: 'prefix', path: '/api/remote', handler: async (req, res) => {
+      // 配对面有自己的一道门：它不能要求管理面那个 x-orchestrator-request 头，那等于把配对锁死。
+      if (!pairingFence(req, ctx.webServer.port)) { json(res, 403, { error: 'Local origin required' }); return }
+      // 策略从这里读，配对面才不会变成一个永远放行的假开关。
+      const remote = pairingHandler(devicesOf(runtime))
+      const payload = req.method === 'GET' ? undefined : await readBody(req, 64 * 1024).catch(() => '')
+      const reply = await remote(new Request(`http://dsh${req.url}`, {
+        method: req.method, ...(typeof payload === 'string' ? { body: payload } : {}),
+      }))
+      json(res, reply.status, await reply.json())
+    } }),
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }

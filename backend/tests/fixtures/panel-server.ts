@@ -291,6 +291,10 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  // 配对面在面板里只作展示：测试关心的是面板能不能读设备表，配对流程本身有自己的测试。
+  'POST remote/pairing': { body: true, answer: async () => ({ code: '000000', deviceId: 'test' }) },
+  'GET remote/devices': { answer: async () => ({ devices: [] }) },
+  'DELETE remote/devices': { body: true, answer: async () => ({ ok: true as const }) },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

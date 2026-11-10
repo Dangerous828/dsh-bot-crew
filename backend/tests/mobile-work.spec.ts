@@ -1,0 +1,249 @@
+import { afterEach, expect, it, vi } from 'vitest'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { phoneHandler, queuedRequests, registerMobileHttp } from '../src/app/mobile-http.ts'
+import { workOf } from '../src/app/work.ts'
+import { DeviceStore, issuePairingCode } from '../src/app/remote.ts'
+import type { HttpHost } from '../src/app/http.ts'
+
+const directories: string[] = []
+afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
+
+/** One ticket of a crew, shaped the way the store hands it out. */
+const ticket = (over: Record<string, unknown> = {}) => ({
+  id: 'tk1', title: '调开登录页间距', createdAt: '2026-11-09T10:00:00.000Z', updatedAt: '2026-11-09T10:03:00.000Z',
+  channels: [{ source: 'team' }], execution: { name: 'fix-spacing', session_id: 'worker-tk1' },
+  ended: undefined, ...over,
+})
+
+function host(over: { tickets?: { id?: string }[]; bots?: unknown[] } = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(stateDir)
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  return {
+    ready: Promise.resolve(), machine: { stateDir },
+    health: { runtime: { state: 'ready' }, mobile: { state: 'ready' } },
+    store: {
+      settings: () => ({ paused: false, sources: { team: { config: { bots: over.bots ?? [] } } } }),
+      tickets: {
+        list: () => over.tickets ?? [ticket()],
+        get: (id: string) => (over.tickets ?? [ticket()]).find(entry => entry.id === id),
+      },
+    },
+  } as unknown as HttpHost
+}
+
+it('registers the work routes on the same authenticated carrier as the rest', () => {
+  const registered: { path?: string; methods?: string[] }[] = []
+  const child = { get: () => ({ fetch: { register: (route: unknown) => { registered.push(route as never); return vi.fn(async () => {}) } } }), effect: vi.fn() }
+  const ctx = { inject: (_deps: string[], action: (scope: unknown) => void) => action(child) }
+  registerMobileHttp(ctx as never, host())
+  expect(registered.map(route => route.path)).toEqual([
+    '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models',
+    '/api/mobile/model', '/api/mobile/pair',
+  ])
+})
+
+it('returns how one ticket was worked, in order', async () => {
+  const upstream = vi.fn(async () => Response.json({}))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+
+  const response = await handler(new Request('http://dsh/api/mobile/work?ticket=tk1'))
+  expect(response.status).toBe(200)
+  // Nothing went to the gateway: how a ticket was worked is the store's answer, not a queue read.
+  expect(upstream).not.toHaveBeenCalled()
+  const got = await response.json() as { ticket_id?: string; title?: string; stage?: string; steps?: { kind: string; at: string }[] }
+  expect(got.ticket_id).toBe('tk1')
+  // A live ticket's stage comes from the stage machine; this fixture has no assignments, so it reports `unknown`
+  // rather than failing. An ended ticket is checked below.
+  expect(got.stage).toBe('unknown')
+  expect(got.title).toBe('调开登录页间距')
+  // Steps are ordered by time. The store carries none yet, so the list is empty rather than invented.
+  expect(got.steps).toEqual([])
+})
+
+it('reports the outcome of a ticket that ended', async () => {
+  const ended = { ...ticket(), ended: { outcome: 'done' } }
+  const runtimeHost = { ...host({ tickets: [ended] }), } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+  const body = await (await handler(new Request('http://dsh/api/mobile/work?ticket=tk1'))).json() as { stage?: string }
+  expect(body.stage).toBe('done')
+})
+
+it('refuses a work request that names no ticket', async () => {
+  const upstream = vi.fn(async () => Response.json({}))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  expect((await handler(new Request('http://dsh/api/mobile/work'))).status).toBe(400)
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('returns the subagent tree of a worker, however deep it goes', async () => {
+  // A live session tree: worker → subagent → subagent of a subagent.
+  const headers: Record<string, string | undefined> = {
+    'worker-tk1': undefined, 'sub-a': 'worker-tk1', 'sub-a-1': 'sub-a', 'sub-b': 'worker-tk1', unrelated: undefined,
+  }
+  const tree = {
+    get: (id: string) => id in headers ? { session: { header: { parentSession: headers[id] } } } : undefined,
+    list: () => Object.keys(headers),
+  }
+  const runtimeHost = { ...host(), agents: tree } as unknown as HttpHost
+  const upstream = vi.fn(async () => Response.json({}))
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', upstream as typeof fetch)
+
+  const result = await handler(new Request('http://dsh/api/mobile/agents?ticket=tk1'))
+  expect(result.status).toBe(200)
+  const body = await result.json() as { agents: { id: string; children: { id: string; children: { id: string }[] }[] }[] }
+  // Three levels deep is the point: a nested subagent must not be flattened away.
+  expect(body.agents[0]!.id).toBe('worker-tk1')
+  expect(body.agents[0]!.children.map(child => child.id).sort()).toEqual(['sub-a', 'sub-b'])
+  expect(body.agents[0]!.children[0]!.children).toHaveLength(1)
+  // A session outside the tree is not pulled in.
+  expect(JSON.stringify(body)).not.toContain('unrelated')
+})
+
+it('switches the model for the crew and reports what it switched to', async () => {
+  let saved: { executor?: { model?: unknown } } | undefined
+  const store = {
+    settings: () => ({ paused: false, executor: { model: { provider: 'deepseek', model: 'deepseek-v3' }, maxWorkers: 3, directory: '', prepare: '', blockedCommands: [] } }),
+    saveSettings: (next: { executor?: { model?: unknown } }) => { saved = next },
+    tickets: { list: () => [], get: () => undefined },
+  }
+  const runtimeHost = { ...host(), store } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+
+  const response = await handler(new Request('http://dsh/api/mobile/model', {
+    method: 'POST', body: JSON.stringify({ provider: 'deepseek', model: 'deepseek-v4' }),
+  }))
+  expect(response.status).toBe(200)
+  expect(await response.json()).toMatchObject({ ok: true, model: { provider: 'deepseek', model: 'deepseek-v4' } })
+  expect(saved?.executor?.model).toMatchObject({ provider: 'deepseek', model: 'deepseek-v4' })
+})
+
+it('refuses a model change with no model named', async () => {
+  const upstream = vi.fn(async () => Response.json({}))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  expect((await handler(new Request('http://dsh/api/mobile/model', { method: 'POST', body: '{}' }))).status).toBe(400)
+  // A model name with no provider does not say where to reach it.
+  expect((await handler(new Request('http://dsh/api/mobile/model', { method: 'POST', body: JSON.stringify({ model: 'x' }) }))).status).toBe(400)
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('reports a sent message with no reply yet as still queued', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [
+    { id: 'm1', role: 'user', text: '改一下间距', request_id: 'req-1', at: new Date().toISOString() },
+    { id: 'r1', role: 'agent', text: '好', bot_id: 'lin', reply_to: 'm1' },
+    { id: 'm3', role: 'user', text: '顺便看下 SE', request_id: 'req-2', at: new Date().toISOString() },
+  ] }))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  const response = await handler(new Request('http://dsh/api/mobile/timeline'))
+  const body = await response.json() as { queued?: string[]; error?: string }
+  expect({ status: response.status, error: body.error }).toEqual({ status: 200, error: undefined })
+  // m1 was answered, m3 was not: only m3 can still be withdrawn.
+  expect(body.queued).toEqual(['req-2'])
+})
+
+it('stops offering a withdraw once the crew has had time to pick the message up', () => {
+  const now = Date.parse('2026-11-09T10:00:00.000Z')
+  const items = [
+    { id: 'm1', role: 'user', request_id: 'fresh', at: '2026-11-09T09:59:30.000Z' },
+    // Older than the window: the crew is on it, so it can no longer be taken back.
+    { id: 'm2', role: 'user', request_id: 'stale', at: '2026-11-09T09:55:00.000Z' },
+  ]
+  expect(queuedRequests(items, now)).toEqual(['fresh'])
+})
+
+it('keeps a message whose time cannot be read rather than hiding it', () => {
+  // An unreadable timestamp is not evidence the crew picked it up.
+  expect(queuedRequests([{ id: 'm1', role: 'user', request_id: 'odd', at: 'not a time' }])).toEqual(['odd'])
+})
+
+it('finds subagents from the sessions the store recorded, since agents answers by id only', async () => {
+  // `ctx.agents` has no list, so the ids have to come from the store's session records.
+  const headers: Record<string, string | undefined> = {
+    'worker-tk1': undefined, 'sub-x': 'worker-tk1',
+  }
+  const trees = {
+    get: (id: string) => id in headers ? { session: { header: { parentSession: headers[id] } } } : undefined,
+    // Deliberately no `list`: this is the shape DSH actually provides.
+  }
+  const store = {
+    settings: () => ({ paused: false }),
+    keys: (family: string | { prefix: string }) =>
+      (typeof family === 'string' ? family : family.prefix) === 'session-prompts:'
+        ? ['session-prompts:worker-tk1', 'session-prompts:sub-x'] : [],
+    tickets: { list: () => [], get: () => undefined },
+  }
+  const runtimeHost = { ...host(), agents: trees, store } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+
+  const body = await (await handler(new Request('http://dsh/api/mobile/agents?ticket=tk1'))).json() as
+    { agents: { id: string; children: { id: string }[] }[] }
+  expect(body.agents[0]!.children.map(child => child.id)).toEqual(['sub-x'])
+})
+
+it('reports what the store does have: each assignment summary in order, when there are any', async () => {
+  // 工单里没有「第几步、做到哪」的明细，只有每次执行留下的 state/summary。这里说的是那份事实，
+  // 不是设计稿上画的时间线 —— 画时间线得有数据，没有数据就不编。
+  const withReport = {
+    ...ticket(),
+    assignments: [
+      { id: 'a1', state: 'ended', startedAt: '2026-11-09T10:00:00.000Z', report: { state: 'work', summary: '改了 login.tsx 两处' } },
+      { id: 'a2', state: 'running', startedAt: '2026-11-09T10:03:00.000Z', report: { state: 'work', summary: '在 390 宽度复查' } },
+    ],
+  }
+  const handler = phoneHandler(host({ tickets: [withReport] }), 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+  const body = await (await handler(new Request('http://dsh/api/mobile/work?ticket=tk1'))).json() as
+    { steps: { at: string; kind: string; text: string }[] }
+  expect(body.steps.map(step => step.text)).toEqual(['改了 login.tsx 两处', '在 390 宽度复查'])
+  expect(body.steps.map(step => step.at)).toEqual(['2026-11-09T10:00:00.000Z', '2026-11-09T10:03:00.000Z'])
+})
+
+it('orders conclusions by when they were reached, not when the work began', () => {
+  // 两次执行重叠：A 开始早、结束晚。按开始时间排会倒着念。
+  const overlapping = {
+    ...ticket(),
+    assignments: [
+      { id: 'a1', state: 'ended', startedAt: '2026-11-09T10:00:00.000Z', endedAt: '2026-11-09T10:09:00.000Z', report: { state: 'progress', summary: '先做的那件', at: '2026-11-09T10:09:00.000Z' } },
+      { id: 'a2', state: 'ended', startedAt: '2026-11-09T10:01:00.000Z', endedAt: '2026-11-09T10:05:00.000Z', report: { state: 'progress', summary: '后做完的那件', at: '2026-11-09T10:05:00.000Z' } },
+    ],
+  }
+  // 10:05 得出的结论在前，10:09 的在后 —— 按开始时间排会把这个顺序整个倒过来。
+  // stepsOf 只抽取，排序在 workOf 里 —— 这里测的是完整的读法，不是抽取本身。
+  expect(workOf(overlapping as never)!.steps.map(step => step.text)).toEqual(['后做完的那件', '先做的那件'])
+})
+
+it('lets a phone redeem its code over the message surface, which already carries credentials', async () => {
+  // 手机提交配对码走消息面：Connection 已经验过签名凭据，这正是它能到达的地方。
+  const dir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(dir)
+  const devices = new DeviceStore(dir)
+  const code = issuePairingCode(devices, '')
+
+  const runtimeHost = { ...host(), remote: devices } as unknown as HttpHost
+  const upstream = vi.fn(async () => Response.json({}))
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', upstream as typeof fetch)
+
+  const paired = await handler(new Request('http://dsh/api/mobile/pair', { method: 'POST',
+    body: JSON.stringify({ code, deviceId: 'phone-1', name: 'Kenton 的手机', platform: 'android' }) }))
+  expect(paired.status).toBe(200)
+  const credential = await paired.json() as { token?: string; deviceId?: string }
+  expect(credential.deviceId).toBe('phone-1')
+  expect(devices.allows('phone-1', credential.token!)).toBe(true)
+  // 这不需要网关参与：配对是后端自己的事。
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('refuses a wrong code over the message surface without burning the real one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(dir)
+  const devices = new DeviceStore(dir)
+  const code = issuePairingCode(devices, '')
+  const handler = phoneHandler({ ...host(), remote: devices } as unknown as HttpHost, 'http://127.0.0.1:8788',
+    vi.fn(async () => Response.json({})) as typeof fetch)
+
+  const wrong = await handler(new Request('http://dsh/api/mobile/pair', { method: 'POST',
+    body: JSON.stringify({ code: '000000', deviceId: 'phone-1', name: 'x', platform: 'android' }) }))
+  expect(wrong.status).toBe(403)
+  // 打错一次不该让人重新生成。
+  const right = await handler(new Request('http://dsh/api/mobile/pair', { method: 'POST',
+    body: JSON.stringify({ code, deviceId: 'phone-1', name: 'x', platform: 'android' }) }))
+  expect(right.status).toBe(200)
+})

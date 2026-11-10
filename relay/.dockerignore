@@ -1,0 +1,8 @@
+# 构建上下文里不需要的东西。
+# 注意：node_modules 与 dist 都要排除 —— 镜像里的 dist 是构建阶段现场编出来的，
+# 把一个 macOS 上编的 dist 拷进去，在 Linux 上会因为路径与二进制差异出怪问题。
+node_modules
+dist
+tests
+.scratch
+*.log

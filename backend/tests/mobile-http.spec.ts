@@ -21,6 +21,11 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
   expect(registered).toMatchObject([
     { path: '/api/mobile/timeline', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/send', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/work', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/agents', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
   ])
 })
 it('injects only the server credential and refuses malformed sends before enqueue', async () => {
@@ -47,4 +52,47 @@ it('shows actual runtime state and reports transport failures without secrets', 
   const failed = await handler(new Request('http://dsh/api/mobile/timeline'))
   expect(failed.status).toBe(502)
   expect(await failed.text()).not.toContain('private')
+})
+
+// 消息面的每一条都在 Connection 的 Fetch 上注册，鉴权由 Connection 在调用处理器之前完成。
+// 插件自己再加一层凭据是没用的：请求根本到不了这里。
+// 这条测试钉住「凭据由谁负责」，防止有人误以为能在插件侧绕过 Connection。
+it('leaves authentication to Connection instead of inventing a second door', () => {
+  const registered: string[] = []
+  const ctx = {
+    inject: (_deps: string[], run: (child: unknown) => void) => {
+      run({
+        get: () => ({ fetch: { register: (route: { path: string }) => { registered.push(route.path); return () => {} } } }),
+        // 注册完要在 effect 里收尾；这里只要它存在，不需要真的跑。
+        effect: () => () => {},
+      })
+    },
+    logger: { warn: () => {} },
+  }
+  registerMobileHttp(ctx as never, host() as never)
+  expect(registered.length).toBe(7)
+  // 只注册到 Connection，不额外挂到原始 web 路由上。
+  expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
+})
+
+// 左栏「模型」那一项要能选：切之前先得知道有哪些。只回可用的 provider，
+// 读不出来的那几家单独列出来，别让人以为它本来就没有模型。
+it('lists the models a person can switch to, with the one in use and the providers that failed', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(stateDir)
+  const models = vi.fn(async () => ({
+    default: { provider: 'dsh', model: 'default' }, routableProviders: ['dsh'],
+    groups: [{ id: 'dsh', name: 'DSH', models: [{ id: 'm1', name: 'Model One', description: 'fast' }] }],
+    failures: [{ id: 'broken', name: 'Broken', message: 'secret endpoint 10.0.0.1' }],
+  }))
+  const handler = phoneHandler({ ready: Promise.resolve(), machine: { stateDir }, health: {},
+    store: { settings: () => ({ paused: false, executor: { model: { provider: 'dsh', model: 'm1' } } }), tickets: { list: () => [] } },
+    models } as unknown as HttpHost, 'http://127.0.0.1:8788', vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/models'))
+  expect(result.status).toBe(200)
+  const body = await result.json() as Record<string, unknown>
+  expect(body).toMatchObject({ current: { provider: 'dsh', model: 'm1' },
+    providers: [{ id: 'dsh', name: 'DSH', models: [{ id: 'm1', name: 'Model One', description: 'fast' }] }],
+    failures: [{ id: 'broken', name: 'Broken' }] })
+  // 失败原因里可能带内网地址和密钥，不往设备上送。
+  expect(JSON.stringify(body)).not.toContain('10.0.0.1')
 })

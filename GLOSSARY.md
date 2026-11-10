@@ -56,6 +56,24 @@ Bot 是身份与呈现，**不是** Agent，也不持有任何任务状态。
 **attention**
 Bot 卡在某个问题上等人回答的状态。表现为 Ticket 上的一条 question。
 
+## 出门
+
+**relay / 中转**
+`relay/` 那个服务。宿主**出站**连它，手机从任何地方连它，它按 `instanceId` 把请求送回宿主。
+它不存状态、不验设备凭据、不认识业务路径。
+
+**tunnel / 隧道**
+宿主与中转之间那条 WebSocket 连接（`backend/src/app/tunnel.ts`）。`live` 之外的状态
+都意味着此刻手机走隧道会失败。
+
+**instanceId**
+一台宿主在中转上的名字。手机用它选机器，所以必须稳定 —— 换了它，手机就要重新找路。
+不显式配置时由状态目录算出来。
+
+**降级链**
+从便宜到贵排好的三条路：`lan` → `relay.self` → `relay.fallback`（`docs/06-relay.md`）。
+兜底与被兜底不能共享故障域，否则兜底等于没有。
+
 ## 网关与队列
 
 **gateway / mobilegw**

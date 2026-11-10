@@ -1,4 +1,3 @@
-!.env.example
 *.app
 *.log
 *.sqlite
@@ -7,6 +6,8 @@
 .DS_Store
 .env
 .env.*
+# 示例文件不是秘密，要能进仓；必须排在 .env.* 之后。
+!**/.env.example
 .venv/
 app/.gradle/
 app/app/build/

@@ -16,10 +16,18 @@ android {
         versionName = "0.1.0"
 
         // 队伍地址与 token 从本地配置读，不进仓库；没配时指向模拟器里的宿主机。
-        val gateway = providers.gradleProperty("crewGateway").getOrElse("http://10.0.2.2:8788")
+        // 默认指向队伍自己的监听，不是网关：配对和消息面都在这条路上，网关只有对话条目。
+        // 端口按 stateDir 算出来，见 backend/src/app/lan-server.ts 的 lanPort。
+        val gateway = providers.gradleProperty("crewGateway").getOrElse("http://10.0.2.2:43499")
         val gatewayToken = providers.gradleProperty("crewToken").getOrElse("")
         buildConfigField("String", "GW_BASE", "\"$gateway\"")
         buildConfigField("String", "GW_TOKEN", "\"$gatewayToken\"")
+        // 内置配对：调试包直接带着设备凭据出门，省掉每次手输地址和码。
+        // 空字符串表示不内置，照常走配对屏。
+        val builtInDevice = providers.gradleProperty("crewDevice").getOrElse("")
+        val builtInToken = providers.gradleProperty("crewCredential").getOrElse("")
+        buildConfigField("String", "CREW_DEVICE", "\"$builtInDevice\"")
+        buildConfigField("String", "CREW_CREDENTIAL", "\"$builtInToken\"")
     }
 
     buildFeatures {

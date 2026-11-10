@@ -1,0 +1,23 @@
+{
+  "name": "dsh-bot-crew-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outbound-tunnel relay for dsh-bot-crew: hosts dial in, phones reach them from anywhere.",
+  "type": "module",
+  "main": "dist/main.js",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "22.20.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}

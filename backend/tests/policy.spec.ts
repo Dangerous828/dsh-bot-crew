@@ -255,6 +255,8 @@ describe('settings migration', () => {
       policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
       eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
       executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
+      // 新加的配置块走默认值：旧存档里没有它，迁移不该为它编内容。
+      remote: { pairing: 'code', lan: true },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })

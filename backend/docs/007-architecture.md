@@ -343,7 +343,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
-| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline and idempotent sends; server-side gateway credentials |
+| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline and idempotent sends; also the work, agent-tree, model and pairing routes; server-side gateway credentials |
+| `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
+| `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
+| `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
+| `src/app/relay-protocol.ts` | Tunnel protocol v2 on the wire: `[type][id][length][payload]` frames, the 28 frame codes, the streaming decoder with its size cap, close codes and UTF-8-safe truncation. Byte-for-byte parity with the AI-HUB reference is pinned by `tests/relay-protocol.spec.ts`; `relay/` keeps a copy that `relay/sync-protocol.sh` refreshes |
+| `src/app/tunnel.ts` | The outbound tunnel: dials the relay, registers by instance id, hands the relay's requests to the phone handler through `forward`, streams the response back, keeps the heartbeat, and reconnects with exponential backoff (jittered, ceilinged). Chosen by a record rather than by patching the LAN listener |
+| `src/app/relay-chain.ts` | The ladder it walks when the phone is not on this network: LAN first, then the self-hosted relay, then relays elsewhere (`parseRelayCandidates` reads `CREW_RELAY_URLS`). A probe has its own timeout, so one hanging hop cannot stall the ladder |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
@@ -445,6 +451,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/mobile-http.spec.ts` | Connection Fetch registration, validated sends, server-only credentials and transport errors |
+| `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation |
+| `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
+| `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, port reporting, forwarding after the gate |
+| `tests/relay-protocol.spec.ts` | The wire format against the AI-HUB reference implementation, both directions: every frame code, every id width, byte-identical encoding, chunked decoding, the frame-size cap, close codes that survive Chinese reasons |
+| `tests/tunnel.spec.ts` | The outbound tunnel against a real relay: registering, serving a request, streaming, reconnect with backoff, heartbeat both ways, cancellation, upstream failures that stay off the phone |
+| `tests/relay-chain.spec.ts` | The ladder's order and its fall-through, a hanging probe that cannot stall it, the chosen route being remembered, and the environment's relay list including what it refuses |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |

@@ -17,6 +17,9 @@ interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
 
+/** 一台配过的设备。凭据摘要不外传。 */
+export interface PairedDeviceView { deviceId: string; name: string; platform: string; pairedAt: string }
+
 export interface Api {
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }
@@ -43,6 +46,10 @@ export interface Api {
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }
+  // 配对从电脑这一侧发起：主人点一下，屏幕上出码，手机拿去提交。
+  'POST remote/pairing': { body: { deviceId?: string }; response: { code: string; deviceId: string } }
+  'GET remote/devices': { response: { devices: PairedDeviceView[] } }
+  'DELETE remote/devices': { body: { deviceId?: string; all?: boolean }; response: { ok: true } }
 }
 type Path<K> = K extends `${string} ${infer P}` ? P : never
 type Params<P> = P extends `${string}:${infer Name}/${infer Rest}` ? Record<Name, string> & Params<Rest>

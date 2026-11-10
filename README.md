@@ -19,6 +19,7 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `dsh-bridge/` | 配置 + 脚本 | 把后端装进一个 dsh profile 并起起来 | `./dsh-bridge/up.sh --profile crew` |
 | `desktop/` | Go + mygo | macOS 桌面端，原生 UI，无 webview | `cd desktop && go run .` |
 | `app/` | Kotlin + Compose | Android 客户端 | `cd app && ./gradlew assembleDebug` |
+| `relay/` | TypeScript | 出门时走的中转：宿主出站连它，手机从任何地方连它 | `cd relay && pnpm install && pnpm test` |
 
 为什么后端离不开 dsh、为什么客户端只接消息面，见 `docs/adr/`；词表见 `GLOSSARY.md`。
 
@@ -33,6 +34,7 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 | `docs/03-host-wiring.md` | 怎么挂到宿主上 |
 | `docs/04-verified.md` | 已经实测过的结论 |
 | `docs/05-running.md` | 怎么把后端跑起来 |
+| `docs/06-relay.md` | 出门之后那三条路：局域网 / 自建中转 / 兜底，以及为什么是这个顺序 |
 | `docs/adr/0001` | 后端留在 dsh 进程里，不抽独立服务 |
 | `docs/adr/0002` | 客户端只接消息面，不接管理面 |
 | `.scratch/four-blocks/` | 这次拆四块的规格与票据 |

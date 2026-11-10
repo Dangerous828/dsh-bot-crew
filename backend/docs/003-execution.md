@@ -201,3 +201,18 @@ An Eval in progress does not expire during a pause; its deadline moves later by 
 ### Invalid configuration
 
 A stored Source configuration that its kind rejects disables that Source instance.
+
+## 时间字段速查
+
+一个 Assignment 上有多个时间。它们答的不是同一个问题，混用会把顺序念反。
+
+| 字段 | 什么时候写 | 答什么问题 |
+|---|---|---|
+| `createdAt` | 建这条记录时 | 这张票什么时候产生的 |
+| `startedAt` | 执行真正开始 | 干活是从哪一刻起的 |
+| `deliveredAt` | Input 最后一次送达 worker | worker 从哪一刻起还在忙这些 Input |
+| `idleAt` | worker 一轮结束、手上没活 | 它从哪一刻起空下来了 |
+| `endedAt` | 执行结束 | 这件事什么时候收的尾 |
+| `report.at` | worker 交回一句结论时 | **这句结论什么时候得出的** |
+
+排序"按时间念一串结论"时用的是 `report.at`，不是 `startedAt`。两次执行可以重叠：先开始的未必先交出结论，按开始时间排会把顺序整个念反。

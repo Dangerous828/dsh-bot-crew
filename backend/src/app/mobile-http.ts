@@ -43,6 +43,46 @@ function earliestTicketAt(data: Record<string, unknown>, botId: string): string 
   return earliest
 }
 
+/**
+ * The messages the crew read and decided not to act on, with the reason it gave.
+ *
+ * A message the crew judges as small talk produces no Ticket and therefore no reply, so the conversation shows a
+ * person talking to nobody. That is correct behaviour, but invisible: the phone cannot tell "still thinking" from
+ * "never going to answer". This names the ones that were looked at and left, so the surface can say so.
+ */
+export function declinedRequests(items: TimelineItem[], decisions: readonly { kind?: string; at?: string; threadKey?: string;
+  reason?: readonly { code?: string; values?: Record<string, unknown> }[] }[], now = Date.now(), windowMs = QUEUE_WINDOW_MS): {
+  request_id: string; reason: string
+}[] {
+  // A Trigger's Thread key carries the queue row it came from (`team:main:6`), which is how a decision points back
+  // at a message. Only the newest decision per thread counts: a follow-up can turn an earlier refusal into work.
+  const latest = new Map<string, { reason: string; at: number }>()
+  for (const decision of decisions) {
+    if (typeof decision.threadKey !== 'string') continue
+    const row = /:(\d+)$/.exec(decision.threadKey)?.[1]
+    if (!row) continue
+    const at = Date.parse(decision.at ?? '')
+    if (!Number.isFinite(at)) continue
+    const seen = latest.get(row)
+    if (seen && at <= seen.at) continue
+    // Anything other than a refusal is the crew taking the message, which supersedes an earlier refusal on the
+    // same thread: the newest decision is the one that describes what happened.
+    if (decision.kind !== 'ignore') { latest.delete(row); continue }
+    const said = decision.reason?.find(entry => typeof entry.values?.text === 'string')?.values?.text
+    latest.set(row, { reason: typeof said === 'string' && said ? said : '这条被判定不需要动手', at })
+  }
+  return items.flatMap(item => {
+    if (item.role !== 'user' || typeof item.request_id !== 'string' || !item.request_id) return []
+    const at = Date.parse(item.at ?? '')
+    if (!Number.isFinite(at) || now - at > windowMs) return []
+    const row = typeof item.id === 'string' ? /^m(\d+)$/.exec(item.id)?.[1] : undefined
+    const found = row ? latest.get(row) : undefined
+    // A decision older than the message describes a different one: the thread key is not enough on its own.
+    if (!found || found.at < at) return []
+    return [{ request_id: item.request_id, reason: found.reason }]
+  })
+}
+
 /** The Bot roster the phone offers as mention targets; unreadable settings fall back to no roster. */
 function crewRoster(settings: Settings, since: (botId: string) => string = () => ''): {
   bots: { id: string; name: string; role: string; persona?: string; since?: string }[]
@@ -230,6 +270,11 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
         // Withdrawing it means the crew has not read it, which is what the phone needs to offer.
         queued: queuedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : []),
+        // The messages read and left on purpose. Without these the phone cannot tell a thought in progress from
+        // one that will never be answered.
+        // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
+        declined: declinedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : [],
+          runtime.store.read?.recentDecisions?.(0, 200) ?? []),
         status: { runtime: runtime.health.runtime?.state ?? 'starting', mobile: runtime.health.mobile?.state ?? 'starting', paused: settings.paused } })
       }
       // `work` and `agents` are the gateway's own JSON; hand it back untouched so a new field it adds

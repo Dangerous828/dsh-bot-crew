@@ -430,7 +430,8 @@ private fun CrewScreen(
                         if (shown.messages.isNotEmpty()) listState.animateScrollToItem(shown.messages.size - 1)
                     }
                     // 连不上就别让人发：发出去也到不了，还让人以为发了。
-                    Composer(draft, shown.queued.size, sending, palette, enabled = problem == null, onChange = onDraft) {
+                    Composer(draft, shown.queued.size, shown.declined.lastOrNull()?.reason, sending, palette,
+                        enabled = problem == null, onChange = onDraft) {
                         val text = draft
                         onSending(true)
                         scope.launch {
@@ -1091,6 +1092,7 @@ private fun MessageRow(
 private fun Composer(
     draft: String,
     queued: Int,
+    declinedReason: String?,
     sending: Boolean,
     palette: CrewPalette,
     enabled: Boolean,
@@ -1102,6 +1104,15 @@ private fun Composer(
             // 排队的消息要看得见，否则发出去像石沉大海。
             Text(
                 "$queued 条排队中，等队伍读完手上这一步",
+                fontSize = 11.sp,
+                color = palette.faint,
+                modifier = Modifier.padding(start = 16.dp, top = 8.dp),
+            )
+        }
+        if (!declinedReason.isNullOrBlank()) {
+            // 读过但不动手的那条也要说一声：屏幕上只有自己说的话时，分不清「还在想」和「不会回」。
+            Text(
+                "有一条队伍看过了没动手：$declinedReason",
                 fontSize = 11.sp,
                 color = palette.faint,
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp),

@@ -689,6 +689,14 @@ func (s *app) composer(c *ui.Context, p Palette) {
 				FontSize(FontTiny).TextColor(p.Faint)
 		})
 	}
+	// 读过但不动手的那几条也要说一声，否则屏幕上只有自己说的话，分不清「还在想」和「不会回」。
+	if s.conversation != nil && len(s.conversation.Declined) > 0 {
+		declined := s.conversation.Declined[len(s.conversation.Declined)-1]
+		ui.Row(c).FillWidth().PaddingX(ContentInset).PaddingY(8).Children(func() {
+			ui.Text(c, "有一条队伍看过了没动手："+declined.Reason).
+				FontSize(FontTiny).TextColor(p.Faint)
+		})
+	}
 	// 输入区：画板里圆角 13、白底细边、上下留白，和消息流的左边距对齐。
 	ui.Row(c).FillWidth().PaddingX(ContentInset).PaddingY(12).Gap(8).Background(p.Card).Children(func() {
 		placeholder := "跟队伍说点什么"

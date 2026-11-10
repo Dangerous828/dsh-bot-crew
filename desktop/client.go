@@ -182,8 +182,17 @@ type Conversation struct {
 	Status       BackendStatus
 	// Queued holds the request ids of messages the crew has not answered yet; those can still be withdrawn.
 	Queued []string
+	// Declined holds the messages the crew read and chose not to act on, with the reason it gave. Without it the
+	// conversation cannot tell a thought still in progress from one that will never be answered.
+	Declined []Declined
 	// Model is what the crew is answering with right now; the roster footer shows it.
 	Model string
+}
+
+// Declined 是被读过、但不打算动手的那条消息，以及给出来的理由。
+type Declined struct {
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason"`
 }
 
 // Client 连一段对话。base 是消息面的根，token 是网关凭据。
@@ -210,6 +219,7 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		Tasks        []Task        `json:"tasks"`
 		Status       BackendStatus `json:"status"`
 		Queued       []string      `json:"queued"`
+		Declined     []Declined    `json:"declined"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/mobile/timeline", nil, &payload); err != nil {
 		return nil, err
@@ -219,7 +229,7 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		payload.Items[i].Text = readable(payload.Items[i].Text)
 	}
 	return &Conversation{Messages: payload.Items, Bots: payload.Bots, DefaultBotID: payload.DefaultBotID,
-		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued}, nil
+		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined}, nil
 }
 
 // Send 把一句话送进对话。mentions 里是点名的 bot_id，可以没有。

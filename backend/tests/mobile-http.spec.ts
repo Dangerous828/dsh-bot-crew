@@ -124,3 +124,26 @@ it('forwards to the gateway the state directory owns, not to the first crew on t
   await quiet(new Request('http://dsh/api/mobile/timeline'))
   expect(seen.at(-1)).toContain(':8788/timeline')
 })
+
+it('names the messages the crew read and left, so the phone can tell it apart from one still being thought about', async () => {
+  const { declinedRequests } = await import('../src/app/mobile-http.ts')
+  const items = [
+    { id: 'm1', role: 'user', request_id: 'r1', at: '2026-11-10T04:00:00.000Z' },
+    { id: 'm2', role: 'user', request_id: 'r2', at: '2026-11-10T04:05:00.000Z' },
+    { id: 'm3', role: 'user', request_id: 'r3', at: '2026-11-10T04:10:00.000Z' },
+  ]
+  const decisions = [
+    { kind: 'ignore', threadKey: 'team:main:1', at: '2026-11-10T04:00:20.000Z',
+      reason: [{ code: 'said', values: { text: '只是寒暄，不必开票' } }] },
+    // A later decision on the same thread replaces the earlier one: a follow-up can turn a refusal into work.
+    { kind: 'ignore', threadKey: 'team:main:2', at: '2026-11-10T04:05:20.000Z',
+      reason: [{ code: 'said', values: { text: '旧理由' } }] },
+    { kind: 'accept', threadKey: 'team:main:2', at: '2026-11-10T04:06:00.000Z' },
+    // A decision recorded before its message arrived describes something else, so it explains nothing.
+    // A decision on another thread never leaks onto this one either.
+  ]
+  // Within the queue window: the phone only needs this while a message still looks unanswered.
+  const now = Date.parse('2026-11-10T04:00:45.000Z')
+  const declined = declinedRequests(items as never, decisions as never, now, 90_000)
+  expect(declined).toEqual([{ request_id: 'r1', reason: '只是寒暄，不必开票' }])
+})

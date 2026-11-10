@@ -34,7 +34,12 @@ data class Conversation(
     val status: CrewStatus = CrewStatus("", "", false),
     /** 还没被回复的消息，也就是还能撤回的那几条。 */
     val queued: List<String> = emptyList(),
+    /** 队伍读过但决定不动手的消息，连理由一起。没有它，屏幕上分不清「还在想」和「不会回」。 */
+    val declined: List<Declined> = emptyList(),
 )
+
+/** 一条被读过、但不打算动手的消息。 */
+data class Declined(val requestId: String, val reason: String)
 
 /**
  * 消息面的线上格式。只说两件事：把回话读成对话，把一句话写成请求。
@@ -103,7 +108,14 @@ object CrewWire {
         )
         val queuedJson = root.optJSONArray("queued") ?: JSONArray()
         val queued = (0 until queuedJson.length()).mapNotNull { queuedJson.optString(it).takeIf(String::isNotBlank) }
-        return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued)
+        val declinedJson = root.optJSONArray("declined") ?: JSONArray()
+        val declined = (0 until declinedJson.length()).mapNotNull { index ->
+            val row = declinedJson.optJSONObject(index) ?: return@mapNotNull null
+            val requestId = row.optString("request_id")
+            if (requestId.isBlank()) return@mapNotNull null
+            Declined(requestId, row.optString("reason", ""))
+        }
+        return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined)
     }
 
     /** 发消息的请求体。requestId 是幂等键，重试要沿用同一个。 */

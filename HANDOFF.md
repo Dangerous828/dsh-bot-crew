@@ -1,6 +1,6 @@
 # 交接：dsh-bot-crew 当前状态
 
-> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `61c0997`，**69 个文件未提交**。
+> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `dc76379`，**工作区干净**。
 > 本文只写当前状态与下一步，不写新旧对比。
 
 ## 一、这是什么
@@ -9,8 +9,8 @@
 
 | 块 | 技术 | 状态 |
 |---|---|---|
-| `backend/` | TypeScript（DSH/Cordis 插件） | 1391 tests / 75 files 全绿，tsc 0 错 |
-| `desktop/` | Go + `github.com/egoist/mygo` v0.8.3 | go vet + go test 通过，**交互有缺口** |
+| `backend/` | TypeScript（DSH/Cordis 插件） | 1392 tests / 75 files 全绿，tsc 0 错 |
+| `desktop/` | Go + `github.com/egoist/mygo` v0.8.3 | go vet + go test 通过，导航与工单卡已接线 |
 | `app/` | Kotlin + Compose（`com.dsh.botcrew`） | 39 tests 通过，画板还原基本完成 |
 | `dsh-bridge/` | 配置 + `up.sh` | 可用 |
 
@@ -41,11 +41,10 @@
 - 这一版 `go build` / `go vet` / `go test` / `pre-commit` 全过
 
 **还没做的**：
-1. **左栏四个导航项全是死的**：`▤ 后台` / `◐ 模型` / `▢ 产出` / `◷ 常规任务`，`desktop/ui.go:230-260` 附近，没有一个有 `OnClick`。
-   - 「后台」应该就是右栏三标签那块的聚焦/展开
-   - 「模型」应该能切模型（后端接口 `switchModel` 已有，见 `backend/src/app/work.ts`）
-   - 「产出」「常规任务」目前后端没有对应数据，要么做成明确的空态，要么先不摆
-2. **右栏工单卡整体不可点**：只有标题文字有 `OpenWork` 入口，卡片本体是死的。
+1. ~~左栏四个导航项全是死的~~ —— **已接**：四项都有 `OnClick`，「后台」改为「已选中时才收起」
+   （原先是首次点击把它收起来，用户报的就是这个"点什么都没反应"），「模型」走 `modelPane`，
+   「产出」「常规任务」走 `emptyPane` 明确空态。见 `desktop/nav.go` + `desktop/ui.go`。
+2. ~~右栏工单卡整体不可点~~ —— **已接**：卡片本体接管 `s.openWork`，「看它怎么做」那行不再单独抢指针。
 3. **顶部「看它的屏幕」**：`screenReady` 为 false 时点击给提示，这条**是对的**（宁可说没接上，也不装死）。别改。
 4. ~~`s.workError` 字段还不存在~~ —— 已补，连同 `workRow`/`clockOf`
 
@@ -112,6 +111,11 @@ sh .githooks/pre-commit    # 上面几项串起来，应输出「pre-commit: 通
   - `SCStream`（持续流）在 1440 宽 + 多显示器下必报 `-3811`
   - `NSView.cacheDisplayInRect` 与 `CALayer.renderInContext` 抓 mygo 窗口**全是空白**——mygo 走 Metal，不往 CALayer 缓存
   - **判据：截图 88KB = 空白纯色，213KB+ = 有内容**
+- **刚启动的瞬间抓图会拿到未完成帧**：曾把「三栏挤在左上 1000×580」当成布局 bug 追了十几分钟，
+  实际布局数据一直是 1440×868、根节点铺满窗口，只是抓到了进程启动瞬间的半成品帧。
+  截图前先确认目标进程已经起来并稳定一拍，或隔一秒重抓一次再判读。
+- **验证改动的正确姿势**：源码改完 `go build` 到固定路径，只启动一次，之后全程 `shot.sh <path> <window-id>`；
+  不要为了「对照改前改后」再造一个旧版二进制，也不要为了打探针再编第四个 probe
 - **安卓**：`adb exec-out screencap -p > x.png`，绕开 ScreenCaptureKit
   - 模拟器：`~/Library/Android/sdk/emulator/emulator -avd crew -no-snapshot-load -no-audio -gpu swiftshader_indirect`
   - 凭据必须与后端一致：`-PcrewDevice=emulator -PcrewCredential=test-credential`
@@ -145,10 +149,10 @@ sh .githooks/pre-commit    # 上面几项串起来，应输出「pre-commit: 通
 
 ## 八、下一步建议顺序
 
-1. **桌面左栏四个导航项接上点击**（后台/模型/产出/常规任务目前全没 `OnClick`）
-2. **右栏工单卡本体接上点击**（现在只有标题行可点）
-3. 手机暗色主题过一遍图
-4. 桌面空态 / 断连两张画板
+1. ~~桌面左栏四个导航项接上点击~~ —— 已接（`dc76379`）
+2. ~~右栏工单卡本体接上点击~~ —— 已接（`dc76379`）
+3. 手机暗色主题过一遍图（画板 5，仍未验证）
+4. 桌面空态 / 断连两张画板（画板 2、3）
 5. NAS 部署 relay + Caddy 反代（走 Hermes）
 6. 顺手查一下 NAS 上 `dsh-relay` 容器的反复断连
 

@@ -1,6 +1,6 @@
 # 交接：dsh-bot-crew 当前状态
 
-> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `82c8a0d`，**工作区干净**。
+> 写于 2026-11-10。分支 `feat/four-blocks`，最后提交 `46cfc91`，**工作区干净**。
 > 本文只写当前状态与下一步，不写新旧对比。
 
 ## 一、这是什么
@@ -228,3 +228,55 @@ DSH_GW=http://127.0.0.1:38162 DSH_DEVICE=crew-desktop \
 ```
 
 `38162` 是 `superagent-web` 这个 stateDir 的 lan 端口；换 profile 就换端口，用 `lsof -nP -p <dsh pid>` 认。
+
+
+---
+
+## 十二、2026-11-10 13:26：端到端跑通，四个后端缺陷修完
+
+### 实机证据
+
+码农完整跑完一张工单，三轮回复全部落到手机时间线：
+
+```
+13:11:40  收到：在 README.md 末尾追加一行「验证完成」，改完告诉主人加了什么。
+13:15:19  已完成：…PR #2，分支 append-readme-line-81904779528e，提交 a5b0647，diff 1 文件 +2 −0
+13:15:23  加好了：README.md 末尾新增一行「验证完成」，见 PR #2
+```
+
+工单 `outcome: completed`，3 分 39 秒。手机 timeline 14 条，其中 3 条 agent 角色；`tasks: 2`。
+
+判定回显实测：
+
+```json
+"declined": [{"request_id": "4eba0f96-…",
+  "reason": "闲聊：主人让「写手」随便聊两句，没有任何仓库改动请求，也不匹配 copy/visual 规则。"}]
+```
+
+### 这一轮修的第四个缺陷
+
+消息被判「不需要动」时界面完全静默，屏幕上只剩自己说的话，分不清「还在想」和「不会回」。
+timeline 现在多带一个 `declined`：被 `ignore` 的消息连同它给的理由一起交出去。
+判定按线程取最新一条 —— 后来的 `accept` 会撤销先前的忽略，否则一次跟进之后还挂着旧理由。
+桌面端与手机端在输入区上方说一句「有一条队伍看过了没动手：<理由>」。
+
+### 四个后端缺陷汇总
+
+1. **配对面收不到请求体**（`http.ts`）：`readBody()` 解出对象，回填条件却写 `typeof === 'string'`，
+   body 被整个丢掉 —— 出码与兑换一律 400。面板的「配对手机」「撤销设备」一直不可用。
+2. **消息面网关端口写死 8788**（`mobile-http.ts`）：`gatewayOrigin()` 没跟随 `stateDir`，
+   第二套队伍的 timeline 被转发到第一套的网关，回来 401。
+3. **回复路径 `deployment` undefined**（`team.ts`）：`SourceChannel.send` 只传 `commands`，
+   读 `.stateDir` 直接抛 TypeError，每条回复重试 5 次后进死信。
+4. **回复写错库**（`team.ts`）：上一版退回 CLI 默认库，而它写死是 `state/superagent`，
+   第二套队伍的回复静默写进隔壁库。
+
+四个都补了回归测试，都实测「移除修复后确实红」。
+
+### 已知未做
+
+- **手机端裸排**：Bot 消息仍是白卡气泡，画板要求裸排。要拆 Box/background/clip，牵动名字与时间戳布局。
+- **手机端工作区**：`GET /api/mobile/screen` 不存在；紫色那组 `#5B4BE0/#DCD8F7/#F1EFFC` 在 `app/` 里引用 0 次。
+- **截图工具**：`SCScreenshotManager` 报 `-3811`，`CGWindowListCreateImage` 在 macOS 15+ 已移除，
+  `screencapture` 整屏全黑（锁屏或非活动空间）。功能验证走接口，视觉确认需解锁屏幕。
+- **旧库 119 条历史回复**：在 `state/superagent/mobileq.db`，属于第一套队伍，未清理。

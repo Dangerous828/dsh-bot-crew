@@ -757,6 +757,187 @@ fun screenClock(at: String): String = try {
         .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
 } catch (_: DateTimeParseException) { at }
 
+/** 产出里的一份文件：worker 真的写过的那条路径。只列路径与次数，不下发内容（契约 §5.4）。 */
+data class OutputItem(
+    val id: String,
+    val ticketId: String,
+    val path: String,
+    val title: String,
+    val kind: String,
+    val writes: Int,
+)
+
+/** 按类的条数。结果条上那句「两张图片」就是从这里来的，不在客户端自己数一遍。 */
+data class OutputCounts(val file: Int, val image: Int)
+
+/**
+ * 一张（或一栏）产出的快照（契约 §5.4）。
+ *
+ * state 的三种取值不能混：live 有东西；empty 读得到、确实没有；unavailable 读不到。
+ * 把读不到说成没有，就是替队伍编一句话。
+ */
+data class OutputsView(
+    val items: List<OutputItem>,
+    val state: String,
+    val counts: OutputCounts = OutputCounts(0, 0),
+    /** 只在 state 不是 live 时出现，是后端给的一句中文原因。 */
+    val reason: String = "",
+    /** 只在带 ?ticket= 查询时出现。 */
+    val ticketId: String = "",
+) {
+    val live: Boolean get() = state == "live"
+}
+
+object OutputsWire {
+    fun parse(body: String): OutputsView {
+        val root = JSONObject(body)
+        val items = mutableListOf<OutputItem>()
+        val raw = root.optJSONArray("items")
+        if (raw != null) for (index in 0 until raw.length()) {
+            val item = raw.optJSONObject(index) ?: continue
+            // 没有 id 的条目按契约不该出现；真出现了也不自己拼一个 —— 去重靠它。
+            val id = item.optString("id").trim()
+            if (id.isEmpty()) continue
+            items.add(
+                OutputItem(
+                    id = id,
+                    ticketId = item.optString("ticket_id").trim(),
+                    path = item.optString("path"),
+                    title = item.optString("title"),
+                    kind = item.optString("kind"),
+                    writes = item.optInt("writes", 0),
+                ),
+            )
+        }
+        val counts = root.optJSONObject("counts")
+        return OutputsView(
+            items = items,
+            // 缺省时落到 unavailable（说「读不到」是实话，说「没有」是编的）；
+            // 不认识的取值原样留着，界面只认 live —— 认不出的状态一律不画结果条。
+            state = root.optString("state", "unavailable"),
+            counts = OutputCounts(
+                file = counts?.optInt("file", 0)?.coerceAtLeast(0) ?: 0,
+                image = counts?.optInt("image", 0)?.coerceAtLeast(0) ?: 0,
+            ),
+            reason = root.optString("reason", ""),
+            ticketId = root.optString("ticket_id", ""),
+        )
+    }
+}
+
+/**
+ * 消息结果条（契约 §5.4 末节）：挂在一条消息下面那行「✓ 两张图片已放进产出」。
+ *
+ * 四条规则都在这里，界面只照着画：
+ * 1. 消息必须带 ticket_ref（读消息上那个字段，不拿代码卡里的、也不按时间猜一张票）；
+ * 2. 用 `GET /api/mobile/outputs?ticket=` 读那一张；
+ * 3. 只有 state == live 且真有条目时才画，文案由 counts 拼；
+ * 4. empty / unavailable / 请求失败一律不画 —— 结果条只在「有事发生」时出现，
+ *    把「读不到」画成一条成果，等于把故障当成队伍的产出。
+ */
+object OutputsCopy {
+    /** 这条消息该读哪张票。只认消息自己带的 `ticket_ref`；没有就是空串，绝不拿别的票顶替。 */
+    fun barTicket(message: Message): String = message.ticketRef.trim()
+
+    /**
+     * 结果条上那句话：「N 张图片已放进产出」/「N 个文件已放进产出」，两类都有就说全。
+     * 逐字对齐桌面端 outputResultLine —— 两端同一句话，人才不会以为是两件事。
+     */
+    fun resultLine(view: OutputsView): String {
+        val file = view.counts.file
+        val image = view.counts.image
+        return when {
+            file > 0 && image > 0 -> "$file 个文件 · $image 张图片已放进产出"
+            image > 0 -> "$image 张图片已放进产出"
+            file > 0 -> "$file 个文件已放进产出"
+            else -> ""
+        }
+    }
+
+    /**
+     * 这条消息下面该不该画、画哪句话。null 表示不画。
+     *
+     * view 为 null 是「读过了、读不到」或「还没读过」—— 两种情况都不画：
+     * 前者把故障画成成果，后者会先闪一条空的再变成有内容的。
+     */
+    fun barLine(view: OutputsView?): String? {
+        if (view == null || view.state != "live" || view.items.isEmpty()) return null
+        return resultLine(view).ifEmpty { null }
+    }
+}
+
+/**
+ * 结果条按票的缓存：读过就记着，读不到的也记一笔。
+ *
+ * 「读不到」和「还没读」在界面上是同一件事 —— 都不画；但缓存必须分开：
+ * 前者已经试过了，不该每帧重发请求，后者还该去读一次。桌面端 perTicket 的
+ * 「值是 nil 表示读过了、读不到」就是这条，这里照同一套做。
+ *
+ * 另加一条桌面端没有的：每条记录都带「它是第几轮时间线读来的」。读到第 3 轮、
+ * 而界面已经在第 4 轮时，这条照样算没读过、要重读 —— worker 可能只写了个文件、
+ * 一句话都没多说，消息条数不变，但产出变了。按轮次认账，而不是靠清表，
+ * 就也不需要在组合期间改状态（那会让 Compose 在画的过程中把状态写脏）。
+ */
+class OutputsCache {
+    /** 票号 → （这一轮的产出，读不到时是 null）。只有当前轮次的那条算数。 */
+    private val read = mutableMapOf<String, Pair<Int, OutputsView?>>()
+    /** 正在读的：票号 → 这一轮是第几轮。 */
+    private val reading = mutableMapOf<String, Int>()
+
+    /**
+     * 这张票现在该不该发请求。空票号永远不发 —— 没有票号就没有结果条，
+     * 不许拿别的票或最近的票顶替（契约 §5.4）。
+     */
+    fun need(ticket: String, epoch: Int): Boolean {
+        if (ticket.isEmpty()) return false
+        val cached = read[ticket]
+        if (cached != null && cached.first == epoch) return false
+        return reading[ticket] != epoch
+    }
+
+    /** 记下「这一轮已经在读了」，防止同一张票在同一轮里并发发两个请求。 */
+    fun start(ticket: String, epoch: Int): Boolean {
+        if (!need(ticket, epoch)) return false
+        reading[ticket] = epoch
+        return true
+    }
+
+    /**
+     * 一次读取结束。view 为 null 表示读不到（请求失败、404 等），也照样记一笔，
+     * 据此不再重发；结果条据此不画。
+     *
+     * 比手上这一轮旧的答案直接丢掉：刷新之后旧请求晚回来，不能把新轮次的账本
+     * 改成旧数据，也不能把新轮次「正在读」的记号抹掉 —— 那会让这一轮
+     * 永远停在「读过、没有」，结果条再也不出现。
+     */
+    fun finish(ticket: String, view: OutputsView?, epoch: Int) {
+        val startedAt = reading[ticket]
+        val current = read[ticket]?.first ?: 0
+        if (epoch < maxOf(startedAt ?: 0, current)) return
+        if (startedAt == epoch) reading.remove(ticket)
+        read[ticket] = epoch to view
+    }
+
+    /**
+     * 这一条读了一半被取消（消息滚出列表，它的 LaunchedEffect 会跟着走）：
+     * 放掉「正在读」的记号就好，不记结果 —— 滚回来时该再读一次，
+     * 否则那张票会永远停在「读过了、没有」，结果条再也不出现。
+     */
+    fun abandon(ticket: String, epoch: Int) {
+        if (reading[ticket] == epoch) reading.remove(ticket)
+    }
+
+    /** 这张票下面该画的那句话。null 就是「不画」。上一轮的结果不算数。 */
+    fun line(ticket: String, epoch: Int): String? {
+        val cached = read[ticket] ?: return null
+        if (cached.first != epoch) return null
+        return OutputsCopy.barLine(cached.second)
+    }
+
+    /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */
+    fun tried(ticket: String, epoch: Int): Boolean = read[ticket]?.first == epoch
+}
+
 object BotsWire {
     /** 与后端 crew/directory.ts 的 BOT_ID、以及 TeamConfig 的 schema 同一形状。 */
     val ID = Regex("^[a-z0-9_-]+$")

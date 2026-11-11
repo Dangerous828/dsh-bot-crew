@@ -659,3 +659,136 @@ class CodeCardButtonsTest {
         assertEquals("看看改完的样子", CodeCopy.PREVIEW)
     }
 }
+
+/**
+ * 消息结果条（契约 §5.4 末节）。
+ *
+ * 四条规则：消息带 ticket_ref、读的是那一张、只有 live 才画、empty/unavailable/失败都不画。
+ * 这里钉住每一处「宁可不画也不编」的断面 —— 结果条一旦把故障或别的票画成成果，
+ * 人就会以为那件事真的做完了。
+ */
+class OutputsBarTest {
+
+    private val liveBody = """
+        {"items":[
+           {"id":"tk-1|a.png","ticket_id":"tk-1","path":"a.png","title":"a.png","kind":"image","writes":2,"at":"2026-11-11T10:05:00Z"},
+           {"id":"tk-1|b.ts","ticket_id":"tk-1","path":"b.ts","title":"b.ts","kind":"file","writes":1,"at":"2026-11-11T10:04:00Z"}],
+         "state":"live","counts":{"file":1,"image":1},"ticket_id":"tk-1"}
+    """.trimIndent()
+
+    private fun view(body: String): OutputsView = OutputsWire.parse(body)
+
+    @Test
+    fun readsWhatTheCrewHandedOver() {
+        val parsed = view(liveBody)
+        assertEquals("live", parsed.state)
+        assertEquals(2, parsed.items.size)
+        assertEquals("tk-1|a.png", parsed.items[0].id)
+        assertEquals("image", parsed.items[0].kind)
+        assertEquals("tk-1", parsed.ticketId)
+        assertEquals(OutputCounts(file = 1, image = 1), parsed.counts)
+    }
+
+    @Test
+    fun theLineIsBuiltFromCountsTheSameWayAsTheDesktop() {
+        // 逐字对齐桌面端 outputResultLine：两端同一句话，人才不会以为是两件事。
+        assertEquals("1 个文件 · 2 张图片已放进产出",
+            OutputsCopy.resultLine(OutputsView(emptyList(), "live", OutputCounts(1, 2))))
+        assertEquals("2 张图片已放进产出",
+            OutputsCopy.resultLine(OutputsView(emptyList(), "live", OutputCounts(0, 2))))
+        assertEquals("3 个文件已放进产出",
+            OutputsCopy.resultLine(OutputsView(emptyList(), "live", OutputCounts(3, 0))))
+        // 两类都是 0：一句话也拼不出来，调用方据此不画。
+        assertEquals("", OutputsCopy.resultLine(OutputsView(emptyList(), "live", OutputCounts(0, 0))))
+    }
+
+    @Test
+    fun onlyLiveOutputsMakeABar() {
+        assertEquals("1 个文件 · 1 张图片已放进产出", OutputsCopy.barLine(view(liveBody)))
+        // empty：读得到、确实没有 —— 不画。
+        assertNull(OutputsCopy.barLine(view("""{"items":[],"state":"empty","counts":{"file":0,"image":0}}""")))
+        // unavailable：读不到 —— 也不画。把故障画成成果是最糟的一种假。
+        assertNull(OutputsCopy.barLine(view(
+            """{"items":[],"state":"unavailable","counts":{"file":0,"image":0},"reason":"这张工单的执行记录读不出来了"}""")))
+        // 请求失败：缓存里连 view 都没有。
+        assertNull(OutputsCopy.barLine(null))
+        // 说 live 却一条都没有：仍然不画，不给它编一个「0 个文件」。
+        assertNull(OutputsCopy.barLine(view("""{"items":[],"state":"live","counts":{"file":0,"image":0}}""")))
+        // 缺席的状态落到 unavailable（说读不到，不说没有）；不认识的取值原样留着，
+        // 界面只认 live，所以照样不画。
+        assertEquals("unavailable", view("""{"items":[]}""").state)
+        assertNull(OutputsCopy.barLine(view("""{"items":[],"state":"weird"}""")))
+    }
+
+    @Test
+    fun theBarOnlyReadsTheMessagesOwnTicket() {
+        fun message(raw: String): Message =
+            CrewWire.parseTimeline("""{"items":[$raw],"bots":[],"default_bot_id":""}""").messages.single()
+        // 带票号：读这一张。
+        assertEquals("tk-1", OutputsCopy.barTicket(message(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"改好了","ticket_ref":"tk-1"}""")))
+        // 没带票号：空串。界面据此什么都不读，绝不按时间猜一张最近的票。
+        assertEquals("", OutputsCopy.barTicket(message(
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"改好了"}""")))
+        // 空白票号也算没带，让「没有」只有一种形状。
+        assertEquals("", OutputsCopy.barTicket(message(
+            """{"id":"r3","role":"agent","bot_id":"coder","text":"x","ticket_ref":"  "}""")))
+    }
+
+    @Test
+    fun theCacheRemembersWhatItTriedAndOnlyAsksOnce() {
+        val cache = OutputsCache()
+        val epoch = 1
+        assertFalse("没有票号就不发请求", cache.need("", epoch))
+        assertFalse("没有票号也不记成在读", cache.start("", epoch))
+        assertTrue(cache.need("tk-1", epoch))
+        assertTrue(cache.start("tk-1", epoch))
+        assertFalse("同一张票在同一轮里不并发发第二个请求", cache.start("tk-1", epoch))
+
+        cache.finish("tk-1", view(liveBody), epoch)
+        assertFalse("读到了就不必再读", cache.need("tk-1", epoch))
+        assertEquals("1 个文件 · 1 张图片已放进产出", cache.line("tk-1", epoch))
+
+        // 读不到也记一笔：结果条不画，但同样不再重发请求。
+        assertTrue(cache.start("tk-2", epoch))
+        cache.finish("tk-2", null, epoch)
+        assertTrue(cache.tried("tk-2", epoch))
+        assertFalse(cache.need("tk-2", epoch))
+        assertNull(cache.line("tk-2", epoch))
+    }
+
+    @Test
+    fun aNewTimelineMakesTheCacheReadAgain() {
+        val cache = OutputsCache()
+        cache.start("tk-1", 1)
+        cache.finish("tk-1", view(liveBody), 1)
+        // 同一轮里反复问：不再发请求。
+        assertFalse(cache.need("tk-1", 1))
+        assertEquals("1 个文件 · 1 张图片已放进产出", cache.line("tk-1", 1))
+        // 时间线又读回来一次（第 2 轮）：worker 可能只写了个文件、一句新话也没说，
+        // 所以这一轮必须重读，而不是继续拿第 1 轮的结果画。
+        assertTrue(cache.need("tk-1", 2))
+        assertNull("上一轮的结果不拿来画这一轮", cache.line("tk-1", 2))
+        assertTrue(cache.start("tk-1", 2))
+        // 第 1 轮的请求这会儿才回来：它不能把第 2 轮的账本改成旧数据，
+        // 更不能把第 2 轮「正在读」的记号抹掉 —— 那会让这一轮永远停在「读过、没有」。
+        cache.finish("tk-1", view(liveBody), 1)
+        assertNull(cache.line("tk-1", 2))
+        assertFalse("第 2 轮仍在读，不该再发第二个请求", cache.need("tk-1", 2))
+        // 这一轮自己读回来，才开始算数。
+        cache.finish("tk-1", view(liveBody), 2)
+        assertFalse(cache.need("tk-1", 2))
+        assertEquals("1 个文件 · 1 张图片已放进产出", cache.line("tk-1", 2))
+    }
+
+    @Test
+    fun aCancelledReadIsNotRecordedAsUnreadable() {
+        val cache = OutputsCache()
+        assertTrue(cache.start("tk-9", 1))
+        cache.abandon("tk-9", 1)
+        assertFalse("取消不是读不到", cache.tried("tk-9", 1))
+        assertTrue("滚回来还要再读一次", cache.start("tk-9", 1))
+        cache.finish("tk-9", null, 1)
+        assertTrue(cache.tried("tk-9", 1))
+    }
+}

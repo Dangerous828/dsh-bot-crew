@@ -119,9 +119,12 @@ type app struct {
 	// 点选「等你决定」卡上的选项。answers 是正在发的「票号|选项 id」，防止连点；
 	// answerNote 只说成没成，不冒充断连横幅。answerTicket 记着这句话是哪张票的：
 	// 消息流里可能同时挂着两张待决的卡，答了 A 不该在 B 上也说一句「已答」。
+	// answerAsked 记着答这句话时卡上问的是哪一组（见 answerSignature）：同一张票
+	// 换了个新问题，那句话就是按上一道题说的，不能挂到新问题下面。
 	answers      map[string]bool
 	answerNote   string
 	answerTicket string
+	answerAsked  string
 	answered     chan answerResult
 
 	// 插队：把排队中的一句直接交给正在跑的 worker。
@@ -225,10 +228,12 @@ type withdrawResult struct {
 }
 
 // answerResult 是一次点选选项的结果。key 是「票号|选项 id」，带回来才知道该松开哪个按钮；
-// ticket 带回来，那句话只写在它自己那张卡上。
+// ticket 带回来，那句话只写在它自己那张卡上；asked 是答这句话时卡上问的是哪一组，
+// 结果回来时票上的问题已经变了，这句话就不该再显示。
 type answerResult struct {
 	key    string
 	ticket string
+	asked  string
 	err    error
 }
 
@@ -478,6 +483,11 @@ func (s *app) drain(c *ui.Context) {
 					before = len(s.conversation.Messages)
 				}
 				s.conversation, s.problem = conversation, ""
+				// 答完之后这张票可能已经换了一组新问题：刚才那句回执是按上一道题说的，
+				// 不能跟到新问题下面（「已按这个答了」短暂出现在新问题卡上，就是它）。
+				if s.answerNote != "" && !s.answerIsCurrent() {
+					s.answerNote = ""
+				}
 				// 聊天是「越新越靠下」：第一次读到时直接落到最底，之后只有
 				// 用户本来就在底部（没往上翻）才跟着新消息走。往上翻着读历史
 				// 时把视图拽回底部，等于把人正在看的一段抢走。
@@ -607,11 +617,16 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.answered:
 			// 发出去就重读一次：问题被答掉之后，这张卡要么换成新的一组选项，要么整张消失。
 			delete(s.answers, result.key)
-			s.answerTicket = result.ticket
+			s.answerTicket, s.answerAsked = result.ticket, result.asked
 			if result.err != nil {
 				s.answerNote = "没答上：" + result.err.Error()
 			} else {
-				s.answerNote = "已按这个答了，队伍下一步会接上"
+				// 只在这道题还在等、还是同一组时才说「已答」：结果回来时若已经
+				// 刷新成了新问题（或者这张票走了），那句话说的就是上一道题，收起来。
+				s.answerNote = ""
+				if s.answerIsCurrent() {
+					s.answerNote = "已按这个答了，队伍下一步会接上"
+				}
 				go s.refresh()
 			}
 			c.Invalidate()
@@ -1482,12 +1497,13 @@ func (s *app) answer(task Task, option AttentionOption) {
 		s.answered = make(chan answerResult, 4)
 	}
 	s.answers[slot] = true
-	s.answerNote, s.answerTicket = "", task.ID
+	asked := answerSignature(task)
+	s.answerNote, s.answerTicket, s.answerAsked = "", task.ID, asked
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation))
-		s.answered <- answerResult{key: slot, ticket: task.ID, err: err}
+		s.answered <- answerResult{key: slot, ticket: task.ID, asked: asked, err: err}
 		s.wake()
 	}()
 }
@@ -1551,7 +1567,8 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 						}).OnClick(func() { s.answer(task, option) })
 				}
 				// 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
-				if s.answerTicket == task.ID && s.answerNote != "" {
+				// 同一张票换了新问题也不算「这张卡答过」—— 那句话是按上一道题说的。
+				if s.answerTicket == task.ID && s.answerNote != "" && s.answerAsked == answerSignature(task) {
 					ui.Text(c, s.answerNote).FontSize(FontHairline).TextColor(p.Faint)
 				}
 				// 回一句就落在同一段对话里：直接聚焦输入框，不再多造一个输入层。
@@ -1583,6 +1600,31 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 
 // answerSlot 是「这张票上的这个选项」的标识：正在发的按钮和结果回来时按它对应上。
 func answerSlot(task Task, option AttentionOption) string { return task.ID + "|" + option.ID }
+
+// answerSignature 是这张卡此刻问的是哪一组：换了问题或换了选项，它就与旧的那组不同。
+// 「已按这个答了」只对得上同一组 —— 否则那张卡上写着的是另一道题。
+func answerSignature(task Task) string {
+	parts := []string{task.Question}
+	for _, option := range task.Options {
+		parts = append(parts, option.ID+"\x00"+option.Label)
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// answerIsCurrent 判断手里那句回执是不是还对得上现在这张卡：
+// 答的那道题还在等、还是同一组问题。票走了或换了新问题，这句话就该收起来。
+func (s *app) answerIsCurrent() bool {
+	if s.answerTicket == "" {
+		return false
+	}
+	for _, task := range s.pendingDecisions() {
+		if task.ID != s.answerTicket {
+			continue
+		}
+		return answerSignature(task) == s.answerAsked
+	}
+	return false
+}
 
 // optionMark 是选项左边那个字母：A、B、C…。超过 26 个就退回数字，
 // 但后端最多给四个，这条只是兜底。
@@ -1724,8 +1766,8 @@ func isWarnBot(botID string) bool {
 //   - 采用：走已有的消息通道（POST /api/mobile/send），把「采用这段改动」这句
 //     当普通回答发出去，点名写这段的那位 Bot。它本来就是一次对话里的表态，
 //     和「等你决定」卡上点选选项是同一条路。
-//   - 看看改完的样子：走已有的 POST /api/mobile/screen，读这段改动所属工单的
-//     活动快照。快照里就是它改完跑了什么、输出什么。
+//   - 看看改完的样子：走已有的 GET /api/mobile/screen?ticket=…（client.Screen，契约 §5.1），
+//     读这段改动所属工单的活动快照。快照里就是它改完跑了什么、输出什么。
 //
 // 两件事都得先说清「对谁做」：没有票号或没有署名对象时，按钮照样在，
 // 但按下去只会得到一句实话，而不是静默不动或改到别的工单上。

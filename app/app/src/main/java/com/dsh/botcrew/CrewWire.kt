@@ -1977,3 +1977,37 @@ object ReplySpendCopy {
     /** 额度告急那行字；不告急或不知道时是空串（不写一句「额度充足」占位置）。 */
     fun warning(view: ReplySpends): String = view.warning
 }
+
+
+/** 播报：把一句话念出来。念不出声时说的是为什么。 */
+data class SpeechResult(val available: Boolean, val wav: ByteArray?, val seconds: Double, val truncated: Boolean, val reason: String)
+
+object SpeechWire {
+    /** 失败时的 JSON 回答（后端念不出来时回的是 JSON，不是音频）。 */
+    fun parseFailure(body: String): SpeechResult {
+        val reason = try {
+            JSONObject(body).optString("reason")
+        } catch (_: Exception) { "" }
+        return SpeechResult(false, null, 0.0, false, reason.ifBlank { "这次没念出声" })
+    }
+}
+
+/** 播报那几行字。纯函数，测试直接钉住。 */
+object SpeechCopy {
+    const val LISTEN = "听"
+    const val PLAYING = "念着…"
+    const val FAILED = "念不出来"
+
+    /** 念完那一句：说清多长，截断的还要说明为什么只念了一部分。 */
+    fun done(seconds: Double, truncated: Boolean): String {
+        val length = when {
+            seconds <= 0.0 -> ""
+            seconds < 1.0 -> "不到 1 秒"
+            else -> "${seconds.toInt()} 秒"
+        }
+        val parts = mutableListOf<String>()
+        if (length.isNotEmpty()) parts.add(length)
+        if (truncated) parts.add("太长了，只念了前面一段")
+        return parts.joinToString(" · ")
+    }
+}

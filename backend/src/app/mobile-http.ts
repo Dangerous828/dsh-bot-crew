@@ -18,6 +18,7 @@ import type { AuditRow } from './audit.ts'
 import type { Spend } from './spend.ts'
 import type { Transcript } from './voice.ts'
 import type { Quota, ReplySpend } from './quota.ts'
+import type { SpeakOutcome } from './speech.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
@@ -47,6 +48,8 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   audit?: (ticketId: string) => Promise<AuditRow | undefined>
   /** 逐条用量：每一步用的哪个模型、花了多少、上下文还剩多少。 */
   replySpends?: (ticketId: string) => Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string } | undefined>
+  /** 播报：把一句话念成 WAV。宿主没有播报能力时如实说，不假装念了。 */
+  speak?: (text: string) => Promise<SpeakOutcome>
   /** 语音：把一段 WAV 转成文字。宿主没有识别能力时如实回 `available: false`。 */
   transcribe?: (audio: Uint8Array, signal: AbortSignal) => Promise<Transcript>
   forgetMemory?: (name: string) => boolean
@@ -332,6 +335,8 @@ const OPERATIONS = {
   voice: { methods: ['POST'] },
   // 逐条用量：每一步用的谁、多少，「它刚才那一下」问的就是这个。
   'reply-spend': { methods: ['GET'], needsTicket: true },
+  // 播报：念一句话，回 WAV。走 POST 是因为正文是要念的字。
+  speak: { methods: ['POST'] },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -433,7 +438,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
       || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory'
-      || operation === 'spend' || operation === 'audit' || operation === 'voice' || operation === 'reply-spend') {
+      || operation === 'spend' || operation === 'audit' || operation === 'voice' || operation === 'reply-spend' || operation === 'speak') {
       await runtime.ready
       if (operation === 'routines') {
         // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
@@ -461,6 +466,28 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         } catch (error) {
           return response(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
         }
+      }
+      if (operation === 'speak') {
+        const speak = runtime.speak?.bind(runtime)
+        if (!speak) return response(200, { available: false, reason: '这台后端没有接入播报' })
+        let text = ''
+        try { text = (JSON.parse(body || '{}') as { text?: unknown }).text as string ?? '' } catch { text = '' }
+        if (!text.trim()) return response(400, { error: 'text is required' })
+        const outcome = await speak(text)
+        if (outcome.status !== 'ok') {
+          return response(200, { available: false, status: outcome.status, reason: outcome.reason })
+        }
+        // 二进制回包：`audio/wav`。手机直接写进播放器。
+        // 长度与「有没有截断」放进响应头：手机不必解析 WAV 头就能显示这两件事。
+        return new Response(new Blob([outcome.audio], { type: 'audio/wav' }), {
+          status: 200,
+          headers: {
+            'cache-control': 'no-store',
+            'content-type': 'audio/wav',
+            'x-speech-seconds': outcome.seconds.toFixed(2),
+            'x-speech-truncated': outcome.truncated ? '1' : '0',
+          },
+        })
       }
       if (operation === 'voice') {
         // 语音输入：body 就是录音本身（不是 JSON、不是 base64 —— 多一层编码就多一次出错的机会）。
@@ -949,6 +976,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/voice', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 逐条用量：这张票每一步用的谁、多少、上下文还剩多少。
       connection.fetch.register({ path: '/api/mobile/reply-spend', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      // 播报：念一句话，回 WAV。
+      connection.fetch.register({ path: '/api/mobile/speak', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

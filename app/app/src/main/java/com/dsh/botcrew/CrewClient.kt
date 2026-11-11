@@ -168,6 +168,44 @@ class CrewClient(
         }
     }
 
+    /**
+     * 播报：把一句话念成 WAV。
+     *
+     * 念不出来时后端回的是 JSON（带 `reason`），念出来时回的是音频字节 ——
+     * 所以先看响应头，别把一段 JSON 当 WAV 交给播放器。
+     */
+    suspend fun speak(text: String): SpeechResult = withContext(Dispatchers.IO) {
+        val connection = URL(base + "/api/mobile/speak").openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 8_000
+            // 念一段话可能要几秒；`say` 本身很快，但要把转码算进去。
+            connection.readTimeout = 60_000
+            connection.doOutput = true
+            connection.setRequestProperty("content-type", "application/json")
+            connection.setRequestProperty("authorization", "Bearer " + token)
+            val payload = JSONObject().put("text", text).toString().toByteArray()
+            connection.setFixedLengthStreamingMode(payload.size)
+            connection.outputStream.use { it.write(payload) }
+            val code = connection.responseCode
+            val type = connection.contentType ?: ""
+            if (code !in 200..299 || !type.startsWith("audio/")) {
+                val body = (connection.errorStream ?: connection.inputStream)?.bufferedReader()?.use { it.readText() } ?: ""
+                return@withContext SpeechWire.parseFailure(body)
+            }
+            val bytes = connection.inputStream.use { it.readBytes() }
+            SpeechResult(
+                available = true,
+                wav = bytes,
+                seconds = connection.getHeaderField("x-speech-seconds")?.toDoubleOrNull() ?: 0.0,
+                truncated = connection.getHeaderField("x-speech-truncated") == "1",
+                reason = "",
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     /** 逐条用量：这张票每一步用的谁、多少、上下文还剩多少。 */
     suspend fun replySpends(ticketId: String): ReplySpends =
         parse(read("/api/mobile/reply-spend?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"), ReplySpendWire::parse)

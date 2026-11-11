@@ -2543,6 +2543,70 @@ private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
     node.children.forEach { AgentBranch(it, depth + 1, palette) }
 }
 
+/**
+ * 「听」那一小行：按一下把这句话念出来。
+ *
+ * 念不出来时说的是为什么（这台机器没有那个声音 / 转换失败），
+ * 不是一句通用的「播报不可用」—— 那三个原因的处置完全不同。
+ */
+@Composable
+private fun SpeakButton(client: CrewClient, palette: CrewPalette, text: String) {
+    val scope = rememberCoroutineScope()
+    var playing by remember { mutableStateOf(false) }
+    var note by remember { mutableStateOf("") }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    Row(
+        modifier = Modifier.padding(top = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        TextButton(
+            enabled = !playing,
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+            modifier = Modifier.defaultMinSize(minHeight = 22.dp),
+            onClick = {
+                playing = true
+                note = SpeechCopy.PLAYING
+                scope.launch {
+                    try {
+                        val result = client.speak(text)
+                        val wav = result.wav
+                        if (!result.available || wav == null) {
+                            note = result.reason
+                            return@launch
+                        }
+                        // 交给系统播放器念：不在应用里自己解码 PCM。
+                        val file = java.io.File(context.cacheDir, "speech-${System.currentTimeMillis()}.wav")
+                        java.io.FileOutputStream(file).use { it.write(wav) }
+                        note = SpeechCopy.done(result.seconds, result.truncated)
+                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                            setDataAndType(
+                                androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file),
+                                "audio/wav",
+                            )
+                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(intent)
+                    } catch (error: Exception) {
+                        note = error.message ?: SpeechCopy.FAILED
+                    } finally {
+                        playing = false
+                    }
+                }
+            },
+        ) {
+            Text(
+                if (playing) SpeechCopy.PLAYING else SpeechCopy.LISTEN,
+                fontSize = 10.5.sp,
+                color = if (playing) palette.faint else palette.accent,
+            )
+        }
+        if (note.isNotEmpty()) {
+            Text(note, fontSize = 10.sp, color = palette.faint, maxLines = 1)
+        }
+    }
+}
+
 @Composable
 private fun MessageRow(
     message: Message,
@@ -2622,6 +2686,10 @@ private fun MessageRow(
                     lineHeight = 22.4.sp,
                     color = palette.ink,
                 )
+                // 念出来：只有机器人说的话才值得听，自己打的不用念回来。
+                if (fromBot && message.text.isNotBlank()) {
+                    SpeakButton(client, palette, message.text)
+                }
                 message.code?.let { block ->
                     Spacer(Modifier.height(9.dp))
                     // 署名带下去：卡上的「采用」要点名写这段的那位，不能猜成默认 Bot。

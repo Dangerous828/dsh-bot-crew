@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  播报用的临时音频放在 cache 里，念完就该被系统回收。
+  只暴露这一层：别把应用私有的其它目录交给外部播放器。
+-->
+<paths>
+    <cache-path name="speech" path="." />
+</paths>

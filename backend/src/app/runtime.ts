@@ -38,6 +38,7 @@ import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from 
 import { approvalOf, approvalPrompt, type ApprovalDecision } from './approval.ts'
 import { quotaOf, quotaWarning, replySpendOf, type Quota, type ReplySpend } from './quota.ts'
 import { connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
+import { speak as speakText, systemSpeakHost, DEFAULT_VOICE, type SpeakOutcome, type SpeakHost } from './speech.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -545,6 +546,23 @@ export class Runtime extends Service implements SourceHost {
   /** 写操作被拦下时的那一句话，直接给人看。 */
   connectionAskText(verdict: ConnectionVerdict): string {
     return verdict.reason || `要用${verdict.kind ? KIND_NAME[verdict.kind] : '外部服务'}做改动，先问你一声`
+  }
+
+  /**
+   * 播报：把一句话念成 WAV。
+   *
+   * 用系统 `say`：与语音识别同一套前提 —— 不出本机、不传凭据、不按字计费。
+   * 宿主没有这个能力（非 macOS、或没装那个声音）时如实说，不假装念了。
+   */
+  speak(text: string): Promise<SpeakOutcome> {
+    return speakText(this.speechHost(), text, DEFAULT_VOICE)
+  }
+
+  /** 播报用的宿主。第一次用到时才建：不起子进程，只是个对象。 */
+  private speech?: SpeakHost
+  private speechHost(): SpeakHost {
+    this.speech ??= systemSpeakHost()
+    return this.speech
   }
 
   /** 已配对的设备。读不到就当没有：推送不该把整个队伍拖垮。 */

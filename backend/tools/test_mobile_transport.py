@@ -118,6 +118,20 @@ class MobileTransportTest(unittest.TestCase):
         reply = items[-1]
         self.assertEqual(reply['reply_to'], 'm%d' % first)
 
+    def test_timeline_reports_which_messages_the_crew_picked_up(self):
+        # 「未读」唯一的证据就是这个字段（契约 §5.6）。没读过是空串，被 pull/claim 取走之后有值。
+        # 先发一条、让它被取走，再发一条留在队列里，两种状态就同时出现在一份时间线里。
+        self.request('/send', {'text': '会被读走', 'request_id': 'unread-1'})
+        self.queue('pull', '--after', '0', '--json')
+        self.request('/send', {'text': '还没读', 'request_id': 'unread-2'})
+        items = self.request('/timeline')[1]['items']
+        by_request = {item['request_id']: item for item in items}
+        self.assertNotEqual(by_request['unread-1']['read_at'], '', '被取走的消息该有读走的时刻')
+        self.assertEqual(by_request['unread-2']['read_at'], '', '还在队列里的是空串')
+        # 键必须一直在：缺席会被上游读成「这份时间线说不清」，那是另一种状态。
+        for item in items:
+            self.assertIn('read_at', item)
+
     def test_claim_takes_a_message_out_of_the_queue_for_a_steer(self):
         sent = self.request('/send', {'text': '插一句', 'request_id': 'steer-1'})[1]
         status, body = self.request('/claim', {'request_id': 'steer-1'})

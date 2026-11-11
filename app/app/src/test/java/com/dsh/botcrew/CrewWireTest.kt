@@ -791,6 +791,38 @@ class OutputsBarTest {
         cache.finish("tk-9", null, 1)
         assertTrue(cache.tried("tk-9", 1))
     }
+
+    // ── 未读（契约 §5.6）────────────────────────────────────────
+    // 手机只认后端那个数。最容易出的错是把「算不出来」读成 0 —— 那会在界面上
+    // 说「都读过了」，而实际是网关根本没报告。
+
+    @Test
+    fun readsTheUnreadCountTheBackendReported() {
+        val body = """{"items":[],"bots":[],"default_bot_id":"","unread":{"count":2,"state":"live"}}"""
+        assertEquals(2, CrewWire.parseTimeline(body).unread)
+        // 读得到、确实是 0 条：0 是真话，不是「不知道」。
+        val empty = """{"items":[],"unread":{"count":0,"state":"live"}}"""
+        assertEquals(0, CrewWire.parseTimeline(empty).unread)
+    }
+
+    @Test
+    fun anUncountableTimelineIsNotZero() {
+        // state 不是 live：后端明说算不出来，count 一律不认。
+        val unknown = """{"items":[],"unread":{"count":null,"state":"unknown","reason":"没报告"}}"""
+        assertNull(CrewWire.parseTimeline(unknown).unread)
+        // 老后端整段没有这个字段：同样不下结论。
+        assertNull(CrewWire.parseTimeline("""{"items":[]}""").unread)
+        // state 说 live 却没有 count，是自相矛盾的一份，也不能当成 0。
+        assertNull(CrewWire.parseTimeline("""{"items":[],"unread":{"state":"live"}}""").unread)
+    }
+
+    @Test
+    fun theBadgeNeverGrowsPastTwoDigits() {
+        // 15dp 的胶囊放不下三位数；99 是它能完整写下的最大值。
+        assertEquals("1", unreadBadge(1))
+        assertEquals("99", unreadBadge(99))
+        assertEquals("99+", unreadBadge(100))
+    }
 }
 
 /**

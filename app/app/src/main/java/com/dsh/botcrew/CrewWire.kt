@@ -73,6 +73,13 @@ data class Conversation(
     val queued: List<String> = emptyList(),
     /** 队伍读过但决定不动手的消息，连理由一起。没有它，屏幕上分不清「还在想」和「不会回」。 */
     val declined: List<Declined> = emptyList(),
+    /**
+     * 「未读」：人发出去、队伍还没读走的有几条（契约 §5.6）。
+     *
+     * 它是 null 表示这份时间线说不清（网关没有报告读走状态），与「确实是 0 条」不同。
+     * 徽标只在非 null 且大于 0 时出现 —— 把说不清画成 0，等于替队伍说它都读过了。
+     */
+    val unread: Int? = null,
 )
 
 /** 一条被读过、但不打算动手的消息。 */
@@ -252,7 +259,22 @@ object CrewWire {
             if (requestId.isBlank()) return@mapNotNull null
             Declined(requestId, row.optString("reason", ""))
         }
-        return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined)
+        return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined,
+            unreadOf(root))
+    }
+
+    /**
+     * 「未读」的条数，读不出来时是 null（契约 §5.6）。
+     *
+     * 只认后端那个数：`count` 是整数且 `state == "live"` 才算数。两者缺一就是说不清 ——
+     * 客户端不拿 `items` 自己数一遍，那是第二份口径，迟早和后端对不上。
+     * `count` 是 0 时照实返回 0：读得到、确实没有未读，和读不出来不是一件事。
+     */
+    private fun unreadOf(root: JSONObject): Int? {
+        val unread = root.optJSONObject("unread") ?: return null
+        if (unread.optString("state") != "live") return null
+        if (!unread.has("count") || unread.isNull("count")) return null
+        return unread.optInt("count", -1).takeIf { it >= 0 }
     }
 
     /** 发消息的请求体。requestId 是幂等键，重试要沿用同一个。 */

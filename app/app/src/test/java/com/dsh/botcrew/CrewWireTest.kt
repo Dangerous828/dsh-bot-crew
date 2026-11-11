@@ -1,5 +1,6 @@
 package com.dsh.botcrew
 
+import java.time.ZoneId
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1010,5 +1011,208 @@ class TicketProgressTest {
         )
         assertEquals(4 to 5, progressOf(before))
         assertEquals(2 to 2, progressOf(after))
+    }
+}
+
+/**
+ * 常规任务（契约 §5.5）。
+ *
+ * 这一屏最容易错的地方不是画得丑，是「说了句其实没发生的事」：
+ * 把读不到说成没有、给没跑过的账编一个日期、把不认识的周期猜成「每天」、
+ * 或者把账本画成「到点会自己跑」。这里把每一处断面都钉住。
+ */
+class RoutinesBarTest {
+
+    private val liveBody = """
+        {"items":[
+           {"id":"daily-standup","title":"每天站会","cycle":"daily","bot_id":"lead","enabled":true,
+            "created_at":"2026-11-11T09:00:00.000Z","next_run":"2026-11-12T09:00:00.000Z","overdue":false},
+           {"id":"weekly-review","title":"周报","cycle":"weekly","enabled":false,
+            "created_at":"2026-11-01T09:00:00.000Z","last_run":"2026-11-08T09:00:00.000Z",
+            "next_run":"2026-11-15T09:00:00.000Z","overdue":true}],
+         "state":"live","counts":{"enabled":1,"paused":1},"runner":"none"}
+    """.trimIndent()
+
+    private fun view(body: String): RoutinesView = RoutinesWire.parse(body)
+
+    @Test
+    fun readsWhatTheSurfaceSends() {
+        val parsed = view(liveBody)
+        assertEquals("live", parsed.state)
+        assertTrue(parsed.live)
+        assertEquals(2, parsed.items.size)
+        assertEquals(RoutineCounts(enabled = 1, paused = 1), parsed.counts)
+        // 后端还没有调度器：这一栏不许被读成「已排好」。
+        assertEquals("none", parsed.runner)
+
+        val first = parsed.items[0]
+        assertEquals("daily-standup", first.id)
+        assertEquals("每天站会", first.title)
+        assertEquals("daily", first.cycle)
+        assertEquals("lead", first.botId)
+        assertTrue(first.enabled)
+        assertFalse(first.overdue)
+        assertEquals("2026-11-12T09:00:00.000Z", first.nextRun)
+        // 没跑过就是没跑过：last_run 缺席不该被解出一个日期。
+        assertEquals("", first.lastRun)
+
+        val second = parsed.items[1]
+        assertEquals("weekly", second.cycle)
+        assertFalse(second.enabled)
+        assertTrue("关着的那条也照实说它逾期了", second.overdue)
+        assertEquals("2026-11-08T09:00:00.000Z", second.lastRun)
+        // 账本允许不指定负责人：空串就是没有，不编一个 default。
+        assertEquals("", second.botId)
+    }
+
+    @Test
+    fun emptyAndUnreadableAreTwoDifferentSentences() {
+        // empty：读得到、确实一条都没有。
+        val empty = view(
+            """{"items":[],"state":"empty","counts":{"enabled":0,"paused":0},"reason":"账本里还没有常规任务","runner":"none"}"""
+        )
+        assertEquals("empty", empty.state)
+        assertFalse(empty.live)
+        assertTrue(empty.items.isEmpty())
+        assertEquals("账本里还没有常规任务", empty.reason)
+
+        // unavailable：读不到。同一份 items 是空数组，但说的必须是另一句话。
+        val broken = view(
+            """{"items":[],"state":"unavailable","counts":{"enabled":0,"paused":0},"reason":"常规任务的账本读不出来"}"""
+        )
+        assertEquals("unavailable", broken.state)
+        assertFalse(broken.live)
+        assertEquals("常规任务的账本读不出来", broken.reason)
+        // 两句话不能互相顶替 —— 这是这一栏最要紧的一条。
+        assertEquals("还没有常规任务", RoutinesCopy.EMPTY_TITLE)
+        assertEquals("读不到常规任务", RoutinesCopy.UNREADABLE_TITLE)
+        assertNotEquals(RoutinesCopy.EMPTY_TITLE, RoutinesCopy.UNREADABLE_TITLE)
+    }
+
+    @Test
+    fun aMissingStateIsUnreadableNotEmpty() {
+        // 缺 state：说「读不到」是实话，说「没有」是编的。
+        assertEquals("unavailable", view("""{"items":[]}""").state)
+        // 不认识的 state 原样留着，界面只认 live，照样不当成有账。
+        val weird = view("""{"items":[],"state":"weird"}""")
+        assertEquals("weird", weird.state)
+        assertFalse(weird.live)
+        // 后端没发 runner 时按 none 走：保守地说「不会自己跑」。
+        assertEquals("none", weird.runner)
+    }
+
+    @Test
+    fun halfRecordsAreSkippedInsteadOfBeingPadded() {
+        val parsed = view(
+            """
+            {"items":[
+               {"title":"没有 id 的一条","cycle":"daily","next_run":"2026-11-12T09:00:00Z"},
+               {"id":"no-title","cycle":"daily","next_run":"2026-11-12T09:00:00Z"},
+               {"id":"blank-title","title":"   ","cycle":"hourly"},
+               {"id":"ok","title":"好的那条","cycle":"daily"}],
+             "state":"live","counts":{"enabled":1,"paused":0},"runner":"none"}
+            """.trimIndent()
+        )
+        // 没有 id 就指认不了，没有标题那一行就是空白：两种都不画，不拿半个字段凑一行。
+        assertEquals(1, parsed.items.size)
+        assertEquals("ok", parsed.items.single().id)
+    }
+
+    @Test
+    fun anUnknownCycleIsShownAsIs() {
+        assertEquals("每小时", RoutinesCopy.cycleName("hourly"))
+        assertEquals("每天", RoutinesCopy.cycleName("daily"))
+        assertEquals("每周", RoutinesCopy.cycleName("weekly"))
+        // 不认识的周期不猜成「每天」：猜错的那一格会让人以为它明天早上就会跑。
+        assertEquals("fortnightly", RoutinesCopy.cycleName("fortnightly"))
+        // 缺 cycle 时整条不该读丢（后端已经算好 next_run），只是那一段说「周期没写」。
+        assertEquals("周期没写 · 开着", RoutinesCopy.detailLine(RoutineItem("x", "x", "")))
+    }
+
+    @Test
+    fun theLastRunLineNeverInventsADate() {
+        // 没有就是没有：只说「还没跑过」，不拿 created_at 冒充。
+        assertEquals("还没跑过", RoutinesCopy.lastRunLine(""))
+        assertEquals("还没跑过", RoutinesCopy.lastRunLine("昨天"))
+        // 读得懂才写时间，且跟着设备时区走。
+        assertEquals("上次 11-08 17:00", RoutinesCopy.lastRunLine("2026-11-08T09:00:00.000Z", UTC8))
+        // 认不出的时间不把原始串甩给人看。
+        assertEquals("", RoutinesCopy.time("2026-13-45T99:00:00Z", UTC8))
+    }
+
+    @Test
+    fun theNextRunLineSaysTheTruthAboutOverdue() {
+        val open = RoutineItem(
+            "a", "每天站会", "daily",
+            enabled = true, nextRun = "2026-11-12T01:00:00.000Z", overdue = false,
+        )
+        assertEquals("按周期算下一次 11-12 09:00", RoutinesCopy.nextRunLine(open, UTC8))
+        // 逾期写「该跑了」而不是「下一次」：确实没有人会去跑它。
+        val late = open.copy(nextRun = "2026-11-11T01:00:00.000Z", overdue = true)
+        assertEquals("该跑了（11-11 09:00）", RoutinesCopy.nextRunLine(late, UTC8))
+        // 关掉的那条不算「下一次」，否则关着也像随时会跑。
+        assertEquals("关着，不算下一次", RoutinesCopy.nextRunLine(late.copy(enabled = false), UTC8))
+        // 时间读不懂就整格不说。
+        assertEquals("", RoutinesCopy.nextRunLine(open.copy(nextRun = ""), UTC8))
+    }
+
+    @Test
+    fun theWhenLineNeverLeavesADanglingSeparator() {
+        assertEquals(
+            "还没跑过 · 该跑了（11-11 09:00）",
+            RoutinesCopy.whenLine("还没跑过", "该跑了（11-11 09:00）"),
+        )
+        assertEquals("", RoutinesCopy.whenLine("", ""))
+        assertEquals("上次 11-11 09:00", RoutinesCopy.whenLine("上次 11-11 09:00", ""))
+        assertEquals("关着，不算下一次", RoutinesCopy.whenLine("", "关着，不算下一次"))
+    }
+
+    @Test
+    fun theDetailLineDropsTheEmptyParts() {
+        val item = RoutineItem("a", "每天站会", "daily", botId = "lead", enabled = true)
+        assertEquals("每天 · 大哥 负责 · 开着", RoutinesCopy.detailLine(item, "大哥"))
+        // 花名册上没有这个人：退回 id，不空着。
+        assertEquals("每天 · lead 负责 · 开着", RoutinesCopy.detailLine(item, ""))
+        // 没指定负责人：那半句整个不写，不留一个悬空的「 · 」。
+        assertEquals("每天 · 关着", RoutinesCopy.detailLine(item.copy(botId = "", enabled = false)))
+    }
+
+    @Test
+    fun theSummaryUsesTheCountsTheSurfaceSent() {
+        assertEquals(
+            "2 条开着 · 1 条关着",
+            RoutinesCopy.summary(RoutinesView(emptyList(), "live", RoutineCounts(2, 1))),
+        )
+        assertEquals(
+            "1 条开着",
+            RoutinesCopy.summary(RoutinesView(emptyList(), "live", RoutineCounts(1, 0))),
+        )
+        // 都是 0：一个字也不拼，调用方据此整行不画。
+        assertEquals("", RoutinesCopy.summary(RoutinesView(emptyList(), "live", RoutineCounts(0, 0))))
+    }
+
+    @Test
+    fun theFootnoteOnlyAppearsWhenThereIsALedger() {
+        // 有账才说「这些账到点不会自己跑」——与桌面端逐字同一句。
+        assertEquals(
+            "这些账到点不会自己跑：后端还没有调度器，逾期只是提醒。",
+            RoutinesCopy.footnote(view(liveBody)),
+        )
+        // 还没读回来、读不到、空态：清单不存在或被换成了别的话，这句脚注不叠上去。
+        assertNull(RoutinesCopy.footnote(null))
+        assertNull(RoutinesCopy.footnote(view("""{"items":[],"state":"unavailable","reason":"读不出来"}""")))
+        assertNull(RoutinesCopy.footnote(view("""{"items":[],"state":"empty"}""")))
+        // runner 真的变成 live（将来的调度器）时，这句话就该收起来 —— 那时它就不成立了。
+        assertNull(RoutinesCopy.footnote(view(liveBody.replace("\"none\"", "\"live\""))))
+        // 认不出的 runner 照样说：说多了只是保守，说少了是假装有人会跑。
+        assertEquals(
+            RoutinesCopy.NO_SCHEDULER,
+            RoutinesCopy.footnote(view(liveBody.replace("\"none\"", "\"weird\""))),
+        )
+    }
+
+    private companion object {
+        /** 测试固定在东八区：断言里写的是人看到的本地时间，跟着 CI 的默认时区漂就没意义了。 */
+        val UTC8: ZoneId = ZoneId.of("Asia/Shanghai")
     }
 }

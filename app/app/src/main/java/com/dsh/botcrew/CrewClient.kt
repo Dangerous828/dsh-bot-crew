@@ -103,6 +103,14 @@ class CrewClient(
         return OutputsWire.parse(read("/api/mobile/outputs$query", "GET"))
     }
 
+    /**
+     * 常规任务：主人写下的定时账本（契约 §5.5）。
+     *
+     * 只有这一条读的接口，没有写接口 —— 加 / 改 / 开关 / 删这一轮都还没有定由谁来写，
+     * 所以客户端不拿本地状态去凑一份「改过了」的样子。
+     */
+    suspend fun routines(): RoutinesView = RoutinesWire.parse(read("/api/mobile/routines", "GET"))
+
     /** 接手：把这个工单停下来。停不下来就抛错，界面照实说，不假装点过了。 */
     suspend fun takeover(ticketId: String) {
         read("/api/mobile/takeover", "POST", JSONObject().put("ticket", ticketId).toString())

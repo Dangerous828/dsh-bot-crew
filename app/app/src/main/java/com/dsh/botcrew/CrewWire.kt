@@ -489,6 +489,28 @@ object WorkWire {
     }
 }
 
+/**
+ * 认两种写法：后台的 `2026-09-14T03:00:00.000Z`，以及不带时区的 `2026-09-14T03:00:00`。
+ * 后者只能当本地时间读，这是唯一能猜的解读。读不懂返回 null —— 不拿一个猜出来的时刻去填界面。
+ *
+ * 名片上「认识多久」和常规任务的「上次 / 下次跑」都读这套时间，两处各写一份迟早会走样。
+ */
+internal fun isoTimestamp(raw: String?): Instant? {
+    val text = raw?.trim().orEmpty()
+    if (text.isEmpty()) return null
+    return try {
+        OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant()
+    } catch (_: DateTimeParseException) {
+        try {
+            LocalDateTime.parse(text, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+        } catch (_: DateTimeParseException) {
+            null
+        }
+    }
+}
+
 /** 名片上「认识多久」那一行的取值。 */
 object BotSince {
     /** 只到日期：具体几点几分对「认识多久」没有意义，反而把行撑长。 */
@@ -502,28 +524,8 @@ object BotSince {
      * 不拿「未知」占位 —— 那是把缺数据画成了数据。
      */
     fun label(raw: String?, zone: ZoneId = ZoneId.systemDefault()): String? {
-        val at = instantOf(raw) ?: return null
+        val at = isoTimestamp(raw) ?: return null
         return "从 ${DATE.format(at.atZone(zone))} 起"
-    }
-
-    /**
-     * 认两种写法：后台的 `2026-09-14T03:00:00.000Z`，以及不带时区的 `2026-09-14T03:00:00`。
-     * 后者只能当本地时间读，这是唯一能猜的解读。
-     */
-    private fun instantOf(raw: String?): Instant? {
-        val text = raw?.trim().orEmpty()
-        if (text.isEmpty()) return null
-        return try {
-            OffsetDateTime.parse(text, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant()
-        } catch (_: DateTimeParseException) {
-            try {
-                LocalDateTime.parse(text, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                    .atZone(ZoneId.systemDefault())
-                    .toInstant()
-            } catch (_: DateTimeParseException) {
-                null
-            }
-        }
     }
 }
 
@@ -1049,6 +1051,224 @@ class OutputsCache {
 
     /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */
     fun tried(ticket: String, epoch: Int): Boolean = read[ticket]?.first == epoch
+}
+
+/**
+ * 账本里的一条常规任务（契约 §5.5）。
+ *
+ * 除了 id 与标题，其余全按「有没有」分档：`botId` 空就是没指定负责人、
+ * `lastRun` 空就是没记过执行、`nextRun` 空就是这个时间读不懂。
+ * 三种「没有」都不补一个假值 —— 补上去的那一格看上去和真数据一模一样。
+ */
+data class RoutineItem(
+    val id: String,
+    val title: String,
+    /** hourly / daily / weekly；不认识的周期原样留着，界面照原词显示。 */
+    val cycle: String,
+    /** 负责的 Bot。账本允许不指定（谁有空谁接），所以是空串而不是 null。 */
+    val botId: String = "",
+    val enabled: Boolean = true,
+    val createdAt: String = "",
+    /** 账本里真记过一次执行才有；没有就是空串。 */
+    val lastRun: String = "",
+    /** 后端按周期算出来的下一次，不是「已经排好的作业」。读不懂就是空串。 */
+    val nextRun: String = "",
+    /** 算出来的时间已经过了。后端没有调度器，所以这只表示「该跑了，但没人跑」。 */
+    val overdue: Boolean = false,
+)
+
+/** 开着的与关掉的各几条。用后端给的那一份，不在客户端再数一遍。 */
+data class RoutineCounts(val enabled: Int = 0, val paused: Int = 0)
+
+/**
+ * 一栏常规任务的快照（契约 §5.5）。
+ *
+ * state 与产出（§5.4）同一套三态，不许合并：
+ * - `live`：有账可列；
+ * - `empty`：读得到、确实一条都没有；
+ * - `unavailable`：读不到。这一档只能说「读不出来」，绝不能说「还没有常规任务」。
+ *
+ * `runner` 恒为 `none`：后端没有调度器，界面据此说「到点不会自己跑」，不画成「已排好」。
+ */
+data class RoutinesView(
+    val items: List<RoutineItem>,
+    val state: String,
+    val counts: RoutineCounts = RoutineCounts(),
+    /** 只在 state 不是 live 时出现，是后端给的一句中文原因。 */
+    val reason: String = "",
+    val runner: String = "none",
+) {
+    /** 只有这一档才逐条画。认不出的 state 一律不当作 live。 */
+    val live: Boolean get() = state == "live"
+}
+
+object RoutinesWire {
+    /**
+     * 读一份 `GET /api/mobile/routines` 的回答。
+     *
+     * 一条记录认不出来（没 id、没标题）就跳过那一条，不拿半个字段凑一行；
+     * 缺 `cycle` 时留空串而不是丢掉这一条 —— 后端已经按周期算好了 `next_run`，
+     * 客户端只负责「不认识的周期原样显示」，不替它判断这是不是一条真账。
+     */
+    fun parse(body: String): RoutinesView {
+        val root = JSONObject(body)
+        val items = mutableListOf<RoutineItem>()
+        val raw = root.optJSONArray("items")
+        if (raw != null) for (index in 0 until raw.length()) {
+            val item = raw.optJSONObject(index) ?: continue
+            val id = item.optString("id").trim()
+            val title = item.optString("title").trim()
+            // 没有 id 就没法指认，没有标题那一行就是一块空白：两种都不画。
+            if (id.isEmpty() || title.isEmpty()) continue
+            items.add(
+                RoutineItem(
+                    id = id,
+                    title = title,
+                    cycle = item.optString("cycle").trim(),
+                    botId = item.optString("bot_id").trim(),
+                    // 缺省是「开着」：后端只在真的关掉时才发 false，缺字段被读成关掉会凭空多一条「已关掉」。
+                    enabled = item.optBoolean("enabled", true),
+                    createdAt = item.optString("created_at").trim(),
+                    lastRun = item.optString("last_run").trim(),
+                    nextRun = item.optString("next_run").trim(),
+                    overdue = item.optBoolean("overdue", false),
+                ),
+            )
+        }
+        val counts = root.optJSONObject("counts")
+        return RoutinesView(
+            items = items,
+            // 缺省落到 unavailable：说「读不到」是实话，说「没有」是编的。
+            // 不认识的取值原样留着，界面只认 live。
+            state = root.optString("state", "unavailable"),
+            counts = RoutineCounts(
+                enabled = counts?.optInt("enabled", 0)?.coerceAtLeast(0) ?: 0,
+                paused = counts?.optInt("paused", 0)?.coerceAtLeast(0) ?: 0,
+            ),
+            reason = root.optString("reason", ""),
+            // 后端没发就按 none 走：保守地说「不会自己跑」，比假装排好了强。
+            runner = root.optString("runner", "none").ifEmpty { "none" },
+        )
+    }
+}
+
+/**
+ * 常规任务这一屏上的文字：周期、开关、上次 / 下次、栏头小结，以及三态各自那句话。
+ *
+ * 与桌面端 routinesPane / cycleName / routineSummary / routineWhenLine 逐句对齐：
+ * 同一件事在手机和电脑上得是同一句话，人才不会以为是两回事。纯函数，测试直接钉住。
+ */
+object RoutinesCopy {
+    /**
+     * 这一栏必须说的那句实话（桌面端 noSchedulerNote，一字不改）。
+     *
+     * 是账不是调度器：让人以为放着它就会跑，比空着更糟。
+     */
+    const val NO_SCHEDULER = "这些账到点不会自己跑：后端还没有调度器，逾期只是提醒。"
+
+    /** 请求已经发出、还没回来。不能说成「没有」，也不能说成「读不到」。 */
+    const val READING = "正在读常规任务…"
+
+    /** 读都读不到（请求失败）时的抬头。不是空态，绝不借用「还没有常规任务」。 */
+    const val UNREADABLE_TITLE = "读不到常规任务"
+
+    /** 后端没给原因时补的那半句：说的是「不知道为什么」，不是「没有」。 */
+    const val UNREADABLE_BODY = "队伍没说原因，这一栏现在读不出来"
+
+    /** 空态的抬头与正文（与桌面端 nav.go 的 emptyCopy 同一句）。 */
+    const val EMPTY_TITLE = "还没有常规任务"
+    const val EMPTY_BODY = "这里是定时要做的事的账本。一条都还没有；账本里的任务到点不会自己跑 —— 后端还没有调度器。"
+
+    /** 每次进屏都先说一句开关按不动，免得人按了几下才发现它只是个显示。 */
+    const val READ_ONLY = "开关只看不能按：这一版还没有改账本的接口。"
+
+    /**
+     * 周期的中文说法。认不出的原词原样显示：不猜成「每天」——
+     * 猜错的那一格会让人以为它明天早上就会跑。
+     */
+    fun cycleName(cycle: String): String = when (cycle) {
+        "hourly" -> "每小时"
+        "daily" -> "每天"
+        "weekly" -> "每周"
+        else -> cycle
+    }
+
+    /** 开关的状态词。开着就是开着，关着就说关着，没有第三种写法。 */
+    fun switchName(enabled: Boolean): String = if (enabled) "开着" else "关着"
+
+    /** 栏头那行小结：开着几条、关掉几条。都为 0 时返回空串，调用方据此整行不画。 */
+    fun summary(view: RoutinesView): String {
+        val parts = mutableListOf<String>()
+        if (view.counts.enabled > 0) parts.add("${view.counts.enabled} 条开着")
+        if (view.counts.paused > 0) parts.add("${view.counts.paused} 条关着")
+        return parts.joinToString(" · ")
+    }
+
+    /**
+     * 后端时间裁成「01-02 15:04」；读不出来返回空串。
+     * 认不出的时间不把原始串甩给人看 —— 那一串 ISO 对谁都不是一句人话。
+     */
+    fun time(at: String, zone: ZoneId = ZoneId.systemDefault()): String {
+        val moment = isoTimestamp(at) ?: return ""
+        return DateTimeFormatter.ofPattern("MM-dd HH:mm").format(moment.atZone(zone))
+    }
+
+    /**
+     * 「上次跑」这一格。没有就是没有：只写「还没跑过」，不拿 created_at 冒充，
+     * 也不补一个日期（契约 §5.5：这一版没有任何代码会自动写 last_run）。
+     */
+    fun lastRunLine(lastRun: String, zone: ZoneId = ZoneId.systemDefault()): String {
+        val clock = time(lastRun, zone)
+        return if (clock.isEmpty()) "还没跑过" else "上次 $clock"
+    }
+
+    /**
+     * 「下次跑」这一格。
+     *
+     * - 关着的那条不算「下一次」，否则关着也像随时会跑；
+     * - 逾期写「该跑了」而不是「下一次」，因为确实没有人会去跑它；
+     * - 时间读不懂就整格不说，别把原始串甩给人看。
+     */
+    fun nextRunLine(item: RoutineItem, zone: ZoneId = ZoneId.systemDefault()): String {
+        if (!item.enabled) return "关着，不算下一次"
+        val clock = time(item.nextRun, zone)
+        if (clock.isEmpty()) return ""
+        return if (item.overdue) "该跑了（$clock）" else "按周期算下一次 $clock"
+    }
+
+    /**
+     * 「上次」「下次」拼成一行。两截都不说时返回空串，调用方整行不画 ——
+     * 一行只剩一个「 · 」比没有更难读。
+     */
+    fun whenLine(lastRun: String, nextRun: String): String = when {
+        lastRun.isEmpty() && nextRun.isEmpty() -> ""
+        nextRun.isEmpty() -> lastRun
+        lastRun.isEmpty() -> nextRun
+        else -> "$lastRun · $nextRun"
+    }
+
+    /** 第二行：周期 · 谁负责 · 开关。没指定负责人的那半句整个不写，不留下悬空的分隔符。 */
+    fun detailLine(item: RoutineItem, botName: String = ""): String {
+        val cycle = cycleName(item.cycle).ifEmpty { "周期没写" }
+        val owner = botName.trim().ifEmpty { item.botId.trim() }
+        val parts = mutableListOf(cycle)
+        if (owner.isNotEmpty()) parts.add("$owner 负责")
+        parts.add(switchName(item.enabled))
+        return parts.joinToString(" · ")
+    }
+
+    /**
+     * 列表底部那行脚注。
+     *
+     * 与桌面端 routinesPane 末尾同一条规则：`runner` 不是 `live` 就写 —— 认不出的 runner
+     * （老后端、将来的新值）也一样写，说多了只是保守，说少了是假装有人会跑。
+     * 还没读回来、读不到、空态时返回 null：那时清单不在，这句话该由空态那张卡自己说，
+     * 不该在下面再叠一行「这些账」—— 会让人以为清单在下面、只是没显示出来。
+     */
+    fun footnote(view: RoutinesView?): String? {
+        if (view == null || !view.live) return null
+        return if (view.runner == "live") null else NO_SCHEDULER
+    }
 }
 
 object BotsWire {

@@ -136,11 +136,14 @@ val DarkPalette = CrewPalette(
 )
 
 /**
- * 手机上三屏：队伍、后台，以及某个 Bot 的屏幕（工作区）。
+ * 手机上这几屏：队伍、后台、某个 Bot 的屏幕（工作区）、模型，以及常规任务。
  *
  * 从队伍进去时记下是谁的屏幕 —— 张冠李戴比进不去更糟，所以这个值一路带到工作区页。
+ *
+ * 常规任务（契约 §5.5）从后台那一屏进：桌面端它也是后台左栏里的一项，
+ * 手机这一屏就是从「后台」页头点进去的同一个位置。
  */
-private enum class Screen { Crew, Backend, Workspace, Models }
+private enum class Screen { Crew, Backend, Workspace, Models, Routine }
 
 /**
  * 该 Bot 手上最近那张还没结束的票：接手与暂停都只对这张有意义。
@@ -227,7 +230,9 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
             }
 
             when (screen) {
-                Screen.Backend -> BackendScreen(client, conversation, palette, { screen = Screen.Crew }, { refresh() })
+                Screen.Backend -> BackendScreen(client, conversation, palette, { screen = Screen.Crew },
+                    { refresh() }, onRoutines = { screen = Screen.Routine })
+                Screen.Routine -> RoutineScreen(client, conversation, palette, onBack = { screen = Screen.Backend })
                 Screen.Workspace -> WorkspaceScreen(
                     client = client,
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
@@ -1351,6 +1356,8 @@ private fun BackendScreen(
     palette: CrewPalette,
     onCrew: () -> Unit,
     onRefresh: () -> Unit,
+    /** 「常规任务」：后台这一屏的常驻入口，与桌面端左栏那一项同一个位置。 */
+    onRoutines: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     // 三档：进行中 / 待你 / 已完成。手机屏窄，标签放不下一排就换成可点的文字行。
@@ -1359,6 +1366,10 @@ private fun BackendScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("后台", fontSize = 15.sp, fontWeight = FontWeight(640), color = palette.ink)
             Box(modifier = Modifier.weight(1f))
+            // 常规任务放在「队伍」旁边：这一屏本来就窄，多一个图标反而看不出是什么。
+            // 它是一个独立的一屏，不是页签 —— 进去读一次，退回来还是后台这一档。
+            // 桌面端它也是后台栏里的一项（nav.go 的 navRoutine），两边进的是同一件事。
+            TextButton(onClick = onRoutines) { Text("常规任务", color = palette.accent) }
             TextButton(onClick = onCrew) { Text("队伍", color = palette.accent) }
         }
         val allTickets = conversation?.tickets.orEmpty()
@@ -1442,6 +1453,217 @@ private fun BackendScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * 「常规任务」：主人写下的定时账本（契约 §5.5）。
+ *
+ * 三态分开说，一句都不能互相顶替：
+ * - 还没读回来：说「正在读」；
+ * - `live`：逐条列标题、周期、负责的 Bot、开关、上次 / 下次跑，底部一行「到点不会自己跑」；
+ * - `empty`：读得到、确实一条都没有 —— 说「还没有常规任务」，并且同样说明它不会自己跑；
+ * - `unavailable` / 请求失败：只说「读不到」，绝不借用「还没有」。
+ *
+ * 开关这一版只是显示：后端没有写接口，按下去看起来生效了就是撒谎。所以每一条的开关
+ * 只写一个词（开着 / 关着），顶上还先写一句「只看不能按」。
+ *
+ * 进来读一次，不轮询：这一屏是账本，不是正在发生的事；返回再进来会重新读一遍
+ * （组合项整个重建），下次跑的时间因此不会停在上一次。
+ */
+@Composable
+private fun RoutineScreen(
+    client: CrewClient,
+    conversation: Conversation?,
+    palette: CrewPalette,
+    onBack: () -> Unit,
+) {
+    // null 表示还没读回来。读失败时 view 也是 null，另有 problem 说明为什么。
+    var view by remember { mutableStateOf<RoutinesView?>(null) }
+    var problem by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        try {
+            view = client.routines()
+            problem = null
+        } catch (error: Exception) {
+            problem = error.message
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(palette.card)
+                .padding(start = 6.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // 退回后台：这一屏就是从那里进来的，回去还是那一档。
+            TextButton(onClick = onBack) { Text("返回", color = palette.accent) }
+            Text("常规任务", fontSize = 20.sp, fontWeight = FontWeight(660), color = palette.ink)
+            Spacer(Modifier.weight(1f))
+        }
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+
+        val loaded = view
+        if (loaded == null) {
+            // 读失败先说读失败：那时说「正在读」是句假话，说「还没有」是编的。
+            val unreadable = problem != null
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .background(palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    if (unreadable) RoutinesCopy.UNREADABLE_TITLE else RoutinesCopy.READING,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight(600),
+                    color = palette.muted,
+                )
+                // 请求失败时带上队伍那句话（可能是 401、503），原样写出来，不粉饰成「读不到」。
+                if (unreadable) {
+                    Text(
+                        problem ?: RoutinesCopy.UNREADABLE_BODY,
+                        fontSize = 12.sp,
+                        lineHeight = 19.sp,
+                        color = palette.danger,
+                    )
+                }
+            }
+            return@Column
+        }
+
+        if (!loaded.live || loaded.items.isEmpty()) {
+            // empty 与 unavailable 都落在这里，但说的不是同一句话。
+            val unreadable = !loaded.live
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .background(palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    if (unreadable) RoutinesCopy.UNREADABLE_TITLE else RoutinesCopy.EMPTY_TITLE,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight(600),
+                    color = palette.muted,
+                )
+                // 后端给了原因就写它那一句；没给才落到这两句各自的兜底，不自己编一个理由。
+                Text(
+                    when {
+                        unreadable -> loaded.reason.ifBlank { RoutinesCopy.UNREADABLE_BODY }
+                        else -> RoutinesCopy.EMPTY_BODY
+                    },
+                    fontSize = 12.sp,
+                    lineHeight = 19.sp,
+                    color = palette.faint,
+                )
+                if (!unreadable) {
+                    // 空态更要说清它不会自己跑：让人以为写着就会跑，比空着更糟。
+                    Text(RoutinesCopy.NO_SCHEDULER, fontSize = 11.sp, color = palette.faint)
+                }
+            }
+            return@Column
+        }
+
+        // 栏头小结：用后端给的 counts，不自己再数一遍。
+        val summary = RoutinesCopy.summary(loaded)
+        if (summary.isNotEmpty()) {
+            Text(
+                summary,
+                fontSize = 11.sp,
+                color = palette.faint,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        // 先把「开关按不动」说在前面：等按了几下才发现它只是个显示，比一开始就说清楚更伤人。
+        Text(
+            RoutinesCopy.READ_ONLY,
+            fontSize = 11.sp,
+            color = palette.hint,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+        )
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(loaded.items, key = { it.id }) { item ->
+                RoutineRow(item, conversation, palette)
+            }
+        }
+        // 脚注钉在列表下面，不滚走：账本有一百条的时候，「到点不会自己跑」这句话
+        // 也不该跟着滚出屏幕 —— 它说的不是某一条，是整本账的性质。
+        // 与桌面端 routinesPane 末尾那行同一句、同一个位置（清单之后）。
+        RoutinesCopy.footnote(loaded)?.let { line ->
+            Text(
+                line,
+                fontSize = 11.sp,
+                lineHeight = 17.sp,
+                color = palette.faint,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+        }
+    }
+}
+
+/**
+ * 账本里的一条：标题（带逾期标记）、周期 · 谁负责 · 开关、上次 / 下次。
+ *
+ * 「上次跑」没有就写「还没跑过」，不填日期；关着的那条不说「下一次」，逾期也只对开着的说。
+ * 开关写成一个词（开着 / 关着），不是开关控件：这一版没有写接口，
+ * 画一个能拨的形状就是在许一个空诺 —— 拨过去什么也不会发生。
+ */
+@Composable
+private fun RoutineRow(item: RoutineItem, conversation: Conversation?, palette: CrewPalette) {
+    // 负责人的名字优先用花名册上的；不在花名册（或没这个人）时把 id 原样写出来，不空着。
+    val botName = conversation?.bots?.firstOrNull { it.id == item.botId }?.name.orEmpty()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(palette.card, RoundedCornerShape(10.dp))
+            .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+            .padding(horizontal = 11.dp, vertical = 9.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                item.title,
+                fontSize = 13.sp,
+                fontWeight = FontWeight(600),
+                color = palette.ink,
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+            )
+            // 逾期只说开着的那条：关掉的账不算「该跑了」，那是替它安排了一件不会发生的事。
+            if (item.overdue && item.enabled) {
+                Text("逾期", fontSize = 10.5.sp, color = palette.warn)
+            }
+            Text(
+                RoutinesCopy.switchName(item.enabled),
+                fontSize = 10.5.sp,
+                color = if (item.enabled) palette.accent else palette.faint,
+            )
+        }
+        Text(
+            RoutinesCopy.detailLine(item, botName),
+            fontSize = 11.sp,
+            color = palette.muted,
+            maxLines = 1,
+        )
+        val whens = RoutinesCopy.whenLine(
+            RoutinesCopy.lastRunLine(item.lastRun),
+            RoutinesCopy.nextRunLine(item),
+        )
+        if (whens.isNotEmpty()) {
+            Text(whens, fontSize = 11.sp, color = palette.faint, maxLines = 1)
         }
     }
 }

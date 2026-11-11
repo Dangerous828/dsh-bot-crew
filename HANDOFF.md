@@ -10,7 +10,7 @@
 
 | 块 | 技术 | 状态 |
 |---|---|---|
-| `backend/` | TypeScript（DSH/Cordis 插件） | 1392 tests / 75 files 全绿（**此为旧基线**，11-11 已到 78 files / 1447 tests，见 §十五），tsc 0 错 |
+| `backend/` | TypeScript（DSH/Cordis 插件） | **78 个 spec 文件**（67 `.spec.ts` + 11 `.spec.tsx`）全绿，tsc 0 错（用例数早期记录已作废，口径统一为 spec 文件数） |
 | `desktop/` | Go + `github.com/egoist/mygo` v0.8.3 | go vet + go test 通过，导航与工单卡已接线 |
 | `app/` | Kotlin + Compose（`com.dsh.botcrew`） | 39 tests 通过，画板还原基本完成 |
 | `dsh-bridge/` | 配置 + `up.sh` | 可用 |
@@ -67,7 +67,7 @@
 
 ## 五、隧道与中转（已部署）
 
-- `backend/src/app/relay-protocol.ts` / `tunnel.ts` / `relay-chain.ts` + `relay/` 服务端：**代码完成**，backend 1418 tests、relay 55 tests 全绿。
+- `backend/src/app/relay-protocol.ts` / `tunnel.ts` / `relay-chain.ts` + `relay/` 服务端：**代码完成**，backend 78 个 spec 文件、relay 55 tests 全绿。
 - **已部署到 NAS**（2026-11-10）：容器 `crew-relay` 监听 `192.168.31.152:18800`，公网入口
   `https://jarvis.kentonnie.top/crew-relay/`（jarvis-caddy 的 `handle_path /crew-relay/*`）。
   实测 `/health` 返回 `tunnels:1`，带设备凭据的 timeline 返回 200；未带凭据返回 401
@@ -285,7 +285,10 @@ timeline 现在多带一个 `declined`：被 `ignore` 的消息连同它给的�
 
 ### 已知未做
 
-- **手机端裸排**：Bot 消息仍是白卡气泡，画板要求裸排。要拆 Box/background/clip，牵动名字与时间戳布局。
+- ~~**手机端裸排**：Bot 消息仍是白卡气泡，画板要求裸排。要拆 Box/background/clip，牵动名字与时间戳布局。~~
+  —— 2026-11-10 14:07 提交 `81846d0`（feat(app): Bot 的话不再套气泡）已做：Bot 消息改为裸排
+  （名字一行 + 正文 14/22.5、`palette.ink`、左侧 25×25 头像列），只有自己发的话仍是深色胶囊 + 右下 4dp 尖角。
+  见 `app/.../CrewUi.kt` 的 `MessageRow`。
 - ~~**手机端工作区**：`GET /api/mobile/screen` 不存在~~ —— 2026-11-10 已实现 `screen` / `takeover` / `pause`
   与 `bots` 四个接口，手机端已接线（见 `交接-剩余五项-20261110.md`）。画面源本身仍未接，接口如实回 `unavailable`。
 - **截图工具**：`SCScreenshotManager` 报 `-3811`，`CGWindowListCreateImage` 在 macOS 15+ 已移除，
@@ -375,7 +378,7 @@ settings/team/tickets，**不含任何凭据**。桌面按钮落到 `~/Desktop/c
   `shutdown()` 里 clearTimeout。
 
 **测试**
-backend `pnpm check`（typecheck + 78 文件 / 1429 用例）、desktop `go vet` + `go test`、
+backend `pnpm check`（typecheck + 78 个 spec 文件，口径按文件数；当时另记 1429 用例）、desktop `go vet` + `go test`、
 app `testDebugUnitTest`（JDK21 + ANDROID_HOME）、`check-design`、`check-parity` 全绿。
 新增：`TestDiscoveredCrewCarriesThePortThatAnswersManagement`（钉住上面那个 404 bug 不再复发）、
 `exports records ... without credentials`（导出不含 digest/token/credential）。
@@ -426,7 +429,7 @@ app `testDebugUnitTest`（JDK21 + ANDROID_HOME）、`check-design`、`check-pari
 `archivedSessionIds`）同样是全局的，所以「在 desktop 里隐藏」对两端都生效。
 
 **四、验证**
-backend `pnpm check` 78 文件 / 1447 用例全绿；desktop `go vet` + `go test` 通过；
+backend `pnpm check` 78 个 spec 文件全绿（67 `.spec.ts` + 11 `.spec.tsx`；用例数当时记作 1447，口径已统一按文件数）；desktop `go vet` + `go test` 通过；
 服务重启后 11 项 health 全 `ready`，Electron 不再触碰桥的 `stateDir`（lsof 为 0）。
 提交 `b00a0f8`，已推 `origin/feat/four-blocks`。
 

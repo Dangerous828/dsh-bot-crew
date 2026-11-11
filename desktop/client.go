@@ -123,23 +123,26 @@ type BotCard struct {
 // the ticket is open unless its state is one of the five terminal outcomes.
 func (t *Task) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		State       string `json:"state"`
-		Open        *bool  `json:"open"`
-		Retryable   bool   `json:"retryable"`
-		BotID       string `json:"bot_id,omitempty"`
-		NeedsPerson string `json:"needs_person,omitempty"`
-		CreatedAt   string `json:"created_at,omitempty"`
-		UpdatedAt   string `json:"updated_at,omitempty"`
-		TotalSteps  int    `json:"total_steps,omitempty"`
+		ID          string            `json:"id"`
+		Title       string            `json:"title"`
+		State       string            `json:"state"`
+		Open        *bool             `json:"open"`
+		Retryable   bool              `json:"retryable"`
+		BotID       string            `json:"bot_id,omitempty"`
+		NeedsPerson string            `json:"needs_person,omitempty"`
+		Question    string            `json:"question,omitempty"`
+		Options     []AttentionOption `json:"options,omitempty"`
+		CreatedAt   string            `json:"created_at,omitempty"`
+		UpdatedAt   string            `json:"updated_at,omitempty"`
+		TotalSteps  int               `json:"total_steps,omitempty"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	*t = Task{ID: wire.ID, Title: wire.Title, State: wire.State, Retryable: wire.Retryable,
-		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, CreatedAt: wire.CreatedAt,
-		UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps, Open: !terminalState(wire.State)}
+		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, Question: wire.Question, Options: wire.Options,
+		CreatedAt: wire.CreatedAt, UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps,
+		Open: !terminalState(wire.State)}
 	if wire.Open != nil {
 		t.Open = *wire.Open
 	}
@@ -167,11 +170,24 @@ type Task struct {
 	BotID     string `json:"bot_id,omitempty"`
 	// NeedsPerson names what the ticket is waiting for, when it is waiting on a person.
 	NeedsPerson string `json:"needs_person,omitempty"`
-	CreatedAt   string `json:"created_at,omitempty"`
-	UpdatedAt   string `json:"updated_at,omitempty"`
+	// Question is the sentence the ticket waits on, when it waits on an answer rather than on a delivery,
+	// a review, or a failure. Empty means the backend named no question, and the card must not invent one.
+	Question string `json:"question,omitempty"`
+	// Options are the answers that question offers, in reading order. Empty means it takes a written reply;
+	// the front end never makes up A/B out of the question's own words.
+	Options   []AttentionOption `json:"options,omitempty"`
+	CreatedAt string            `json:"created_at,omitempty"`
+	UpdatedAt string            `json:"updated_at,omitempty"`
 	// TotalSteps 是这张票计划里的总步数。后端目前还没有这个字段 ——
 	// 没有它就画不出进度条，见 ui.go 的 progressOf。
 	TotalSteps int `json:"total_steps,omitempty"`
+}
+
+// AttentionOption 是「等你决定」那张卡上的一个答案：id 在这句问题里唯一且稳定，
+// label 是给人读的一句话，点下去就把这句话原样作为回答发回去。
+type AttentionOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
 // AgentNode is one agent under a ticket. A subagent of a subagent is a child again, so this nests.

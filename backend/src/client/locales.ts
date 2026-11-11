@@ -702,6 +702,8 @@ const TEXT = {
   'userError.notFollowing': ['这个工单没有订阅那个线程。', USER_ERRORS.notFollowing[1]],
   'userError.questionWithResult': ['给人的问题不能同时是就绪的结果或回答，请分开报告。', USER_ERRORS.questionWithResult[1]],
   'userError.askerWithoutQuestion': ['提出问题的消息需要附上它提出的问题。', USER_ERRORS.askerWithoutQuestion[1]],
+  'userError.optionsWithoutQuestion': ['可以点的回答必须附上它所回答的问题，写进 human_action。', USER_ERRORS.optionsWithoutQuestion[1]],
+  'userError.tooManyOptions': ['给人的问题提供两到四个回答，每个都要有稳定的 id 和一句短标签。', USER_ERRORS.tooManyOptions[1]],
   'userError.notAsker': ['问题必须指明提出它的那条人发的消息，且那条消息已送达这个工单。', USER_ERRORS.notAsker[1]],
   'userError.notAnswerable': ['回答必须指明它所回答的、由人提出的问题，且这个问题已送达这个工单。', USER_ERRORS.notAnswerable[1]],
   'userError.ackEnded': ['工单已结束，不要确认过去的请求。', USER_ERRORS.ackEnded[1]],

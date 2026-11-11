@@ -21,3 +21,4 @@ dist/
 node_modules
 node_modules/
 state/
+.claude/settings.local.json

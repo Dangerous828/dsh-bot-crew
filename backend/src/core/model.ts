@@ -271,8 +271,16 @@ export interface PolicyEffect {
 export type TicketEndBy = 'executor' | 'human'
 /** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
-/** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
-export interface Attention { id: string; question: string; triggerId?: string }
+/**
+ * One answer a worker offered with its question for a person: `id` is stable within that question, `label` is the sentence
+ * a person reads and whose words go back as their message. Absent options mean the question takes a written answer only.
+ */
+export interface AttentionOption { id: string; label: string }
+/**
+ * A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to, and
+ * `options` the at most four answers it offered, in the order the person should read them.
+ */
+export interface Attention { id: string; question: string; triggerId?: string; options?: AttentionOption[] }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string

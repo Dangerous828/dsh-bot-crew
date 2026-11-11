@@ -129,6 +129,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
         summary: z.string().min(1),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+        human_options: z.array(z.object({ id: z.string().regex(/^[a-z0-9_-]{1,40}$/), label: z.string().trim().min(1).max(80) }))
+          .min(2).max(4).optional().describe('With human_action: 2-4 concrete answers the person can tap, in reading order, with a stable id and a short label; omit when the question needs a written reply.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
@@ -142,6 +144,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+            ...(args.human_options ? { options: args.human_options } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)

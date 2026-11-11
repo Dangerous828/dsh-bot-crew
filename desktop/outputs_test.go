@@ -155,3 +155,70 @@ func TestOutputChannelsAreWired(t *testing.T) {
 		t.Fatal("产出的按票缓存没建：读不到的那张会每帧重发请求")
 	}
 }
+
+// ticketRefOf 把票号塞进 Extra —— ticketRef 读的就是这里，测试也跟着走同一条路。
+func ticketRefOf(ref string) map[string]json.RawMessage {
+	quoted, _ := json.Marshal(ref)
+	return map[string]json.RawMessage{"ticket_ref": quoted}
+}
+
+// 同一张票的票号会挂在「收到」和「报结果」两条回复上：只让最后一条挂结果条。
+// 判据是纯函数 lastOfTicket，这里把它几条边界一次钉死。
+func TestOnlyTheLastMessageOfATicketShowsTheBar(t *testing.T) {
+	// 按时间线顺序排：先「收到」，干完再「报结果」—— 两条都带 tk-1。
+	messages := []Message{
+		{Role: "agent", Text: "收到，这就去改"},
+		{Role: "agent", Text: "开始改了", Extra: ticketRefOf("tk-1")},
+		{Role: "agent", Text: "改好了", Extra: ticketRefOf("tk-1")},
+	}
+	if lastOfTicket(messages, 1) {
+		t.Fatal("前面的同票号回复不该挂结果条：屏幕上会连着两条同一句话")
+	}
+	if !lastOfTicket(messages, 2) {
+		t.Fatal("最后一条带 tk-1 的回复才该挂结果条")
+	}
+	// 没有票号的那一条永远不挂 —— 绝不因为「前后都没票号」就替它认一张票。
+	if lastOfTicket(messages, 0) {
+		t.Fatal("没票号的消息不该挂结果条")
+	}
+}
+
+func TestLastOfTicketCountsOnlyBotReplies(t *testing.T) {
+	// 自己发的话不挂结果条，所以它带同票号也不算「压住上面那条回复」。
+	messages := []Message{
+		{Role: "agent", Text: "改好了", Extra: ticketRefOf("tk-2")},
+		{Role: "user", Text: "@coder 再看看", Extra: ticketRefOf("tk-2")},
+	}
+	if !lastOfTicket(messages, 0) {
+		t.Fatal("后面只有人说的话时，Bot 那条仍是这张票的最后一条回复")
+	}
+	// 反过来：人说的那条无论后面有没有同票号的回复，都不挂。
+	if lastOfTicket(messages, 1) {
+		t.Fatal("自己发的话不挂结果条")
+	}
+}
+
+func TestLastOfTicketKeepsTicketsApartAndForgivesBadIndex(t *testing.T) {
+	// 两张票各论各的：tk-3 后面来了 tk-4，不影响 tk-3 那条仍是它自己的最后一条。
+	messages := []Message{
+		{Role: "agent", Text: "tk-3 收到", Extra: ticketRefOf("tk-3")},
+		{Role: "agent", Text: "tk-4 收到", Extra: ticketRefOf("tk-4")},
+	}
+	if !lastOfTicket(messages, 0) || !lastOfTicket(messages, 1) {
+		t.Fatal("不同票号互不压盖：两条都是各自票号的最后一条")
+	}
+	// 只有一条、带票号：它就是最后一条。
+	if !lastOfTicket(messages[:1], 0) {
+		t.Fatal("独生子该挂结果条")
+	}
+	// 越界的下标返回 false，别让调用方一处写错就炸掉整屏。
+	if lastOfTicket(messages, 2) || lastOfTicket(messages, -1) || lastOfTicket(nil, 0) {
+		t.Fatal("越界下标该安静地不画")
+	}
+	// 空白票号算没带，与 ticketRef 的规矩一致。
+	blank := []Message{{Role: "agent", Text: "x", Extra: ticketRefOf("  ")}}
+	if lastOfTicket(blank, 0) {
+		t.Fatal("空白票号不算票号")
+	}
+}
+

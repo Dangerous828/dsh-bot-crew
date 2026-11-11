@@ -795,6 +795,75 @@ class OutputsBarTest {
         assertTrue(cache.tried("tk-9", 1))
     }
 
+    // ── 结果条挂在哪一条（同一张票只挂最后一次）───────────────────
+
+    /** 把若干条原始 item 读成时间线，顺序就是测试给的顺序。 */
+    private fun timelineOf(vararg items: String): List<Message> =
+        CrewWire.parseTimeline("""{"items":[${items.joinToString(",")}],"bots":[],"default_bot_id":""}""").messages
+
+    @Test
+    fun onlyTheLastMessageOfATicketShowsTheBar() {
+        // 同一张票挂在「收到」和「报结果」两条回复上：前面那条不画，只有最后一条画。
+        val messages = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"收到，这就去改","ticket_ref":"tk-1"}""",
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"开始改了","ticket_ref":"tk-1"}""",
+            """{"id":"r3","role":"agent","bot_id":"coder","text":"改好了","ticket_ref":"tk-1"}""",
+        )
+        assertFalse("前面的同票号回复不挂结果条", OutputsCopy.lastOfTicket(messages, 0))
+        assertFalse(OutputsCopy.lastOfTicket(messages, 1))
+        assertTrue("最后一条带 tk-1 的回复才挂", OutputsCopy.lastOfTicket(messages, 2))
+        // 只有一条、带票号：它就是最后一条。
+        assertTrue(OutputsCopy.lastOfTicket(messages.take(1), 0))
+    }
+
+    @Test
+    fun theLastOneRuleStillOnlyReadsThatMessagesOwnTicket() {
+        val messages = timelineOf(
+            // 没票号的那条永远不画，也绝不因为「后面那条也没票号」就替它认一张票。
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"在的"}""",
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"x","ticket_ref":"  "}""",
+        )
+        assertFalse("没带票号不挂结果条", OutputsCopy.lastOfTicket(messages, 0))
+        assertFalse("空白票号也算没带", OutputsCopy.lastOfTicket(messages, 1))
+        // 两张票各论各的，互不压盖。
+        val two = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"tk-3 收到","ticket_ref":"tk-3"}""",
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"tk-4 收到","ticket_ref":"tk-4"}""",
+        )
+        assertTrue(OutputsCopy.lastOfTicket(two, 0))
+        assertTrue(OutputsCopy.lastOfTicket(two, 1))
+    }
+
+    @Test
+    fun onlyBotRepliesCanHoldTheBar() {
+        // 自己发的话不挂结果条，所以它带同票号也不算「压住上面那条回复」。
+        val messages = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"改好了","ticket_ref":"tk-2"}""",
+            """{"id":"m1","role":"user","text":"@coder 再看看","ticket_ref":"tk-2"}""",
+        )
+        assertTrue("后面只有人说的话，Bot 那条仍是最后一条", OutputsCopy.lastOfTicket(messages, 0))
+        assertFalse("自己发的话不挂结果条", OutputsCopy.lastOfTicket(messages, 1))
+        // 反过来：人说的话夹在两条 Bot 回复中间，不能把上一条的「最后一条」顶掉。
+        val sandwiched = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"收到","ticket_ref":"tk-5"}""",
+            """{"id":"m1","role":"user","text":"快点"}""",
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"好了","ticket_ref":"tk-5"}""",
+        )
+        assertFalse(OutputsCopy.lastOfTicket(sandwiched, 0))
+        assertTrue(OutputsCopy.lastOfTicket(sandwiched, 2))
+    }
+
+    @Test
+    fun aBadIndexIsQuiet() {
+        val messages = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"x","ticket_ref":"tk-1"}""",
+        )
+        // 越界的下标安静地返回 false，别让调用方一处写错就炸掉整屏。
+        assertFalse(OutputsCopy.lastOfTicket(messages, 1))
+        assertFalse(OutputsCopy.lastOfTicket(messages, -1))
+        assertFalse(OutputsCopy.lastOfTicket(emptyList(), 0))
+    }
+
     // ── 未读（契约 §5.6）────────────────────────────────────────
     // 手机只认后端那个数。最容易出的错是把「算不出来」读成 0 —— 那会在界面上
     // 说「都读过了」，而实际是网关根本没报告。

@@ -674,6 +674,9 @@ private fun CrewScreen(
                                 generation = timelineEpoch,
                                 onOutputsRead = outputsRefresh,
                                 outputsTick = outputsTick,
+                                // 同一张票的票号会挂在「收到」和「报结果」两条回复上：只让这张票
+                                // 在时间线上的最后一条回复挂结果条，见 OutputsCopy.lastOfTicket。
+                                showResult = OutputsCopy.lastOfTicket(shown.messages, index),
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {
@@ -1991,6 +1994,11 @@ private fun MessageRow(
      * 它的值没人用，所以要在正文里读一下，否则 Compose 不会把这一格记成依赖。
      */
     outputsTick: Int = 0,
+    /**
+     * 这一条该不该挂结果条。由调用方用 OutputsCopy.lastOfTicket 按整条时间线算好 ——
+     * 「同一张票只挂在最后一条回复上」，判断要看得见整列消息，所以不在这一格里算。
+     */
+    showResult: Boolean = false,
     showName: Boolean = true,
     topGap: Dp = 0.dp,
 ) {
@@ -2063,10 +2071,16 @@ private fun MessageRow(
                 }
                 // 结果条：「✓ 两张图片已放进产出」。只在「这条话带票号、那张票确实有产出」时画，
                 // 放在代码卡之后，与桌面端同序。line 是纯查表，不发请求。
+                //
+                // 同一张票会挂在好几条回复上（先一句「收到」，干完再一句「报结果」）。
+                // 两条各画一遍，屏幕上就是连着两条同一句话 —— 所以只让这张票在时间线上的
+                // 最后一条回复挂它，判断由调用方按整列消息算好，见 OutputsCopy.lastOfTicket。
                 val ticket = OutputsCopy.barTicket(message)
                 // 缓存是普通表，Compose 不会自己知道它变了：读完一次 outputsTick 就加一，
                 // 这一格跟着重算，才读得到新结果。票号与轮次也进键 —— 换了消息或换了轮次要重查。
-                val line = remember(outputsTick, ticket, generation) { outputs.line(ticket, generation) }
+                val line = remember(outputsTick, ticket, generation, showResult) {
+                    if (showResult) outputs.line(ticket, generation) else null
+                }
                 line?.let {
                     Spacer(Modifier.height(9.dp))
                     ResultBar(it, palette)
@@ -2074,7 +2088,8 @@ private fun MessageRow(
                 // 没读过就先要一份；读完之前不画，免得先闪一条空的再变成有内容的。
                 // 读不到的也记一笔（见 OutputsCache）：结果条不会每帧重发请求。
                 // 每读回一次时间线 generation 就加一，这里会跟着重读一次。
-                if (ticket.isNotEmpty()) {
+                // 不挂结果条的那几条不去读：同一张票只读一次，读了也没地方画。
+                if (showResult && ticket.isNotEmpty()) {
                     LaunchedEffect(ticket, generation) {
                         if (!outputs.start(ticket, generation)) return@LaunchedEffect
                         var view: OutputsView? = null

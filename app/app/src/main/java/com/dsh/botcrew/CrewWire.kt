@@ -915,10 +915,42 @@ object OutputsWire {
  * 3. 只有 state == live 且真有条目时才画，文案由 counts 拼；
  * 4. empty / unavailable / 请求失败一律不画 —— 结果条只在「有事发生」时出现，
  *    把「读不到」画成一条成果，等于把故障当成队伍的产出。
+ *
+ * 另有一条「挂在哪一条」的规矩，见 lastOfTicket：同一张票号只挂在最后一条回复上。
  */
 object OutputsCopy {
     /** 这条消息该读哪张票。只认消息自己带的 `ticket_ref`；没有就是空串，绝不拿别的票顶替。 */
     fun barTicket(message: Message): String = message.ticketRef.trim()
+
+    /**
+     * 时间线上这一条，是不是这张票的「最后一条」—— 只有它才轮到挂结果条。
+     *
+     * 同一张票的票号会挂在好几条回复上（先一句「收到」、干完再一句「报结果」），
+     * 两条各画一遍，屏幕上就是连着两条「1 个文件已放进产出」—— 看着像交了两回活。
+     * 规则：同一张票号，只让时间线上最后一条带它的回复挂结果条，之前的同票号消息不画。
+     *
+     * 判法只有「从这一条往后找」一件事：后面没有第二条带同票号的回复，这一条就是最后一条。
+     * 不倒着排序、不按 at 比时间、更不看 id —— 顺序就是列表给的顺序，两端都照它办，
+     * 才不会因为时钟差一秒而让两端画出不一样的结果。
+     *
+     * 三条边界，与桌面端 lastOfTicket 逐条对齐：
+     * - 自己发的话不挂结果条（两端都只在 Bot 的回复下面画），所以也不算「压住上面那条」；
+     * - 没有票号的这一条永远 false —— 绝不因为「前后都没票号」就替它认一张票；
+     * - 越界的下标返回 false，别让调用方一处写错就炸掉整屏。
+     */
+    fun lastOfTicket(messages: List<Message>, index: Int): Boolean {
+        if (index !in messages.indices) return false
+        val message = messages[index]
+        if (!message.fromBot) return false
+        val ticket = barTicket(message)
+        if (ticket.isEmpty()) return false
+        for (later in index + 1..messages.lastIndex) {
+            val other = messages[later]
+            if (!other.fromBot) continue
+            if (barTicket(other) == ticket) return false
+        }
+        return true
+    }
 
     /**
      * 结果条上那句话：「N 张图片已放进产出」/「N 个文件已放进产出」，两类都有就说全。

@@ -15,7 +15,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, liveTicket, reasonText, runningAssignment, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
-  type Ticket, type Trigger } from '../core/index.ts'
+  type Ticket, type Trigger, type AssessmentOutcome } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -35,6 +35,7 @@ import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from 
 import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './compact-memory.ts'
 import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
 import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
+import { approvalOf, approvalPrompt, type ApprovalDecision } from './approval.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -213,7 +214,7 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
-        outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+        outbox, prepareTicket: (ticket, outcome) => this.prepareWithApproval(executor.prepare(ticket, outcome), outcome), emit: event => {
           // 评估结果一律记一行。它平时是静默的：决策只在内存里广播一次，没人在听的时候就消失了。
           // 于是「队伍为什么不接这活」在运行时看不见 —— 事后只能翻数据库，而那时上下文已经没了。
           // 用 console 而不是 ctx.logger：宿主的 logger 收进了它自己的频道，不在这个进程的日志文件里。
@@ -460,6 +461,46 @@ export class Runtime extends Service implements SourceHost {
     }
     if (dispatched.length) this.passes.request()
     return { dispatched, held }
+  }
+
+  /**
+   * 接了的活要不要先问一声。
+   *
+   * 挂在这里而不是挂进 worker：`prepareTicket` 在 `executor.start` 之前跑，
+   * 所以「停下等点头」不需要让一个 worker 先起来再干等 —— 那会白占一个并发位。
+   *
+   * 要问的时候做三件事：把问题写成 `attention`（手机与桌面上的 A/B 按钮据此画出来）、
+   * 把指令强度降成 `inferred`（worker 不会自己开工）、把这条推送出去。
+   */
+  private prepareWithApproval(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
+    let decision: ApprovalDecision
+    try {
+      const settings = this.store.settings()
+      const config = (settings as { approval?: { mode?: 'auto' | 'ask' | 'off'; askWhenBudgetUsed?: number } }).approval
+      decision = approvalOf({
+        mode: config?.mode ?? 'ask',
+        rules: outcome.rules ?? [],
+        sensitive: (settings.policy?.rules ?? []).filter(rule => rule.sensitive).map(rule => rule.id),
+      })
+    } catch (error) {
+      // 判定读不出来时保守：先问一句。宁可多问一次，也不要替主人做主。
+      decision = { ask: true, because: 'mode', reason: `读不出审批设置（${String(error)}），先问你一声` }
+    }
+    if (!decision.ask) return ticket
+    const prompt = approvalPrompt(ticket.title, decision)
+    console.log('[approval] asking ticket=%s because=%s', ticket.id, decision.because)
+    this.pushNotice({ title: '等你点头', body: prompt.question, kind: 'approval' })
+    return {
+      ...ticket,
+      // 强度降成 `inferred`：worker 据此知道「这不是已经批准的活」。
+      mandate: { ...ticket.mandate, strength: 'inferred' },
+      attention: {
+        id: `attention-approval-${ticket.id}`,
+        question: prompt.question,
+        ...(ticket.origin?.triggerId ? { triggerId: ticket.origin.triggerId } : {}),
+        options: prompt.options,
+      },
+    }
   }
 
   /**

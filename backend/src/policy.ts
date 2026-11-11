@@ -60,12 +60,17 @@ export function assessmentOutcome(assessment: Assessment, settings: Pick<Setting
     rules: matches.map(match => match.rule_id), audit, ...(name ? { name } : {}) }
 }
 const DEFAULT_RULES = [
-  { id: 'copy', name: 'Copy fixes', enabled: true, instruction: 'Explicit requests to correct a typo, wording, punctuation or existing translation. Preserve product promises and business meaning.' },
-  { id: 'visual', name: 'Visual fixes', enabled: true, instruction: 'Explicit implementation requests for local spacing, alignment, overflow or styling, with a specified target or an objectively established existing standard/correct state to restore. Locating an element or calling it inconsistent, unattractive or hard to understand does not establish a target. Do not invent visual style, information hierarchy, rendering or interaction decisions. No redesign, new interaction or behavior. A known spacing defect does not authorize adjacent undefined restyling; assess only a clearly separable authorized scope. If direction or scope is unsettled, observe only: no acknowledgement, worker or unsolicited question.' },
+  { id: 'copy', name: 'Copy fixes', enabled: true, sensitive: false, instruction: 'Explicit requests to correct a typo, wording, punctuation or existing translation. Preserve product promises and business meaning.' },
+  { id: 'visual', name: 'Visual fixes', enabled: true, sensitive: false, instruction: 'Explicit implementation requests for local spacing, alignment, overflow or styling, with a specified target or an objectively established existing standard/correct state to restore. Locating an element or calling it inconsistent, unattractive or hard to understand does not establish a target. Do not invent visual style, information hierarchy, rendering or interaction decisions. No redesign, new interaction or behavior. A known spacing defect does not authorize adjacent undefined restyling; assess only a clearly separable authorized scope. If direction or scope is unsettled, observe only: no acknowledgement, worker or unsolicited question.' },
 ]
 /** An assessment rule; its instruction may also specify PR reviewers and whether to wait for their approval. */
 export const RuleSchema = z.object({ id: RuleIdSchema, name: z.string().trim().min(1).max(LIMITS.ruleName), enabled: z.boolean(),
-  instruction: z.string().trim().min(1).max(LIMITS.ruleInstruction) }).strict()
+  instruction: z.string().trim().min(1).max(LIMITS.ruleInstruction),
+  /**
+   * 命中这一条时要先问人（`approval.mode` 为 `ask` 时）。
+   * 与 `enabled` 分开：`enabled` 说「这条规矩算不算数」，`sensitive` 说「算数之后要不要停下来问」。
+   */
+  sensitive: z.boolean().default(false) }).strict()
 export type Rule = z.infer<typeof RuleSchema>
 export const RoleModelSchema = z.object({ provider: z.string().trim().min(1), model: z.string().trim().min(1), reasoningEffort: z.string().trim().min(1).optional() }).strict()
 export type RoleModel = z.infer<typeof RoleModelSchema>
@@ -79,6 +84,17 @@ export type SourcePolicy = z.infer<typeof SourcePolicySchema>
 export const PolicyConfigSchema = z.object({
   rules: z.array(RuleSchema).refine(rules => new Set(rules.map(rule => rule.id)).size === rules.length, 'Duplicate rule IDs').default(DEFAULT_RULES),
   sources: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), SourcePolicySchema).default({}),
+}).strict()
+/**
+ * 审批档位：接了的活做不做。
+ *
+ * 与 `eval.mode` 是两件事：那个判「接不接」，这个判「做不做」。
+ * 默认 `ask`：只对标记了 `sensitive` 的规矩停下来 ——— 每件小事都点头，人三天后就会闭眼点同意。
+ */
+export const ApprovalConfigSchema = z.object({
+  mode: z.enum(['auto', 'ask', 'off']).default('ask'),
+  /** 额度用到多少比例就先问一句。0.9 表示剩不到一成时。 */
+  askWhenBudgetUsed: z.number().min(0).max(1).default(0.9),
 }).strict()
 export const EvalConfigSchema = z.object({
   mode: z.enum(['off', 'observe', 'auto']).default('observe'),
@@ -110,6 +126,7 @@ export const SettingsSchema = z.object({
   sources: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), SourceInstanceSchema).default({}),
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
+  approval: ApprovalConfigSchema.default(() => ApprovalConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
   remote: RemoteConfigSchema.default(() => RemoteConfigSchema.parse({})),
 }).strict()
@@ -123,8 +140,24 @@ export const POLICY_REVISION = 'mandate-v3'
  * Compute a version hash for settings that affect work authorization.
  * Changes to models, concurrency, pause state, or polling intervals do not invalidate existing decisions.
  */
+/**
+ * 策略内容的版本。**同样内容必须算出同样的版本**，所以序列化前要按键排序：
+ * 两个内容相同、只是字段插入顺序不同的对象，`JSON.stringify` 给的是两个字符串，
+ * 于是同一份策略会算出两个版本，`revalidate` 会误判成「策略变了」而撤掉所有 Mandate。
+ * 这是真的发生过的事（新增一个带默认值的规则字段就会触发）。
+ */
 export function policyVersion(settings: Settings): string {
-  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources }))
+  return key(POLICY_REVISION, JSON.stringify(stable({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources })))
+}
+
+/** 递归按键排序后再交给 `JSON.stringify`：数组保序（顺序有意义），对象的键统一排。 */
+function stable(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stable)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+      .map(name => [name, stable((value as Record<string, unknown>)[name])]))
+  }
+  return value
 }
 export function allowedSender(settings: Settings, actor: ActorRef): z.infer<typeof AllowedSchema> | undefined {
   return settings.policy.sources[actor.source]?.allowed.find(entry => sameName(entry.id, actor.id))

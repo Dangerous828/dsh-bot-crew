@@ -190,7 +190,7 @@ describe('revalidating a Mandate from the admission table', () => {
       eval: { mode: item.mode },
       sources: { feishu: feishuSource({ chats, directMessages: true }) },
       policy: {
-        rules: [{ id: 'copy', name: 'Copy', enabled: item.rule, instruction: 'x' }],
+        rules: [{ id: 'copy', name: 'Copy', enabled: item.rule, instruction: 'x', sensitive: false }],
         sources: { feishu: { allowed: item.listed ? [{ id: SENDER }] : [], admission: { [CHAT]: Object.fromEntries(cells.map(cell => [cell, grant(cell)])) } } },
       },
     })
@@ -238,7 +238,7 @@ describe('settings migration', () => {
       sources: { feishu: { enabled: true, config: { chats: [], directMessages: true }, authority: { chats: [] } } },
     }))
     expect(saved.policy).toEqual({
-      rules: [{ id: 'visual', name: 'V', enabled: true, instruction: 'x' }],
+      rules: [{ id: 'visual', name: 'V', enabled: true, instruction: 'x', sensitive: false }],
       sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }, { id: 'ou_bob', name: 'Bob' }], syncChat: CHAT, admission: {} }, github: { allowed: [{ id: 'alice' }, { id: 'carol' }], admission: {} } },
     })
     expect(saved).toMatchObject({ paused: false, executor: { model: null, maxWorkers: 2, directory: '', prepare: '', blockedCommands: [] } })
@@ -257,6 +257,7 @@ describe('settings migration', () => {
       executor: { model: null, botModels: {}, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
       // 新加的配置块走默认值：旧存档里没有它，迁移不该为它编内容。
       remote: { pairing: 'code', lan: true },
+      approval: { mode: 'ask', askWhenBudgetUsed: 0.9 },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })

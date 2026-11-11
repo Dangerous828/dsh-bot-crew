@@ -59,7 +59,15 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
   let service: Service | undefined
   let current: number | undefined
 
-  const fail = (error: unknown): void => { onError?.(error) }
+  /**
+   * 广播出错时的统一去处。底层异步报错（组播被系统收走、socket 关了）之后，这条记录已经不会再应答：
+   * current 不跟着清掉，published() 就还自称在广播，健康检查会以为手机上看得见这台机器。
+   * `from` 是出错的那条记录：换端口时停掉的旧记录也可能晚到一笔错误，那不该抹掉正在播的新记录。
+   */
+  const fail = (error: unknown, from?: Service): void => {
+    if (!from || from === service) current = undefined
+    onError?.(error)
+  }
 
   return {
     publish(port) {
@@ -77,10 +85,11 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
           name, type: SERVICE_TYPE, port, protocol: 'tcp',
           txt: { crew, port: String(port) },
         })
-        service.on('error', fail)
+        const announced = service
+        announced.on('error', error => fail(error, announced))
       } catch (error) {
+        // fail 里已经把 current 清掉了：构造或播报当场失败，同样等于没在广播。
         fail(error)
-        current = undefined
       }
     },
     async stop() {

@@ -228,12 +228,14 @@ def outcome(pids, current):
 def status(args):
     pids = processes(args.profile)
     current = state(args.url) if pids else None
+    # 进程活着但绑在旧网卡上时，手机连不上而所有健康项都是绿的。这里主动说出来。
+    # Ask once and reuse: each call re-reads the patch file, so asking twice can even disagree with itself.
+    drift = bind_drift(args.profile)
     print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
                       'manually_stopped': stopped(args.profile), 'health': current and current['health'],
                       'errors': current and current['errors'], 'setup': current and current['setup'],
                       'feishu': current and current['feishu'],
-                      # 进程活着但绑在旧网卡上时，手机连不上而所有健康项都是绿的。这里主动说出来。
-                      **({'bind_stale': bind_drift(args.profile)} if bind_drift(args.profile) else {})},
+                      **({'bind_stale': drift} if drift else {})},
                      ensure_ascii=False, indent=2))
     return outcome(pids, current)
 

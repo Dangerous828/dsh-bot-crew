@@ -20,12 +20,15 @@ object CrewDiscovery {
     const val SERVICE_TYPE = "_dsh-crew._tcp."
 
     /**
-     * 一路找下去。每发现一台就发一条，重复的同一个实例名不重复发。
+     * 一路找下去。每看见一台发一条 [CrewSighting.Found]，哪台不见了发一条 [CrewSighting.Lost]。
      *
-     * 找失败（没开组播、系统限流）就结束这一路，不抛给界面：找不到只是退回手输地址，
+     * 报告「不见了」和报告「看见了」一样重要：同一网段常有多台队伍，界面按名字维护一张表，
+     * 只进不出的话，关掉的那台会一直留在列表里，点它就连不上。
+     *
+     * 找失败（没开组播、系统限流、没给附近设备权限）就结束这一路，不抛给界面：找不到只是退回手输地址，
      * 那不是错误，是「这台网络里没有队伍」。
      */
-    fun find(context: Context): Flow<CrewBeacon> = callbackFlow {
+    fun find(context: Context): Flow<CrewSighting> = callbackFlow {
         val manager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
         if (manager == null) { close(); return@callbackFlow }
 
@@ -37,11 +40,18 @@ object CrewDiscovery {
             override fun onServiceFound(info: NsdServiceInfo) {
                 // 只认自己的类型；系统有时会把同一网段的别的服务也递过来。
                 if (!info.serviceType.startsWith("_dsh-crew")) return
-                resolve(manager, info) { beacon -> if (seen.add(beacon.name)) trySend(beacon) }
+                // 同一个实例系统会重复上报，解析也慢；同名的只发一次，界面那边才是一台一行。
+                resolve(manager, info) { beacon ->
+                    if (seen.add(beacon.name)) trySend(CrewSighting.Found(beacon))
+                }
             }
 
             override fun onServiceLost(info: NsdServiceInfo) {
+                // 报一声「没了」。不在这里再按类型筛一遍：筛选条件一旦和 onServiceFound 有出入，
+                // 这一台就永远留在列表里，点它是一台已经关掉的电脑。名字对不上表里任何一行时，
+                // 界面那边是一次空操作，多发一条没有代价。
                 seen.remove(info.serviceName)
+                trySend(CrewSighting.Lost(info.serviceName))
             }
 
             override fun onDiscoveryStopped(serviceType: String) {}
@@ -78,3 +88,16 @@ object CrewDiscovery {
 
 /** 找到的一台队伍：名字给人看，`base` 直接填进地址框。 */
 data class CrewBeacon(val name: String, val base: String)
+
+/**
+ * 发现流上的一件事：看见一台，或者一台不见了。
+ *
+ * 用事件而不是「当前整张表」，是因为表在界面那边（跟着 Compose 的 state 走）；
+ * 这里只负责如实报告发生了什么。
+ */
+sealed interface CrewSighting {
+    data class Found(val beacon: CrewBeacon) : CrewSighting
+
+    /** 服务名，不是 beacon：它消失时常常已经解析不出地址了。 */
+    data class Lost(val name: String) : CrewSighting
+}

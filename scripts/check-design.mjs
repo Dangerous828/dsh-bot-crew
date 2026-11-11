@@ -55,6 +55,37 @@ for (const r of [...radii].sort(byNumber)) {
   if (!radiusScale.has(Number(r))) problems.push(`桌面画板里的圆角 ${r}px 在 theme.go 里没有对应项`)
 }
 
+// 2a) 手机画板的每个颜色也要在 CrewUi.kt 里有值（Kotlin 写 0xFFRRGGBB）。
+//
+//     工作区那组紫是已知未接项：CrewPalette 还没收它们，工作区页也还没接后端。
+//     这里显式列出，而不是让检查器静默放过 —— 哪天补上了，把对应行删掉即可。
+const MOBILE_COLOR_EXEMPT = new Map([
+  ['#5B4BE0', '接管操作：工作区未接后端'],
+  ['#DCD8F7', '接管淡底：同上'],
+  ['#F1EFFC', '接管极淡紫：同上'],
+  ['#D5D5DC', '冷灰边：工作区专用'],
+  ['#2E5D52', '强调深一档：画板未用于已实现元素'],
+  ['#A8E3D2', '强调亮：同上'],
+  ['#1A1A1E', '冷深：同上'],
+  ['#494650', '更深一层：同上'],
+  ['#10201C', '压在强调上的字：暗色画板专用，已由白色承担'],
+])
+const mobileColors = new Set()
+for (const { text } of mobileBoards) {
+  for (const m of text.matchAll(/#([0-9A-Fa-f]{6})\b/g)) mobileColors.add('#' + m[1].toUpperCase())
+}
+// 只看两套调色板里真的赋了值的那些，不看整个文件：
+// 同一个色在别处出现（比如某处临时用的色）不代表调色板收下了它。
+const ktSource = readFileSync(join(root, 'app/app/src/main/java/com/dsh/botcrew/CrewUi.kt'), 'utf8')
+const paletteBlock = (name) => ktSource.match(new RegExp(`val ${name} = CrewPalette\\(([\\s\\S]*?)\\n\\)`))?.[1] ?? ''
+const kotlinPaletteColors = (paletteBlock('LightPalette') + paletteBlock('DarkPalette')).toUpperCase()
+for (const color of [...mobileColors].sort()) {
+  if (MOBILE_COLOR_EXEMPT.has(color)) continue
+  if (!kotlinPaletteColors.includes(color.slice(1))) {
+    problems.push(`手机画板里的 ${color} 在两套 CrewPalette 里都没有对应值`)
+  }
+}
+
 // 2b) 手机画板的字号与圆角要与 CrewUi.kt 对得上。
 //     两端各写一份刻度，漏改一处就只剩一端是新值。
 const kt = readFileSync(join(root, 'app/app/src/main/java/com/dsh/botcrew/CrewUi.kt'), 'utf8')
@@ -82,6 +113,21 @@ for (const color of brandColors) {
   }
   if (!theme.toUpperCase().includes(color.toUpperCase())) {
     problems.push(`品牌色 ${color} 在 theme.go 里没有，实现漏了这一层`)
+  }
+}
+
+// 3b) 桌面画板用到的**每一个**颜色，theme.go 里都要有实值。
+//
+//     上面那份品牌色清单是手写的，漏了就会一直漏：空态的暖灰虚线框
+//     (#D9D3C9 / #B8B1A5) 和卡内行分隔 (#F4F0EA) 就是这么漏掉的 ——
+//     实现里拿 Line / Faint 顶替，画出来发灰，和画板不是一套。
+const allBoardColors = new Set()
+for (const { text } of desktopBoards) {
+  for (const m of text.matchAll(/#[0-9A-Fa-f]{6}\b/g)) allBoardColors.add(m[0].toUpperCase())
+}
+for (const color of [...allBoardColors].sort()) {
+  if (!theme.toUpperCase().includes(color)) {
+    problems.push(`桌面画板里的 ${color} 在 theme.go 里没有对应值`)
   }
 }
 
@@ -124,5 +170,7 @@ if (problems.length) {
 }
 console.log(
   `design: 通过（${desktopBoards.length} 张桌面画板 + ${mobileBoards.length} 张手机画板：` +
-  `${sizes.size} 个字号、${radii.size} 个圆角、${brandColors.length} 个颜色都与实现对得上）`,
+  `${sizes.size} 个字号、${radii.size} 个圆角、${allBoardColors.size} 个桌面色、` +
+  `${mobileColors.size} 个手机色（${MOBILE_COLOR_EXEMPT.size} 个已知未接）、` +
+  `${brandColors.length} 个品牌色都与实现对得上）`,
 )

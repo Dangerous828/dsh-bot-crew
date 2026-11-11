@@ -1,7 +1,12 @@
 // 配色：从设计稿抽出来的两套命名颜色。界面只按名字取色，不写字面色值。
 package main
 
-import "github.com/egoist/mygo/ui"
+import (
+	"os"
+	"strings"
+
+	"github.com/egoist/mygo/ui"
+)
 
 // Palette 是一套主题里用到的全部颜色。亮暗两套同名不同值。
 // 字段是 ui.Color 而不是十六进制串：取色只在这里发生，界面拿到的永远是可画的颜色。
@@ -50,6 +55,19 @@ type Palette struct {
 	Pressed ui.Color
 	// PressedSoft 是没选中的页签被按住时的底：轨道里浮起一层很淡的色，别压过选中项。
 	PressedSoft ui.Color
+	// EmptyEdge / EmptyGlyph / EmptyGlyphSoft 是空态那两个虚线框：
+	// 边框比普通 Line 更暖（画板 #D9D3C9），里面的人形/气泡是两种暖灰
+	// （#B8B1A5 / #C9C2B6）。用 Line + Faint 画出来会显得发灰、没有温度。
+	EmptyEdge      ui.Color
+	EmptyGlyph     ui.Color
+	EmptyGlyphSoft ui.Color
+	// RowRule 是卡片内部行与行之间的分隔：比 Line 再淡一档（画板 #F4F0EA）。
+	RowRule ui.Color
+	// Faintest 是脚注那种「比卡片再浅一层」的底（画板 #FDFCFA）。
+	Faintest ui.Color
+	// DangerDeep 是断连横幅里那段正文：比 Danger 更深，因为它是一段要读的话，
+	// 不是一个告警符号。画板亮色 #8A4038 / 暗色 #E58A80（暗色下已经够亮）。
+	DangerDeep ui.Color
 	// WarmBase 是「等你决定」卡的底：比 WarmSoft 再暖一档、几乎就是页底色。
 	// 画板用 #FDF9F4（亮色）/ 暖深（暗色），和普通的 WeakSoft 区分开 ——
 	// 它是「需要你动手」的那一块，不该和警告徽标同色。
@@ -80,6 +98,12 @@ var LightPalette = Palette{
 	Pressed:     ui.Hex("#E3DED6"), // 选中项被按住
 	PressedSoft: ui.Hex("#E7E3DC"), // 未选中项被按住
 	WarmBase:    ui.Hex("#FDF9F4"), // 「等你决定」卡底（画板 Desktop.dc.html:200）
+	DangerDeep:  ui.Hex("#8A4038"), // 断连横幅正文（画板 Desktop-offline.dc.html:100）
+	RowRule:     ui.Hex("#F4F0EA"), // 卡内行分隔（画板 Desktop.dc.html:173）
+	EmptyEdge:      ui.Hex("#D9D3C9"), // 空态虚线框（画板 Desktop-empty.dc.html:31/51）
+	EmptyGlyph:     ui.Hex("#B8B1A5"), // 空态人形/气泡图标
+	EmptyGlyphSoft: ui.Hex("#C9C2B6"), // 空态次级图标
+	Faintest:    ui.Hex("#FDFCFA"), // 脚注底（画板 Desktop.dc.html:188）
 }
 
 // DarkPalette 是深墨底的一套。强调色提亮一档，否则它和底色糊在一起。
@@ -93,7 +117,7 @@ var DarkPalette = Palette{
 	Code:        ui.Hex("#1E1D23"),
 	SelectedAlt: ui.Hex("#2A2830"), AccentSoft2: ui.Hex("#1E3A34"), WarnSoft2: ui.Hex("#3A2A1C"),
 	WarnEdge: ui.Hex("#4A3A28"), DangerEdge: ui.Hex("#55302F"), Footer: ui.Hex("#25242A"),
-	Hint: ui.Hex("#6E6960"), DangerSoft: ui.Hex("#2A1E1E"), Raised: ui.Hex("#1D1C21"),
+	Hint: ui.Hex("#6E6860"), DangerSoft: ui.Hex("#2A1E1E"), Raised: ui.Hex("#1D1C21"),
 	InkStrong: ui.Hex("#FFFFFF"),
 	// 暗色：轨道与选中项照画板（Desktop-dark.dc.html:252 的 #2A2830 / #232228），
 	// 按住的两层按同族取，选中项比卡片再深一点才分得出来。
@@ -101,7 +125,15 @@ var DarkPalette = Palette{
 	Pressed:     ui.Hex("#1B1A20"),
 	PressedSoft: ui.Hex("#35333B"),
 	// 画板暗色里「等你决定」卡是暖深 #241F1A；比 WarnSoft 更深，压在卡片上不发光。
-	WarmBase: ui.Hex("#241F1A"),
+	WarmBase:   ui.Hex("#241F1A"),
+	DangerDeep: ui.Hex("#E58A80"),
+	// 暗色下「比卡片浅一层」在视觉上不存在：脚注用抬起层，行分隔用分隔色。
+	RowRule:  ui.Hex("#2A2830"),
+	Faintest: ui.Hex("#1D1C21"),
+	// 暗色没有对应的暖灰：虚线框落到分隔色，图标落到弱字色。
+	EmptyEdge:      ui.Hex("#33313A"),
+	EmptyGlyph:     ui.Hex("#928C82"),
+	EmptyGlyphSoft: ui.Hex("#6E6860"),
 }
 
 // PaletteFor 按是否深色返回对应的一套。
@@ -113,7 +145,16 @@ func PaletteFor(dark bool) Palette {
 }
 
 // ThemeColors 从 mygo 的主题里取这套配色：它记着系统外观，所以窗口跟着系统变。
+//
+// CREW_THEME=light|dark 只是拍照/对照时的开关：验亮色得把系统切成亮色，
+// 而这台机器是别人的工作环境。设了就用它，没设照样跟系统走。
 func ThemeColors(t *ui.Theme) Palette {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CREW_THEME"))) {
+	case "light":
+		return LightPalette
+	case "dark":
+		return DarkPalette
+	}
 	return PaletteFor(t != nil && t.Dark)
 }
 

@@ -18,7 +18,20 @@ data class Message(
     val at: String,
     /** 自己发的消息的幂等键；撤回排队中的消息要用它。 */
     val requestId: String = "",
+    /** 这条消息带的代码片段；没有就是 null。字段名后端可能给 code 也可能给 diff。 */
+    val code: CodeBlock? = null,
 )
+
+/** 一条消息里的代码片段：文件名、增删行数、逐行内容与类别。 */
+data class CodeBlock(
+    val path: String,
+    val added: Int,
+    val removed: Int,
+    val lines: List<CodeLine>,
+)
+
+/** 代码里的一行。kind 取 added / removed / 空。 */
+data class CodeLine(val text: String, val kind: String)
 
 /**
  * 名片上能看到的那些字。它是呈现，不持有任何任务状态。
@@ -59,6 +72,24 @@ object CrewWire {
     fun parseCredential(body: String): Credential? = PairingWire.parseCredential(body)
 
 
+    private fun parseCode(item: JSONObject): CodeBlock? {
+        val block = item.optJSONObject("code") ?: item.optJSONObject("diff") ?: return null
+        val raw = block.optJSONArray("lines") ?: JSONArray()
+        val lines = mutableListOf<CodeLine>()
+        for (i in 0 until raw.length()) {
+            val line = raw.optJSONObject(i) ?: continue
+            lines.add(CodeLine(line.optString("text"), line.optString("kind")))
+        }
+        // 没有行内容就只有个文件名，画出来是张空卡 —— 不如不画。
+        if (lines.isEmpty()) return null
+        return CodeBlock(
+            path = block.optString("path"),
+            added = block.optInt("added"),
+            removed = block.optInt("removed"),
+            lines = lines,
+        )
+    }
+
     fun parseTimeline(body: String): Conversation {
         val root = JSONObject(body)
         val messages = mutableListOf<Message>()
@@ -77,6 +108,7 @@ object CrewWire {
                     text = readable(item.optString("text")),
                     at = item.optString("at"),
                     requestId = item.optString("request_id"),
+                    code = parseCode(item),
                 ),
             )
         }

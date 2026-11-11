@@ -2,6 +2,47 @@
 
 九张画板。亮暗两套配色、对话与后台、空态与断连。
 
+## 看稿子
+
+稿子是 [baoyu-design](https://github.com/JimLiu/baoyu-design)（宝玉）的 canvas 格式：
+`project/canvas.json` 记布局，`project/*.dc.html` 一个画板一个自包含 HTML。
+编辑器服务不一定开着，所以仓库里带了一个只读查看器：
+
+```bash
+python3 tools/canvas-viewer.py .        # http://127.0.0.1:4730/
+```
+
+它会按 `canvas.json` 的坐标把九张板子铺成一块画布，标签跳转、±/适应、Cmd+滚轮缩放。
+
+已经导出的图片分两处，**别混着看**：
+
+- `render/` —— 从画板渲染的 2× 图，`render/九张画板总览.png` 是九张拼合（2088×2668）
+- 仓库根目录的 PNG —— **真机 / 真窗口截图**（`mobile-current.png`、`desktop-shadow.png` 等）
+
+设计系统（色板、字号、圆角、尺寸）抽成了两份：`设计系统.md` 给人看，`tokens.json` 给程序读。
+
+## 拿真实密度对照实现
+
+空数据下看不出排版对不对 —— 一屏空态能掩盖所有间距问题。`tools/design-mock.py`
+把画板里的文字原样喂给桌面端，于是屏幕上任何一处不合，都是实现的差，不是内容不同：
+
+```bash
+python3 tools/design-mock.py &                     # 127.0.0.1:18899
+cd ../../desktop && go build -o /tmp/crew . && \
+  DSH_GW=http://127.0.0.1:18899 DSH_TOKEN=x DSH_DEVICE=shot /tmp/crew &
+sh ../scripts/shot.sh /tmp/now.png                # 按窗口 ID 单张抓
+```
+
+**抓图前先确认只有一扇 crew 窗口**：`shot-window.swift` 取第一个标题匹配的窗口，
+残留的旧进程会让你一直在看旧画面（这一坑踩过一次，白改了三轮）。
+
+对照结果见 `render/对照-设计稿vs实现.png`（桌面亮暗两套）与 `render/对照-手机.png`。
+
+**手机端只装模拟器**。`adb devices` 里挂着的可能是一台真机（`SM-A226B`），
+`ro.kernel.qemu=0` 就能看出来 —— 别按「有设备就是模拟器」去装。用
+`adb -s emulator-5554` 显式指定目标，并在部署前跑一次
+`adb -s emulator-5554 shell getprop ro.kernel.qemu`（`1` 才是模拟器）。
+
 ## 稿子与代码的对照
 
 改稿子前先看这张表：标「已实现」的改动要同步到代码，标「仅设计」的改动只活在稿子里。
@@ -10,33 +51,42 @@
 |---|---|---|---|
 | `Desktop.dc.html` | 三栏：花名册 / 对话 / 后台 | `desktop/ui.go` 的 `roster`、`conversationPane`、`backendPane` | 已实现 |
 | | 花名册每行分两截：人设 + 任务状态 | `desktop/ui.go` 的 `roster` | 已实现 |
-| | 子代理卡（可展开，按层缩进） | `desktop/ui.go` 的 `agentRow` + `client.go` 的 `Agents` | 已实现 |
-| | 等你决定卡（赭色） | `desktop/ui.go` 的 `taskCard` 按 `NeedsPerson` 着色 | 已实现 |
-| | 后台失败态 + 重试 | `desktop/ui.go` 的 `taskCard` 按 `state == "failed"` 着色 | 部分：着色有，**重试没接线**（后端有 `POST tickets/:id/retry`，界面没调） |
-| | 排队插话的可见状态 | `desktop/ui.go` 的 `composer` 读 `conversation.Queued` | 部分：只显示条数，**撤回没做**（见下） |
-| | 「看它的屏幕」按钮 | — | 仅设计 |
-| | 模型切换标签 | — | 仅设计：后端无切模型 UI 入口 |
+| | Bot 消息是「头像 + 无气泡正文」 | `desktop/ui.go` 的 `message` / `messageAvatar` | 已实现（28×28 实心方块） |
+| | 子代理卡（可展开，按层缩进） | `desktop/ui.go` 的 `subagentCard` + `client.go` 的 `Agents` | 已实现；消息流内，与正文左基线对齐 |
+| | 等你决定卡（赭色） | `desktop/ui.go` 的 `pendingCard`（消息流末尾）+ `taskCard`（右栏） | 已实现：两处各司其职 |
+| | 消息里带代码片段 | `desktop/ui.go` 的 `codeCard` | 已实现：文件名 + `+N −M` + 逐行增删底色 |
+| | 聊天贴着最新消息 | `desktop/ui.go` 的 `chatScroll` / `chatPinned` | 已实现：首次落到最底；上翻后不抢视图 |
+| | 工单卡状态点 + 进度条 | `desktop/ui.go` 的 `taskCard` | 状态点已实现；**进度条不画**（后端无 `total_steps`，没有分母就是假进度） |
+| | 后台失败态 + 重试 | `desktop/ui.go` 的 `taskCard` 按 `ticket.retryable` 着色；两端都调 `POST /api/mobile/retry` | 已实现（手机/桌面） |
+| | 排队插话的可见状态 | 桌面 `composer` / 手机 `Composer` 读 `queued` | 已实现：显示条数与正文，可撤回（`POST /api/mobile/withdraw`，409 已读/已回复时如实提示）|
+| | 插队（跳过排队） | 桌面/手机排队条与输入框旁的「插队」 | 已实现：新写一句可发送即插队（网关标记已读，不重复路由）；队列里还没被读走的也能插；已在处理中的会如实拒绝 |
+| | 模型 / 推理档位 / 成员模型 | 桌面 `modelPane`，后端 `/api/mobile/models`、`/efforts`、`/model` | 已实现：可切全场或某位成员的模型，档位由适配器现查；成员可「跟随全员」 |
+| | 「看它的屏幕」按钮 | 桌面/手机调用 `GET /api/mobile/screen` | 已实现：显示该工单的会话活动快照（命令/输出/回话/状态，已掩码与截断）；没有记录时如实给原因 |
+| | 模型切换标签 | 桌面 `modelPane` + `POST /api/mobile/model` | 已实现（桌面）；手机端只有客户端方法，没有 UI |
 | `Desktop-dark.dc.html` | 同一套结构，暗色 | `desktop/theme.go` 的 `DarkPalette`，`ThemeColors` 跟随系统 | 已实现 |
 | `Desktop-empty.dc.html` | 队伍为空、后台 0 张 | `desktop/ui.go` 的空态分支 | 已实现 |
 | `Desktop-offline.dc.html` | 断连横幅 + 重试 + 输入框禁用 | `desktop/ui.go` 的 `problem` 横幅与 `composer` | 已实现 |
 | `Mobile.dc.html` | 配对屏（首次打开） | `app/.../PairingScreen.kt` | 已实现，**真机截图验证过亮暗两套** |
-| | 队伍、对话、后台两屏切换 | `app/.../CrewUi.kt` 的 `CrewRoot` | 代码在，**未在真机连上后端** |
-| | 子代理折叠卡 | `app/.../CrewUi.kt` 的 `SubagentCard` | 已实现 |
-| | 等你决定卡 | `app/.../CrewUi.kt` 的 `TicketStrip` | 已实现 |
-| | 排队条数 | `app/.../CrewUi.kt` 的 `Composer` | 部分：只显示条数，**撤回没做**（见下） |
+| | 队伍、对话、后台两屏切换 | `app/.../CrewUi.kt` 的 `CrewRoot` | 已实现，模拟器连宿主后端验证过（时间线、后台页） |
+| | Bot 消息带头像 | `app/.../CrewUi.kt` 的 `MessageRow` | 已实现（25×25） |
+| | 子代理折叠卡 | `app/.../CrewUi.kt` 的 `SubagentCard` | 已实现：22×22 图标 + 「N 个子代理 / x 在跑」两行 |
+| | 等你决定卡 | `app/.../CrewUi.kt` 的 `TicketStrip` | 已实现：赭边 + 暖底 + 自写一句 + 回 |
+| | 消息里带代码片段 | `app/.../CrewUi.kt` 的 `CodeCard` | 已实现 |
+| | 排队条数 | `app/.../CrewUi.kt` 的 `Composer` | 已实现：显示条数与正文，撤回按钮接 `/api/mobile/withdraw` |
 | `Mobile-dark.dc.html` | 暗色 | `app/.../CrewUi.kt` 的 `DarkPalette` + `isSystemInDarkTheme` | 已实现 |
 | `Mobile-roster.dc.html` | 队伍空态，加「队伍 / 后台」切换 | `app/.../CrewUi.kt` 的 `EmptyState` | 已实现 |
 | `Mobile-card.dc.html` | 名片：人设全文、`bot/<id>`、最近工单、"跟他说话" | `app/.../CrewUi.kt` 的 `BotCardSheet` | 已实现 |
-| `Mobile-workspace.dc.html` | 全屏工作区、接手操作、让它停一下 | — | 仅设计：需要后端暴露接管接口 |
+| `Mobile-workspace.dc.html` | 全屏工作区、接手操作、让它停一下 | `app/.../CrewUi.kt` 的 `WorkspaceScreen` | 已实现；画面仍是 unavailable 的实话 |
 
 ## 稿子里还没落地的三块
 
-- **看它的屏幕 / 全屏工作区**：要后端能转发 worker 的实时画面，现在没有任何接口。
-- **排队消息的撤回**：`queued` 给了 request id，但 `tools/mobileq` 只有 pull / reply / thread / inject / outbox，
-  没有撤回。要做就得动队列语义，还要回答「已经派出去的工单怎么收回」，那是独立的一块。
-- **公网隧道**：局域网这条路已经通了（`/api/remote/enter` 只认凭据、不限来源，实测从 192.168.31.127 可达）。
-  出门仍然连不上：那需要一台公网中转服务器，`dsh-mobile-plugin` 自己的 `relayUrl` 默认也是空的 —— 中转要自备。
-- **后台的重试按钮**：后端 `POST tickets/:id/retry` 已经有了，两个客户端都没接。
+> 2026-11-10 更新：公网隧道、重试、排队撤回、屏幕活动快照、三栏拖拽/收起均已落地；下表保留设计当初的判断。
+
+- **看它的屏幕 / 全屏工作区**：已接后端 `GET /api/mobile/screen`，显示的是 worker 会话的活动快照（它刚跑了什么、输出了什么、说了什么），不是像素截帧；没有记录时给真实原因。全屏仍是画板元素，未接接口。
+- **排队消息的撤回**：后端 `POST /api/mobile/withdraw` 与两端 UI 已实现；只允许撤回还没被读走、还没被回复的消息，否则 409。
+- **公网隧道**：已部署。NAS `crew-relay`（192.168.31.152:18800）+ Caddy 子路径
+  `https://jarvis.kentonnie.top/crew-relay/`，宿主主动外连，实测 tunnels:1。
+- **后台的重试按钮**：已接。两端走手机面 `POST /api/mobile/retry?ticket=`（管理面要求本机同源，手机到不了）。
 
 ## 客户端连哪个地址（重要）
 
@@ -117,6 +167,8 @@ GET http://127.0.0.1:7862/api/mobile/timeline
 而插件要重新加载才会执行新代码，那不是这个会话能做的。
 
 **已知小问题**：收起键盘后焦点跳到地址框并弹出字母键盘（应为数字键盘或保持无焦点）。
+
+**2026-11-10 复核**：桌面端工作区（model/后台/收起/三栏拖拽/看屏幕）已在真实窗口点击与拖拽验证；手机端时间线与「已完成」页在模拟器验证。像素级对照清单见 `/tmp/design-diff.md`（并行审计产出，不随仓库提交）。
 
 ## 内置配对（调试用）
 

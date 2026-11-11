@@ -635,9 +635,9 @@ func (s *app) roster(c *ui.Context, p Palette) {
 					ui.Column(c).FillWidth().Gap(12).Padding(11).Children(func() {
 						// 画板这里是 52×52 虚线圈、圆角 16；圆角 20 那个是中栏的 64×64 空态，别混用。
 						ui.Column(c).Width(52).Height(52).Radius(RadiusFolderSml).
-							BorderWidth(1).BorderColor(p.Line).Background(p.Surface).
+							BorderWidth(1).BorderColor(p.EmptyEdge).Background(p.Surface).
 							AlignItems(ui.Center).PaddingY(9).Children(func() {
-							ui.Text(c, "+").FontSize(FontGlyph).TextColor(p.Faint)
+							ui.Text(c, "+").FontSize(FontGlyph).TextColor(p.EmptyGlyph)
 						})
 						ui.Text(c, "队伍还是空的。").FontSize(FontBody).TextColor(p.Muted)
 						ui.Text(c, "加一位 Bot，他从今天起会记住\n你们的每一次对话。").
@@ -682,12 +682,12 @@ func (s *app) roster(c *ui.Context, p Palette) {
 						ui.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
 							ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Baseline).Children(func() {
 								ui.Text(c, strings.TrimSpace(bot.Name)).FontSize(FontName).FontWeight(WeightName).
-									TextColor(p.Ink).NoWrap()
+									LineHeight(1.25).TextColor(p.Ink).NoWrap()
 								ui.Row(c).Grow(1).MinWidth(0).ClipX().Children(func() {
 									if bot.Persona != "" {
 										// 职能跟名字同一行，弱一档：它是「他是什么人」，不是状态。
 										ui.Text(c, clipRunes(bot.Persona, 12)).FontSize(FontHairline).
-											TextColor(p.Faint).NoWrap().Ellipsis("…")
+											LineHeight(1.25).TextColor(p.Faint).NoWrap().Ellipsis("…")
 									}
 								})
 							})
@@ -701,7 +701,7 @@ func (s *app) roster(c *ui.Context, p Palette) {
 								if s.stateColor(p, bot.ID) == p.Hint {
 									stateTint = p.Faint
 								}
-								ui.Text(c, s.stateOf(bot.ID)).FontSize(FontBody).TextColor(stateTint)
+								ui.Text(c, s.stateOf(bot.ID)).FontSize(FontBody).LineHeight(1.3).TextColor(stateTint)
 							})
 						})
 						// 「改」：点人不该只等于「选他」。这一格把「改这一位」从只有手机能做的事
@@ -931,6 +931,8 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 			// 断连：一行说清现状与后果，右边给「重试」。连的是哪一支仍写出来，
 			// 但不再摆成两行说教 —— 画板这里是一条能重试的横幅。
 			ui.Column(c).FillWidth().Children(func() {
+				// 画板：淡红底、图标与正文用更深的红（#8A4038），
+				// 「重试」是主强调绿 —— 它是个能按的动作，不是又一句警告。
 				ui.Row(c).FillWidth().PaddingX(28).PaddingY(9).Gap(9).
 					AlignItems(ui.Center).Background(p.DangerSoft).Children(func() {
 					ui.Text(c, "⚠").FontSize(FontBody).TextColor(p.Danger)
@@ -938,9 +940,9 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 					if s.endpoint != "" {
 						line = "连不上 " + s.endpoint + " —— 已经读到的消息还在，等连上了会自动续上"
 					}
-					ui.Text(c, line).FontSize(FontBody).TextColor(p.Danger)
+					ui.Text(c, line).FontSize(FontBody).TextColor(p.DangerDeep)
 					ui.Row(c).Grow(1)
-					ui.Text(c, "重试").FontSize(FontSmall).TextColor(p.Danger).
+					ui.Text(c, "重试").FontSize(FontSmall).TextColor(p.Accent).
 						Cursor(ui.CursorPointer).OnClick(s.refresh)
 				})
 				ui.Column(c).FillWidth().Height(1).Background(p.DangerEdge)
@@ -1208,8 +1210,8 @@ func (s *app) stream(c *ui.Context, p Palette) {
 		// 空态居中：画板里它落在消息区正中，不是贴着标题栏左上角。
 		ui.Column(c).Grow(1).FillWidth().Center().Gap(10).PaddingX(ContentInset).Children(func() {
 			ui.Column(c).Width(64).Height(64).Radius(RadiusFolder).BorderWidth(1).
-				BorderColor(p.Line).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				ui.Text(c, "···").FontSize(FontEmptyIcon).TextColor(p.Faint)
+				BorderColor(p.EmptyEdge).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				ui.Text(c, "···").FontSize(FontEmptyIcon).TextColor(p.EmptyGlyph)
 			})
 			ui.Text(c, "还没有人说话").FontSize(FontTitle).FontWeight(WeightName).TextColor(p.Muted)
 			ui.Text(c, "在下面写一句，他就会记得。").FontSize(FontLabel).TextColor(p.Hint)
@@ -1278,12 +1280,15 @@ func (s *app) subagentCard(c *ui.Context, p Palette, tree []AgentNode) {
 				ui.Row(c).Grow(1)
 				ui.Text(c, fmt.Sprintf("%d 在跑 · %d 已完成", running, done)).FontSize(FontSmall).TextColor(p.Faint)
 			})
-			ui.Column(c).FillWidth().Height(1).Background(p.Line)
+			// 行间分隔比卡片边框再淡一档（画板 #F4F0EA）：一行一条线的话，
+			// 用卡片边框那种色会把整张卡切成几块。
+			ui.Column(c).FillWidth().Height(1).Background(p.RowRule)
 			for _, node := range tree {
 				s.subagentRow(c, p, node, 0)
 			}
 			ui.Column(c).FillWidth().Height(1).Background(p.Line)
-			ui.Row(c).FillWidth().Padding(12).Background(p.Footer).Children(func() {
+			// 脚注底是画板的 #FDFCFA：比卡片再浅一层，收住这张卡。
+			ui.Row(c).FillWidth().Padding(12).Background(p.Faintest).Children(func() {
 				ui.Text(c, "子代理还能再派子代理，层级在这张卡里逐层展开").
 					FontSize(FontSmall).TextColor(p.Faint)
 			})
@@ -1378,13 +1383,13 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 		// 与 Bot 消息同一列头像：这张卡是那位 Bot 在等你。
 		s.messageAvatar(c, p, task.BotID)
 		ui.Column(c).Grow(1).MinWidth(0).Gap(8).Children(func() {
-			if s.botTurnStartOfTask(task) {
+			// 名字行只在有职能可写时出现：头像已经说明是谁，独占一行只会
+			// 把这张卡推高，和上面几条消息的节奏对不齐。
+			if role := s.roleOf(task.BotID); role != "" {
 				ui.Row(c).Gap(7).AlignItems(ui.Baseline).Children(func() {
 					ui.Text(c, s.nameOf(task.BotID)).FontSize(FontSmall).
 						FontWeight(WeightName).TextColor(p.Ink)
-					if role := s.roleOf(task.BotID); role != "" {
-						ui.Text(c, role).FontSize(FontHairline).TextColor(p.Faint)
-					}
+					ui.Text(c, role).FontSize(FontHairline).TextColor(p.Faint)
 				})
 			}
 			// 不加 FillWidth：在 Row 里嵌套 Column 时它会让这一列的宽度等待
@@ -1429,11 +1434,6 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 		})
 	})
 }
-
-// botTurnStartOfTask 用在没有消息 ID 的卡上：这张票是那位 Bot 这一轮的落点。
-// 同一个人在消息流里已经说过话就不必再标一次名字，但票与发言是两种条目，
-// 分开判断容易错位，所以这里保守地标出来。
-func (s *app) botTurnStartOfTask(task Task) bool { return true }
 
 func (s *app) message(c *ui.Context, p Palette, message Message) {
 	fromBot := message.Role == "agent"
@@ -1498,29 +1498,6 @@ func (s *app) messageAvatar(c *ui.Context, p Palette, botID string) {
 		AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 		ui.Text(c, firstRune(s.nameOf(botID))).FontSize(FontBody).FontWeight(WeightFigure).TextColor(tint)
 	})
-}
-
-// botTurnStart 判断这条 Bot 消息是不是「这个人这一轮的第一句」。
-//
-// 连续同一个人的发言只在第一句标名字：画板里几段林的话连排时，名字只在
-// 换人时出现一次，否则每一句都顶一行名字，读起来像好几拨人在轮流说。
-func (s *app) botTurnStart(message Message) bool {
-	if s.conversation == nil {
-		return true
-	}
-	index := -1
-	for i, candidate := range s.conversation.Messages {
-		if candidate.ID == message.ID {
-			index = i
-			break
-		}
-	}
-	// 找不到（比如消息是刚追加的）：保守地标出来，宁可多标一次也不藏掉是谁说的。
-	if index <= 0 {
-		return true
-	}
-	previous := s.conversation.Messages[index-1]
-	return previous.Role != "agent" || previous.BotID != message.BotID
 }
 
 // roleOf 是花名册里那半句「前端 · 话少，先验再说」的前半截。
@@ -1741,8 +1718,12 @@ func (s *app) composer(c *ui.Context, p Palette) {
 		ui.Row(c).FillWidth().Radius(RadiusBig).Background(p.Card).
 			BorderWidth(1).BorderColor(p.Line).PaddingX(13).PaddingY(9).Gap(8).
 			AlignItems(ui.Center).Children(func() {
-			ui.TextInput(c, &s.input).Placeholder(placeholder).Grow(1).
-				PlaceholderColor(p.Faint).OnSubmit(func() { s.send() })
+			// 输入框也得自己定字色与底：mygo 的默认色跟着系统外观走，
+			// 而这扇窗的主题可以由 CREW_THEME 覆盖 —— 系统是暗、窗口是亮时，
+			// 默认色会把输入框画成一整块黑底（实测过，亮色主题下很扎眼）。
+				ui.TextInput(c, &s.input).Placeholder(placeholder).Grow(1).
+					PlaceholderColor(p.Faint).TextColor(p.Ink).CaretColor(p.Accent).
+					SelectionColor(p.AccentSoft).Background(p.Card).OnSubmit(func() { s.send() })
 			if s.sending {
 				ui.Text(c, "发送中…").FontSize(FontTiny).TextColor(p.Faint)
 			} else {
@@ -1834,6 +1815,30 @@ func (s *app) pauseAll() {
 		s.pauseDone <- pauseResult{err: s.client.Pause(ctx)}
 		s.wake()
 	}()
+}
+
+// lastStepHint 是这张票最后发生的一件事，用来填卡片底部左边那句现状。
+// 没读过经过就返回空串 —— 卡片上留白比写一句猜的强。
+func (s *app) lastStepHint(task Task) string {
+	steps := s.stepsFor(task.ID)
+	if len(steps) == 0 {
+		return ""
+	}
+	return clipRunes(steps[len(steps)-1].Text, 18)
+}
+
+// taskDotColor 是工单卡标题左侧那个 5px 点的颜色：
+// 在跑绿、等你赭、失败红，其余（已完成/未知）灰。
+func (s *app) taskDotColor(p Palette, task Task) ui.Color {
+	switch {
+	case task.NeedsPerson == "failed" || task.Retryable:
+		return p.Danger
+	case task.NeedsPerson != "":
+		return p.Warn
+	case task.Open:
+		return p.Accent
+	}
+	return p.Faint
 }
 
 // taskCountLine 是右栏栏头那一行：永远有张数，有票时再补在跑/失败。
@@ -2003,8 +2008,8 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 		} else {
 			ui.Column(c).FillWidth().Grow(1).Center().Gap(8).Children(func() {
 				ui.Column(c).Width(22).Height(22).Radius(RadiusItem).BorderWidth(1).
-					BorderColor(p.Line).AlignItems(ui.Center).PaddingY(2).Children(func() {
-					ui.Text(c, "▤").FontSize(FontBody).TextColor(p.Faint)
+					BorderColor(p.EmptyEdge).AlignItems(ui.Center).PaddingY(2).Children(func() {
+					ui.Text(c, "▤").FontSize(FontBody).TextColor(p.EmptyGlyphSoft)
 				})
 				ui.Text(c, s.emptyTabTitle()).FontSize(FontLabel).FontWeight(WeightName).TextColor(p.Muted)
 				ui.Text(c, "队伍接到的活会出现在这里。").FontSize(FontBody).TextColor(p.Hint)
@@ -2291,9 +2296,18 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 	card := ui.Column(c).FillWidth().PaddingX(25).PaddingY(12).Gap(4).Radius(RadiusCard).
 		Background(soft).BorderWidth(1).BorderColor(edge).Cursor(ui.CursorPointer)
 	card.Children(func() {
-		ui.Text(c, task.Title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(tint)
+		// 标题行：左边一个 5px 的状态点，右边标题。画板用这个点代替任何色块，
+		// 一列卡扫一眼就能看出哪张在跑、哪张卡住、哪张失败了。
+		ui.Row(c).FillWidth().Gap(7).AlignItems(ui.Start).Children(func() {
+			// 点对齐到第一行字的中线附近：margin-top 5 是画板给的那个值。
+			ui.Column(c).Width(5).Height(5).Radius(RadiusDot).Margin(0, 5, 0, 0).
+				Background(s.taskDotColor(p, task))
+			ui.Text(c, task.Title).FontSize(FontBodyWide).FontWeight(WeightCard).
+				LineHeight(1.45).TextColor(tint).Grow(1).MinWidth(0)
+		})
 
-		// 状态行：谁在做 + 第几步。设计稿把这两件事压在第二行。
+		// 状态行：谁在做 + 第几步。设计稿把这两件事压在第二行，
+		// 并且缩进 17 避开上面那个状态点（卡片左边距 25 → 状态行 42）。
 		detail := stateWord(task.State)
 		if task.BotID != "" {
 			detail += " · " + s.nameOf(task.BotID)
@@ -2301,13 +2315,15 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 		if step := s.stepOf(task); step != "" {
 			detail += " · " + step
 		}
-		ui.Text(c, detail).FontSize(FontTiny).TextColor(p.Muted)
-		// 进度条：画板里 2px 圆角、2px 高。
-		//
-		// 能不能画取决于有没有「共几步」这个分母 —— 后端目前只给已发生的经过，
-		// 没有计划里的总步数。没有分母就不画，宁可空着也不画一根假的。
+		ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+			ui.Text(c, detail).FontSize(FontTiny).TextColor(p.Muted)
+		})
+		// 进度条：画板里 2px 圆角、2px 高，但只在有「共几步」这个分母时才画。
+		// 后端目前只给已发生的经过，没有计划里的总步数 —— 没有分母就不画，
+		// 宁可空着也不画一根永远停在 100% 的假条。
 		if done, total := s.progressOf(task); total > 0 {
-			ui.Row(c).FillWidth().Height(2).Radius(RadiusTiny).Background(p.Line).Children(func() {
+			ui.Row(c).FillWidth().PaddingStart(12).Height(3).Radius(RadiusTiny).
+				Background(p.Track).Children(func() {
 				ui.Row(c).WidthPercent(float32(done) / float32(total) * 100).FillHeight().
 					Radius(RadiusTiny).Background(p.Accent)
 			})
@@ -2315,15 +2331,20 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 
 		if task.NeedsPerson != "" {
 			// 等的原因要写明，否则「等你」不告诉人要等什么。
-			ui.Text(c, task.NeedsPerson).FontSize(FontTiny).TextColor(p.Warn)
+			ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+				ui.Text(c, task.NeedsPerson).FontSize(FontTiny).TextColor(p.Warn)
+			})
 			if waited := s.waitedFor(task); waited != "" {
-				ui.Text(c, "卡在等你 · 等你 "+waited).FontSize(FontHairline).TextColor(p.Warn)
+				ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+					ui.Text(c, "卡在等你 · 等你 "+waited).FontSize(FontHairline).TextColor(p.Warn)
+				})
 			}
 		}
 		if task.Retryable {
-			// 失败的票得有一条出路，否则只能干看着。
+			// 失败的票得有一条出路，否则只能干看着。画板里这一行右对齐。
 			ticketID := task.ID
-			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Grow(1)
 				// 这一行自己接点击：重试是另一件事，不能让它顺手把卡片也展开了。
 				ui.Text(c, "重试 →").FontSize(FontTiny).TextColor(p.Accent).Cursor(ui.CursorPointer).OnClick(func() {
 					go func() {
@@ -2350,12 +2371,19 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 		if opened {
 			arrow = "收起 ↑"
 		}
-		ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-			ui.Text(c, arrow).FontSize(FontTiny).TextColor(p.Accent)
-			ui.Row(c).Grow(1)
-			if err := s.workError; opened && err != "" {
-				ui.Text(c, err).FontSize(FontHairline).TextColor(p.Danger)
+		// 画板里这一行是「左边一句现状、右边一个入口」，入口靠右贴着卡边。
+		// 左边那句放这张票最后发生的动作（有的话），没有就让它空着，
+		// 不编一句「正在处理」来充数。
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
+			if opened {
+				if err := s.workError; err != "" {
+					ui.Text(c, err).FontSize(FontHairline).TextColor(p.Danger)
+				}
+			} else if hint := s.lastStepHint(task); hint != "" {
+				ui.Text(c, hint).FontSize(FontTiny).TextColor(p.Hint).MaxLines(1).Ellipsis("…")
 			}
+			ui.Row(c).Grow(1)
+			ui.Text(c, arrow).FontSize(FontTiny).TextColor(p.Accent)
 		})
 
 		// 读到的每一步：谁做的、做了什么、成没成。层级靠缩进。
@@ -2775,12 +2803,14 @@ func (s *app) botEditor(c *ui.Context, p Palette) {
 			ui.Text(c, "bot/"+s.editingBot).FontSize(FontMini).TextColor(p.Faint)
 
 			ui.Text(c, "名字").FontSize(FontTiny).FontWeight(WeightName).TextColor(p.Faint)
-			ui.TextInput(c, &s.botName).FillWidth().FontSize(FontBodyWide)
+			ui.TextInput(c, &s.botName).FillWidth().FontSize(FontBodyWide).
+				TextColor(p.Ink).CaretColor(p.Accent).SelectionColor(p.AccentSoft).Background(p.Card)
 
 			ui.Text(c, "人设（他怎么说话、擅长什么）").FontSize(FontTiny).FontWeight(WeightName).TextColor(p.Faint)
 			ui.Column(c).FillWidth().Height(96).Padding(9).Radius(RadiusItem).
 				BorderWidth(1).BorderColor(p.Line).Background(p.Surface).Children(func() {
-				ui.TextInput(c, &s.botPersona).FillWidth().FontSize(FontBodyWide)
+				ui.TextInput(c, &s.botPersona).FillWidth().FontSize(FontBodyWide).
+					TextColor(p.Ink).CaretColor(p.Accent).SelectionColor(p.AccentSoft).Background(p.Card)
 			})
 			ui.Text(c, "留空就是没有特别的人设，他会照队伍默认的方式说话。").
 				FontSize(FontMini).TextColor(p.Faint)

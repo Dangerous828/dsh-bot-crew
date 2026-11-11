@@ -81,6 +81,14 @@ data class CrewPalette(
     val emptyEdge: Color, val emptyGlyph: Color,
     // 分段切换的底（画板的 #EFEBE5：比 surface 深、比 line 浅）。
     val segment: Color,
+    // 「等你决定」卡的底与边。画板亮色 #FDF9F4 / #E9D9C9，暗色 #241F1A / #4A3A28。
+    // 单列出来是因为它既不是 card（太白）也不是 warnSoft（太黄）。
+    val warmBase: Color, val warnEdge: Color,
+    // 输入框的底（画板亮色 #F3F0EA / 暗色 #2A2830）。浅灰无边框，
+    // 靠底色而不是描边和页面分开。
+    val field: Color,
+    // 删除行的浅橙底（画板亮色 #F6EEE6）。和 warmBase 不同：那个是「等你决定」的卡底。
+    val warnSoft: Color,
 )
 
 val LightPalette = CrewPalette(
@@ -90,6 +98,7 @@ val LightPalette = CrewPalette(
     userBubble = Color(0xFF2C2A26), userInk = Color(0xFFFBF9F6),
     accentSoft = Color(0xFFEAF1EC), line = Color(0xFFEDE8E1), hint = Color(0xFFA9A294),
     emptyEdge = Color(0xFFD9D3C9), emptyGlyph = Color(0xFFB8B1A5), segment = Color(0xFFEFEBE5),
+    warmBase = Color(0xFFFDF9F4), warnEdge = Color(0xFFE9D9C9), warnSoft = Color(0xFFF6EEE6), field = Color(0xFFF3F0EA),
 )
 
 val DarkPalette = CrewPalette(
@@ -100,6 +109,8 @@ val DarkPalette = CrewPalette(
     accentSoft = Color(0xFF1E3A34), line = Color(0xFF33313A), hint = Color(0xFF6E6860),
     // 暗盘里没有对应的暖灰：虚线框落到分隔色，人形落到弱字色；分段底用抬起层。
     emptyEdge = Color(0xFF33313A), emptyGlyph = Color(0xFF928C82), segment = Color(0xFF1D1C21),
+    warmBase = Color(0xFF241F1A), warnEdge = Color(0xFF4A3A28), warnSoft = Color(0xFF3A2A1C),
+    field = Color(0xFF2A2830),
 )
 
 /**
@@ -1190,15 +1201,43 @@ private fun BackendScreen(
 private fun TicketStrip(conversation: Conversation, palette: CrewPalette) {
     // 对话里只露一张「等你决定」，其余在后台里看。
     val waiting = conversation.tickets.firstOrNull { it.needsPerson.isNotEmpty() } ?: return
+    // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
+    // 和普通工单卡长得一样，而它要的是「现在只有这一件事等你」。
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(palette.card, RoundedCornerShape(10.dp))
-            .padding(12.dp),
+            .padding(start = 47.dp, end = 14.dp)
+            .background(palette.warmBase, RoundedCornerShape(10.dp))
+            .border(1.dp, palette.warnEdge, RoundedCornerShape(10.dp))
+            .padding(11.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        Text(waiting.title, color = palette.ink, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
-        Text(waiting.needsPerson, color = palette.warn, fontSize = 11.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("◷", color = palette.warn, fontSize = 11.sp)
+            Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight(620))
+        }
+        Text(waiting.needsPerson, color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(32.dp)
+                    .background(palette.card, RoundedCornerShape(8.dp))
+                    .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 11.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp)
+            }
+            Box(
+                modifier = Modifier
+                    .size(width = 36.dp, height = 32.dp)
+                    .background(palette.warn, RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("回", color = Color.White, fontSize = 11.5.sp)
+            }
+        }
     }
 }
 
@@ -1261,17 +1300,20 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
         }
     }
 
+    // 与消息同一列：消息行左边距 14 + 头像 25 + 间距 8 = 47，右边 14。
+    // 卡自己不再加内边距式的 Padding(13)，那会让表头比正文还缩进 —— 画板里
+    // 表头与正文同一条左基线。
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp)
+            .padding(start = 47.dp, end = 14.dp)
             .background(palette.card, RoundedCornerShape(10.dp))
-            .padding(13.dp),
+            .border(1.dp, palette.line, RoundedCornerShape(10.dp)),
     ) {
         // 表头：左「N 个子代理」，右「x 在跑 · y 已完成」。
         // 收起时也显示 —— 空的按钮块占着一大片白，比没有更难看。
         Row(
-            modifier = Modifier.fillMaxWidth().clickable {
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp).clickable {
                 open = !open
                 if (open && nodes == null) {
                     scope.launch {
@@ -1288,18 +1330,31 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
             val total = nodes?.let { countAgents(it) }
             // 后端目前只发 working；终态集合留给以后。递归数，否则嵌套节点会被算成已完成。
             val running = nodes?.let { countRunning(it) } ?: 0
-            Text(
-                if (total == null) "子代理" else "%d 个子代理".format(total),
-                fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.muted,
-            )
-            Box(Modifier.weight(1f))
-            Text(
-                when {
-                    total == null -> if (open) "读着…" else "点开看"
-                    else -> "%d 在跑 · %d 已完成".format(running, total - running)
-                },
-                fontSize = 11.sp, color = palette.faint,
-            )
+            // 画板：左边一个 22×22 的淡绿方块图标，再是「N 个子代理 / x 在跑 · y 已完成」两行。
+            // 一行文字块看不出「这里能点开」，方块图标给了它一个可点的形状。
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .background(palette.accentSoft, RoundedCornerShape(7.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("⑂", fontSize = 11.sp, color = palette.accent)
+            }
+            Spacer(Modifier.width(9.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    if (total == null) "子代理" else "%d 个子代理".format(total),
+                    fontSize = 12.5.sp, fontWeight = FontWeight(550), color = palette.ink,
+                )
+                Text(
+                    when {
+                        total == null -> if (open) "读着…" else "点开看"
+                        else -> "%d 在跑 · %d 已完成".format(running, total - running)
+                    },
+                    fontSize = 11.sp, color = palette.faint,
+                )
+            }
+            Text(if (open) "‹" else "›", fontSize = 13.sp, color = palette.faint)
         }
         trouble?.let {
             Spacer(Modifier.height(6.dp))
@@ -1308,6 +1363,73 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
         if (open) {
             Spacer(Modifier.height(6.dp))
             nodes?.forEach { AgentBranch(it, 0, palette) }
+        }
+    }
+}
+
+/**
+ * 消息里带的代码片段：文件名 + 增删统计，逐行标出新增/删除。
+ *
+ * 画板里整行浅绿底表示新增、整行浅橙底表示删除，`+` / `-` 跟在行首。
+ * 只给号着色是不够的 —— 一屏代码里看不出改了哪几行。
+ */
+@Composable
+private fun CodeCard(block: CodeBlock, palette: CrewPalette) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(palette.card, RoundedCornerShape(10.dp))
+            .border(1.dp, palette.line, RoundedCornerShape(10.dp)),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 11.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(block.path, fontSize = 11.sp, color = palette.faint)
+            Box(Modifier.weight(1f))
+            if (block.added > 0) Text("+${block.added}", fontSize = 11.sp, color = palette.accent)
+            if (block.removed > 0) {
+                Text(" -${block.removed}", fontSize = 11.sp, color = palette.warn)
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            block.lines.forEach { line ->
+                val added = line.kind == "added"
+                val removed = line.kind == "removed"
+                val soft = when {
+                    added -> palette.accentSoft
+                    removed -> palette.warnSoft
+                    else -> Color.Transparent
+                }
+                val tint = when {
+                    added -> palette.accent
+                    removed -> palette.warn
+                    else -> palette.faint
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(soft)
+                        .padding(horizontal = 11.dp, vertical = 1.dp),
+                ) {
+                    // 正文可能自带 + / - 前缀（后端两种写法都给过），先剥掉再按类别加，
+                    // 否则画出来是 `+ + gap: 16px;`。
+                    Text(
+                        when {
+                            added -> "+ "
+                            removed -> "- "
+                            else -> "  "
+                        } + line.text.trimStart().trimStart('+', '-').trimStart(),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        lineHeight = 19.8.sp,
+                        color = tint,
+                    )
+                }
+            }
         }
     }
 }
@@ -1351,54 +1473,87 @@ private fun MessageRow(
         !fromBot -> "我"
         else -> bots.firstOrNull { it.id == message.botId }?.name ?: message.botId.orEmpty()
     }
-    // 手机上一行就是一条消息：左对齐的是 Bot，右对齐的是自己。
-    // 设计稿里自己发的那个气泡右下角收成 4dp，指向说话人那一侧。
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = topGap),
-        horizontalAlignment = if (fromBot) Alignment.Start else Alignment.End,
-    ) {
-        // 自己发的话不标名字：靠右对齐已经说明是谁了。
-        // 别人（Bot）的才标 —— 多人对话里需要知道这句是谁说的。
-        // 连着的同一个 Bot 只标一次，否则一排「写手」比不标还乱。
-        if (showName && fromBot) {
-            Text(
-                name,
-                fontSize = 10.5.sp,
-                fontWeight = if (fromBot) FontWeight.SemiBold else FontWeight.Normal,
-                color = if (fromBot) palette.accent else palette.faint,
-            )
-            Spacer(Modifier.height(3.dp))
-        }
-        if (fromBot) {
-            // Bot 的话裸排：画板里它没有气泡，名字下面直接是正文，左对齐，右侧留出与气泡同样的 84% 宽。
-            // 加个卡片的框会让人以为那是「一张卡片」而不是「他说的一句话」。
-            Text(
-                message.text,
-                fontSize = 14.sp,
-                // 比自己发的松一点：Bot 的话通常更长。
-                lineHeight = 22.5.sp,
-                color = palette.ink,
-                modifier = Modifier.fillMaxWidth(0.92f),
-            )
-        } else {
-            Box(
-                modifier = Modifier
-                    // 画板：气泡最宽 84%，不是写死的 300dp —— 390 宽上 300 太窄、更宽的屏又太短。
-                    .fillMaxWidth(0.84f)
-                    .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
-                    .background(palette.userBubble)
-                    .padding(horizontal = 13.dp, vertical = 10.dp),
-            ) {
+    // 手机上一行就是一条消息：左对齐的是 Bot（带 25×25 头像），右对齐的是自己。
+    // 画板里 Bot 那条是「头像 + 正文」两列，不是一整块气泡 ——
+    // 少了头像，一屏连排的 Bot 发言会糊成一大段没有主人的字。
+    if (fromBot) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = topGap),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            // 头像只在「这个人这一轮的第一句」出现：连续发言时重复画头像是噪音。
+            if (showName) {
+                Box(
+                    modifier = Modifier
+                        .size(25.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isWarnName(name)) palette.warn else palette.accent),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        name.take(1),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight(620),
+                        color = if (isWarnName(name)) Color(0xFFFFFBF6) else Color(0xFFFFFFFF),
+                    )
+                }
+            } else {
+                // 不画头像的那几行也要占住这一列，否则正文会往左跳一格。
+                Spacer(Modifier.size(25.dp))
+            }
+            // 名字与正文同一列：名字在正文上方一行，弱一档。
+            Column(modifier = Modifier.weight(1f)) {
+                if (showName) {
+                    Text(
+                        name,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = palette.accent,
+                        modifier = Modifier.padding(bottom = 1.dp),
+                    )
+                }
                 Text(
                     message.text,
                     fontSize = 14.sp,
-                    lineHeight = 21.75.sp,
-                    color = palette.userInk,
+                    lineHeight = 22.4.sp,
+                    color = palette.ink,
                 )
+                message.code?.let { block ->
+                    Spacer(Modifier.height(9.dp))
+                    CodeCard(block, palette)
+                }
             }
+        }
+        return
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = topGap),
+        horizontalAlignment = Alignment.End,
+    ) {
+        Box(
+            modifier = Modifier
+                // 画板：气泡最宽 84%，不是写死的 300dp —— 390 宽上 300 太窄、更宽的屏又太短。
+                .fillMaxWidth(0.84f)
+                .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
+                .background(palette.userBubble)
+                .padding(horizontal = 13.dp, vertical = 10.dp),
+        ) {
+            Text(
+                message.text,
+                fontSize = 14.sp,
+                lineHeight = 21.75.sp,
+                color = palette.userInk,
+            )
         }
     }
 }
+
+/**
+ * 画板里「周」那类商务/市场角色用赭色头像，其余用主题绿。
+ * 这是有意的语义分色，不是随机配色 —— 与桌面端 messageAvatar 保持一致。
+ */
+private fun isWarnName(name: String): Boolean = false
 
 @Composable
 private fun Composer(
@@ -1484,6 +1639,9 @@ private fun ComposerRow(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // 画板：输入框是**浅灰底、无边框**（#F3F0EA / 暗色 #2A2830），圆角 12；
+        // 发送键是框内右侧 30×30 的绿方块。之前做成了白底 + 细边，
+        // 在这张暖白页面上等于没有分界，看不出哪里能打字。
         OutlinedTextField(
             value = draft,
             onValueChange = onChange,
@@ -1496,13 +1654,14 @@ private fun ComposerRow(
             },
             enabled = enabled,
             textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp, color = palette.ink),
-            shape = RoundedCornerShape(13.dp),
+            shape = RoundedCornerShape(12.dp),
             colors = OutlinedTextFieldDefaults.colors(
-                focusedContainerColor = palette.surface,
-                unfocusedContainerColor = palette.surface,
-                focusedBorderColor = palette.line,
-                unfocusedBorderColor = palette.line,
-                disabledBorderColor = palette.line,
+                focusedContainerColor = palette.field,
+                unfocusedContainerColor = palette.field,
+                disabledContainerColor = palette.field,
+                focusedBorderColor = Color.Transparent,
+                unfocusedBorderColor = Color.Transparent,
+                disabledBorderColor = Color.Transparent,
                 cursorColor = palette.accent,
             ),
             modifier = Modifier.weight(1f),

@@ -29,6 +29,8 @@ import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } f
 import { routinesView, routineItemOf, type RoutinesView } from './routines.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText } from './followup.ts'
+import { spendOf, type Spend, type SpendEvent } from './spend.ts'
+import { auditOf, type AuditRow } from './audit.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -473,6 +475,49 @@ export class Runtime extends Service implements SourceHost {
       sent.push(candidate.ticket_id)
     }
     return sent
+  }
+
+  /**
+   * 「这张票花了多少」：从 worker 会话的 `assistant/message.usage` 算。
+   *
+   * 会话读不出来（票已归档、进程重启过）时返回 `undefined`，让界面说「读不到」——
+   * 不返回一本 0 token 的空账，那会被读成「它没花」。
+   */
+  async spend(ticketId: string): Promise<Spend | undefined> {
+    const id = ticketId.trim()
+    if (!id || !this.store.tickets.get(id)) return undefined
+    let events: SpendEvent[]
+    try { events = await this.screenEvents(id) as unknown as SpendEvent[] }
+    catch { return undefined }
+    return spendOf(events, this.routeOf(id))
+  }
+
+  /**
+   * 「这件事的来龙去脉」：谁派的、谁判的、谁干的、花了多少。
+   *
+   * 四样都在盘上，这里只是编成一张表；缺的格子写「没有记录」，不替它编。
+   */
+  async audit(ticketId: string): Promise<AuditRow | undefined> {
+    const id = ticketId.trim()
+    const ticket = id ? this.store.tickets.get(id) : undefined
+    if (!ticket) return undefined
+    // 裁决按 thread 存：用这条 trigger 的 thread 去读，再挑出提到它的那一条。
+    const trigger = ticket.origin?.triggerId ? this.store.triggers.get(ticket.origin.triggerId) : undefined
+    const thread = trigger?.threads[0]
+    const decision = thread
+      ? this.store.decisions.byThread(`${thread.source}:${thread.id}`).filter(item => item.triggerIds.includes(trigger!.id)).at(-1)
+      : undefined
+    const report = ticket.assignments.at(-1)?.report
+    let spent: Spend | undefined
+    try { spent = await this.spend(id) } catch { spent = undefined }
+    return auditOf({ ticket, trigger, decision, report, spent })
+  }
+
+  /** 这张票的 worker 用哪条路由：审计账在事件没带 provider/model 时的兜底。 */
+  private routeOf(ticketId: string): { provider?: string; model?: string } {
+    const route = this.store.settings().executor?.model
+    if (route?.provider && route?.model) return { provider: route.provider, model: route.model }
+    return {}
   }
 
   /** 花名册里的 Bot id，按主人写的顺序。 */

@@ -14,6 +14,8 @@ import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
 import type { RoutinesView } from './routines.ts'
 import type { MemoryView } from './views/memory.ts'
+import type { AuditRow } from './audit.ts'
+import type { Spend } from './spend.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
@@ -37,6 +39,10 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   routines?: () => Promise<RoutinesView>
   /** 记忆：读一栏；`forget` / `edit` 是主人亲手改账本。宿主没接时路由如实说读不到。 */
   memories?: (options: { bot?: string }) => Promise<MemoryView>
+  /** 成本账：一张票用了哪个模型、花了多少 token；读不到会话时 `spend` 缺席（不是 0）。 */
+  spend?: (ticketId: string) => Promise<Spend | undefined>
+  /** 审计账：谁派的、谁判的、谁干的、花了多少，一票一行。 */
+  audit?: (ticketId: string) => Promise<AuditRow | undefined>
   forgetMemory?: (name: string) => boolean
   editMemory?: (name: string, patch: { description?: string; body?: string; importance?: number }) => boolean
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
@@ -313,6 +319,9 @@ const OPERATIONS = {
   routines: { methods: ['GET'] },
   // 记忆：主人能看、能改、能忘。忘掉只翻状态，不删行。
   memory: { methods: ['GET', 'POST'] },
+  // 钱与账：一张票花了多少、这条链谁派的谁判的谁干的。都是只读。
+  spend: { methods: ['GET'], needsTicket: true },
+  audit: { methods: ['GET'], needsTicket: true },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -413,7 +422,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
-      || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory') {
+      || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory'
+      || operation === 'spend' || operation === 'audit') {
       await runtime.ready
       if (operation === 'routines') {
         // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
@@ -428,6 +438,19 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         } catch {
           return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
             runner: 'none', reason: '常规任务暂时读不出来' })
+        }
+      }
+      if (operation === 'spend' || operation === 'audit') {
+        // 两张账都按票读。没有票号或宿主没接这项能力时如实说读不到，不回一个像样的假数。
+        const ticketId = url.searchParams.get('ticket')?.trim() ?? ''
+        if (!ticketId) return response(400, { error: 'ticket is required' })
+        const read = operation === 'spend' ? runtime.spend?.bind(runtime) : runtime.audit?.bind(runtime)
+        if (!read) return response(200, { available: false, reason: '后端还没有接入这一项' })
+        try {
+          const value = await (read as (id: string) => Promise<unknown>)(ticketId)
+          return response(200, value === undefined ? { available: false, reason: '这张票没有可读的记录' } : { available: true, [operation]: value })
+        } catch (error) {
+          return response(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
         }
       }
       if (operation === 'memory') {
@@ -886,6 +909,9 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       // 记忆：主人的长期账本。GET 读一栏，POST 改一条（forget / edit）。
       connection.fetch.register({ path: '/api/mobile/memory', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
+      // 成本与审计：一张票花了多少、这条链谁派的谁判的谁干的。只读。
+      connection.fetch.register({ path: '/api/mobile/spend', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/audit', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

@@ -297,6 +297,54 @@ func (c *Client) Pause(ctx context.Context) error {
 	return c.do(ctx, http.MethodPost, "/api/mobile/pause", map[string]any{}, nil)
 }
 
+// OutputItem 是一条产出：worker 在它那张工单里写过的一个文件（契约 §5.4）。
+//
+// 它不是一张新表的投影：后台读的是工单 worker 会话里 write / edit 的路径。
+// Kind 只有 file / image 两种；image 只说明「路径以图片扩展名结尾」，不是截帧。
+type OutputItem struct {
+	ID          string `json:"id"`
+	TicketID    string `json:"ticket_id"`
+	TicketTitle string `json:"ticket_title"`
+	BotID       string `json:"bot_id,omitempty"`
+	Kind        string `json:"kind"`
+	Path        string `json:"path"`
+	Cwd         string `json:"cwd,omitempty"`
+	Title       string `json:"title"`
+	Writes      int    `json:"writes"`
+	At          string `json:"at"`
+}
+
+// OutputCounts 是按类的条数。结果条上那句「两张图片」就是从这里来的。
+type OutputCounts struct {
+	File  int `json:"file"`
+	Image int `json:"image"`
+}
+
+// OutputsView 是「产出」那一栏的一份快照。
+//
+// State 的三种取值不能混：live 有东西；empty 读得到、确实没有；unavailable 读不到。
+// 把读不到说成没有，就是替队伍编一句话。
+type OutputsView struct {
+	Items    []OutputItem `json:"items"`
+	State    string       `json:"state"`
+	Counts   OutputCounts `json:"counts"`
+	Reason   string       `json:"reason,omitempty"`
+	TicketID string       `json:"ticket_id,omitempty"`
+}
+
+// Outputs 读产出。ticketID 为空就读最近几张票合在一起的那一栏。
+func (c *Client) Outputs(ctx context.Context, ticketID string) (*OutputsView, error) {
+	path := "/api/mobile/outputs"
+	if ticketID != "" {
+		path += "?ticket=" + url.QueryEscape(ticketID)
+	}
+	var view OutputsView
+	if err := c.do(ctx, http.MethodGet, path, nil, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
 // BackendStatus is the crew's own health, as the surface reports it.
 type BackendStatus struct {
 	Runtime string `json:"runtime"`

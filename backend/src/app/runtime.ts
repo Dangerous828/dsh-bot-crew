@@ -25,6 +25,7 @@ import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
 import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
+import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -301,6 +302,20 @@ export class Runtime extends Service implements SourceHost {
       offset += page.events.length
     }
     return events
+  }
+
+  /**
+   * 「产出」：把若干张工单交出来的文件合成一栏。
+   *
+   * 数据源只有一个 —— 每张票 worker 会话的事件流里 write / edit 写过哪些文件。
+   * 一张票的会话读不出来（结束了、被回收了）就是那一条读不出来，不让整栏报错；
+   * 全读不出来时 `outputsView` 会说 `unavailable`，而不是「没有产出」。
+   */
+  async outputs(tickets: readonly OutputsTicket[]): Promise<OutputsView> {
+    return outputsView(tickets, async ticketId => {
+      const { events } = await this.ctx.sessionController.inspect(workerSessionId(ticketId) as SessionId)
+      return events as unknown as OutputEvent[]
+    })
   }
 
   handOff(from: Pick<OutboundMessage, 'id' | 'channel'>, bot_id: string, text: string, origin?: Ticket): boolean {

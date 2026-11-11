@@ -343,8 +343,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
-| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline, idempotent sends and the withdrawal of a still-queued message; also the work, agent-tree, model and pairing routes; server-side gateway credentials |
+| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline, idempotent sends and the withdrawal of a still-queued message; also the work, agent-tree, model, pairing and outputs routes; server-side gateway credentials |
 | `src/app/screen.ts` | The phone's "看画面" snapshot: the worker session's recent commands, output, speech and status, trimmed and secret-masked; a pure function over session events, not a screenshot |
+| `src/app/outputs.ts` | The phone's 产出 list: the files a worker wrote (the `write` / `edit` calls in its session events), one row per path with its write count; a pure function that keeps "nothing yet" apart from "could not read" |
 | `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
@@ -422,6 +423,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
+| `tests/outputs.spec.ts` | The 产出 list: which tool calls count as a written file, one row per path with its write count, images counted apart, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
 | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |
 | `tests/contract-timeline.spec.ts` | The message-surface contract: the roles the gateway actually writes, and unknown fields surviving a read |

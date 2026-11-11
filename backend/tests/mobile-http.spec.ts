@@ -29,6 +29,7 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered' },
@@ -144,7 +145,7 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(15)
+  expect(registered.length).toBe(16)
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -243,11 +244,12 @@ it('points a code reply at its own ticket, and leaves it blank when it cannot te
     { kind: 'accept', threadKey: 'team:main:10', ticketId: 'tk-3', at: '2026-11-11T00:00:25.000Z' },
   ]
   const refs = ticketRefs(items as never, decisions as never)
-  expect(Object.fromEntries(refs)).toEqual({ r7: 'tk-1' })
+  expect(Object.fromEntries(refs)).toEqual({ r7: 'tk-1', r11: 'tk-3' })
   const out = withTicketRefs(items as never, refs) as Record<string, unknown>[]
   expect(out[1]).toMatchObject({ id: 'r7', ticket_ref: 'tk-1' })
   expect(out[2]).not.toHaveProperty('ticket_ref')
-  expect(out[3]).not.toHaveProperty('ticket_ref')
+  // 不带代码的回话也补：消息结果条要知道这张票的产出在哪。
+  expect(out[3]).toMatchObject({ id: 'r11', ticket_ref: 'tk-3' })
   // 消息面的其余字段一格不改：只是把缺的那个补上。
   expect(out[0]).toEqual(items[0])
 })

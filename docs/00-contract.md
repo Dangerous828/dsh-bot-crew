@@ -144,6 +144,38 @@
 - **未实现的审批能力不得虚构按钮或审批状态**。
 - 被撤回的消息不出现在 `items`，也不出现在 `queued`。
 
+### 进度：`tasks[].total_steps` · `steps_done`
+
+工单卡上的进度条要一个**分母**。分母只有一个出处：worker 自己写的待办清单
+（DSH 的 `todo_write`，落成 worker 会话的 `todo/write` 事件）。后台把最后一条待办
+的计数记在 Ticket 上，再随 `tasks` 下发：
+
+```jsonc
+{
+  "id": "tk-1",
+  "state": "working",
+  "total_steps": 3,               // 计划里的总步数（待办清单的条数）
+  "steps_done": 1                 // 其中已经走完的步数，0 ≤ steps_done ≤ total_steps
+}
+```
+
+- **两个字段要么一起出现，要么一起不出现。** 没有待办清单 = 没有计划，两个字段都缺省；
+  客户端**不得**拿已发生的事件条数、报告条数、`steps` 的条数当分母 —— 那不是计划，
+  画出来的进度条会永远停在 100%。
+- `total_steps` 是 `≥ 1` 的整数。`steps_done` 后端保证已夹在 `[0, total_steps]` 内，
+  客户端仍应自行夹一次（后端版本可能不一致），宽度不超过 100%。
+- 进度是**只读展示**：它不参与页签归属、不决定 `open` / `retryable`，也不表示工单「完成了几成」。
+  一张票可能计划 3 步、走了 1 步就报 `ready` —— 以 `state` 为准，不以进度为准。
+- worker 每改一次待办就整份重写，后台取**最后一条**，不把历史叠起来。计划被改小时
+  `total_steps` 随之变小（进度条可能因此回退），这是真话，不做单调化。
+- 客户端没有别的进度来源：**不得**新增「进度查询」接口，也不得从 `/api/mobile/work`
+  的 `steps` 反推分母。
+- 手机端这轮**只读不改**：`app/.../CrewWire.kt` 的 `WorkTicket` 还没有 `total_steps` /
+  `steps_done` 两个字段，`CrewUi.kt` 的 `TaskRow` 也没有进度条。要接的时候按本节做：
+  在 `WorkTicket` 上加两个 `Int`，`CrewWire` 里读同名字段（缺省 0），
+  `TaskRow` 里仅当 `totalSteps > 0` 时画一条 3dp 的轨道 + 按比例的填充，
+  与 `desktop/ui.go` 的 `progressOf` 同一口径（分母来自计划，不来自已发生条数）。不新增路由。
+
 ### 等你决定：`tasks[].needs_person` · `question` · `options`
 
 后台卡在等某个人拍板时，`tasks` 里那一项除了 `needs_person`（`stage.action`，取值

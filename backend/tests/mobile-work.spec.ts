@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { phoneHandler, queuedRequests, registerMobileHttp } from '../src/app/mobile-http.ts'
-import { workOf } from '../src/app/work.ts'
+import { planFrom, planOf, workOf } from '../src/app/work.ts'
 import { DeviceStore, issuePairingCode } from '../src/app/remote.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
@@ -258,6 +258,57 @@ it('orders conclusions by when they were reached, not when the work began', () =
   // 10:05 得出的结论在前，10:09 的在后 —— 按开始时间排会把这个顺序整个倒过来。
   // stepsOf 只抽取，排序在 workOf 里 —— 这里测的是完整的读法，不是抽取本身。
   expect(workOf(overlapping as never)!.steps.map(step => step.text)).toEqual(['后做完的那件', '先做的那件'])
+})
+
+it('reads the plan out of the worker\'s todo list, as counts only', () => {
+  // 进度条的分母只有一个出处：worker 自己写的待办清单。三种写法都认。
+  expect(planOf({ todos: [{ status: 'completed' }, { status: 'in_progress' }, { status: 'pending' }] })).toEqual({ total: 3, done: 1 })
+  expect(planOf({ items: [{ status: 'done' }, { status: 'completed' }] })).toEqual({ total: 2, done: 2 })
+  expect(planOf([{ state: 'checked' }, { done: true }, { status: 'pending' }])).toEqual({ total: 3, done: 2 })
+  // 没有待办就没有计划 —— 不是「零步的计划」，前端据此不画进度条。
+  expect(planOf({ todos: [] })).toBeUndefined()
+  expect(planOf({})).toBeUndefined()
+  expect(planOf(undefined)).toBeUndefined()
+})
+
+it('takes the last todo write, and does not fall back past an unreadable one', () => {
+  const events = [
+    { type: 'todo/write', data: { todos: [{ status: 'pending' }, { status: 'pending' }, { status: 'pending' }] } },
+    { type: 'assistant/message', data: { text: '改完了' } },
+    // 最后一条是 worker 此刻的状态：读不懂就说没有，不拿上一条冒充现在。
+    { type: 'todo/write', data: { something: 'else' } },
+  ]
+  expect(planFrom(events)).toBeUndefined()
+  expect(planFrom(events.slice(0, 2))).toEqual({ total: 3, done: 0 })
+  // 完全没有待办事件：没有计划。
+  expect(planFrom([{ type: 'assistant/message', data: {} }])).toBeUndefined()
+})
+
+it('caps a runaway todo list instead of trusting any number an event carries', () => {
+  const many = Array.from({ length: 500 }, () => ({ status: 'pending' }))
+  expect(planOf({ todos: many })).toEqual({ total: 200, done: 0 })
+})
+
+it('reports the plan with the ticket, and omits both fields when there is none', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  const planned = { ...ticket(), plan: { total: 3, done: 2, at: '2026-11-09T10:03:00.000Z' } }
+  const unplanned = { ...ticket(), id: 'tk2' }
+  const body = await (await phoneHandler(host({ tickets: [planned, unplanned] }), undefined, upstream as typeof fetch)(
+    new Request('http://dsh/api/mobile/timeline'))).json() as { tasks: Record<string, unknown>[] }
+
+  expect(body.tasks[0]).toEqual(expect.objectContaining({ id: 'tk1', total_steps: 3, steps_done: 2 }))
+  // 没有计划时两个字段都不出现：客户端拿「有 total_steps」当画不画的开关。
+  expect(body.tasks[1]).not.toHaveProperty('total_steps')
+  expect(body.tasks[1]).not.toHaveProperty('steps_done')
+})
+
+it('never sends more finished steps than the plan holds', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  // 计划被改小过：走过的步数比现在的总步数还多。夹回上限，别让手机的进度条溢出。
+  const shrunk = { ...ticket(), plan: { total: 2, done: 5, at: '2026-11-09T10:03:00.000Z' } }
+  const body = await (await phoneHandler(host({ tickets: [shrunk] }), undefined, upstream as typeof fetch)(
+    new Request('http://dsh/api/mobile/timeline'))).json() as { tasks: Record<string, unknown>[] }
+  expect(body.tasks[0]).toEqual(expect.objectContaining({ total_steps: 2, steps_done: 2 }))
 })
 
 it('lets a phone redeem its code over the message surface, which already carries credentials', async () => {

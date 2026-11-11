@@ -2707,11 +2707,18 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 			ui.Text(c, detail).FontSize(FontTiny).TextColor(p.Muted)
 		})
 		// 进度条：画板里 2px 圆角、2px 高，但只在有「共几步」这个分母时才画。
-		// 后端目前只给已发生的经过，没有计划里的总步数 —— 没有分母就不画，
+		// 分母来自后端下发的计划（worker 自己的待办清单）；没有计划就不画，
 		// 宁可空着也不画一根永远停在 100% 的假条。
+		//
+		// 零步走完时只画轨道、不画那一格强调色：宽度 0 的格子有些引擎仍会画出一个点，
+		// 看上去像「已经走了一步」。
 		if done, total := s.progressOf(task); total > 0 {
+			filled := done > 0
 			ui.Row(c).FillWidth().PaddingStart(12).Height(3).Radius(RadiusTiny).
 				Background(p.Track).Children(func() {
+				if !filled {
+					return
+				}
 				ui.Row(c).WidthPercent(float32(done) / float32(total) * 100).FillHeight().
 					Radius(RadiusTiny).Background(p.Accent)
 			})
@@ -2943,33 +2950,42 @@ func (s *app) shownTasks() []Task {
 
 // progressOf 是这张票走到第几步 / 共几步。
 //
-// 返回 (0, 0) 表示「算不出来」：后端只记录已发生的经过（steps），
-// 没有计划里的总步数。拿「读到几步」当分母，进度条会永远停在 100%。
+// 分子分母都来自后端下发的计划（worker 自己写的待办清单）：StepsDone 与 TotalSteps。
+// 不拿「读到几步」当分子：那张过程只在卡片展开时才读，收起来的卡会显示 0，
+// 而且它记的是「有几次汇报」，不是「计划里走完了几步」—— 两回事。
+//
+// 返回 (0, 0) 表示「算不出来」：这张票没有计划（后端没下发 TotalSteps），
+// 没有分母就不画进度条，宁可空着也不画一根永远 100% 的假条。
 func (s *app) progressOf(task Task) (int, int) {
 	if task.TotalSteps <= 0 {
 		return 0, 0
 	}
-	return len(s.stepsFor(task.ID)), task.TotalSteps
+	done := task.StepsDone
+	if done < 0 {
+		done = 0
+	}
+	// 走完的步数不可能超过总数：后端若给了个自相矛盾的值（计划改小了），进度条也不该溢出。
+	if done > task.TotalSteps {
+		done = task.TotalSteps
+	}
+	return done, task.TotalSteps
 }
 
-// stepOf 从已读到的经过里取「第几步」，没有就说没有。
+// stepOf 从后端的计划里取「第几步」，没有就说没有。
+//
+// 这一行走在概览行上，不靠卡片展开：计划随票一起下发，不需要为它多拉一次经过。
+// 没有计划时不编一句「第 N 步」出来 —— 那个 N 没有出处。
 func (s *app) stepOf(task Task) string {
-	// 只在这张卡被展开、steps 真的读过之后才有「第几步」可说。
-	// 概览行不主动去拉：一张卡一次请求，右栏一屏六七张就是六七次往返，
-	// 而画板那里本来也只有第一张在跑的有进度。
-	if s.openTicket != task.ID {
+	done, total := s.progressOf(task)
+	if total <= 0 {
 		return ""
 	}
-	steps := s.stepsFor(task.ID)
-	if len(steps) == 0 {
-		return ""
+	// 已经走完的按总步数算：卡片停在「共 3 步」上，而不是「第 2 步」。
+	step := done
+	if step > 0 {
+		return fmt.Sprintf("第 %d 步 / 共 %d 步", step, total)
 	}
-	// 后端给了总步数才写「第 N 步 / 共 M 步」；只给到过的步数就只写「第 N 步」，
-	// 不拿已读条数当分母 —— 那会让进度看起来永远快到头。
-	if task.TotalSteps > 0 {
-		return fmt.Sprintf("第 %d 步 / 共 %d 步", len(steps), task.TotalSteps)
-	}
-	return fmt.Sprintf("第 %d 步", len(steps))
+	return fmt.Sprintf("共 %d 步", total)
 }
 
 // stepsFor 是这个 app 上记着的某张票的经过。同一时刻只展示一张。

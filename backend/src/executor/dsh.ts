@@ -15,6 +15,7 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
+import { planOf } from '../app/work.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
@@ -516,6 +517,18 @@ export class DshExecutor implements Executor {
     // history: a step that claimed it may be cancelled or fail before, which drops it.
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const ticketId = ticketOfSession(session.id)
+      // 计划（待办清单）一变就记到票上：进度条的分母只有 worker 自己写的那份待办给得出。
+      // 这里只存计数，不存文字；读不懂的事件当作「没有计划」，不覆盖已有的那一份。
+      if (event.type === 'todo/write') {
+        if (ticketId === undefined || this.host.closing()) return
+        const plan = planOf(event.data)
+        if (!plan) return
+        const ticket = this.host.store.tickets.get(ticketId)
+        if (!ticket || ticket.ended) return
+        ticket.plan = { ...plan, at: now() }
+        this.host.store.tickets.save(ticket)
+        return
+      }
       if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
       const message = event.data
       void this.background(Promise.resolve().then(() => {

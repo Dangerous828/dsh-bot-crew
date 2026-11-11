@@ -16,6 +16,56 @@ export interface AgentRegistry {
 export interface WorkStep { at: string; kind: 'said' | 'did' | 'checked'; text: string }
 export interface WorkView { ticket_id: string; title: string; stage: string; bot_id?: string; steps: WorkStep[] }
 
+/** 一张票此刻的计划：共几步、完成几步。 */
+export interface Plan { total: number; done: number }
+
+/** 待办里算「走完了」的几个写法：DSH 写 `completed`，老事件里也见过 `done` / `checked`。 */
+const PLAN_DONE = new Set(['completed', 'done', 'checked'])
+/** 上限。待办是给人看的一张单子，不是数据集：超出这个数的只按上限算，免得一个坏事件把界面撑爆。 */
+const PLAN_MAX_STEPS = 200
+
+/**
+ * 从一条 `todo/write` 事件的 data 里数出「共几步、完成几步」。
+ *
+ * 认三种写法：`todos` / `items` 是数组，或 data 自己就是数组。每一项是否完成看
+ * `status` / `done` / `state`。认不出来就返回 undefined —— 宁可不画进度条，
+ * 也不拿一个猜出来的分母当真。
+ */
+export function planOf(data: unknown): Plan | undefined {
+  const list = Array.isArray(data) ? data
+    : data && typeof data === 'object'
+      ? ((data as { todos?: unknown; items?: unknown }).todos ?? (data as { items?: unknown }).items)
+      : undefined
+  if (!Array.isArray(list) || list.length === 0) return undefined
+  const total = Math.min(list.length, PLAN_MAX_STEPS)
+  let done = 0
+  for (const item of list.slice(0, total)) {
+    if (!item || typeof item !== 'object') continue
+    const todo = item as { status?: unknown; done?: unknown; state?: unknown }
+    const status = typeof todo.status === 'string' ? todo.status.toLowerCase() : ''
+    const state = typeof todo.state === 'string' ? todo.state.toLowerCase() : ''
+    if (PLAN_DONE.has(status) || PLAN_DONE.has(state) || todo.done === true) done++
+  }
+  return { total, done }
+}
+
+/**
+ * 一张票最新的计划：取它最后一条 `todo/write`。worker 每改一次待办就整份重写，
+ * 所以最后一条就是现在的全部，不需要把历史叠起来。
+ *
+ * 没有这样的事件就返回 undefined。这里不看 assignments：它们记的是「派了几次活」，
+ * 不是「计划里有几步」，拿它当分母会画出一根永远不满的假进度条。
+ */
+export function planFrom(events: readonly { type: string; data?: unknown }[]): Plan | undefined {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!event || event.type !== 'todo/write') continue
+    // 最后一条读不懂时不再往前翻：那是 worker 此刻的状态，不是它早些时候的状态。
+    return planOf(event.data)
+  }
+  return undefined
+}
+
 /** One agent under a ticket. A subagent of a subagent is a child again, so the shape carries any depth. */
 export interface AgentNode { id: string; label: string; state: string; children: AgentNode[] }
 

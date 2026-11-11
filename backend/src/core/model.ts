@@ -313,6 +313,12 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /**
+   * The worker's own plan, as it last wrote its todo list: how many steps it meant to take, and how many it had finished.
+   * Only the counts are kept — the texts stay in the Session. Absent when the worker never wrote a plan, which is not a plan
+   * of zero steps: without a denominator nothing may be drawn as a fraction of it.
+   */
+  plan?: { total: number; done: number; at: string }
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it

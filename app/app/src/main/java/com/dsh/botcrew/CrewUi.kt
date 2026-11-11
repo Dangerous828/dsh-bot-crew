@@ -696,9 +696,16 @@ private fun CrewScreen(
                     // 消息共用这一份结果。从前是每条消息各自调用一次 lastOfTicket
                     // （每趟都往后扫一遍尾巴），一屏就是十几趟 O(n)。key 用消息列表本身：
                     // 时间线没变（每 6 秒读回来的那份 equals 相同）时它原样留着，连这一趟都不做。
+                    // 键是 messages 的内容，不是列表实例：时间线每 6 秒读一份回来，
+                    // 内容没变时这份结果原样留着。它是 O(n) 的，放在滚动帧里算就是每帧 O(n) ——
+                    // 120Hz 上帧预算 8ms，这一趟能占掉一大截，于是滑动就不跟手了。
                     val resultEnds = remember(shown.messages) {
                         OutputsCopy.takeLastOfTicket(shown.messages)
                     }
+                    // 滚动中先不挂结果条：它每条都要查一次缓存、必要时发一次读请求，
+                    // 挂在滚动帧里就是每帧多一份活。120Hz 上一帧只有 8ms，这点活足够掉帧。
+                    // 手一停，它立刻回来 —— 停手的那一帧重算一次，人看不到「刚才没有」。
+                    val scrolling = listState.isScrollInProgress
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.weight(1f),
@@ -732,7 +739,7 @@ private fun CrewScreen(
                                 // 同一张票的票号会挂在「收到」和「报结果」两条回复上：只让这张票
                                 // 在时间线上的最后一条回复挂结果条，见 OutputsCopy.lastOfTicket。
                                 // 这份判断整列只算一次，见上面的 resultEnds。
-                                showResult = resultEnds.getOrElse(index) { false },
+                                showResult = !scrolling && resultEnds.getOrElse(index) { false },
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {

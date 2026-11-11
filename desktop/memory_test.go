@@ -125,3 +125,41 @@ func TestAuditLineSaysWhatIsMissing(t *testing.T) {
 		t.Fatalf("with decision: %q", got)
 	}
 }
+
+// 空态框里那个符号跟着标题走：三处空态各有自己的记号，别都画成一个圈。
+func TestGlyphOfNamesEachEmptyState(t *testing.T) {
+	cases := map[string]string{
+		"还没有产出":   "▤",
+		"还没有常规任务": "◷",
+		"还没有记住什么": "◇",
+		"别的东西":    "◌",
+	}
+	for title, want := range cases {
+		if got := glyphOf(title); got != want {
+			t.Fatalf("%q: %q != %q", title, got, want)
+		}
+	}
+}
+
+// 空态与读不到是两件事：前者用虚线框（这里还没有东西），后者用实线框（读不出来）。
+// 这条钉住 emptyCopy 只在真的「一条都没有」时才给得出标题 —— 别处不该拿它冒充。
+func TestEmptyCopyOnlySpeaksForReallyEmptyPanes(t *testing.T) {
+	for _, item := range navOrder {
+		title, body := emptyCopy(item)
+		if item == navMemory || item == navOutput || item == navRoutine {
+			if title == "" || body == "" {
+				t.Fatalf("%v should have empty copy", item)
+			}
+			// 空态原话里不许出现「读不到」：那是另一件事的词。
+			if strings.Contains(title, "读不到") || strings.Contains(body, "读不到") {
+				t.Fatalf("%v empty copy must not say unreadable: %q / %q", item, title, body)
+			}
+		}
+	}
+}
+
+func TestMin32(t *testing.T) {
+	if min32(3, 5) != 3 || min32(5, 3) != 3 || min32(4, 4) != 4 {
+		t.Fatal("min32 must return the smaller one")
+	}
+}

@@ -2998,11 +2998,7 @@ func (s *app) outputsPane(c *ui.Context, p Palette) {
 		} else if view.Reason != "" {
 			body = view.Reason
 		}
-		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
-			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
-			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
-			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
-		})
+		s.emptyPanel(c, p, title, body)
 		return
 	}
 
@@ -3095,14 +3091,32 @@ func (s *app) routinesPane(c *ui.Context, p Palette) {
 		} else if view.Reason != "" {
 			body = view.Reason
 		}
+		if view.State == "empty" {
+			// 空态：虚线框，外加这一栏特有的那句「会不会自己跑」。
+			// 让人以为放着它就会跑，比空着更糟。
+			ui.Column(c).FillWidth().Gap(10).Padding(28).Radius(RadiusCard).Children(func() {
+				dashedFrame(c, 64, 20, p.Line, func() {
+					ui.Column(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+						ui.Text(c, glyphOf(title)).FontSize(FontEmptyIcon).TextColor(p.Faint)
+					})
+				})
+				ui.Row(c).Children(func() {
+					ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
+				})
+				ui.Row(c).Children(func() {
+					ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint).MaxLines(3)
+				})
+				ui.Row(c).Children(func() {
+					ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
+				})
+			})
+			return
+		}
+		// 读不到：实线框 + 「读不到」，不借空态那个虚线框的壳。
 		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
 			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
 			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
 			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
-			if view.State == "empty" {
-				// 空态也要说清这里放的是什么、会不会自己跑：让人以为放着它就会跑，比空着更糟。
-				ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
-			}
 		})
 		return
 	}
@@ -3206,11 +3220,7 @@ func (s *app) memoryPane(c *ui.Context, p Palette) {
 		} else if view.Reason != "" {
 			body = view.Reason
 		}
-		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
-			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
-			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
-			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
-		})
+		s.emptyPanel(c, p, title, body)
 		return
 	}
 
@@ -4380,4 +4390,83 @@ func (s *app) exportRecords() {
 		s.exportCh <- exportResult{path: path}
 		s.wake()
 	}()
+}
+
+// emptyPanel 是空态那一块：虚线方框 + 图标 + 一句标题 + 一句说明。
+//
+// 三处空态（产出、常规任务、记忆）共用它，因为「空」在这三处的意思完全一样：
+// 读得到、确实一条都没有。画板 Desktop-empty 里就是这么画的。
+//
+// 它只用于 `empty`。读不到（`unavailable`）另走一条，不能借这个壳 ——
+// 虚线框说「还没放东西进来」，把「读不出来」装进去就是把两件事混成一件事。
+func (s *app) emptyPanel(c *ui.Context, p Palette, title, body string) {
+	ui.Column(c).FillWidth().Gap(10).Padding(28).Radius(RadiusCard).Children(func() {
+		dashedFrame(c, 64, 20, p.Line, func() {
+			ui.Column(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				ui.Text(c, glyphOf(title)).FontSize(FontEmptyIcon).TextColor(p.Faint)
+			})
+		})
+		ui.Row(c).Children(func() {
+			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
+		})
+		ui.Row(c).Children(func() {
+			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint).MaxLines(3)
+		})
+	})
+}
+
+// glyphOf 是空态框里那个符号。用字符而不是图片：它跟着字号缩，也不用带资源。
+func glyphOf(title string) string {
+	switch {
+	case strings.Contains(title, "产出"):
+		return "▤"
+	case strings.Contains(title, "常规"):
+		return "◷"
+	case strings.Contains(title, "记住"), strings.Contains(title, "记忆"):
+		return "◇"
+	default:
+		return "◌"
+	}
+}
+
+// dashedFrame 画一个虚线框：四条边各由一排短段拼出来。
+//
+// mygo 没有虚线边框的原语（`BorderWidth` 只画实线），而画板里空态那个框是虚线的。
+// 虚线在这里不只是装饰：它说的是「这块地方现在还空着」；实线框看起来像一张已经有
+// 内容的卡片，反而更容易被误读成「有东西没显示出来」。
+//
+// 段长 5、间隔 4，按边长自动排满；四边用各自的 Row/Column 摆，不依赖透明覆盖层。
+func dashedFrame(c *ui.Context, size, radius float32, tint ui.Color, body func()) {
+	const dash, gap float32 = 5, 4
+	// 一段虚线：横边用宽 5 高 1，竖边用宽 1 高 5。
+	line := func(length float32, vertical bool) {
+		total := dash + gap
+		for at := float32(0); at+gap < length; at += total {
+			width := min32(dash, length-at)
+			if vertical {
+				ui.Row(c).Width(1).Height(width).Background(tint)
+			} else {
+				ui.Row(c).Width(width).Height(1).Background(tint)
+			}
+		}
+	}
+	ui.Column(c).Width(size).Height(size).Radius(radius).Children(func() {
+		// 上边
+		ui.Row(c).FillWidth().Height(1).Children(func() { line(size, false) })
+		// 中间：左右两条竖边夹住内容。
+		ui.Row(c).FillWidth().Grow(1).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Height(size - 2).Width(1).Children(func() { line(size-2, true) })
+			ui.Row(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).Children(body)
+			ui.Row(c).Height(size - 2).Width(1).Children(func() { line(size-2, true) })
+		})
+		// 下边
+		ui.Row(c).FillWidth().Height(1).Children(func() { line(size, false) })
+	})
+}
+
+func min32(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
 }

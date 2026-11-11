@@ -1473,6 +1473,8 @@ private fun MessageRow(
         !fromBot -> "我"
         else -> bots.firstOrNull { it.id == message.botId }?.name ?: message.botId.orEmpty()
     }
+    // 分色按 Bot ID 判，不按显示名：名字是花名册里可改的呈现，ID 才是身份。
+    val warn = isWarnBot(message.botId)
     // 手机上一行就是一条消息：左对齐的是 Bot（带 25×25 头像），右对齐的是自己。
     // 画板里 Bot 那条是「头像 + 正文」两列，不是一整块气泡 ——
     // 少了头像，一屏连排的 Bot 发言会糊成一大段没有主人的字。
@@ -1488,14 +1490,14 @@ private fun MessageRow(
                     modifier = Modifier
                         .size(25.dp)
                         .clip(RoundedCornerShape(8.dp))
-                        .background(if (isWarnName(name)) palette.warn else palette.accent),
+                        .background(if (warn) palette.warn else palette.accent),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
                         name.take(1),
                         fontSize = 11.sp,
                         fontWeight = FontWeight(620),
-                        color = if (isWarnName(name)) Color(0xFFFFFBF6) else Color(0xFFFFFFFF),
+                        color = if (warn) Color(0xFFFFFBF6) else Color(0xFFFFFFFF),
                     )
                 }
             } else {
@@ -1552,8 +1554,12 @@ private fun MessageRow(
 /**
  * 画板里「周」那类商务/市场角色用赭色头像，其余用主题绿。
  * 这是有意的语义分色，不是随机配色 —— 与桌面端 messageAvatar 保持一致。
+ * 规则照抄桌面端 isWarnBot：按 bot_id 判，不按名字判 —— 显示名可以在花名册里改。
  */
-private fun isWarnName(name: String): Boolean = false
+private fun isWarnBot(botId: String?): Boolean = when (botId) {
+    "zhou", "business", "market" -> true
+    else -> false
+}
 
 @Composable
 private fun Composer(

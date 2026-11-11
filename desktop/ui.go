@@ -670,7 +670,7 @@ func (s *app) roster(c *ui.Context, p Palette) {
 						soft, tint := p.AccentSoft2, p.Accent
 						if selected {
 							soft, tint = p.Accent, p.AccentInk
-						} else if i == 2 {
+						} else if isWarnBot(bot.ID) {
 							soft, tint = p.WarnSoft2, p.Warn
 						}
 						ui.Column(c).Width(AvatarSmall).Height(AvatarSmall).Radius(RadiusPane).Background(soft).

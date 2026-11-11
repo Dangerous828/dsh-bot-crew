@@ -27,4 +27,10 @@ func TestTheChannelsAreWired(t *testing.T) {
 	if s.withdrawn == nil {
 		t.Fatal("withdrawn 是 nil：撤回的结果永远送不到界面")
 	}
+	if s.adopted == nil {
+		t.Fatal("adopted 是 nil：按了「采用」会永远停在「采用中…」")
+	}
+	if s.previewed == nil {
+		t.Fatal("previewed 是 nil：「看看改完的样子」永远等不到结果")
+	}
 }

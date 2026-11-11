@@ -21,17 +21,22 @@ import (
 //
 // 它说的是「改了什么」：文件名、逐行的增删、以及各自属于哪一类。
 // 这些信息后端已经给了，只是之前没画出来。
+//
+// TicketRef 是这段改动属于哪张工单：卡片下面「看看改完的样子」要在那张票的
+// 活动快照里看，不能拿第一张在跑的票冒充。没有就不猜，说了也做不到就如实讲。
 type CodeBlock struct {
-	Path    string
-	Added   int
-	Removed int
-	Lines   []CodeLine
+	ID        string     `json:"id,omitempty"`
+	Path      string     `json:"path"`
+	Added     int        `json:"added"`
+	Removed   int        `json:"removed"`
+	Lines     []CodeLine `json:"lines"`
+	TicketRef string     `json:"ticket_ref,omitempty"`
 }
 
 // CodeLine 是代码块里的一行。Kind 取 added / removed / 空。
 type CodeLine struct {
-	Text string
-	Kind string
+	Text string `json:"text"`
+	Kind string `json:"kind"`
 }
 
 // Message 是对话里的一条。Role 只有两种：人说的，和队伍里某个 Bot 说的。
@@ -70,6 +75,9 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 //
 // 字段名不一定叫 code —— 后端可能给 `code` 也可能给 `diff`，
 // 两种都认，免得为了一个显示字段去动契约。
+//
+// 票号优先取代码块自己的，其次取消息上的 `ticket_ref`（契约 §4 那个只读引用）：
+// 卡片上的「看看改完的样子」要知道去看哪张票，缺了就如实说，不拿别的票顶。
 func (m Message) Code() *CodeBlock {
 	if m.Extra == nil {
 		return nil
@@ -84,10 +92,34 @@ func (m Message) Code() *CodeBlock {
 			continue
 		}
 		if block.Path != "" || len(block.Lines) > 0 {
+			if block.TicketRef == "" {
+				block.TicketRef = m.ticketRef()
+			}
+			// 卡片身份：没有 id 时用票号 + 文件名拼一个，足够区分同一段对话里的两张卡，
+			// 「采用中 / 已采用」与回执都按它各记各的。
+			if block.ID == "" {
+				block.ID = block.TicketRef + "|" + block.Path
+			}
 			return &block
 		}
 	}
 	return nil
+}
+
+// ticketRef 是消息上那个只读的票号引用。它只用来展示，不据此维护任何任务账。
+func (m Message) ticketRef() string {
+	if m.Extra == nil {
+		return ""
+	}
+	raw, ok := m.Extra["ticket_ref"]
+	if !ok {
+		return ""
+	}
+	var ref string
+	if err := json.Unmarshal(raw, &ref); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(ref)
 }
 
 func (m Message) MarshalJSON() ([]byte, error) {

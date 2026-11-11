@@ -47,6 +47,15 @@ func newApp(client *Client) *app {
 		withdrawn:     make(chan withdrawResult, 4),
 		answered:      make(chan answerResult, 4),
 		steerDone:     make(chan steerResult, 4),
+
+		// 代码卡上那两个按钮的结果：不 make 的话，按下去界面会永远停在「采用中…」。
+		adopted:   make(chan adoptResult, 4),
+		previewed: make(chan previewResult, 4),
+		// 两张表按卡建：回执要落在自己的卡上，「采用中」与「已采用」也要各记各的。
+		adopting:   map[string]bool{},
+		adoptNotes: map[string]string{},
+		adoptedOK:  map[string]bool{},
+
 		pauseDone:     make(chan pauseResult, 2),
 		botSaved:      make(chan botSaveResult, 2),
 		devicesCh:     make(chan devicesResult, 4),

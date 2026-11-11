@@ -167,13 +167,14 @@ func (t *Task) UnmarshalJSON(data []byte) error {
 		CreatedAt   string            `json:"created_at,omitempty"`
 		UpdatedAt   string            `json:"updated_at,omitempty"`
 		TotalSteps  int               `json:"total_steps,omitempty"`
+		StepsDone   int               `json:"steps_done,omitempty"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	*t = Task{ID: wire.ID, Title: wire.Title, State: wire.State, Retryable: wire.Retryable,
 		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, Question: wire.Question, Options: wire.Options,
-		CreatedAt: wire.CreatedAt, UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps,
+		CreatedAt: wire.CreatedAt, UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps, StepsDone: wire.StepsDone,
 		Open: !terminalState(wire.State)}
 	if wire.Open != nil {
 		t.Open = *wire.Open
@@ -210,9 +211,12 @@ type Task struct {
 	Options   []AttentionOption `json:"options,omitempty"`
 	CreatedAt string            `json:"created_at,omitempty"`
 	UpdatedAt string            `json:"updated_at,omitempty"`
-	// TotalSteps 是这张票计划里的总步数。后端目前还没有这个字段 ——
-	// 没有它就画不出进度条，见 ui.go 的 progressOf。
+	// TotalSteps 是这张票计划里的总步数，StepsDone 是其中走完的几步。两个都来自
+	// worker 自己写的待办清单（见后端 work.ts 的 planOf）；后端没有计划时两个都缺省，
+	// 此时不画进度条 —— 见 ui.go 的 progressOf。
 	TotalSteps int `json:"total_steps,omitempty"`
+	// StepsDone 只在 TotalSteps 同时出现时有意义；后端没给计划就一起缺着。
+	StepsDone int `json:"steps_done,omitempty"`
 }
 
 // AttentionOption 是「等你决定」那张卡上的一个答案：id 在这句问题里唯一且稳定，

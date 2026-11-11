@@ -646,6 +646,12 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           // 只在下发「等你答一个问题」时带上那句问题与它的备选答案：delivery / review / blocked / failed
           // 也是等人，但等的不是一个能二选一的问题，编一组选项出来就是假按钮。
           const asking = stage.stage === 'person' && stage.action === 'answer' && ticket.attention
+          // 计划的计数：worker 自己写的待办清单里有几步、走完几步（见 work.ts 的 planOf）。
+          // 没有待办清单就没有分母 —— 这两个字段整个不出现，客户端据此不画进度条，
+          // 而不是拿已发生的条数当分母画一根永远 100% 的假条。
+          const plan = ticket.plan && ticket.plan.total > 0
+            ? { total_steps: ticket.plan.total, steps_done: Math.min(ticket.plan.done, ticket.plan.total) }
+            : {}
           return { id: ticket.id, title: ticket.title,
             // `state` 是给人看的词（终态用 outcome，进行中用 stage）；放哪个页签、能不能重试
             // 由下面两个布尔决定，客户端不再自己解释词表。
@@ -655,6 +661,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             retryable,
             // Lets the phone place a task in the conversation by time and say whether it waits for the owner.
             created_at: ticket.createdAt, updated_at: ticket.updatedAt,
+            ...plan,
             ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}),
             // 问题和选项成对下发，见 docs/00-contract §5：没有 options 就是只有一个自写框。
             ...(asking ? { question: ticket.attention!.question,

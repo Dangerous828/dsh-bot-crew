@@ -38,7 +38,9 @@
 | 0x0A–0x0F | wsUpgrade…wsClose | — | — | WebSocket 隧道。**本实现不支持**，收到就丢 |
 | 0x10 | ping | 两端 | 空 | 15s 一拍 |
 | 0x11 | pong | 两端 | 空 | 45s（宿主）/ 60s（中转）收不到就判死 |
-| 0x12–0x1B | pairRequest…pushSend | — | — | 参考实现有，本实现不参与 |
+| 0x12–0x19 | pairRequest…revokeAllAck | — | — | 参考实现有，本实现不参与 |
+| 0x1A | pushRegister | 宿主→中转 | `{deviceId, platform, token}` | 手机说自己挂在哪条隧道上：记下它此刻在线，并把攒着的推送补发掉 |
+| 0x1B | pushSend | 双向 | `{deviceId, title, body, sessionId?, kind?}` | 宿主→中转是「要发一条」；中转→宿主（下到手机那条隧道）是真正送达。设备不在线时中转攒着（每设备 50 条、24 小时、同 kind 只留最新），连上来时补发 |
 | 0x14 | httpCancel | 中转→宿主 | 空 | 手机放弃了，宿主应当停掉上游的活 |
 | 0x1C | migrate | — | — | 「这台搬家了」。本实现不参与 |
 

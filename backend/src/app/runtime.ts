@@ -32,6 +32,9 @@ import { followupsOf, followupText } from './followup.ts'
 import { spendOf, type Spend, type SpendEvent } from './spend.ts'
 import { auditOf, type AuditRow } from './audit.ts'
 import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from './voice.ts'
+import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './compact-memory.ts'
+import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
+import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -135,6 +138,14 @@ export class Runtime extends Service implements SourceHost {
   private closingFlag = false
   /** 待命期间重跑 setup 的定时器；关掉 runtime 时必须清掉，否则会对着已释放的锁再跑一次。 */
   private setupRetry?: ReturnType<typeof setTimeout>
+  /** 待发件箱：手机离线时留件，连上来的第一时间补发。 */
+  private readonly pushOutbox = new PushOutbox()
+  /** 今天报过日报没有（`YYYY-MM-DD`），同一天只说一次。 */
+  private dailySaid = ''
+  /** 今天派出去的常规任务次数（日报用）。 */
+  private routinesToday = 0
+  /** 会话压缩的监听只挂一次；挂不上（老宿主）时也不会每轮重试。 */
+  private compactionWatch = false
   /** 常规任务的调度器；`start` 之后才有，`stop` 时清掉（`routines()` 据此说 runner 是 live 还是 none）。 */
   private routineTimer?: ReturnType<typeof setInterval>
   private stopping?: Promise<void>
@@ -442,10 +453,69 @@ export class Runtime extends Service implements SourceHost {
         this.store.set(KV.routines.task(task.id), { ...record, ...next })
       }
       console.log('[routine] dispatched id=%s bot=%s ticket_of=%s', task.id, recipient, trigger.id)
+      this.routinesToday += 1
+      // 到点派了单要说一声：不然主人只会在下次开电脑时才发现队伍早上干过活。
+      this.pushNotice({ title: '到点派了一件事', body: `「${task.title}」已经交给 ${recipient}。`, kind: 'routine' })
       dispatched.push(task.id)
     }
     if (dispatched.length) this.passes.request()
     return { dispatched, held }
+  }
+
+  /**
+   * 把一条话送到主人的每台设备上。
+   *
+   * 走 `push.ts` 的投递层：在线直送、离线留件。中转那侧真正在不在线由宿主判不了，
+   * 所以这里只判断「结果是不是人说得出的一句话」—— 送不到也要留一条可查的记录，
+   * 不能静默消失。
+   */
+  private pushNotice(notice: Notice): PushOutcome[] {
+    const recipients: PushRecipient[] = this.devices().map(device => ({ deviceId: device.deviceId }))
+    if (!recipients.length) return []
+    const messages: PushMessage[] = pushFor(notice, recipients)
+    // 这条队伍自己挂着的隧道由中转判在线；宿主这一侧一律按「可能不在线」处理，
+    // 于是每条都先留件，再让中转在设备连上来时取走 —— 不会漏，也不会重复弹。
+    const outcomes = messages.map(message => deliver(message, { online: false, outbox: this.pushOutbox }))
+    for (const outcome of outcomes) {
+      console.log('[push] %s kind=%s device=%s', outcome.status, notice.kind, outcome.deviceId)
+    }
+    return outcomes
+  }
+
+  /** 已配对的设备。读不到就当没有：推送不该把整个队伍拖垮。 */
+  private devices(): readonly { deviceId: string }[] {
+    const host = this as { remote?: { list?: () => readonly { deviceId: string }[] } }
+    try { return host.remote?.list?.() ?? [] } catch { return [] }
+  }
+
+  /** 一条设备连上来时取走它的待发件。 */
+  takePending(deviceId: string): PushMessage[] { return this.pushOutbox.take(deviceId) }
+
+  /**
+   * 大哥的日报：晚上九点之后说一次，说的是今天真发生过的数。
+   *
+   * 与跟进分开：跟进说的是「有一件事卡住了」，日报说的是「今天一共怎么样」。
+   * 两件都塞进一条里，人会分不清哪句要他现在动手。
+   */
+  async runDaily(now = new Date()): Promise<Notice | undefined> {
+    if (!dailyDue(now)) return undefined
+    const day = now.toISOString().slice(0, 10)
+    if (this.dailySaid === day) return undefined
+    const tickets = this.store.tickets.open()
+    const finished = tickets.filter(ticket => ticket.ended && ticket.ended.at.startsWith(day)).length
+    // 结局里没有 `failed`：失败是一个中间状态（还能重试）。日报里数的是「今天结束但没办成」的，
+    // 也就是 `dropped` / `stopped` 这两种 —— 别把「还在跑」误报成失败。
+    const failed = tickets.filter(ticket => ticket.ended && ticket.ended.at.startsWith(day)
+      && (ticket.ended.outcome === 'dropped' || ticket.ended.outcome === 'stopped')).length
+    const waiting = tickets.filter(ticket => ticketCard(ticket).state.startsWith('person/')).length
+    const notice = dailyNotice({
+      day: `${now.getMonth() + 1} 月 ${now.getDate()} 日`, finished, failed, waiting, routines: this.routinesToday,
+    })
+    // 什么也没发生的日子不发：一条「今天什么也没发生」只是在占人时间。
+    if (!notice) { this.dailySaid = day; return undefined }
+    this.pushNotice(notice)
+    this.dailySaid = day
+    return notice
   }
 
   /**
@@ -473,6 +543,8 @@ export class Runtime extends Service implements SourceHost {
       this.sessions.relay(key('followup-relay', candidate.ticket_id, String(now)),
         JSON.stringify({ ...candidate, kind: 'follow_up_due', candidate: candidate.kind, text }))
       console.log('[followup] reminded ticket=%s kind=%s stalled_ms=%d', candidate.ticket_id, candidate.kind, candidate.stalled_ms)
+      // 跟进光落在工单上不够：人不在电脑前时，这条等于没发生。
+      this.pushNotice({ title: '有事等你', body: text, kind: 'followup' })
       sent.push(candidate.ticket_id)
     }
     return sent
@@ -686,6 +758,7 @@ export class Runtime extends Service implements SourceHost {
     this.executor.resume()
     this.passes.start()
     this.startRoutines()
+    this.watchCompaction()
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
@@ -723,6 +796,51 @@ export class Runtime extends Service implements SourceHost {
     }
   }
   /**
+   * 盯住宿主折会话：折出来的摘要记进记忆账本。
+   *
+   * 这一条是「会话可以短、记忆要长」的接缝：压缩器由宿主决定什么时候折、怎么折，
+   * 这里只管折完之后那一段落进账本 —— 于是会话归档、重开新 Session 之后，
+   * 它仍然带着「之前聊过什么」。
+   *
+   * 只记 worker 会话的摘要：主人自己那几条 DSH 会话不归这支队伍管，
+   * 把它们的摘要写进队伍账本，等于偷看别人的工作。
+   */
+  private watchCompaction(): void {
+    if (this.compactionWatch) return
+    this.compactionWatch = true
+    try {
+      this.ctx.on('session/event', (session: unknown, event: unknown) => {
+        const candidate = event as CompactionSummaryEvent | undefined
+        if (!candidate || !worthRemembering(candidate)) return
+        const id = (session as { id?: unknown } | undefined)?.id
+        if (typeof id !== 'string') return
+        // 只认自己派出去的 worker 会话（`worker-<ticket>`）。
+        const match = /^worker-(.+)$/.exec(id)
+        const ticketId = match?.[1]
+        const ticket = ticketId ? this.store.tickets.get(ticketId) : undefined
+        if (!ticket) return
+        const bot = (ticket.channels[0]?.address as { bot_id?: unknown } | undefined)?.bot_id
+        if (typeof bot !== 'string' || !bot) return
+        try {
+          const fact = summaryFact(candidate)
+          this.memory.ledger.settle({
+            bot_id: bot,
+            fact: { dedupe_key: fact.dedupe_key, description: fact.description, body: fact.body, type: 'project', importance: 3 },
+            origin: `ticket:${ticket.id}`,
+            source: { ticket_id: ticket.id },
+          })
+          console.log('[memory] compact settled ticket=%s chars=%d', ticket.id, fact.body.length)
+        } catch (error) {
+          console.log('[memory] compact settle failed ticket=%s error=%s', ticket.id, String(error))
+        }
+      })
+    } catch (error) {
+      // 宿主没有这个事件（老版本）时安静跳过：压缩还在跑，只是不落账本。
+      console.log('[memory] compaction watch unavailable: %s', String(error))
+    }
+  }
+
+  /**
    * 起调度器：一分钟看一次账本。
    *
    * 第一次检查故意晚一个 tick：启动时正忙着建会话、同步花名册，
@@ -735,6 +853,7 @@ export class Runtime extends Service implements SourceHost {
       if (this.closing()) return
       void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
       void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })
+      void this.runDaily().catch(error => { console.log('[daily] tick failed: %s', String(error)) })
     }, TICK_MS)
     // 定时器不该一个人把进程钉住（测试、以及脚本里的一次性启动）。
     this.routineTimer.unref?.()

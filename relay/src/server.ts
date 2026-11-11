@@ -51,6 +51,23 @@ interface PendingRequest {
 }
 
 /** 一条已登记的隧道。 */
+/** 一台设备在中转这边的一点点状态：挂着哪条隧道、有几条没送到。 */
+interface DeviceChannel {
+  deviceId: string
+  instanceId?: string
+  /** 最近一次收到它的帧（注册或 pong）。用来判它在不在。 */
+  seenAt: number
+  /** 设备离线期间攒下的推送。上限与 TTL 与宿主那侧一致。 */
+  pending: { title: string; body: string; sessionId?: string; kind?: string; at: number }[]
+}
+
+/** 一台设备最多攒几条、留多久。手机上收到十条一样的「有未读」不如收到一条。 */
+const MAX_PENDING_PER_DEVICE = 50
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000
+
+/** 一台设备多久没动静算掉线。比心跳间隔宽一倍，避免网络抖一下就判死。 */
+const DEVICE_STALE_MS = 90_000
+
 interface Tunnel {
   instanceId: string
   connection: WebSocketConnection
@@ -176,6 +193,13 @@ export function createRelay(options: RelayOptions = {}): Relay {
 
   /** instanceId → 隧道。只有一条：同一个 id 后来者会把旧的那条顶掉。 */
   const tunnels = new Map<string, Tunnel>()
+  /**
+   * deviceId → 它最近一次挂上来的那条隧道 + 待发的几条。
+   *
+   * 中转是唯一知道「这台手机此刻在不在线」的地方（它挂着隧道），所以推送的投递判定
+   * 只能在这里做。宿主那边只管说「要发什么」，说不清「发到没有」。
+   */
+  const devices = new Map<string, DeviceChannel>()
   /** 来源地址 → 失败记录。定期清理，不然它会随访问者的数量单调长。 */
   const strikes = new Map<string, Strike>()
 
@@ -329,6 +353,32 @@ export function createRelay(options: RelayOptions = {}): Relay {
     return !!offered && safeEqual(offered, options.registerSecret)
   }
 
+  // ── 推送 ───────────────────────────────────────────────────────────
+  /**
+   * 把一条推送写到某条隧道上。
+   *
+   * 用 `T.pushSend` 回下去，与宿主发上来的同一帧类型 —— 手机那侧只需要认一种帧。
+   * 隧道已经不是活着的那条时不写：宁可下次补发，也不要写进一条要断的连接。
+   */
+  function send(tunnel: Tunnel, payload: Record<string, unknown>): void {
+    try { tunnel.connection.sendBinary(encodeFrame(T.pushSend, 0, JSON.stringify(payload))) }
+    catch { /* 连接刚好断了：这条留在待发里，下次连上来补发。 */ }
+  }
+
+  /** 把某台设备攒着的推送补发掉，发完清空。 */
+  function flush(deviceId: string, tunnel: Tunnel): void {
+    const channel = devices.get(deviceId)
+    if (!channel || channel.pending.length === 0) return
+    const now = Date.now()
+    const ready = channel.pending.filter(item => now - item.at < PENDING_TTL_MS)
+    channel.pending = []
+    for (const item of ready) {
+      send(tunnel, { deviceId, title: item.title, body: item.body,
+        ...(item.sessionId ? { sessionId: item.sessionId } : {}), ...(item.kind ? { kind: item.kind } : {}) })
+    }
+    if (ready.length) log({ level: 'info', message: 'push flushed', detail: { deviceId, count: ready.length } })
+  }
+
   // ── 帧分发 ─────────────────────────────────────────────────────────
   function handleFrame(tunnel: Tunnel, frame: Frame): void {
     switch (frame.type) {
@@ -338,6 +388,48 @@ export function createRelay(options: RelayOptions = {}): Relay {
       case T.pong:
         tunnel.lastPong = Date.now()
         return
+      case T.pushRegister: {
+        // 手机说自己是谁：记下它此刻挂在这条隧道上，并把攒着的几条补发出去。
+        const body = parseJson(frame.payload)
+        const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
+        if (!/^dev_[a-z0-9]{6,40}$/.test(deviceId)) return
+        const channel = devices.get(deviceId) ?? { deviceId, seenAt: Date.now(), pending: [] }
+        channel.instanceId = tunnel.instanceId
+        channel.seenAt = Date.now()
+        devices.set(deviceId, channel)
+        flush(deviceId, tunnel)
+        return
+      }
+      case T.pushSend: {
+        // 宿主说要发一条：设备在线就直接写下去，不在线就攒着。
+        const body = parseJson(frame.payload)
+        const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
+        if (!/^dev_[a-z0-9]{6,40}$/.test(deviceId)) return
+        const title = typeof body.title === 'string' ? body.title : ''
+        const text = typeof body.body === 'string' ? body.body : ''
+        if (!text.trim()) return
+        const channel = devices.get(deviceId) ?? { deviceId, seenAt: 0, pending: [] }
+        const live = channel.instanceId ? tunnels.get(channel.instanceId) : undefined
+        const online = !!live && Date.now() - channel.seenAt < DEVICE_STALE_MS
+        if (online && live) {
+          send(live, { deviceId, title, body: text,
+            ...(typeof body.sessionId === 'string' ? { sessionId: body.sessionId } : {}),
+            ...(typeof body.kind === 'string' ? { kind: body.kind } : {}) })
+          log({ level: 'info', message: 'push delivered', detail: { deviceId, online: true } })
+        } else {
+          // 攒着：同 kind 只留最新一条，再按上限与时效裁。
+          const now = Date.now()
+          const kept = channel.pending.filter(item => now - item.at < PENDING_TTL_MS
+            && (typeof body.kind !== 'string' || item.kind !== body.kind))
+          kept.push({ title, body: text, at: now,
+            ...(typeof body.sessionId === 'string' ? { sessionId: body.sessionId } : {}),
+            ...(typeof body.kind === 'string' ? { kind: body.kind } : {}) })
+          channel.pending = kept.slice(-MAX_PENDING_PER_DEVICE)
+          devices.set(deviceId, channel)
+          log({ level: 'info', message: 'push queued', detail: { deviceId, depth: channel.pending.length } })
+        }
+        return
+      }
       case T.register:
         // 已经注册过的连接上再报一次注册是「更新名片」：参考实现是幂等的。这里接受但不重建隧道。
         return

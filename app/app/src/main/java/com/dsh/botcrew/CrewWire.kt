@@ -1438,7 +1438,8 @@ data class RoutineCounts(val enabled: Int = 0, val paused: Int = 0)
  * - `empty`：读得到、确实一条都没有；
  * - `unavailable`：读不到。这一档只能说「读不出来」，绝不能说「还没有常规任务」。
  *
- * `runner` 恒为 `none`：后端没有调度器，界面据此说「到点不会自己跑」，不画成「已排好」。
+ * `runner` 是这台后端现在有没有调度器：`live` 会到点真派单，`none` 只是账本。
+ * 界面据此说「会不会自己跑」，认不出的值一律当 `none` —— 说少了是假装有人会跑。
  */
 data class RoutinesView(
     val items: List<RoutineItem>,
@@ -1515,6 +1516,9 @@ object RoutinesCopy {
      * 是账不是调度器：让人以为放着它就会跑，比空着更糟。
      */
     const val NO_SCHEDULER = "这些账到点不会自己跑：后端还没有调度器，逾期只是提醒。"
+
+    /** 有调度器时说的那句：会派，而且派到哪一目了然。 */
+    const val SCHEDULED = "到点的会自己派给负责的那位，跑过就记上一次；逾期的只提醒，不替你补跑。"
 
     /** 请求已经发出、还没回来。不能说成「没有」，也不能说成「读不到」。 */
     const val READING = "正在读常规任务…"
@@ -1617,7 +1621,7 @@ object RoutinesCopy {
      */
     fun footnote(view: RoutinesView?): String? {
         if (view == null || !view.live) return null
-        return if (view.runner == "live") null else NO_SCHEDULER
+        return if (view.runner == "live") SCHEDULED else NO_SCHEDULER
     }
 }
 

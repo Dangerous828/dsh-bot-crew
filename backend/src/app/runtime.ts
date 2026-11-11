@@ -26,7 +26,9 @@ import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../
 import { ticketCard } from './cards.ts'
 import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
 import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
-import { routinesView, type RoutinesView } from './routines.ts'
+import { routinesView, routineItemOf, type RoutinesView } from './routines.ts'
+import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
+import { followupsOf, followupText } from './followup.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -130,6 +132,8 @@ export class Runtime extends Service implements SourceHost {
   private closingFlag = false
   /** 待命期间重跑 setup 的定时器；关掉 runtime 时必须清掉，否则会对着已释放的锁再跑一次。 */
   private setupRetry?: ReturnType<typeof setTimeout>
+  /** 常规任务的调度器；`start` 之后才有，`stop` 时清掉（`routines()` 据此说 runner 是 live 还是 none）。 */
+  private routineTimer?: ReturnType<typeof setInterval>
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
@@ -384,7 +388,97 @@ export class Runtime extends Service implements SourceHost {
     return routinesView(() => this.store.keys(KV.routines.task).flatMap(name => {
       const record = this.store.get(name)
       return record === undefined ? [] : [record]
-    }))
+    }), Date.now(), this.routineTimer ? 'live' : 'none')
+  }
+
+  /**
+   * 走一遍「常规任务」的账本：到点的派出去，逾期的只记一次提醒。
+   *
+   * 派单不另开派单器：`Engine.receive` 就是手机发消息走的那一条路，
+   * 所以到点派出来的活和主人亲手发的活在同一本账上（票、裁决、回复都在）。
+   *
+   * 不派的情况两种，都不改 `last_run` —— 没跑成就不能记成跑过：
+   * - 队伍暂停（`paused()`）：原因 `paused`；
+   * - 这条没指定 Bot，且队伍一个人都没有：原因 `no_recipient`。
+   */
+  async runRoutines(now = Date.now()): Promise<{ dispatched: string[]; held: string[] }> {
+    const tasks = this.store.keys(KV.routines.task).flatMap(name => {
+      const item = routineItemOf(this.store.get(name), now)
+      return item ? [item] : []
+    })
+    const due = dueOf(tasks, now)
+    if (!due.length) return { dispatched: [], held: [] }
+    const crew = this.crewBots()
+    const dispatched: string[] = [], held: string[] = []
+    for (const task of due) {
+      const recipient = task.bot_id ?? crew[0]
+      if (this.paused() || !recipient) {
+        // 只记一次提醒：`[routine]` 一行，与 [eval] / [memory] 同一个频道。
+        console.log('[routine] held id=%s reason=%s', task.id, this.paused() ? 'paused' : 'no_recipient')
+        held.push(task.id)
+        continue
+      }
+      const at = new Date(now)
+      const messageId = `routine-${task.id}-${at.toISOString()}`
+      const thread = `team:routine:${task.id}:${messageId}`
+      const trigger: Trigger = {
+        id: key('team', messageId), source: 'team', threads: [{ source: 'team', id: thread }],
+        // 到点派单算「人定的常规任务」，不是机器自说自话：主人写下这条账时就是要它这么做。
+        actor: { source: 'team', id: 'routine' }, human: true, addressed: 'mention', at: at.toISOString(),
+        text: routineMessage(task, at), channel: { source: 'team', thread, address: { conversation: 'main', message: messageId, bot_id: recipient } },
+        meta: { conversation: 'main', messageId, root: messageId, bot_id: recipient, routine: task.id },
+      }
+      let taken = false
+      try { taken = this.engine.receive(trigger) === 'stored' }
+      catch (error) { console.log('[routine] dispatch failed id=%s error=%s', task.id, String(error)) }
+      if (!taken) { held.push(task.id); continue }
+      const record = this.store.get(KV.routines.task(task.id))
+      if (record) {
+        // 记上「真跑过」：这是 `last_run` 唯一的写入点。
+        const next = advance({ cycle: record.cycle, created_at: record.created_at, last_run: record.last_run }, now)
+        this.store.set(KV.routines.task(task.id), { ...record, ...next })
+      }
+      console.log('[routine] dispatched id=%s bot=%s ticket_of=%s', task.id, recipient, trigger.id)
+      dispatched.push(task.id)
+    }
+    if (dispatched.length) this.passes.request()
+    return { dispatched, held }
+  }
+
+  /**
+   * 走一遍跟进：卡在等人的票、以及跑着很久没回报的票，各提醒一次。
+   *
+   * 只提醒一次：提醒过的票号记在 KV（`followup.reminded`），票有新动静才清掉。
+   * 隔五分钟问一次「你还在吗」的助手不是助手，是骚扰 —— 这条规矩比「别漏提醒」更重要。
+   */
+  async runFollowups(now = Date.now()): Promise<string[]> {
+    if (this.paused()) return []
+    const tickets = this.store.tickets.open().map(ticket => ({ ticket, state: ticketCard(ticket).state }))
+    const candidates = followupsOf(tickets, now)
+    const sent: string[] = []
+    for (const candidate of candidates) {
+      const seen = this.store.get(KV.followup.reminded(candidate.ticket_id))
+      // 同一种「没下文」只提醒一次：换了一种（从在跑变成等你答）才算新情况。
+      if (seen === `${candidate.kind}:${candidate.action ?? ''}`) continue
+      const ticket = this.store.tickets.get(candidate.ticket_id)
+      const channel = ticket?.channels[0]
+      if (!ticket || !channel) continue
+      const text = followupText(candidate)
+      this.outbox.send({ id: key('followup', candidate.ticket_id, seen ?? 'first', String(now)), channel, text, kind: 'notice', ticketId: ticket.id })
+      this.store.set(KV.followup.reminded(candidate.ticket_id), `${candidate.kind}:${candidate.action ?? ''}`)
+      // 同时告诉主 Session 一声：它在等的那件事没下文了，不用等主人自己发现。
+      this.sessions.relay(key('followup-relay', candidate.ticket_id, String(now)),
+        JSON.stringify({ ...candidate, kind: 'follow_up_due', candidate: candidate.kind, text }))
+      console.log('[followup] reminded ticket=%s kind=%s stalled_ms=%d', candidate.ticket_id, candidate.kind, candidate.stalled_ms)
+      sent.push(candidate.ticket_id)
+    }
+    return sent
+  }
+
+  /** 花名册里的 Bot id，按主人写的顺序。 */
+  private crewBots(): string[] {
+    const config = this.store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined
+    return (config?.bots ?? []).flatMap(bot => bot.bot_id ? [bot.bot_id] : [])
   }
 
   handOff(from: Pick<OutboundMessage, 'id' | 'channel'>, bot_id: string, text: string, origin?: Ticket): boolean {
@@ -533,6 +627,7 @@ export class Runtime extends Service implements SourceHost {
     if (this.closing()) return
     this.executor.resume()
     this.passes.start()
+    this.startRoutines()
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
@@ -569,6 +664,24 @@ export class Runtime extends Service implements SourceHost {
       }
     }
   }
+  /**
+   * 起调度器：一分钟看一次账本。
+   *
+   * 第一次检查故意晚一个 tick：启动时正忙着建会话、同步花名册，
+   * 这时候派单会撞上还没就绪的队伍。晚一分钟不会让谁错过什么 ——
+   * 逾期只提醒，跑的是「该跑的下一轮」。
+   */
+  private startRoutines(): void {
+    if (this.routineTimer || this.closing()) return
+    this.routineTimer = setInterval(() => {
+      if (this.closing()) return
+      void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
+      void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })
+    }, TICK_MS)
+    // 定时器不该一个人把进程钉住（测试、以及脚本里的一次性启动）。
+    this.routineTimer.unref?.()
+  }
+
   /** Retry a pending setup on a short timer; each failure schedules the next. */
   private retrySetup(delay = 5_000): void {
     if (this.closing()) return
@@ -594,6 +707,7 @@ export class Runtime extends Service implements SourceHost {
   private async shutdown(): Promise<void> {
     this.closingFlag = true
     if (this.setupRetry !== undefined) { clearTimeout(this.setupRetry); this.setupRetry = undefined }
+    if (this.routineTimer !== undefined) { clearInterval(this.routineTimer); this.routineTimer = undefined }
     const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()

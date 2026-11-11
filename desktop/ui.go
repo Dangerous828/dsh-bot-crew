@@ -3069,7 +3069,11 @@ func (s *app) routinesPane(c *ui.Context, p Palette) {
 	})
 	// 这一栏只列账，不装作会到点就跑：后端说 runner 是 none 时就把这句话写出来。
 	// 认不出的 runner（老后端、新值）也一样说 —— 说多了只是保守，说少了是假装有人会跑。
-	if view.Runner != "live" {
+	// `runner` 说这台后端有没有调度器：有就写它真会派，没有（含认不出的值）就写不会 ——
+	// 说多了是许空诺，说少了是假装有人会跑。
+	if view.Runner == "live" {
+		ui.Text(c, scheduledNote).FontSize(FontTiny).TextColor(p.Faint)
+	} else {
 		ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
 	}
 }
@@ -3265,6 +3269,9 @@ func memoryDetail(item MemoryItem) string {
 
 // noSchedulerNote 是这一栏必须说的那句实话：账是账，没有人会按点去跑它。
 const noSchedulerNote = "这些账到点不会自己跑：后端还没有调度器，逾期只是提醒。"
+
+// scheduledNote 是反过来那句：后端真有调度器时，说清它会派给谁、跑过记什么、逾期怎么办。
+const scheduledNote = "到点的会自己派给负责的那位，跑过就记上一次；逾期的只提醒，不替你补跑。"
 
 // routineSummary 是「常规任务」栏头那行字：开着几条、关掉几条。都为 0 时返回空串。
 func routineSummary(view RoutinesView) string {

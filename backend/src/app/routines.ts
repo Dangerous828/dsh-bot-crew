@@ -6,9 +6,10 @@
  *
  * 有两点必须说清楚，它们决定了这一栏显示成什么样：
  *
- * 1. **这是账本，不是执行器。** 后端还没有调度器，到点不会有人替你跑。
- *    所以 `next_run` 是**按周期算出来的**一个时间，不是「已经排好的作业」；
- *    过了点就如实标成逾期（`overdue`），不往前推成「下一轮」—— 那是替队伍许一个它做不到的承诺。
+ * 1. **这一份只算账，不跑。** 到点真派单的是 `routine-runner.ts` 与运行时里那台调度器；
+ *    这里负责的是「下一次是什么时候」，它按周期算出来，不是拍下来的排程时间。
+ *    过了点就如实标成逾期（`overdue`），不往前推成「下一轮」—— 没真跑过就不该装作跑过。
+ *    `runner` 字段说的是**这台后端现在有没有调度器**：有就是 `live`，没有才是 `none`。
  * 2. **没跑过就是没跑过。** `last_run` 只在账本里真记过一次执行时才有；
  *    缺了就不给这个字段，客户端不写「从未」以外的任何日期。
  *
@@ -60,8 +61,12 @@ export interface RoutinesView {
   counts: { enabled: number; paused: number }
   /** `state` 不是 `live` 时说清楚为什么。 */
   reason?: string
-  /** 这一栏现在能不能真的按点到点跑。后端还没有调度器，所以恒为 `none`。 */
-  runner: 'none'
+  /**
+   * 这一栏现在能不能按点真跑。
+   * - `live`：调度器在跑，到点会真的派单；
+   * - `none`：这台后端没有调度器（宿主没接，或老版本），界面只该把它当账本看。
+   */
+  runner: 'live' | 'none'
 }
 
 const MAX_TITLE_CHARS = 100
@@ -129,13 +134,15 @@ export function countRoutines(items: readonly RoutineItem[]): { enabled: number;
  * `load` 读账本里所有记录；读不出来就抛 —— 这里记成 `unavailable`，
  * 绝不改成「还没有常规任务」。一条认不出来的记录只丢那一条，不让整栏报错。
  */
-export async function routinesView(load: () => Promise<readonly unknown[]> | readonly unknown[], now = Date.now()): Promise<RoutinesView> {
+export async function routinesView(load: (() => Promise<readonly unknown[]>) | (() => readonly unknown[]) | readonly unknown[],
+  now = Date.now(), runner: RoutinesView['runner'] = 'none'): Promise<RoutinesView> {
   let records: readonly unknown[]
   try {
-    records = await load()
+    // 与记忆同一套调用约定：同步、异步、直接给数组都收。
+    records = typeof load === 'function' ? await load() : await load
   } catch {
     // 读不到与「没有」是两件事：账本存在但打不开，只能说读不出来。
-    return { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 }, runner: 'none',
+    return { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 }, runner,
       reason: '常规任务的账本读不出来' }
   }
   const items: RoutineItem[] = []
@@ -148,6 +155,6 @@ export async function routinesView(load: () => Promise<readonly unknown[]> | rea
     || left.next_run.localeCompare(right.next_run) || left.id.localeCompare(right.id))
   const kept = items.slice(0, MAX_ITEMS)
   const counts = countRoutines(kept)
-  if (kept.length > 0) return { items: kept, state: 'live', counts, runner: 'none' }
-  return { items: [], state: 'empty', counts, runner: 'none', reason: '账本里还没有常规任务' }
+  if (kept.length > 0) return { items: kept, state: 'live', counts, runner }
+  return { items: [], state: 'empty', counts, runner, reason: '账本里还没有常规任务' }
 }

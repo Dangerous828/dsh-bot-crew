@@ -47,6 +47,11 @@ export const KV = {
    * 与工单、会话都分开 —— 工单结束、会话归档，记忆还在。
    */
   memory: { entry: family<import('./memory/recall.ts').MemoryEntry, [name: string]>('memory:entry:') },
+  /**
+   * 跟进：每张票上一次提醒过的是哪种「没下文」（`kind:action`）。
+   * 有值就说明提醒过；票有了新动静才清掉 —— 同一件事不该隔一会儿再问一遍。
+   */
+  followup: { reminded: family<string, [ticket: string]>('followup:reminded:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

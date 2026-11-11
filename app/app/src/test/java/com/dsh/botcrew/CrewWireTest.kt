@@ -1344,8 +1344,11 @@ class RoutinesBarTest {
         assertNull(RoutinesCopy.footnote(null))
         assertNull(RoutinesCopy.footnote(view("""{"items":[],"state":"unavailable","reason":"读不出来"}""")))
         assertNull(RoutinesCopy.footnote(view("""{"items":[],"state":"empty"}""")))
-        // runner 真的变成 live（将来的调度器）时，这句话就该收起来 —— 那时它就不成立了。
-        assertNull(RoutinesCopy.footnote(view(liveBody.replace("\"none\"", "\"live\""))))
+        // runner 是 live（后端真有调度器）时换一句话：说它真会派、跑过记什么、逾期怎么办。
+        assertEquals(
+            "到点的会自己派给负责的那位，跑过就记上一次；逾期的只提醒，不替你补跑。",
+            RoutinesCopy.footnote(view(liveBody.replace("\"none\"", "\"live\""))),
+        )
         // 认不出的 runner 照样说：说多了只是保守，说少了是假装有人会跑。
         assertEquals(
             RoutinesCopy.NO_SCHEDULER,

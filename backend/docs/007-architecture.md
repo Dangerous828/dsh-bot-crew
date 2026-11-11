@@ -353,6 +353,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/memory/settle.ts` | settle 的输入端：从人的原话里认得出「定下来的规矩」，从工单收尾的 `ready` / `dropped` 里取出结论；认不出来就不记，每一条都能指回原文 |
 | `src/app/memory.ts` | 记忆账本：KV 一族 `memory:entry:`，按 Bot 命名空间和 `dedupe_key` 查重，纠错走 `superseded` 而非硬删，「忘掉」只翻状态 |
 | `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
+| `src/app/routine-runner.ts` | 常规任务的执行器：哪几条到点了、派出去时对队伍说的那句话、派完之后账本怎么往前推一格；不补跑、不重试，逾期只提醒 |
+| `src/app/followup.ts` | 跟进：卡在等人的票（10 分钟）与跑着很久没回报的票（45 分钟）各提醒一次，等得久的先；提醒过就安静等着，不追问 |
 | `src/app/views/memory.ts` | 记忆这一栏的形状：一条记忆在界面上的一行（含来源与是否上行）、三态 `live` / `empty` / `unavailable`，以及按 Bot 过滤时仍数整本账 |
 | `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes only a name, the port, and a stateDir fingerprint — never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
@@ -436,6 +438,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-memory-recall.spec.ts` | recall 与 settle 的纯函数：二元组相关度、Bot 命名空间过滤、新鲜度压过旧条目、预算整条取舍、哪句话算「定下来的规矩」、哪种工单收尾值得记 |
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |
 | `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |
+| `tests/crew-routine-runner.spec.ts` | 常规任务调度：只派开着的且到点的、逾期久的先派、停机两天后不补跑、没跑过就写「第一次」 |
+| `tests/crew-followup.spec.ts` | 跟进：等人的门槛比在跑的低、长跑不催命、已结束的不追、说不清多久就不提醒、同一件事只算一次 |
 | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
 | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |

@@ -147,6 +147,20 @@ func TestEmptyPanesSayWhyTheyAreEmpty(t *testing.T) {
 	}
 }
 
+// 调度器上线之后，两句话不能混：有调度器说「会派」，没有说「不会自己跑」。
+// 说反了比不说更糟 —— 一头让人以为放着就会跑，另一头让人以为它从来没跑过。
+func TestRoutineNotesFollowTheRunner(t *testing.T) {
+	if !strings.Contains(scheduledNote, "自己派") {
+		t.Fatalf("有调度器时那句没说会派：%q", scheduledNote)
+	}
+	if !strings.Contains(noSchedulerNote, "不会自己跑") {
+		t.Fatalf("没有调度器时那句没说不会跑：%q", noSchedulerNote)
+	}
+	if scheduledNote == noSchedulerNote {
+		t.Fatal("两句话不该是同一句")
+	}
+}
+
 // 模型面板：每位成员可以有自己的路由，推理档位按当前作用域那条路由显示。
 func TestEachMemberCanUseItsOwnModelAndEffort(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))

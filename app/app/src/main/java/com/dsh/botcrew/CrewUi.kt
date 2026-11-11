@@ -143,6 +143,10 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     var profile by remember { mutableStateOf<BotCard?>(null) }
     // 工作区要看谁的屏幕。null 表示从后台进的，那时还没有具体的人。
     var onScreen by remember { mutableStateOf<BotCard?>(null) }
+    // 代码卡「看看改完的样子」带过来的票号与画面。手机上没有桌面端那块常驻画面区，
+    // 所以那一次读取的结果直接整屏显示；返回时一起清掉，回到队伍不该还挂着旧快照。
+    var previewTicket by remember { mutableStateOf<String?>(null) }
+    var previewView by remember { mutableStateOf<ScreenView?>(null) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
@@ -193,10 +197,15 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     // 执行器被全局暂停这件事压过单个 Bot 的 activity 词，所以从队伍状态里取。
                     paused = conversation?.status?.paused == true,
                     palette = palette,
+                    preview = previewTicket,
+                    previewView = previewView,
                     onBack = {
                         // 回到哪一屏由进来的人决定：名片进的就回队伍，后台进的就回后台。
-                        screen = if (onScreen != null) Screen.Crew else Screen.Backend
+                        // 代码卡进的是从队伍点出来的，所以也回队伍。
+                        screen = if (onScreen != null || previewTicket != null) Screen.Crew else Screen.Backend
                         onScreen = null
+                        previewTicket = null
+                        previewView = null
                     },
                 )
                 Screen.Models -> ModelScreen(client, conversation, palette, onBack = { screen = Screen.Crew })
@@ -210,6 +219,16 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     },
                     // 发出去了才丢掉幂等键：失败重发必须还在。
                     { draft = it }, { sending = it }, { pendingSend = null; refresh() }, { problem = it },
+                    // 代码卡上「看看改完的样子」真读到了画面：整屏去看它的屏幕，看的是
+                    // 这段改动所属的那张票 —— 票号由代码卡带过来，这里不再猜。
+                    onPreview = { ticketId, botId, view ->
+                        previewTicket = ticketId
+                        previewView = view
+                        // 头像尽量给对人：这一段是谁写的就显示谁；不在这份花名册上时留空，
+                        // 抬头只写「工作区」，不编一个名字。
+                        onScreen = conversation?.bots?.firstOrNull { it.id == botId }
+                        screen = Screen.Workspace
+                    },
                     onBackend = { screen = Screen.Backend },
                     onModels = { screen = Screen.Models },
                     onWorkspace = { bot ->
@@ -465,6 +484,8 @@ private fun CrewScreen(
     onSending: (Boolean) -> Unit,
     onSent: () -> Unit,
     onFailed: (String) -> Unit,
+    /** 代码卡上的「看看改完的样子」读到了画面：由上层决定怎么显示（手机上是整屏去看它的屏幕）。 */
+    onPreview: (String, String?, ScreenView) -> Unit,
     onBackend: () -> Unit,
     onModels: () -> Unit,
     onWorkspace: (BotCard?) -> Unit,
@@ -582,14 +603,29 @@ private fun CrewScreen(
                                 previous.fromBot == message.fromBot &&
                                 previous.botId == message.botId
                             MessageRow(
-                                message, shown.bots, palette,
+                                message, shown.bots, palette, client,
+                                // 代码卡上「看看改完的样子」读到了画面：整屏去看它的屏幕。
+                                // 从队伍进来的，退回队伍 —— 和名片进工作区同一条返回规矩。
+                                onScreen = { ticketId, view -> onPreview(ticketId, message.botId, view) },
                                 showName = !sameSpeaker,
                                 // 组内 9、换人 16。第一条上面不留白，否则贴底时首条离底边会多一截。
                                 topGap = if (previous == null) 0.dp else if (sameSpeaker) 9.dp else 16.dp,
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {
-                            item { TicketStrip(shown, palette) }
+                            // 「等你决定」：后端随问题下发了 options 就画成能点的 A/B，
+                            // 点一下直接把那句话发回去（走同一条 POST /send）。
+                            item {
+                                TicketStrip(
+                                    shown, palette, client,
+                                    // 草稿空着才补一句 `@名字 `；已经写了一半的不动它 ——
+                                    // 点一下就把人写了一半的话冲掉，比什么都不做更糟。
+                                    onPrefill = { name ->
+                                        if (draft.isEmpty()) onDraft(if (name.isEmpty()) "" else "@$name ")
+                                    },
+                                    onSent = onSent,
+                                )
+                            }
                             // 第一张工单的子代理能在这里展开，就是「他派了谁」。
                             item { SubagentCard(client, shown.tickets.first().id, palette) }
                         }
@@ -834,6 +870,10 @@ private fun RowScope.SmallCardButton(label: String, palette: CrewPalette, onClic
  *
  * bot 为 null 表示从后台进来、还没指定是谁：那时抬头写「工作区」，也不编一个名字。
  * ticket 是这个 Bot 手上最近一张还没结束的票；没有票时接手只能说「它手上没有活儿」。
+ *
+ * preview 是代码卡上「看看改完的样子」刚读回来的那份快照（票号 + 画面）：
+ * 手机上没有桌面端那块常驻画面区，所以那一次读取的结果直接在这儿整屏显示。
+ * null 表示不是从代码卡进来的，照常按 ticket 读一次。
  */
 @Composable
 private fun WorkspaceScreen(
@@ -842,22 +882,28 @@ private fun WorkspaceScreen(
     ticket: WorkTicket?,
     paused: Boolean,
     palette: CrewPalette,
+    /** 代码卡带过来的票号；有值时这一页读的是它，而不是 bot 手上那张。 */
+    preview: String? = null,
+    previewView: ScreenView? = null,
     onBack: () -> Unit,
 ) {
     // 按过之后显示的那一行。null 表示还没按过；按过一次就一直写着，不闪一下就没。
     var touched by remember { mutableStateOf<String?>(null) }
     // 读屏的结果。view 是后端的话，screenProblem 是链路的话，两者不同时用。
-    var view by remember(bot?.id, ticket?.id) { mutableStateOf<ScreenView?>(null) }
-    var screenProblem by remember(bot?.id, ticket?.id) { mutableStateOf<String?>(null) }
+    // 从代码卡进来的那一次已经在上一屏读过，直接用带回来的画面，不再打一遍。
+    var view by remember(bot?.id, ticket?.id, preview) { mutableStateOf(previewView) }
+    var screenProblem by remember(bot?.id, ticket?.id, preview) { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // 进页面读一次，之后每 5 秒重读一次：worker 在跑，屏幕就该跟着动。
     // 重读失败不把已有的实景擦掉（那会让画面闪成空白）；只有第一次就读不到时才写「读不到」。
-    LaunchedEffect(bot?.id, ticket?.id) {
+    // 代码卡已经带着画面进来了就不重读 —— 那一份就是它刚查到的结果。
+    LaunchedEffect(bot?.id, ticket?.id, preview) {
+        if (previewView != null) return@LaunchedEffect
         while (true) {
             try {
-                view = client.screen(ticket?.id)
+                view = client.screen(preview ?: ticket?.id)
                 screenProblem = null
             } catch (error: Exception) {
                 if (view == null) screenProblem = error.message
@@ -870,7 +916,7 @@ private fun WorkspaceScreen(
     fun reread() {
         scope.launch {
             try {
-                view = client.screen(ticket?.id)
+                view = client.screen(preview ?: ticket?.id)
                 screenProblem = null
             } catch (error: Exception) {
                 if (view == null) screenProblem = error.message
@@ -1059,7 +1105,9 @@ private fun WorkspaceScreen(
                 // 两个按钮现在都动真格。画板把「让它停一下」画成实心强调色；
                 // 接口接上了，但一次请求没回来之前不让连点，所以忙碌时一并变淡。
                 WorkspaceButton(WorkspaceAction.Takeover, palette, enabled = !busy) {
-                    val id = ticket?.id
+                    // 屏幕上显示的是哪张票，接手与暂停就作用在哪张票上：
+                    // 从代码卡进来看的是这段改动所属的那张，不是这位 Bot 手上另一张。
+                    val id = preview ?: ticket?.id
                     if (id == null) {
                         // 它手上没有在跑的票：没有可接的活，别假装接成功了。
                         touched = WorkspaceCopy.TAKEOVER_IDLE
@@ -1084,7 +1132,7 @@ private fun WorkspaceScreen(
                     scope.launch {
                         try {
                             // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
-                            touched = WorkspaceCopy.pauseDone(client.pause(ticket?.id))
+                            touched = WorkspaceCopy.pauseDone(client.pause(preview ?: ticket?.id))
                             // 停完重读：画面顶上那一行要说「停住了」，不能还写着「正在干活」。
                             reread()
                         } catch (error: Exception) {
@@ -1254,10 +1302,46 @@ private fun BackendScreen(
     }
 }
 
+/**
+ * 「等你决定」：赭色细边 + 暖白底，问题下面是后端随问题一起下发的 A/B。
+ *
+ * 点一下就直接答，不经过输入框 —— 画板上那两个按钮是「直接答」，
+ * 多一步「再按发送」就不像在回答了。选项只是呈现，不是审批：回答走的是
+ * 已有的 POST /send，text 里带上选中的 label，并点名在等的那位 Bot（契约 §5）。
+ *
+ * 三条规矩都落在这一处：
+ * - 后端没给 options 就一个选项都不画，也不把 question 拆成选项；
+ * - 防连点：正在发的那一格换成 ✓ 且不再接第二下；
+ * - 回执只写在这张卡自己的问题下：问题的文本或选项一变，旧的另存为作废。
+ */
 @Composable
-private fun TicketStrip(conversation: Conversation, palette: CrewPalette) {
+private fun TicketStrip(
+    conversation: Conversation,
+    palette: CrewPalette,
+    client: CrewClient,
+    /**
+     * 「自己写一句」：把这句在等的人带进输入框，省得人再想上下文。
+     * 只补一个 `@名字 `，不替人写字，也不覆盖已经写了一半的草稿（与桌面端同一条规矩）。
+     */
+    onPrefill: (String) -> Unit,
+    onSent: () -> Unit,
+) {
     // 对话里只露一张「等你决定」，其余在后台里看。
     val waiting = conversation.tickets.firstOrNull { it.needsPerson.isNotEmpty() } ?: return
+    // 这一组问题就是这张卡的身份：换了问题或换了选项，下面两行状态一起作废
+    // （契约 §5：后台重新下发整组 options，旧的一组随即作废，前端不缓存旧选项）。
+    val signature = CrewWire.answerSignature(waiting)
+    // 正在发的那几个选项，键是「票号|选项 id」：挡住连点，也让那一行在发着的时候换成 ✓。
+    var answering by remember(waiting.id, signature) { mutableStateOf(emptySet<String>()) }
+    // 这张卡自己的结果。答的是上一道题，就不写在新问题下面。
+    var note by remember(waiting.id, signature) { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val botName = conversation.bots.firstOrNull { it.id == waiting.botId }?.name?.trim().orEmpty()
+    // 点名用名字：手机上人认的是名片上那两个字。这一位不在花名册上（或名字空着）时退回 id ——
+    // 与桌面端 nameOf 同一条规矩：宁可 @ 一个 id，也不能把回答滑给默认那位。
+    val address = botName.ifEmpty { waiting.botId.trim() }
+    fun addressed(text: String) = if (address.isEmpty()) text else "@$address $text"
+
     // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
     // 和普通工单卡长得一样，而它要的是「现在只有这一件事等你」。
     Column(
@@ -1273,7 +1357,59 @@ private fun TicketStrip(conversation: Conversation, palette: CrewPalette) {
             Text("◷", color = palette.warn, fontSize = 11.sp)
             Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight(620))
         }
-        Text(waiting.needsPerson, color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+        // 有 question 就读 question；没有（delivery / review / blocked / failed 这几种「等你」）
+        // 才退回 needs_person 的人话 —— 绝不补一个空问题。
+        Text(AnswerCopy.body(waiting), color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+        // A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
+        waiting.options.forEachIndexed { index, option ->
+            val slot = CrewWire.answerSlot(waiting.id, option.id)
+            val sending = slot in answering
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(palette.card, RoundedCornerShape(8.dp))
+                    .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+                    // 发着的那一格不再接第二下：按下去没反应比按了有效果更让人以为坏了，
+                    // 所以它的样子会换成 ✓，而不是装作还能点。
+                    .clickable(enabled = !sending) {
+                        answering = answering + slot
+                        note = null
+                        val text = addressed(option.label)
+                        scope.launch {
+                            try {
+                                client.send(
+                                    text,
+                                    CrewWire.mentionsIn(text, conversation.bots),
+                                    java.util.UUID.randomUUID().toString(),
+                                )
+                                note = AnswerCopy.ANSWER_DONE
+                                // 重读时间线：答完之后这张卡要么消失，要么换成下一道题。
+                                onSent()
+                            } catch (error: Exception) {
+                                // 失败写在这张卡自己的结果行里，不冒充断连横幅。
+                                note = AnswerCopy.answerFailed(error.message)
+                            } finally {
+                                answering = answering - slot
+                            }
+                        }
+                    }
+                    .padding(horizontal = 11.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    if (sending) "✓" else AnswerCopy.optionMark(index),
+                    color = palette.accent,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight(620),
+                )
+                Text(option.label, color = palette.ink, fontSize = 13.sp, lineHeight = 19.sp)
+            }
+        }
+        // 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
+        note?.let {
+            Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 16.sp)
+        }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
             Box(
                 modifier = Modifier
@@ -1281,6 +1417,8 @@ private fun TicketStrip(conversation: Conversation, palette: CrewPalette) {
                     .height(32.dp)
                     .background(palette.card, RoundedCornerShape(8.dp))
                     .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+                    // 点它 = 把这句在等的人带进输入框，省得人再想上下文。
+                    .clickable { onPrefill(address) }
                     .padding(horizontal = 11.dp),
                 contentAlignment = Alignment.CenterStart,
             ) {
@@ -1289,7 +1427,8 @@ private fun TicketStrip(conversation: Conversation, palette: CrewPalette) {
             Box(
                 modifier = Modifier
                     .size(width = 36.dp, height = 32.dp)
-                    .background(palette.warn, RoundedCornerShape(8.dp)),
+                    .background(palette.warn, RoundedCornerShape(8.dp))
+                    .clickable { onPrefill(address) },
                 contentAlignment = Alignment.Center,
             ) {
                 Text("回", color = Color.White, fontSize = 11.5.sp)
@@ -1316,7 +1455,12 @@ private fun TaskRow(ticket: WorkTicket, conversation: Conversation?, palette: Cr
         val owner = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name ?: ticket.botId
         Text("${stateWord(ticket.state)} · $owner", color = palette.muted, fontSize = 11.sp)
         if (ticket.needsPerson.isNotEmpty()) {
-            Text(ticket.needsPerson, color = palette.warn, fontSize = 11.sp)
+            // needs_person 存的是类别（answer / review / …），直接画出来是个英文单词。
+            Text(
+                ticket.question.ifBlank { AnswerCopy.waitingWord(ticket.needsPerson) },
+                color = palette.warn,
+                fontSize = 11.sp,
+            )
         }
     }
 }
@@ -1430,8 +1574,46 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
  * 画板里整行浅绿底表示新增、整行浅橙底表示删除，`+` / `-` 跟在行首。
  * 只给号着色是不够的 —— 一屏代码里看不出改了哪几行。
  */
+/**
+ * 消息里带的代码片段：文件名 + 增删统计，逐行标出新增/删除，下面挂两个按钮。
+ *
+ * 画板里整行浅绿底表示新增、整行浅橙底表示删除，`+` / `-` 跟在行首。
+ * 只给号着色是不够的 —— 一屏代码里看不出改了哪几行。
+ *
+ * 两个按钮都不新开后端接口（契约 §5）：
+ * - **采用**：不是把这几行写回工作区（宿主机上没有这条通道，前台也不该绕过 worker
+ *   去动它的工作目录），而是一次表态 —— 走已有的 POST /send 发一句普通消息，
+ *   点名写这段的那位 Bot。因此幂等、排队、撤回、错误码都按那条消息算。
+ * - **看看改完的样子**：走已有的 GET /api/mobile/screen?ticket=…，读这张工单的活动快照。
+ *   没有票号时只如实说看不了，**绝不拿别的票顶替**。
+ *
+ * 两件事都得先说清「对谁做」：没有署名对象时按钮照样在，按下去得到的是一句实话，
+ * 而不是静默不动。
+ */
 @Composable
-private fun CodeCard(block: CodeBlock, palette: CrewPalette) {
+private fun CodeCard(
+    block: CodeBlock,
+    botId: String?,
+    botName: String?,
+    /** 花名册：「采用」那句话要点名，mentions 得从这句里认出来，路由才确定落在那位身上。 */
+    bots: List<BotCard>,
+    palette: CrewPalette,
+    client: CrewClient,
+    /** 拿到快照之后交给上层：手机上没有桌面端那块常驻画面区，去看它的屏幕最顺。 */
+    onScreen: (String, ScreenView) -> Unit,
+) {
+    // 卡的身份。key 由解析层给（后端的 id，或缺省时拼的「票号|文件名」）——
+    // 同一段对话里并排两张卡时，「采用中 / 已采用」与回执都按它各记各的，不串台。
+    var adopting by remember(block.id) { mutableStateOf(false) }
+    var adopted by remember(block.id) { mutableStateOf(false) }
+    var checking by remember(block.id) { mutableStateOf(false) }
+    // 只有这一张卡自己的结果，绝不冒充顶部的断连横幅。
+    var note by remember(block.id) { mutableStateOf<String?>(null) }
+    var noteIsFailure by remember(block.id) { mutableStateOf(false) }
+    // 「看看改完的样子」拿到了但没有画面：这句写在这里，有画面就交给上层去画。
+    val scope = rememberCoroutineScope()
+    val buttons = CodeCardRules.showsButtons(block)
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1488,6 +1670,115 @@ private fun CodeCard(block: CodeBlock, palette: CrewPalette) {
                 }
             }
         }
+        // 按钮是这张卡的一部分：没有改动就没有「采用」，所以只在真有改动时才画。
+        if (buttons) {
+            Box(Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 9.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // 采用：主强调的实心按钮。已采用时换成淡底对勾，但按钮还在（布局不跳）。
+                Box(
+                    modifier = Modifier
+                        .background(
+                            if (adopted) palette.accentSoft else palette.accent,
+                            RoundedCornerShape(8.dp),
+                        )
+                        // 正在发或已经采用过就不再接第二下：一个按下去没反应的手型指针，
+                        // 比一个不能点的按钮更让人以为坏了。
+                        .clickable(enabled = !adopting && !adopted) {
+                            adopting = true
+                            note = null
+                            noteIsFailure = false
+                            val text = CodeCopy.adoptText(block, botId, botName)
+                            scope.launch {
+                                try {
+                                    // mentions 从这句话里认：点名用 id，花名册里有这一位就一定认出来，
+                                    // 这条表态才落在写这段的 Bot 身上，不会滑给默认那位。
+                                    client.send(
+                                        text,
+                                        CrewWire.mentionsIn(text, bots),
+                                        java.util.UUID.randomUUID().toString(),
+                                    )
+                                    adopted = true
+                                    note = CodeCopy.ADOPT_DONE
+                                } catch (error: Exception) {
+                                    note = CodeCopy.adoptFailed(error.message)
+                                    noteIsFailure = true
+                                } finally {
+                                    adopting = false
+                                }
+                            }
+                        }
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        when {
+                            adopted -> CodeCopy.ADOPTED
+                            adopting -> CodeCopy.ADOPTING
+                            else -> CodeCopy.ADOPT
+                        },
+                        fontSize = 11.5.sp,
+                        color = if (adopted) palette.accent else palette.surface,
+                    )
+                }
+                // 看看改完的样子：白底细边的次按钮 —— 画板里就是一主一次。
+                Box(
+                    modifier = Modifier
+                        .background(palette.card, RoundedCornerShape(8.dp))
+                        .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+                        .clickable(enabled = !checking) {
+                            // 票号只认这一段改动自己带的那个。没有就如实说，
+                            // 不拿「第一张在跑的票」顶 —— 那会把 A 的活显示成 B 的结果。
+                            val ticket = block.ticketRef.trim()
+                            if (ticket.isEmpty()) {
+                                note = CodeCopy.NO_TICKET
+                                noteIsFailure = true
+                            } else {
+                                note = null
+                                noteIsFailure = false
+                                checking = true
+                                scope.launch {
+                                    try {
+                                        val view = client.screen(ticket)
+                                        val line = CodeCopy.previewNote(view)
+                                        if (line == null) {
+                                            // 真读到了画面：交给上层换屏，这里不再写一行字。
+                                            onScreen(ticket, view)
+                                        } else {
+                                            note = line
+                                            noteIsFailure = true
+                                        }
+                                    } catch (error: Exception) {
+                                        note = CodeCopy.previewFailed(error.message)
+                                        noteIsFailure = true
+                                    } finally {
+                                        checking = false
+                                    }
+                                }
+                            }
+                        }
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(CodeCopy.PREVIEW, fontSize = 11.5.sp, color = palette.ink)
+                }
+            }
+            // 回执只写在它自己这张卡下面：同一段对话里并排两张卡时，不串台。
+            note?.let {
+                Text(
+                    it,
+                    fontSize = 10.5.sp,
+                    lineHeight = 16.sp,
+                    color = if (noteIsFailure) palette.warn else palette.faint,
+                    modifier = Modifier.padding(start = 9.dp, end = 9.dp, bottom = 9.dp),
+                )
+            }
+        }
     }
 }
 
@@ -1522,6 +1813,8 @@ private fun MessageRow(
     message: Message,
     bots: List<BotCard>,
     palette: CrewPalette,
+    client: CrewClient,
+    onScreen: (String, ScreenView) -> Unit,
     showName: Boolean = true,
     topGap: Dp = 0.dp,
 ) {
@@ -1580,7 +1873,17 @@ private fun MessageRow(
                 )
                 message.code?.let { block ->
                     Spacer(Modifier.height(9.dp))
-                    CodeCard(block, palette)
+                    // 署名带下去：卡上的「采用」要点名写这段的那位，不能猜成默认 Bot。
+                    // 名字取花名册里的显示名；这一位不在花名册上时不编一个，只点名 id。
+                    CodeCard(
+                        block = block,
+                        botId = message.botId,
+                        botName = bots.firstOrNull { it.id == message.botId }?.name,
+                        bots = bots,
+                        palette = palette,
+                        client = client,
+                        onScreen = onScreen,
+                    )
                 }
             }
         }

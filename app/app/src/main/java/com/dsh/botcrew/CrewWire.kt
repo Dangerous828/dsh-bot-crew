@@ -400,11 +400,20 @@ data class CrewStatus(val runtime: String, val mobile: String, val paused: Boole
     fun ready(): Boolean = runtime == "ready" && !paused
 }
 
-/** 工单下的一棵代理树。子代理还能再分子代理，所以这个形状必须能套自己。 */
+/**
+ * 工单下的一棵代理树。子代理还能再分子代理，所以这个形状必须能套自己。
+ *
+ * elapsedSeconds 是「它跑了多久」，与桌面端 client.go 的 AgentNode.ElapsedSeconds 同一字段、
+ * 同一含义。**后端今天还不发这个字段**：backend/src/app/work.ts 的 agentTree() 只填
+ * id / label / state，会话 header 里也没有可用的起止时间。所以它是可空的：
+ * 没有就是 null，界面上不画那一截 —— 宁可少一句「· 42 秒」，也不凭空算一个数出来。
+ * 后端哪天把它加上，这里不用再改。
+ */
 data class AgentNode(
     val id: String,
     val label: String,
     val state: String,
+    val elapsedSeconds: Double? = null,
     val children: List<AgentNode>,
 )
 
@@ -430,9 +439,82 @@ object AgentWire {
             id = value.optString("id"),
             label = value.optString("label"),
             state = value.optString("state"),
+            elapsedSeconds = elapsedOf(value),
             children = (0 until children.length()).mapNotNull { node(children.optJSONObject(it)) },
         )
     }
+
+    /**
+     * 读出 `elapsed_seconds`。缺席、null、以及读不成数的都算「没有」—— 一律 null。
+     *
+     * 这里不拦负数和离谱的大数：那些是「有值但读坏了」，与本字段缺席不是一回事，
+     * 由 [AgentCopy.elapsed] 统一挡住（与桌面端同一个分界：解析只管有没有值，
+     * 画不画由文案层定）。optDouble 缺席时给 NaN，正好可以拿来当「没有」。
+     */
+    private fun elapsedOf(value: JSONObject): Double? {
+        if (!value.has("elapsed_seconds") || value.isNull("elapsed_seconds")) return null
+        val seconds = value.optDouble("elapsed_seconds", Double.NaN)
+        return if (seconds.isNaN()) null else seconds
+    }
+}
+
+/**
+ * 子代理那一行右侧那截话：状态词，跑完了的再补上耗时。
+ *
+ * 与桌面端 `desktop/ui.go` 的 `agentWord` / `agentStatus` / `elapsedSeconds` 是同一套词、
+ * 同一套规矩，两端必须说出同一句话：
+ * - 状态词用「在跑 / 已完成 / 已停下 / 已放弃」，**不是**工单卡上的「在做」——
+ *   同一件事在两个语境里不是一个词，混用会有一边不像画板（画板 Desktop.dc.html:185）。
+ * - 耗时只在后端真的给了才画。今天 agentTree() 不发这个字段，所以实际画出来的
+ *   就是「已完成」三个字 —— 这是有意的：编一个「· 42 秒」出来，屏幕上那个数
+ *   会被当成真的读过。
+ * - 在跑的那个不画耗时：它还没跑完，这个数此刻不成立。
+ */
+object AgentCopy {
+
+    /** 子代理那一行的状态词。零状态（后端没给）按在跑算，与桌面端兜底一致。 */
+    fun word(state: String): String = when (state) {
+        "work", "working" -> "在跑"
+        "completed", "done", "merged", "closed" -> "已完成"
+        "failed", "stopped" -> "已停下"
+        "dropped" -> "已放弃"
+        else -> "在跑"
+    }
+
+    /**
+     * 一行右侧的整句话：状态，跑完了的再补上耗时。
+     *
+     * working 由调用方按 agentDone 算好传进来 —— 与桌面端 `agentStatus(node, working)`
+     * 同一个分工：这里只负责说，不负责判断谁算收工。
+     */
+    fun status(node: AgentNode, working: Boolean): String {
+        val line = word(node.state)
+        // 在跑的那个没有「跑了多久」；后端没给也一样，不补一个空壳「· 」。
+        if (working) return line
+        val spent = elapsed(node.elapsedSeconds) ?: return line
+        return "$line · $spent"
+    }
+
+    /**
+     * 把秒数说成人话，量级跟画板一致（画板是「42 秒」）。
+     *
+     * 超过一分钟进到「1 分 5 秒」：一屏里出现「427 秒」没人算得过来。
+     *
+     * 返回 null 表示「这一截别画」：没有值、负数、NaN、无穷、超过一天 ——
+     * 读坏了就整段不画，留着「已完成 · 」比不画更糟。上界也要挡住，
+     * 与桌面端同一个理由：超大的数转成整数没有意义，画出来是个假数。
+     */
+    fun elapsed(seconds: Double?): String? {
+        seconds ?: return null
+        if (seconds.isNaN() || seconds.isInfinite() || seconds < 0 || seconds > MAX_SECONDS) return null
+        // 四舍五入取整，与桌面端 `int(seconds + 0.5)` 同一个取法（值非负，截断即向下取整）。
+        val total = (seconds + 0.5).toInt()
+        if (total < 60) return "$total 秒"
+        return "${total / 60} 分 ${total % 60} 秒"
+    }
+
+    /** 一天。再长就不是「这一轮跑了多久」，是数据坏了。 */
+    private const val MAX_SECONDS = 24.0 * 60 * 60
 }
 
 /** 手机该连回哪个地址。url 已经带好 IPv6 的方括号，调用方拼端口就行。 */
@@ -655,6 +737,163 @@ object CodeCopy {
 object CodeCardRules {
     fun showsButtons(block: CodeBlock?): Boolean =
         block != null && (block.path.isNotBlank() || block.lines.isNotEmpty())
+}
+
+/**
+ * 代码卡里那一行代码的分词着色。
+ *
+ * 规则与桌面端 `desktop/syntax.go` 是同一套，逐条对得上：改这里就是改那一边，
+ * 两端的代码卡必须看起来是同一张卡。
+ *
+ * 为什么先做「分词」而不是接一个完整的高亮库：画板要的只有一件事 ——
+ * 一行代码里「变了的部分」要看得见。画板 `Desktop.dc.html:133` 里，
+ * 上下文行是暖灰 `#8A8377`，而值 `12px` 是赭色 `#96603A`；改动行整行是绿的。
+ * 达到这个效果只需要认出「数字 / 字符串 / 注释」三类，不需要语法树。
+ *
+ * 这一层刻意不认识具体语言，也不做错误恢复：认不出来的就原样当普通文字，
+ * 拼回去必须和原文逐字相同（见 `CodeSyntaxTest`）—— 高亮可以少，不能吃掉字符。
+ *
+ * 它不带颜色，也不碰 Compose：颜色由界面按主题给（亮暗两套赭不同值），
+ * 这里只说「这一段是哪一类」。这样这一层能在 JVM 单测里直接跑，不用模拟器。
+ */
+internal object CodeSyntax {
+
+    /** 一段文字属于哪一类。Plain 是普通文字，也是「认不出来」时的落点。 */
+    enum class Kind {
+        /** 普通文字：上下文行里的代码、前缀那两格、认不出来的东西。 */
+        Plain,
+
+        /** 数字字面量（含 12px 里的 12、0x1f、1.85）。 */
+        Number,
+
+        /** 引号里的内容，引号本身也算这一段：否则贴着引号的空格会被吃掉。 */
+        Quoted,
+
+        /** 行尾注释，一直吃到行尾。 */
+        Comment,
+    }
+
+    /** 分词结果里的一段。text 原样取自输入，不做 trim。 */
+    data class Token(val text: String, val kind: Kind)
+
+    /**
+     * 一行代码铺到屏幕上要切成几段。
+     *
+     * prefix 是行首那两格（上下文 "  " / 新增 "+ " / 删除 "- "）：它属于这一行，
+     * 不属于某个词，所以单独成一段、跟着整行颜色走（与桌面端 codeSegments 的 prefix 一致）。
+     *
+     * 改动行整行一段、不拆词 —— 桌面端 highlight=false 就是这条：画板里改动的
+     * 是**整行**，行内再分色反而看不出哪一行变了。上下文行才分词着色。
+     *
+     * 正文可能自带 + / - 前缀（后端两种写法都给过），先剥掉再按类别加，
+     * 否则画出来是 `+ + gap: 16px;`。这一条是手机端原来就有的，保留。
+     */
+    fun segments(line: CodeLine): List<Token> {
+        val body = line.text.trimStart().trimStart('+', '-').trimStart()
+        val prefix = when (line.kind) {
+            "added" -> "+ "
+            "removed" -> "- "
+            else -> "  "
+        }
+        // 改动行：整行一段，前缀与正文拼在一起，颜色由界面按行类别给一个色。
+        if (line.kind == "added" || line.kind == "removed") {
+            return listOf(Token(prefix + body, Kind.Plain))
+        }
+        val head = listOf(Token(prefix, Kind.Plain))
+        return head + tokenize(body)
+    }
+
+    /**
+     * 把一行代码切成若干段。
+     *
+     * 规则少到能一眼读完，这才是它敢用的原因：
+     * - 双斜杠与块注释开头起的注释，吃到行尾；贴着行首或空白的双横杠同理；
+     * - 双引号与单引号的字符串，到配对的引号为止（配不上就到行尾）；
+     * - 连续的数字（允许夹一个小数点、跟着单位字母）算一个数字；
+     * - 其余整段算普通文字。
+     *
+     * 逐字对齐 Go 的 tokenizeCode：按下标切子串，不动任何字符。
+     */
+    fun tokenize(text: String): List<Token> {
+        val tokens = mutableListOf<Token>()
+        val plain = StringBuilder()
+        fun flush() {
+            if (plain.isNotEmpty()) {
+                tokens.add(Token(plain.toString(), Kind.Plain))
+                plain.setLength(0)
+            }
+        }
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            when {
+                isCommentStart(text, i) -> {
+                    flush()
+                    tokens.add(Token(text.substring(i), Kind.Comment))
+                    i = text.length
+                }
+                c == '"' || c == '\'' -> {
+                    flush()
+                    var end = i + 1
+                    while (end < text.length && text[end] != c) {
+                        // 反斜杠转义：被转义的那个字符不算收尾的引号。
+                        if (text[end] == '\\' && end + 1 < text.length) end++
+                        end++
+                    }
+                    // 收尾那个引号一起算进来；配不上就吃到行尾。
+                    if (end < text.length) end++
+                    tokens.add(Token(text.substring(i, end), Kind.Quoted))
+                    i = end
+                }
+                c in '0'..'9' -> {
+                    flush()
+                    var end = i
+                    while (end < text.length && isNumberChar(text[end])) end++
+                    tokens.add(Token(text.substring(i, end), Kind.Number))
+                    i = end
+                }
+                else -> {
+                    plain.append(c)
+                    i++
+                }
+            }
+        }
+        flush()
+        return tokens
+    }
+
+    /**
+     * 判断 i 处是不是一段注释的开头。
+     *
+     * 双斜杠与双横杠要求前面不是内容字符：`i--` 是自减，不是注释。
+     * 井号更严 —— 只有它前面整行都是空白才算（shell / yaml / python 的行首注释）。
+     * 放宽到「前面是空格就算」，`color: #FFF` 的颜色值会被整行染灰，值就看不见了；
+     * 宁可漏认一行 `x = 1 # 尾注`，也不能把颜色值认成注释。
+     */
+    private fun isCommentStart(text: String, i: Int): Boolean {
+        val here = text[i]
+        val next = if (i + 1 < text.length) text[i + 1] else '\u0000'
+        return when {
+            here == '/' && (next == '/' || next == '*') -> !hasContentBefore(text, i)
+            here == '-' && next == '-' -> !hasContentBefore(text, i)
+            here == '#' -> text.substring(0, i).all { it == ' ' || it == '\t' }
+            else -> false
+        }
+    }
+
+    /** 这之前有没有代码 —— 只有最后一个字符不是空白，才算「贴着内容」。 */
+    private fun hasContentBefore(text: String, i: Int): Boolean {
+        if (i == 0) return false
+        val last = text[i - 1]
+        return last != ' ' && last != '\t'
+    }
+
+    /**
+     * 数字的一部分：数字、字母（认 0x1f 与 12px 的 px）、小数点。
+     * px 跟着数字走，是为了让 12px 整段染成一个颜色 —— 画板里那一段正是赭色。
+     */
+    private fun isNumberChar(c: Char): Boolean =
+        c in '0'..'9' || c in 'a'..'z' || c in 'A'..'Z' || c == '.'
 }
 
 /** 工作区页里那两个动作。名字就是画板上的字，界面和文案都从这一处取。 */

@@ -20,7 +20,7 @@ import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
-import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
+import { environmentOf, executionRoot, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
@@ -407,6 +407,7 @@ export class Runtime extends Service implements SourceHost {
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    await this.archiveFinishedWorkers()
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -414,6 +415,36 @@ export class Runtime extends Service implements SourceHost {
     this.passes.start()
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
+  }
+  /**
+   * Archives worker Sessions this crew left behind, so the DSH chat list holds only the person's own sessions.
+   *
+   * 工单结束时那条归档调用只覆盖「边跑边结束」的情况。进程重启、崩溃、或同一份 `workspace.json`
+   * 被别的宿主整文件覆写过之后，收尾那一下会丢：会话还在磁盘上，归档集合里却没有它，于是它
+   * 又冒回列表。这里在每次启动收尾时补一遍，分两类：
+   * - 有工单记录、且已结束：直接按票号推会话号；
+   * - 没有工单记录的孤儿（工单表被清过、或换了 stateDir 的老队伍）：扫自己执行目录下的
+   *   `worker-*` 会话。只认本队执行根目录，别处的一概不碰。
+   * 已经归档过的 id 会被 registry 直接跳过，重复调用是安全的。
+   */
+  private async archiveFinishedWorkers(): Promise<void> {
+    const archiving = this.ctx.workspaceRegistry.archiveSession
+    if (typeof archiving !== 'function') return
+    const archive = (sessionId: string): Promise<void> =>
+      archiving.call(this.ctx.workspaceRegistry, sessionId as SessionId, { stopActivity: true }).catch(() => undefined)
+    for (const ticket of this.store.tickets.list()) {
+      if (ticket.ended !== undefined) await archive(workerSessionId(ticket.id))
+    }
+    // 孤儿：本队执行根目录（默认 <stateDir>/work）下、没有工单记录的 worker 会话。
+    const root = executionRoot(this.store.settings(), this.machine.stateDir)
+    const listed = new Set(this.store.tickets.list().map(ticket => workerSessionId(ticket.id)))
+    for (const workspace of this.ctx.workspaceRegistry.list()) {
+      if (workspace.path !== root) continue
+      for (const sessionId of workspace.sessionIds) {
+        if (!sessionId.startsWith('worker-') || listed.has(sessionId)) continue
+        await archive(sessionId)
+      }
+    }
   }
   /** Retry a pending setup on a short timer; each failure schedules the next. */
   private retrySetup(delay = 5_000): void {

@@ -205,7 +205,7 @@ beforeEach(async () => {
     inspect: vi.fn(async () => ({ events: [] })),
   }
   jobs = jobRegistry()
-  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }), list: () => [] }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
@@ -1814,6 +1814,23 @@ it('archives a finished worker Session so the DSH chat list holds only the perso
   const { ticket, sessionId } = await acceptedTicket()
   await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done' })
   await vi.waitFor(() => expect(archived).toContain(sessionId))
+})
+
+// 收尾那一下会丢：进程重启、崩溃、或同一份 workspace.json 被另一台宿主整文件覆写过之后，
+// 会话还在磁盘上却没有进归档集合，于是又冒回列表。启动收尾时要把它补上。
+it('re-archives the worker of a ticket that ended before this startup', async () => {
+  const archived: string[] = []
+  ;(services.workspaceRegistry as Record<string, unknown>).archiveSession = vi.fn(async (id: string) => { archived.push(id) })
+  const { ticket } = await acceptedTicket()
+  // 让工单在没有经过 ticket.ended 出口归档的情况下留下已结束的记录：
+  // 先结束，再把归档调用清空，模拟「那一次写丢了」。
+  await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'ready', summary: 'done' })
+  await vi.waitFor(() => expect(runtime.store.tickets.get(ticket.id)?.ended).toBeDefined())
+  archived.length = 0
+  // 重启：新的 Runtime 在 finishSetup 里要把这条已结束工单的会话补归档。
+  const next = await restart()
+  await next.ready
+  await vi.waitFor(() => expect(archived).toContain(`worker-${ticket.id}`))
 })
 
 // setup 失败会自己再试：代理掉线、CLI 刚重新登录这类原因会自愈，

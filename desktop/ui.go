@@ -1025,9 +1025,17 @@ func (s *app) navRow(c *ui.Context, p Palette, item navItem) {
 		})
 		ui.Text(c, text).FontSize(FontLabel).TextColor(tint)
 		ui.Row(c).Grow(1)
-		// 右端那一点说明：后台是张数，模型是现在用的谁，另外两个没有。
+		// 右端那一点说明：后台是未读 + 张数，模型是现在用的谁，另外两个没有。
 		switch item {
 		case navBackend:
+			// 未读徽标（契约 §5.6）：画板手机端把同样的角标挂在「后台」上（赭底白字），
+			// 桌面画板那一行右端只有张数，所以这里把它摆在张数左边 —— 同一个入口、同一种
+			// 「有东西正等着你」的语义。算不出来时不画，不画成 0。
+			if n, ok := s.unreadCount(); ok {
+				ui.Row(c).PaddingX(6).Radius(RadiusChip).Background(p.Warn).Children(func() {
+					ui.Text(c, badgeText(n)).FontSize(FontTiny).TextColor(p.WarnInk)
+				})
+			}
 			if n := s.openCount(); n > 0 {
 				ui.Row(c).PaddingX(6).Radius(RadiusChip).Background(p.AccentSoft).Children(func() {
 					ui.Text(c, fmt.Sprintf("%d", n)).FontSize(FontTiny).TextColor(p.Accent)
@@ -1052,6 +1060,29 @@ func (s *app) openCount() int {
 		}
 	}
 	return n
+}
+
+// unreadCount 是「未读」徽标上的数，以及这个数该不该画（契约 §5.6）。
+//
+// 两个条件同时成立才画：这份时间线**算得出来**（后端说 live），且条数大于 0。
+// 「算不出来」不是 0 —— 画一个 0 等于替网关说「都读过了」，那正是这一格不能做的事。
+// 说不清时什么都不出现：宁可空着，也不造假。
+func (s *app) unreadCount() (int, bool) {
+	if s.conversation == nil || !s.conversation.Unread.Known() {
+		return 0, false
+	}
+	n := s.conversation.Unread.CountOf()
+	return n, n > 0
+}
+
+// badgeText 把条数压成徽标上的那点字。
+//
+// 两位数以上也要放得下：超过 99 说「99+」，不把行撑开 —— 徽标是个提示，不是账本。
+func badgeText(n int) string {
+	if n > 99 {
+		return "99+"
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 // stateOf 找这位 Bot 手上最近一张工单，用它的状态当「他在干什么」。
@@ -1726,7 +1757,7 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 					})
 					ui.Row(c).PaddingX(13).PaddingY(8).Radius(RadiusItem).
 						Background(p.Warn).Cursor(ui.CursorPointer).Center().Children(func() {
-						ui.Text(c, "回").FontSize(FontBody).TextColor(p.AccentInk)
+						ui.Text(c, "回").FontSize(FontBody).TextColor(p.WarnInk)
 					}).OnClick(func() {
 						if s.input == "" {
 							s.input = "@" + s.nameOf(task.BotID) + " "
@@ -1856,7 +1887,7 @@ func (s *app) message(c *ui.Context, p Palette, message Message) {
 func (s *app) messageAvatar(c *ui.Context, p Palette, botID string) {
 	fill, tint := p.Accent, p.AccentInk
 	if isWarnBot(botID) {
-		fill, tint = p.Warn, p.AccentInk
+		fill, tint = p.Warn, p.WarnInk
 	}
 	ui.Column(c).Width(28).Height(28).Radius(RadiusButton).Background(fill).
 		AlignItems(ui.Center).Justify(ui.Center).Children(func() {

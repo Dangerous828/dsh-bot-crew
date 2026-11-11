@@ -84,3 +84,13 @@ Bot 卡在某个问题上等人回答的状态。表现为 Ticket 上的一条 q
 
 **queue / mobileq**
 `<stateDir>/mobileq.db`（SQLite）。gateway 与 backend 之间的传输层，人看不到。
+
+**读走（read_at）**
+`mobileq.db` 的 `messages.read_at`：`mobileq pull` 把一条消息交给路由、或插队的 `claim`
+把它交给 worker 的那一刻写下的时间。它是队列那一侧**唯一**的「读没读」记录，撤回也按它判 409。
+它说的是「队伍有没有拿到这条话」，**不是**「主人有没有看过队伍的回话」——后者没有任何回执。
+
+**未读（unread）**
+人发出去、队伍还没读走的条数，就是从 `read_at` 空着的那些消息数出来的（契约 `00` §5.6）。
+`unknown` 表示网关没报这一列，此时**不画徽标**：算不出来不等于 0 条。
+

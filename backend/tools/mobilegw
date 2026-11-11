@@ -119,12 +119,17 @@ class H(BaseHTTPRequestHandler):
         try:
             # A withdrawn message is gone from the conversation: it never reached a worker, so the
             # phone must neither show it nor keep offering it in `queued`.
-            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (CONV,)).fetchall()
+            # `read_at` 一起读出来：它是「队伍已经读走」的唯一持久记录。手机面靠它算
+            # 「发出去还没被读走」的条数（契约 §5.6）。撤回只看它有没有值，这里不改那套判定。
+            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions,read_at FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (CONV,)).fetchall()
             reps = c.execute('SELECT id,to_msg,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id', (CONV,)).fetchall()
         finally:
             c.close()
         entries = [(m['id'], 0, m['id'], {'role': 'user', 'text': m['text'], 'at': m['at'],
                     'id': 'm%d' % m['id'], 'request_id': m['request_id'],
+                    # 空串=还没被读走；有值=队伍取走了（pull 或 claim 那一刻）。
+                    # 键永远在：缺席会被读成「这条读没读，网关没说」，那是另一件事。
+                    'read_at': m['read_at'] or '',
                     'mentions': [x for x in ((m['mentions'] or '').split(',')) if x]}) for m in msgs]
         entries += [(r['to_msg'] or 0, 1, r['id'], {'role': 'agent', 'text': r['text'],
                      'at': r['at'], 'id': 'r%d' % r['id'],

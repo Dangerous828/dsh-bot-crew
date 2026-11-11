@@ -91,6 +91,23 @@ func TestAccentOnItsSoftBackground(t *testing.T) {
 	}
 }
 
+// 压在赭色实底上的字（未读徽标、赭色头像、「回」按钮）。
+//
+// 这一条单独测，是因为两套主题的赭不在一个明度档上：亮色是深赭，配白字；
+// 暗色是亮赭，必须配深字。共用一个 AccentInk 时暗色下白字压在 #E0A574 上只有
+// 1.9:1 —— 正是「暗色下文字隐形」那一类缺陷，靠看代码看不出来，只能算。
+func TestWarnInkIsReadableOnWarn(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		p    Palette
+	}{{"亮", LightPalette}, {"暗", DarkPalette}} {
+		// 徽标字只有 11px，属于小字，按 4.5 要求。
+		if got := contrast(c.p.WarnInk, c.p.Warn); got < 4.5 {
+			t.Errorf("%s/赭底上的字: 对比度 %.2f，低于 4.5（徽标会看不清）", c.name, got)
+		}
+	}
+}
+
 // 调色板的每个字段都必须是不透明的。
 //
 // 漏赋值时 ui.Color 是零值：alpha=0，画出来什么都没有。花名册选中底、头像块、

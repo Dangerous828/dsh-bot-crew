@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { phoneHandler, queuedRequests, registerMobileHttp } from '../src/app/mobile-http.ts'
+import { phoneHandler, queuedRequests, registerMobileHttp, unreadOf } from '../src/app/mobile-http.ts'
 import { planFrom, planOf, workOf } from '../src/app/work.ts'
 import { DeviceStore, issuePairingCode } from '../src/app/remote.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
@@ -203,6 +203,59 @@ it('stops offering a withdraw once the crew has had time to pick the message up'
 it('keeps a message whose time cannot be read rather than hiding it', () => {
   // An unreadable timestamp is not evidence the crew picked it up.
   expect(queuedRequests([{ id: 'm1', role: 'user', request_id: 'odd', at: 'not a time' }])).toEqual(['odd'])
+})
+
+// ── 未读（契约 §5.6）──────────────────────────────────────────────
+// 数的是「人发出去、队伍还没读走」的那几条。唯一的证据是网关 `messages.read_at`，
+// 没有就说不清 —— 三条边界各钉一条，免得以后有人把 unknown 当成 0 画出去。
+it('counts the messages a person sent that the crew has not picked up', () => {
+  expect(unreadOf([
+    { id: 'm1', role: 'user', request_id: 'a', at: '1', read_at: '' },
+    { id: 'm2', role: 'user', request_id: 'b', at: '2', read_at: '2026-11-09T10:00:00+0800' },
+    { id: 'm3', role: 'user', request_id: 'c', at: '3', read_at: '' },
+    // 回话没有「读没读」这回事：它不缺 read_at，也一律不算未读。
+    { id: 'r1', role: 'agent', reply_to: 'm1', at: '4' },
+  ])).toEqual({ count: 2, state: 'live' })
+})
+
+it('says it cannot count rather than calling an unreported timeline empty', () => {
+  // 老版本网关不带 read_at。同一份时间线里有能判的、有不能判的，混着数出来的数字是假的，
+  // 所以整份记 unknown —— 宁可不画徽标，也不画一个少算几条的 0。
+  expect(unreadOf([
+    { id: 'm1', role: 'user', request_id: 'a', at: '1', read_at: '' },
+    { id: 'm2', role: 'user', request_id: 'b', at: '2' },
+  ])).toMatchObject({ count: null, state: 'unknown' })
+  // 一条人的消息都没有时是「读得到、确实 0 条」，不是说不清：没有可缺的证据。
+  expect(unreadOf([{ id: 'r1', role: 'agent', at: '1' }])).toEqual({ count: 0, state: 'live' })
+})
+
+it('never counts a withdrawn message the crew never received', () => {
+  expect(unreadOf([{ id: 'm1', role: 'user', request_id: 'a', at: '1', read_at: '', withdrawn: true }]))
+    .toEqual({ count: 0, state: 'live' })
+})
+
+it('hands the unread count to the phone on the same timeline read', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [
+    { id: 'm1', role: 'user', request_id: 'a', text: '在吗', at: '2026-11-09T10:00:00+0800', read_at: '' },
+    { id: 'm2', role: 'user', request_id: 'b', text: '看一下', at: '2026-11-09T10:01:00+0800', read_at: '2026-11-09T10:01:05+0800' },
+    { id: 'r1', role: 'agent', reply_to: 'm2', text: '好', at: '2026-11-09T10:02:00+0800' },
+  ] }))
+  const body = await (await phoneHandler(host(), undefined, upstream as typeof fetch)(
+    new Request('http://dsh/api/mobile/timeline'))).json() as { unread?: { count: number | null; state: string } }
+  // 只算没读走的那一条；已读的和回话都不算。
+  expect(body.unread).toEqual({ count: 1, state: 'live' })
+})
+
+it('passes unknown through the route instead of turning it into zero', async () => {
+  // 老版本网关：人的消息上没有 read_at。路由不该补一个 0 上去 —— 那会把「算不出来」
+  // 说成「都读过了」，两端就会画出一个不存在的「没有未读」。
+  const upstream = vi.fn(async () => Response.json({ items: [
+    { id: 'm1', role: 'user', request_id: 'a', text: '在吗', at: '2026-11-09T10:00:00+0800' },
+  ] }))
+  const body = await (await phoneHandler(host(), undefined, upstream as typeof fetch)(
+    new Request('http://dsh/api/mobile/timeline'))).json() as { unread?: { count: number | null; state: string; reason?: string } }
+  expect(body.unread).toMatchObject({ count: null, state: 'unknown' })
+  expect(body.unread?.reason).toContain('算不出未读')
 })
 
 it('finds subagents from the sessions the store recorded, since agents answers by id only', async () => {

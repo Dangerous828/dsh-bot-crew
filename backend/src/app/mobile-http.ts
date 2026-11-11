@@ -732,6 +732,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
         // Withdrawing it means the crew has not read it, which is what the phone needs to offer.
         queued: queuedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : []),
+        // 「未读」：人发出去、队伍还没读走的有几条（契约 §5.6）。和 `queued` 读的是同一份时间线，
+        // 但判据不同：`queued` 是「还没回复、还能撤回」，未读是「还没被读走」。一条消息可以先被读走
+        // 再慢慢回，那时它已经不算未读了。
+        unread: unreadOf(items),
         // The messages read and left on purpose. Without these the phone cannot tell a thought in progress from
         // one that will never be answered.
         // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
@@ -756,10 +760,44 @@ export const QUEUE_WINDOW_MS = 90_000
 
 /** The parts of a gateway timeline entry this module reads. */
 export interface TimelineItem { id?: string; role?: string; request_id?: string; reply_to?: string; text?: string; at?: string; bot_id?: string
+  /**
+   * 队伍读走这条消息的时刻；空串是「还没读走」，**字段缺席是「这份时间线说不清」**。
+   * 只有人的消息带它（网关 `messages.read_at`），回话没有这个字段 —— 队伍没有「读没读自己的话」这回事。
+   */
+  read_at?: string
+  /** 被撤回的消息本就不上时间线；万一上游给了，也不算未读。 */
+  withdrawn?: boolean
   /** 这条回话带的改动代码（契约 §5「代码卡」）；字段名 `code` 与 `diff` 同形，两个都认。 */
   code?: unknown; diff?: unknown
   /** 这段改动属于哪张工单；只读引用，前台不得据此维护任务账。 */
   ticket_ref?: string }
+
+/** 「未读」的两种说法。`unknown` 是「网关没报告读走状态」，与「确实是 0 条」不是一件事。 */
+export interface UnreadView {
+  /** 条数；`state` 是 `unknown` 时是 null。客户端只认这个数，不自己拿消息列表数。 */
+  count: number | null
+  state: 'live' | 'unknown'
+  /** `state` 不是 live 时说清为什么，一句给人看的中文。 */
+  reason?: string
+}
+
+/**
+ * 人发出去、队伍还没读走的有几条（契约 §5.6）。
+ *
+ * 唯一来源是网关队列已有的 `messages.read_at`：`pull` 与插队的 `claim` 都会写它。
+ * 不新开表、不另存一份状态。三条规矩，都是宁可空着也不造假：
+ * - 一条人的消息缺 `read_at` 字段，整份算 `unknown`。能判的和判不了的不混在一起数。
+ * - 只数 `role === 'user'`：Bot 的回话有没有被主人看过，后端根本没有这份回执，
+ *   拿它当「未读」就是在编。这个缺口写在契约 §5.6 里，不在这里补一个假数。
+ * - 被撤回的不算：它没到过队伍手上。
+ */
+export function unreadOf(items: readonly TimelineItem[]): UnreadView {
+  const people = items.filter(item => item.role === 'user' && !item.withdrawn)
+  if (people.some(item => typeof item.read_at !== 'string')) {
+    return { count: null, state: 'unknown', reason: '这条消息通道还没报告哪些话被读走了，算不出未读' }
+  }
+  return { count: people.filter(item => !item.read_at).length, state: 'live' }
+}
 
 /**
  * The request ids the crew has not answered yet. A reply hangs under the message it answers, so a sent message with

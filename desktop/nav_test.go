@@ -213,3 +213,50 @@ func TestFallingBackToTheCrewDefaultClearsTheMembersRoute(t *testing.T) {
 		t.Fatal("点了「跟随全员」却没有提交")
 	}
 }
+
+// 未读徽标（契约 §5.6）。这组判定决定「画不画、画几」，最容易出的错是把
+// 「算不出来」画成「0 条」—— 那等于替网关说队伍把话都读过了。
+func TestUnreadBadgeOnlyDrawsTruthfulCounts(t *testing.T) {
+	number := func(n int) *int { return &n }
+	cases := []struct {
+		name   string
+		unread Unread
+		want   int
+		show   bool
+	}{
+		// 读得到、确实有 2 条没被读走：画 2。
+		{"两条未读", Unread{Count: number(2), State: "live"}, 2, true},
+		// 读得到、确实是 0 条：不画。0 不占位置，但它是真话。
+		{"确实零条", Unread{Count: number(0), State: "live"}, 0, false},
+		// 读不出来：条数是 null。画 0 就是在说「都读过了」，所以一格都不画。
+		{"算不出来", Unread{Count: nil, State: "unknown", Reason: "网关没报告"}, 0, false},
+		// 老后端整段没有 unread 字段：零值。同样不画，不当成 0 条。
+		{"老后端缺字段", Unread{}, 0, false},
+		// State 说 live 却没有数，是自相矛盾的一份；宁可不画。
+		{"live 却没有数", Unread{State: "live"}, 0, false},
+	}
+	for _, c := range cases {
+		s := &app{conversation: &Conversation{Unread: c.unread}}
+		got, show := s.unreadCount()
+		if got != c.want || show != c.show {
+			t.Errorf("%s: 得到 (%d, %v)，想要 (%d, %v)", c.name, got, show, c.want, c.show)
+		}
+	}
+	// 还没有时间线时什么都不知道：不画。
+	if _, show := (&app{}).unreadCount(); show {
+		t.Error("没有对话时不该画未读徽标")
+	}
+}
+
+func TestUnreadBadgeNeverNeedsAWiderRowThanTheRail(t *testing.T) {
+	// 两位数是常见的；三位数以上压成 99+，徽标宽度不该跟着条数一起长。
+	if got := badgeText(7); got != "7" {
+		t.Errorf("个位数: %q", got)
+	}
+	if got := badgeText(42); got != "42" {
+		t.Errorf("两位数: %q", got)
+	}
+	if got := badgeText(100); got != "99+" {
+		t.Errorf("三位数应压成 99+，得到 %q", got)
+	}
+}

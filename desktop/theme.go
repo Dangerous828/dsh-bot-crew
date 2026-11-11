@@ -25,6 +25,11 @@ type Palette struct {
 	// Warn 是「等你决定」那一类，Danger 是失败。
 	Warn   ui.Color
 	Danger ui.Color
+	// WarnInk 是压在 Warn 实底上的字。亮色主题里它是白的（画板角标 #96603A 底 + #FFFFFF 字），
+	// 暗色主题里要压深（#E0A574 底 + #232228 字）—— 两套的赭不在一个明度档上，
+	// 共用一个 AccentInk 会让暗色下白字压在亮赭上，几乎读不出来。
+	// 用在未读徽标（契约 §5.6）与消息头像那种赭色实底上。
+	WarnInk ui.Color
 	// UserBubble 和 UserInk 是自己发出去的那一侧。
 	UserBubble ui.Color
 	UserInk    ui.Color
@@ -79,7 +84,7 @@ var LightPalette = Palette{
 	Surface: ui.Hex("#FBF9F6"), Card: ui.Hex("#FFFFFF"),
 	Ink: ui.Hex("#1F1D1A"), Muted: ui.Hex("#57524A"), Faint: ui.Hex("#8A8377"), Line: ui.Hex("#EDE8E1"),
 	Accent: ui.Hex("#3E6B62"), AccentInk: ui.Hex("#FFFFFF"),
-	Warn: ui.Hex("#96603A"), Danger: ui.Hex("#B45252"),
+	Warn: ui.Hex("#96603A"), Danger: ui.Hex("#B45252"), WarnInk: ui.Hex("#FFFFFF"),
 	UserBubble: ui.Hex("#2C2A26"), UserInk: ui.Hex("#FBF9F6"),
 	Selected: ui.Hex("#F3F0EA"), AccentSoft: ui.Hex("#EAF1EC"), WarnSoft: ui.Hex("#F6EEE6"),
 	Code: ui.Hex("#F5F2EC"),
@@ -111,7 +116,7 @@ var DarkPalette = Palette{
 	Surface: ui.Hex("#17161A"), Card: ui.Hex("#232228"),
 	Ink: ui.Hex("#F2EFEA"), Muted: ui.Hex("#C4BFB6"), Faint: ui.Hex("#928C82"), Line: ui.Hex("#33313A"),
 	Accent: ui.Hex("#5FBFA8"), AccentInk: ui.Hex("#10201C"),
-	Warn: ui.Hex("#E0A574"), Danger: ui.Hex("#E58A80"),
+	Warn: ui.Hex("#E0A574"), Danger: ui.Hex("#E58A80"), WarnInk: ui.Hex("#232228"),
 	UserBubble: ui.Hex("#3B3942"), UserInk: ui.Hex("#F2EFEA"),
 	Selected: ui.Hex("#2A2830"), AccentSoft: ui.Hex("#1E3A34"), WarnSoft: ui.Hex("#3A2A1C"),
 	Code:        ui.Hex("#1E1D23"),

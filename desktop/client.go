@@ -444,9 +444,33 @@ type Conversation struct {
 	// Declined holds the messages the crew read and chose not to act on, with the reason it gave. Without it the
 	// conversation cannot tell a thought still in progress from one that will never be answered.
 	Declined []Declined
+	// Unread 是「人发出去、队伍还没读走」的条数（契约 §5.6）。Count 是 nil 表示这份时间线
+	// 说不清（网关没报告读走状态）—— 那时不画徽标，不把说不清当成 0。
+	Unread Unread
 	// Model is what the crew is answering with right now; the roster footer shows it.
 	Model string
 }
+
+// Unread 是「未读」这一格的全部内容：数，以及这个数算不算得出来。
+//
+// State 只有 live / unknown 两种。「读得到、确实是 0 条」是 live + Count=0，
+// 与「读不出来」不是一回事：后者画成 0，等于告诉人队伍已经把话都读过了。
+type Unread struct {
+	Count  *int   `json:"count"`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// CountOf 是能画的条数：说不清时是 0，调用方配合 Known 决定画不画。
+func (u Unread) CountOf() int {
+	if u.Count == nil {
+		return 0
+	}
+	return *u.Count
+}
+
+// Known 是「这个数算得出来」。徽标只在它为 true 且条数大于 0 时出现。
+func (u Unread) Known() bool { return u.State == "live" && u.Count != nil }
 
 // Declined 是被读过、但不打算动手的那条消息，以及给出来的理由。
 type Declined struct {
@@ -491,6 +515,8 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		Status       BackendStatus `json:"status"`
 		Queued       []string      `json:"queued"`
 		Declined     []Declined    `json:"declined"`
+		// Unread 缺省时是零值：Count 为 nil、State 为空 —— 两种都不算 known，徽标不出现。
+		Unread Unread `json:"unread"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/mobile/timeline", nil, &payload); err != nil {
 		return nil, err
@@ -501,7 +527,7 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 	}
 	return &Conversation{Messages: payload.Items, Bots: payload.Bots, DefaultBotID: payload.DefaultBotID,
 		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined,
-		Model: payload.Model}, nil
+		Unread: payload.Unread, Model: payload.Model}, nil
 }
 
 // Send 把一句话送进对话。mentions 里是点名的 bot_id，可以没有。

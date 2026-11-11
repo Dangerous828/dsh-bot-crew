@@ -6,6 +6,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -93,6 +95,14 @@ data class CrewPalette(
     // 工单卡进度条的轨道底（画板亮色 #EFEBE5 / 暗色 #2A2830，与桌面端 theme.go 的 Track 同值）。
     // 填充直接复用 accent。没有计划时整条都不画，这块底色也就用不上。
     val track: Color,
+    /**
+     * 压在 `warn` 实底上的字。画板亮色是白（#96603A 底 + #FFFFFF 字），暗色是深字
+     * （#E0A574 底 + #232228 字）—— 两套的赭不在一个明度档上，所以字色也必须分开。
+     *
+     * 未读角标（契约 §5.6）与「等你决定」的「回」按钮都压在这层赭色上：
+     * 亮色下用白读得清，暗色下白压在 #E0A574 上只有 1.9:1，得换成深色。
+     */
+    val onWarn: Color,
 )
 
 val LightPalette = CrewPalette(
@@ -104,6 +114,8 @@ val LightPalette = CrewPalette(
     emptyEdge = Color(0xFFD9D3C9), emptyGlyph = Color(0xFFB8B1A5), segment = Color(0xFFEFEBE5),
     warmBase = Color(0xFFFDF9F4), warnEdge = Color(0xFFE9D9C9), warnSoft = Color(0xFFF6EEE6), field = Color(0xFFF3F0EA),
     track = Color(0xFFEFEBE5),
+    // 画板 Mobile.dc.html:41 的角标：赭底 + 白字。
+    onWarn = Color(0xFFFFFFFF),
 )
 
 val DarkPalette = CrewPalette(
@@ -117,6 +129,8 @@ val DarkPalette = CrewPalette(
     warmBase = Color(0xFF241F1A), warnEdge = Color(0xFF4A3A28), warnSoft = Color(0xFF3A2A1C),
     field = Color(0xFF2A2830),
     track = Color(0xFF2A2830),
+    // 画板 Mobile-dark.dc.html:41 的角标：亮赭底 + 深字（#232228）。
+    onWarn = Color(0xFF232228),
 )
 
 /**
@@ -545,7 +559,14 @@ private fun CrewScreen(
                 onClick = { onWorkspace(null) },
             )
             TextButton(onClick = onModels) { Text("模型", color = palette.accent) }
-            TextButton(onClick = onBackend) { Text("后台", color = palette.accent) }
+            // 「后台」入口本来就该在最常去的地方；画板还给它挂了一枚未读角标（契约 §5.6）。
+            // 算不出来时角标不出现（见 BackendIconButton），入口本身照常在。
+            BackendIconButton(
+                tint = palette.accent,
+                count = conversation?.unread,
+                palette = palette,
+                onClick = onBackend,
+            )
         }
         // 页头那 1 的下边线。画板把它画在页头这一块上，不画在内容上。
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
@@ -1226,6 +1247,54 @@ private fun GlassIconButton(glyph: String, tint: Color, palette: CrewPalette, on
     }
 }
 
+/**
+ * 「后台」入口，右上角带未读角标（契约 §5.6）。
+ *
+ * 画板 Mobile.dc.html 第 39-41 行的原样：32dp、圆角 9、细边；角标是绝对定位在 `top:-4 right:-4`、
+ * 最小 15 高、圆角 8、字号 9.5、赭色底（暗色下是更亮的赭 `#E0A574` 配深字）、左右 3 的内衬。
+ * 这里按同一套数值换算成 dp/sp：15→15.dp、9.5sp、1dp 内衬，8.dp 圆角 —— 手机屏窄，
+ * 角标挂在外面也不会把页头挤开，因为它画在按钮之上而不是排进 Row。
+ *
+ * `count` 为 null 表示算不出来，这时**不画角标**。画一个 0 就是在说「都读过了」，
+ * 那是替网关说话；这一格只画有证据的数。
+ */
+@Composable
+private fun BackendIconButton(tint: Color, count: Int?, palette: CrewPalette, onClick: () -> Unit) {
+    Box(modifier = Modifier.size(32.dp)) {
+        GlassIconButton(glyph = "后台", tint = tint, palette = palette, onClick = onClick)
+        if (count != null && count > 0) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = 4.dp, y = (-4).dp)
+                    // 两颗角的胶囊：画板是 min-width 15 / height 15 / radius 8。
+                    .defaultMinSize(minWidth = 15.dp, minHeight = 15.dp)
+                    .background(palette.warn, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 3.dp, vertical = 1.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    unreadBadge(count),
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight(600),
+                    // 赭色底上的字。画板亮色给的是白（#96603A 底 + #FFFFFF），暗色给的是深字
+                    // （#E0A574 底 + #232228）：亮暗两套的赭不是一个明度档，字也不能共用一个值。
+                    // onWarn 就是这个「压在赭色上当字」的颜色，见 CrewPalette。
+                    color = palette.onWarn,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 角标上的那点字：超过 99 说「99+」，不让徽标跟着条数一起变宽。
+ *
+ * 用 ASCII 的加号而不是中文「以上」：15dp 的胶囊里放不下三个字，
+ * 而把胶囊撑开又会顶到旁边的按钮上。
+ */
+internal fun unreadBadge(count: Int): String = if (count > 99) "99+" else count.toString()
+
 @Composable
 private fun BackendScreen(
     client: CrewClient,
@@ -1457,7 +1526,7 @@ private fun TicketStrip(
                     .clickable { onPrefill(address) },
                 contentAlignment = Alignment.Center,
             ) {
-                Text("回", color = Color.White, fontSize = 11.5.sp)
+                Text("回", color = palette.onWarn, fontSize = 11.5.sp)
             }
         }
     }

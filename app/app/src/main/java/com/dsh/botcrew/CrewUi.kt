@@ -67,8 +67,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** 设计稿里的两套命名颜色。界面只按名字取色，不写字面色值。 */
 data class CrewPalette(
@@ -156,6 +158,17 @@ private fun ticketOf(conversation: Conversation?, bot: BotCard?): WorkTicket? {
     return conversation.tickets.lastOrNull { it.botId == bot.id && it.open }
 }
 
+/**
+ * 时间线刷新的单飞记号：一个普通对象，不进 Compose 状态。
+ *
+ * 它只管「这一趟还在跑吗、跑完要不要再跑一趟」，变了也不需要重画界面 ——
+ * 所以用 remember { } 存着、不当状态读，避免每 6 秒的轮询把 CrewRoot 整屏重组一遍。
+ */
+private class RefreshGuard {
+    var running = false
+    var again = false
+}
+
 @Composable
 fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     var conversation by remember { mutableStateOf<Conversation?>(null) }
@@ -176,28 +189,62 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     // perTicket 清空重读 —— worker 可能只写了个文件，一句话也没多说。
     var timelineEpoch by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
-    val listState = rememberLazyListState()
+    // 时间线刷新的单飞记号（见下面 refresh）。
+    val refreshGuard = remember { RefreshGuard() }
+
+    // 消息结果条按票读产出（契约 §5.4）。挂在 CrewRoot 上、不挂在队伍页里：
+    // 去后台/工作区/模型页再回来时，队伍页会整段重新组合，缓存要是跟着它一起没了，
+    // 每张票都会在切屏后的第一帧重新发一遍请求 —— 那正是「切屏掉帧」的一半来源。
+    // 放在这一层，切回来时结果条是现成的，一帧都不用等。
+    // 轮次还是按时间线走：每读回一份新内容就重读一轮，见 OutputsCache 的说明。
+    val outputs = remember { OutputsCache() }
+    // 子代理树（第一张工单派了谁）。同样挂在这一层：它画在消息列表末尾，
+    // 从后台/工作区回来时人第一眼就看那一块，缓存跟着页面走的话每次都要等一趟网络。
+    val agents = remember { AgentsCache() }
 
     fun refresh() {
+        // 同一时刻只跑一趟。两趟叠在一起时，先发出去的那趟可能带着更旧的时间线后回来，
+        // 把较新的那份盖掉；轮次「变了才加一」也跟着算错，结果条按错轮的账本重读一遍。
+        // 途中又被要求刷新（发完消息马上想看排队的回执）就记一笔，跑完补一趟 —— 不吞掉，
+        // 吞掉就得等下一个 6 秒才看得见自己刚发的话。
+        if (refreshGuard.running) {
+            refreshGuard.again = true
+            return
+        }
+        refreshGuard.running = true
         scope.launch {
             try {
-                val next = client.timeline()
-                // 轮次只在「真的换了一份内容」时才加一。时间线每 6 秒读一次，如果每次都加，
-                // 所有消息的结果条就跟着每 6 秒重读一遍；读完再 outputsTick+1，又重组一遍 ——
-                // 列表在这个环里反复重新布局，人什么都不做也看着它在动。
-                val changed = conversation != next
-                conversation = next
-                problem = null
-                if (changed) {
-                    timelineEpoch += 1
-                    // 只有内容真的变了才记一行。每 6 秒都记的话，日志会被噪声淹掉，
-                    // 也就看不出「哪一次是真的变了」。看：adb logcat -s CrewTimeline
-                    android.util.Log.i("CrewTimeline",
-                        "changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
-                        "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
-                }
+                do {
+                    refreshGuard.again = false
+                    val next = client.timeline()
+                    // 轮次只在「真的换了一份内容」时才加一。时间线每 6 秒读一次，如果每次都加，
+                    // 所有消息的结果条就跟着每 6 秒重读一遍，整列消息行也跟着重组 ——
+                    // 列表在这个环里反复重新布局，人什么都不做也看着它在动。
+                    //
+                    // 这一步比较（Conversation 的逐字段 equals，含每条消息的文本与代码行）
+                    // 放在后台：时间线里有几百条消息时，它是实打实的 CPU 活，正卡在人滑动的那一帧上。
+                    // 结论「变了没变」拿回主线程来用，而写 conversation 的只有这一趟
+                    // （上面那个单飞记号），中间不会有人插进来把它改成别的东西。
+                    val current = conversation
+                    val changed = withContext(Dispatchers.Default) { current != next }
+                    // 只有真变了才写回去。写这一下本身也会做一次 equals（状态按结构比）——
+                    // 每 6 秒在主线程上把几百条消息比一遍，正是我们要省掉的那笔。
+                    // 等值的时候不写：界面不会重组，比较也一次不发生在主线程上。
+                    if (changed) {
+                        conversation = next
+                        timelineEpoch += 1
+                        // 只有内容真的变了才记一行。每 6 秒都记的话，日志会被噪声淹掉，
+                        // 也就看不出「哪一次是真的变了」。看：adb logcat -s CrewTimeline
+                        android.util.Log.i("CrewTimeline",
+                            "changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
+                            "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
+                    }
+                    problem = null
+                } while (refreshGuard.again)
             } catch (error: Exception) {
                 problem = error.message
+            } finally {
+                refreshGuard.running = false
             }
         }
     }
@@ -252,7 +299,7 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     },
                 )
                 Screen.Models -> ModelScreen(client, conversation, palette, onBack = { screen = Screen.Crew })
-                Screen.Crew -> CrewScreen(client, conversation, palette, problem, draft, sending,
+                Screen.Crew -> CrewScreen(client, conversation, outputs, agents, palette, problem, draft, sending,
                     // 结果条按票的缓存每读回一次时间线就清空重读一次（见 CrewScreen）。
                     timelineEpoch = timelineEpoch,
                     requestIdFor = { text ->
@@ -519,6 +566,10 @@ private fun RowScope.SegmentChip(label: String, selected: Boolean, palette: Crew
 private fun CrewScreen(
     client: CrewClient,
     conversation: Conversation?,
+    /** 结果条按票的缓存。由上层持有：切到别的屏再回来时还留着，不必整屏重读。 */
+    outputs: OutputsCache,
+    /** 子代理树按票的缓存。同样由上层持有：它在列表末尾，切回来时最容易被看见。 */
+    agents: AgentsCache,
     palette: CrewPalette,
     problem: String?,
     draft: String,
@@ -543,12 +594,6 @@ private fun CrewScreen(
     var editing by remember { mutableStateOf<BotCard?>(null) }
     // 撤回失败要在这条消息旁边说，不冒充发送失败。
     var withdrawNote by remember { mutableStateOf<String?>(null) }
-    // 消息结果条按票读产出（契约 §5.4）。它跟着这一页活着：同一张票只读一次，
-    // 读不到的也记一笔；每读回一次时间线就整份重读 —— worker 刚写完文件，结果条该跟着变。
-    val outputs = remember { OutputsCache() }
-    // 读回来要重画：Compose 不认普通表里的变化，靠这个数变一下把这一片重新组合一遍。
-    var outputsTick by remember { mutableStateOf(0) }
-    val outputsRefresh: () -> Unit = { outputsTick += 1 }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize()) {
@@ -646,6 +691,13 @@ private fun CrewScreen(
                             onClose = { editing = null },
                             onSaved = { editing = null; profile = null; onSent() })
                     }
+                    // 「同一张票只挂在最后一条回复上」：按这一版时间线算一次，一屏十几条
+                    // 消息共用这一份结果。从前是每条消息各自调用一次 lastOfTicket
+                    // （每趟都往后扫一遍尾巴），一屏就是十几趟 O(n)。key 用消息列表本身：
+                    // 时间线没变（每 6 秒读回来的那份 equals 相同）时它原样留着，连这一趟都不做。
+                    val resultEnds = remember(shown.messages) {
+                        OutputsCopy.takeLastOfTicket(shown.messages)
+                    }
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.weight(1f),
@@ -674,14 +726,12 @@ private fun CrewScreen(
                                 // 组内 9、换人 16。第一条上面不留白，否则贴底时首条离底边会多一截。
                                 topGap = if (previous == null) 0.dp else if (sameSpeaker) 9.dp else 16.dp,
                                 // 结果条：这条话带票号才去读那张票的产出；没有票号就什么都不读。
-                                // outputsTick 只用来在读完时把这一片重画一遍。
                                 outputs = outputs,
                                 generation = timelineEpoch,
-                                onOutputsRead = outputsRefresh,
-                                outputsTick = outputsTick,
                                 // 同一张票的票号会挂在「收到」和「报结果」两条回复上：只让这张票
                                 // 在时间线上的最后一条回复挂结果条，见 OutputsCopy.lastOfTicket。
-                                showResult = OutputsCopy.lastOfTicket(shown.messages, index),
+                                // 这份判断整列只算一次，见上面的 resultEnds。
+                                showResult = resultEnds.getOrElse(index) { false },
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {
@@ -702,7 +752,10 @@ private fun CrewScreen(
                                 )
                             }
                             // 第一张工单的子代理能在这里展开，就是「他派了谁」。
-                            item(key = "subagents") { SubagentCard(client, shown.tickets.first().id, palette) }
+                            // 树按票号缓存（agents），切屏回来时不用再等一次网络。
+                            item(key = "subagents") {
+                                SubagentCard(client, shown.tickets.first().id, agents, timelineEpoch, palette)
+                            }
                         }
                     }
                     // 列表要不要自己滚，只由两件事决定：是不是真的多了一句，以及人是不是本来就贴着底。
@@ -714,6 +767,14 @@ private fun CrewScreen(
                     var settled by remember { mutableStateOf(false) }
                     LaunchedEffect(lastMessageId) {
                         if (lastMessageId.isEmpty()) return@LaunchedEffect
+                        // 手指正按在列表上（甩动或拖动中）：这一下不去动它。
+                        //
+                        // 从前这里不看这个：新消息一到就 scrollToItem，手指还压着也照滚，
+                        // 列表和手指抢同一个位置 —— 手感上就是"滑到一半被拽回去、顿一下"。
+                        // 内容、顺序、什么时候该落底都没改，只是把"人正滑着"这一种情况让给人。
+                        // 让开之后不补滚：人松手时停在哪儿就是哪儿（这本来就是他自己选的），
+                        // 下一次新消息来它照旧跟着走。
+                        if (listState.isScrollInProgress) return@LaunchedEffect
                         val info = listState.layoutInfo
                         val last = info.visibleItemsInfo.lastOrNull()
                         // 离底不足 48px 才算贴着底。用像素而不是索引：一条撑满整屏的长消息也算在底部；
@@ -723,15 +784,18 @@ private fun CrewScreen(
                         // scrollToItem(末项) 只能把它顶到视口顶部；末项比视口矮时列表会停在半途。
                         // 给一个很大的 offset，才是滚到真正的尽头。
                         suspend fun bottom() { listState.scrollToItem(shown.messages.lastIndex, Int.MAX_VALUE) }
+                        // 真正动手之前再看一眼：上面这几行读布局、再等一帧，中间隔着十几毫秒，
+                        // 人完全可能在这期间把手指按下来。按下去之后再滚，等于把上面那条让开的规矩
+                        // 白写了 —— 而且这一下会打断他自己刚甩起来的惯性。
                         if (!settled) {
                             settled = true
                             // 这一帧排完再滚：消息还没量出高度时滚，落点按估算算，会差一截。
                             withFrameNanos { }
-                            bottom()
+                            if (!listState.isScrollInProgress) bottom()
                         } else if (atBottom) {
                             // 结果条、子代理卡是异步读回来的，滚完这句它们才把高度撑开。补一帧再落一次。
                             withFrameNanos { }
-                            bottom()
+                            if (!listState.isScrollInProgress) bottom()
                         }
                     }
                     // 排队中的消息要能撤回：按 request_id 把正文找回来，读不到就显示占位，不编内容。
@@ -1000,12 +1064,19 @@ private fun WorkspaceScreen(
     // 进页面读一次，之后每 5 秒重读一次：worker 在跑，屏幕就该跟着动。
     // 重读失败不把已有的实景擦掉（那会让画面闪成空白）；只有第一次就读不到时才写「读不到」。
     // 代码卡已经带着画面进来了就不重读 —— 那一份就是它刚查到的结果。
+    //
+    // 读到的东西与手上的一模一样就不写回去：view 是状态，写一次就整页重组一次，
+    // 下面那几十行快照文本也跟着全部重排。屏幕上没有变化的那一次，不该付这笔钱。
+    suspend fun read() {
+        val next = client.screen(preview ?: ticket?.id)
+        if (next != view) view = next
+        screenProblem = null
+    }
     LaunchedEffect(bot?.id, ticket?.id, preview) {
         if (previewView != null) return@LaunchedEffect
         while (true) {
             try {
-                view = client.screen(preview ?: ticket?.id)
-                screenProblem = null
+                read()
             } catch (error: Exception) {
                 if (view == null) screenProblem = error.message
             }
@@ -1017,8 +1088,7 @@ private fun WorkspaceScreen(
     fun reread() {
         scope.launch {
             try {
-                view = client.screen(preview ?: ticket?.id)
-                screenProblem = null
+                read()
             } catch (error: Exception) {
                 if (view == null) screenProblem = error.message
             }
@@ -1148,6 +1218,11 @@ private fun WorkspaceScreen(
             val lines = live?.lines.orEmpty()
             if (lines.isNotEmpty()) {
                 // 活动快照：它刚跑了什么、输出了什么、说了什么。不是截帧，是那件事本身。
+                //
+                // 时分秒在这里按整列算一次，而不是每行在正文里现算：screenClock 里是
+                // Instant.parse + 每次新建一个 DateTimeFormatter，一屏一百多行就是一百多次。
+                // 颜色同理，按行的种类在查表里取，不在正文里写 when。
+                val stamps = remember(lines) { lines.map { screenClock(it.at) } }
                 Column(
                     modifier = Modifier
                         .weight(1f)
@@ -1157,9 +1232,9 @@ private fun WorkspaceScreen(
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    lines.forEach { line ->
+                    lines.forEachIndexed { index, line ->
                         Text(
-                            "${screenClock(line.at)}  ${line.text}",
+                            "${stamps[index]}  ${line.text}",
                             fontSize = 11.sp,
                             lineHeight = 16.sp,
                             fontFamily = FontFamily.Monospace,
@@ -1871,23 +1946,52 @@ private fun stateWord(state: String): String = when (state) {
     else -> "在做"
 }
 
-/** 子代理卡：点开才去读树。子代理还能再分子代理，所以按层缩进展开。 */
+/** 子代理卡：一出现就去读树（表头要报数），点开只是把明细放出来。子代理还能再分子代理，所以按层缩进展开。 */
 @Composable
-private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPalette) {
-    var open by remember { mutableStateOf(false) }
-    var nodes by remember { mutableStateOf<List<AgentNode>?>(null) }
-    var trouble by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
+private fun SubagentCard(
+    client: CrewClient,
+    ticketId: String,
+    /** 按票的树缓存（见 AgentsCache）。由上层持有，切屏回来时那一份还在。 */
+    cache: AgentsCache,
+    /** 这一轮时间线的代号：变了就重读一次，队伍派了新的人也看得见。 */
+    generation: Int,
+    palette: CrewPalette,
+) {
+    var open by remember(ticketId) { mutableStateOf(false) }
+    var trouble by remember(ticketId) { mutableStateOf<String?>(null) }
+    // 重试：读不到的那一轮记在缓存里、不会自己再发请求，得有人把这一轮的记号清掉。
+    var retry by remember(ticketId) { mutableStateOf(0) }
+    // 树本身从缓存来。它不是 Compose 的状态，读回来之后靠这枚记号重画这一格。
+    // 表头那两行（「N 个子代理」/「x 在跑 · y 已完成」）从头到尾都是同一档字号的两行，
+    // 有没有数据都不变高，所以读回来不会推动列表。
+    var tick by remember(ticketId) { mutableStateOf(0) }
+    val nodes = remember(ticketId, generation, tick, retry) { cache.get(ticketId, generation) }
 
     // 表头要显示「2 个子代理 · 1 在跑」，所以一出现就得去读，不用等点开。
     // 收起只是收起明细，摘要一直在。
-    LaunchedEffect(ticketId) {
-        if (nodes == null) {
-            try {
-                nodes = client.agents(ticketId)
-            } catch (error: Exception) {
-                trouble = error.message
-            }
+    //
+    // 这里只留这一处读取：从前点开时还抄了一份一模一样的请求，两边各发一遍
+    // —— 表头那趟还没回来就点开，会同时飞出去两个 /agents。
+    // 点开时要做的只是等这一趟：它回来时 tick 变了，卡自己会重画。
+    LaunchedEffect(ticketId, generation, retry) {
+        // start 同时挡住并发：同一张票在这一轮里已经有人发了请求，就不再发第二个。
+        // 按过「重试」时先放掉上一轮「读不到」的记号，再照常走一遍。
+        if (retry > 0) cache.forget(ticketId)
+        if (!cache.start(ticketId, generation)) return@LaunchedEffect
+        trouble = null
+        try {
+            cache.finish(ticketId, client.agents(ticketId), generation)
+            tick += 1
+        } catch (error: CancellationException) {
+            // 这一格被组合带走了：不是「读不到」，别把取消写成一句错误。
+            // 交还给缓存，切回来时还会再读一次。
+            cache.abandon(ticketId, generation)
+            throw error
+        } catch (error: Exception) {
+            // 读不到也记一笔：同一轮里不再重发。trouble 只写在这一张卡上。
+            cache.finish(ticketId, null, generation)
+            tick += 1
+            trouble = error.message
         }
     }
 
@@ -1903,18 +2007,10 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
     ) {
         // 表头：左「N 个子代理」，右「x 在跑 · y 已完成」。
         // 收起时也显示 —— 空的按钮块占着一大片白，比没有更难看。
+        // 点开只改这一枚 open：读取是上面那趟 LaunchedEffect 的事，这里不再发第二个请求。
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp).clickable {
                 open = !open
-                if (open && nodes == null) {
-                    scope.launch {
-                        try {
-                            nodes = client.agents(ticketId)
-                        } catch (error: Exception) {
-                            trouble = error.message
-                        }
-                    }
-                }
             },
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -1950,11 +2046,29 @@ private fun SubagentCard(client: CrewClient, ticketId: String, palette: CrewPale
         trouble?.let {
             Spacer(Modifier.height(6.dp))
             Text(it, color = palette.danger, fontSize = 11.sp)
+            // 读不到得有一条出路：按一下，重读一次这一张票的树。
+            // 缓存里「这一轮读不到」的记号先清掉，否则下面那趟 LaunchedEffect 会当它已经读过。
+            TextButton(onClick = { retry += 1 }) {
+                Text("重试", color = palette.accent, fontSize = 11.sp)
+            }
         }
         if (open) {
-            Spacer(Modifier.height(6.dp))
+            // 树还没回来：先按一行分支的高度占住（与 AgentBranch 同字号、同 2dp 上边距），
+            // 回来时只是把这一处换成真名，卡的上沿不再爬 —— 它挂在消息列表末尾，
+            // 一变高就把上面所有东西顶走一下，正滑着就是一次顿挫。
+            // 真有几行是读回来才知道的，那一下的增高属于数据本身；靠「出现就去读」
+            // 把它压在人还没滑到这里的时候（见上面那趟 LaunchedEffect）。
+            if (nodes == null) {
+                // 和 AgentBranch 同一档字号、同一处内衬：读回来只是把这一行换成真名。
+                Text("· 读着…", fontSize = 11.sp, color = palette.faint,
+                    modifier = Modifier.padding(start = 12.dp, top = 2.dp))
+            }
             nodes?.forEach { AgentBranch(it, 0, palette) }
         }
+        // 收起时不占位，也不做动画：表头那两行（「N 个子代理」/「点开看」或
+        // 「x 在跑 · y 已完成」）无论读没读回来都是同一档字号的两行，读回来不会
+        // 让这张卡变高或变矮，本来就不会推动列表。真有变动的是点开之后树长出来，
+        // 那一下是人自己点的，跟着动是对的 —— 不拿动画把用户的点击拖慢。
     }
 }
 
@@ -2209,21 +2323,21 @@ private fun MessageRow(
     outputs: OutputsCache,
     /** 这一轮时间线的代号：变了就重读一次。 */
     generation: Int,
-    /** 读回来一次，让界面重画一遍（缓存本身不是 Compose 的状态）。 */
-    onOutputsRead: () -> Unit,
     /**
-     * 只用来触发重画：读一次，让这一片在缓存变化后重新组合。
-     * 它的值没人用，所以要在正文里读一下，否则 Compose 不会把这一格记成依赖。
-     */
-    outputsTick: Int = 0,
-    /**
-     * 这一条该不该挂结果条。由调用方用 OutputsCopy.lastOfTicket 按整条时间线算好 ——
+     * 这一条该不该挂结果条。由调用方用 OutputsCopy.takeLastOfTicket 按整条时间线算好 ——
      * 「同一张票只挂在最后一条回复上」，判断要看得见整列消息，所以不在这一格里算。
      */
     showResult: Boolean = false,
     showName: Boolean = true,
     topGap: Dp = 0.dp,
 ) {
+    // 这一条自己的「结果读回来了」记号。它是每条消息各记各的：某张票的产出读回来时，
+    // 只有挂着它的那一条重画（见下面 remember 的键）。
+    //
+    // 从前这一枚是整页共享的（CrewScreen 里的 outputsTick）：任意一张票读回来，
+    // 整列消息行都跟着重组一遍，每行把结果条重查一次 —— 列表越长越明显。
+    // 现在它退到这一行里面，谁读完谁自己动，别处的行不受牵动。
+    var outputsTick by remember { mutableStateOf(0) }
     val fromBot = message.fromBot
     val name = when {
         !fromBot -> "我"
@@ -2296,12 +2410,32 @@ private fun MessageRow(
                 //
                 // 同一张票会挂在好几条回复上（先一句「收到」，干完再一句「报结果」）。
                 // 两条各画一遍，屏幕上就是连着两条同一句话 —— 所以只让这张票在时间线上的
-                // 最后一条回复挂它，判断由调用方按整列消息算好，见 OutputsCopy.lastOfTicket。
+                // 最后一条回复挂它，判断由调用方按整列消息一次算好，见 OutputsCopy.takeLastOfTicket。
                 val ticket = OutputsCopy.barTicket(message)
-                // 缓存是普通表，Compose 不会自己知道它变了：读完一次 outputsTick 就加一，
-                // 这一格跟着重算，才读得到新结果。票号与轮次也进键 —— 换了消息或换了轮次要重查。
-                val line = remember(outputsTick, ticket, generation, showResult) {
+                // 缓存是普通表，Compose 不会自己知道它变了：读完一次，这条自己的
+                // outputsTick 就加一，这一格跟着重算，才读得到新结果。票号、轮次与
+                // 这条该不该挂也进键 —— 换了消息或换了轮次要重查。
+                //
+                // 这枚 tick 是「这一条自己的」：从前它是整页共享的一个，任意一张票
+                // 读回来就把整列消息行全部重组一遍（每行都重算一遍结果条）。
+                // 收窄到这一行之后，一次读取只重画它自己那条结果条。
+                val line = remember(generation, showResult, ticket, outputsTick) {
                     if (showResult) outputs.line(ticket, generation) else null
+                }
+                // 结果条是异步读回来的。读回来之前这块地方的高度必须和读到之后一样，
+                // 否则读完那一刻这条消息长高、列表里下面的东西全被顶走一下 ——
+                // 正滑着就是一次顿挫。
+                //
+                // 占位直接画同一行的空白（同样的上下间距、同样的边框底、同样的一句话），
+                // 只是把字与对勾换成看不见的白：量出来的高度就是真那一行的高度，
+                // 不靠「9 + 9 + 16 ≈ 34dp」这种手算去对（11.5sp 的行高不是字号的 1.4 倍，
+                // 手算出来的数一差，占位就等于没占）。
+                //
+                // 只在「还没读到」的时候占：读过了、确实没有产出，就一点都不留 ——
+                // 那种情况留一块空白是永久的，比读回来时动一下难看得多。
+                if (showResult && line == null && outputs.pending(ticket, generation)) {
+                    Spacer(Modifier.height(9.dp))
+                    ResultBar(" ", palette, hidden = true)
                 }
                 line?.let {
                     Spacer(Modifier.height(9.dp))
@@ -2328,7 +2462,9 @@ private fun MessageRow(
                         }
                         outputs.finish(ticket, view, generation)
                         // 读回来要重画：缓存是普通表，界面不会自己知道它变了。
-                        onOutputsRead()
+                        // 只碰这一条自己的 tick —— 整页共享的那个已经从这一格里拿掉了，
+                        // 否则一次读取会让每一行消息都重组一遍。
+                        outputsTick += 1
                     }
                 }
             }
@@ -2362,9 +2498,13 @@ private fun MessageRow(
  *
  * 与桌面端 resultBar 同一套画法：一行、细边、卡片底，对勾用强调色。
  * 它只在有结果时被调用 —— 空态、读不到、请求失败都不画这条，见 OutputsCopy.barLine。
+ *
+ * `hidden = true` 是同一个框、同一句话、同一处间距，只是字与对勾透明：用来在读回来之前
+ * 把这一行的高度占住。量出来的是真那一行的高度，不是猜的 —— 见 MessageRow 里那一处。
+ * 对无障碍树也不留字：它是占位，不该被读屏念出来。
  */
 @Composable
-private fun ResultBar(line: String, palette: CrewPalette) {
+private fun ResultBar(line: String, palette: CrewPalette, hidden: Boolean = false) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -2374,8 +2514,8 @@ private fun ResultBar(line: String, palette: CrewPalette) {
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("✓", fontSize = 13.sp, color = palette.accent)
-        Text(line, fontSize = 11.5.sp, color = palette.muted)
+        Text("✓", fontSize = 13.sp, color = if (hidden) Color.Transparent else palette.accent)
+        Text(line, fontSize = 11.5.sp, color = if (hidden) Color.Transparent else palette.muted)
     }
 }
 

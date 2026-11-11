@@ -939,6 +939,9 @@ object OutputsCopy {
      * - 自己发的话不挂结果条（两端都只在 Bot 的回复下面画），所以也不算「压住上面那条」；
      * - 没有票号的这一条永远 false —— 绝不因为「前后都没票号」就替它认一张票；
      * - 越界的下标返回 false，别让调用方一处写错就炸掉整屏。
+     *
+     * 单条判法留在这里是给测试与自查用的形状。界面不要按条调它：那是每条消息扫一遍
+     * 尾巴，一屏十几条就是十几趟 O(n) —— 用 takeLastOfTicket 一次算完，见下面那个。
      */
     fun lastOfTicket(messages: List<Message>, index: Int): Boolean {
         if (index !in messages.indices) return false
@@ -952,6 +955,31 @@ object OutputsCopy {
             if (barTicket(other) == ticket) return false
         }
         return true
+    }
+
+    /**
+     * 整条时间线一次算完：第 index 条该不该挂结果条（见上一段的规则）。
+     *
+     * 一行一趟倒着扫就够了：从后往前走，记下已经见过的票号，第一次见到的那个下标就是
+     * 这张票的最后一条。与逐条调用 lastOfTicket 的结果逐条相同，只是从
+     * 「每条各扫一遍尾巴」（n 条 O(n²)）变成「整列扫一遍」（O(n)）。
+     *
+     * 这个函数是纯的，不碰 Compose：调用方按时间线的版本记一次结果就够了，
+     * 不要在每一帧、每一条里重算 —— 那一层见 CrewUi 里的 resultEnds。
+     */
+    fun takeLastOfTicket(messages: List<Message>): BooleanArray {
+        val flags = BooleanArray(messages.size)
+        // 已经见过票号的回复：从后往前，第一次见到的才是这张票的最后一条。
+        val seen = HashSet<String>()
+        for (index in messages.indices.reversed()) {
+            val message = messages[index]
+            // 自己发的话不挂结果条，也不算「压住上面那条」—— 与 lastOfTicket 同一条规矩。
+            if (!message.fromBot) continue
+            val ticket = barTicket(message)
+            if (ticket.isEmpty()) continue
+            if (seen.add(ticket)) flags[index] = true
+        }
+        return flags
     }
 
     /**
@@ -992,6 +1020,10 @@ object OutputsCopy {
  * 而界面已经在第 4 轮时，这条照样算没读过、要重读 —— worker 可能只写了个文件、
  * 一句话都没多说，消息条数不变，但产出变了。按轮次认账，而不是靠清表，
  * 就也不需要在组合期间改状态（那会让 Compose 在画的过程中把状态写脏）。
+ *
+ * 这张表不是 Compose 的状态，读写都在主线程（组合里的 LaunchedEffect 回来那一刻）。
+ * 某个票读完、界面要重画那一行时，由那一行自己的记号说了算 —— 不在这里发通知，
+ * 免得一条读完就把整列消息行都重组一遍。
  */
 class OutputsCache {
     /** 票号 → （这一轮的产出，读不到时是 null）。只有当前轮次的那条算数。 */
@@ -1047,6 +1079,85 @@ class OutputsCache {
         val cached = read[ticket] ?: return null
         if (cached.first != epoch) return null
         return OutputsCopy.barLine(cached.second)
+    }
+
+    /**
+     * 这一轮还在读、还没有答案。界面据此在结果条的位置上先占一行高 ——
+     * 读到之前与读到之后高度一样，列表就不会在读完那一刻被顶走一下。
+     *
+     * 读过了（有结果、或确实读不到）就是 false：那两种都不该再占着地方，
+     * 尤其在「这张票本来就没有产出」时，占着就是一块永久的空白。
+     */
+    fun pending(ticket: String, epoch: Int): Boolean {
+        if (ticket.isEmpty()) return false
+        val cached = read[ticket]
+        if (cached != null && cached.first == epoch) return false
+        return true
+    }
+
+    /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */
+    fun tried(ticket: String, epoch: Int): Boolean = read[ticket]?.first == epoch
+}
+
+/**
+ * 子代理树按票的缓存（第一张工单派了谁）。
+ *
+ * 与 OutputsCache 同一套规矩：不是 Compose 的状态，读完由那一格自己的记号去重画；
+ * 每一条记录都带「它是第几轮时间线读来的」，旧一轮的答案不算数。放在这里而不是界面里，
+ * 是因为它和 OutputsCache 是同一类东西 —— 纯记账，可以单测。
+ *
+ * 为什么要缓存：这张卡画在消息列表**末尾**，从后台/工作区切回来时人第一眼看的就是它。
+ * 缓存跟着页面重新组合的话，每次都要「一边出现一边拉数据」：几百毫秒里那块地方是空的，
+ * 读到之后才长出来 —— 切屏第一帧看上去就是一次卡顿。
+ */
+class AgentsCache {
+    /** 票号 →（这一轮读到的树，读不到时是 null）。 */
+    private val read = mutableMapOf<String, Pair<Int, List<AgentNode>?>>()
+    /** 正在读的：票号 → 这一轮是第几轮。 */
+    private val reading = mutableMapOf<String, Int>()
+
+    /** 这一轮该不该发请求。空票号永远不发（没有票就没有树可读）。 */
+    fun need(ticket: String, epoch: Int): Boolean {
+        if (ticket.isEmpty()) return false
+        val cached = read[ticket]
+        if (cached != null && cached.first == epoch) return false
+        return reading[ticket] != epoch
+    }
+
+    /** 记下「这一轮已经在读」，防止同一张票在同一轮里并发发两个请求。 */
+    fun start(ticket: String, epoch: Int): Boolean {
+        if (!need(ticket, epoch)) return false
+        reading[ticket] = epoch
+        return true
+    }
+
+    /** 一次读取结束。nodes 为 null 表示读不到，也记一笔，这一轮不再重发。 */
+    fun finish(ticket: String, nodes: List<AgentNode>?, epoch: Int) {
+        val startedAt = reading[ticket]
+        val current = read[ticket]?.first ?: 0
+        // 比手上这一轮旧的答案丢掉：刷新之后旧请求晚回来，不能把新轮次的账改回去，
+        // 也不能把新轮次「正在读」的记号抹掉。
+        if (epoch < maxOf(startedAt ?: 0, current)) return
+        if (startedAt == epoch) reading.remove(ticket)
+        read[ticket] = epoch to nodes
+    }
+
+    /** 读了一半被取消（这一格被组合带走了）：放掉「正在读」，切回来再读一次。 */
+    fun abandon(ticket: String, epoch: Int) {
+        if (reading[ticket] == epoch) reading.remove(ticket)
+    }
+
+    /** 清掉这张票的账（按「重试」时用）：下一趟会当成没读过。 */
+    fun forget(ticket: String) {
+        read.remove(ticket)
+        reading.remove(ticket)
+    }
+
+    /** 这一轮读到的树。没读过、或只有旧一轮的，都是 null。 */
+    fun get(ticket: String, epoch: Int): List<AgentNode>? {
+        val cached = read[ticket] ?: return null
+        if (cached.first != epoch) return null
+        return cached.second
     }
 
     /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */

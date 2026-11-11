@@ -41,6 +41,39 @@ func workPaneIn(s *app, p Palette) *ui.Tester {
 	return tt
 }
 
+// 右栏底部的「队列 / N 等待 · 上限 M 并发」只在真的读到槽位情况时才画。
+//
+// 这条盯的是诚实：上限来自管理面的 maxWorkers，读不到时那一行整行不出现，
+// 而不是留一个写死的「上限 3 并发」撑场面。
+func TestTheQueueRowOnlyAppearsWithRealNumbers(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{}
+	p := PaletteFor(false)
+
+	// 还没读到：不画。
+	tt := workPaneIn(s, p)
+	tt.Frame()
+	if tt.HasText("上限 3 并发") || tt.HasText("0 等待 · 上限 3 并发") {
+		t.Error("没读到槽位情况却画出了并发上限：那个数是编的")
+	}
+
+	// 读到了：照管理面报的数画。
+	s.crewLoad = &CrewLoad{Running: 1, Queued: 0, MaxWorkers: 3}
+	tt = workPaneIn(s, p)
+	tt.Frame()
+	if !tt.HasText("0 等待 · 上限 3 并发") {
+		t.Errorf("读到了槽位情况却没画那一行；画的是 %v", tt.Texts())
+	}
+
+	// 上限不是 3 时画的是后端那个数，不是写死的 3。
+	s.crewLoad = &CrewLoad{Running: 2, Queued: 2, MaxWorkers: 5}
+	tt = workPaneIn(s, p)
+	tt.Frame()
+	if !tt.HasText("2 等待 · 上限 5 并发") {
+		t.Errorf("上限跟着管理面走才算读回来的；画的是 %v", tt.Texts())
+	}
+}
+
 // 三个页签悬停都要变手。
 func TestTheThreeTabsShowThePointer(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))

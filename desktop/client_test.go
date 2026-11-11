@@ -501,3 +501,50 @@ func TestManagementRequestsGoToTheManagementPort(t *testing.T) {
 		t.Errorf("请求打到了 %q，应该走管理面", gotPath)
 	}
 }
+
+// 「上限 3 并发」那个数必须从管理面读回来，不能在界面里写死。
+// 它在后端是 executor.maxWorkers（policy.ts 默认 3，管理面板里可改），
+// 所以这里钉住路径与字段名。
+func TestCrewLoadComesFromTheManagementSurface(t *testing.T) {
+	var path, sameOrigin string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		sameOrigin = r.Header.Get("x-orchestrator-request")
+		_, _ = w.Write([]byte(`{"load":{"running":1,"queued":0,"maxWorkers":3}}`))
+	}))
+	defer server.Close()
+
+	c := New("http://127.0.0.1:1", "t", "d").WithManagement(server.URL)
+	load, err := c.CrewLoad(context.Background())
+	if err != nil {
+		t.Fatalf("读槽位情况失败: %v", err)
+	}
+	if path != "/orchestrator/api/state" {
+		t.Errorf("打到 %q，应该是管理面的 /state", path)
+	}
+	if sameOrigin != "1" {
+		t.Errorf("没带同源标记，管理面会拒：%q", sameOrigin)
+	}
+	if load.MaxWorkers != 3 || load.Running != 1 || load.Queued != 0 {
+		t.Errorf("槽位情况解析错: %+v", load)
+	}
+}
+
+// 后端没报并发上限（0）时整份丢掉：界面上不画「上限 0 并发」这种假话。
+func TestCrewLoadWithoutALimitIsDiscarded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"load":{"running":0,"queued":0}}`))
+	}))
+	defer server.Close()
+
+	c := New("http://127.0.0.1:1", "t", "d").WithManagement(server.URL)
+	load, err := c.CrewLoad(context.Background())
+	if err == nil {
+		t.Fatalf("没有上限时应该报错让界面别画，实际拿到了 %+v", load)
+	}
+	// 读不到的那几种原因要分得开：这一种不是「连不上」，是「这个后端没报」。
+	// 断连时 management() 会返回 URL 之类的原话，界面上说的是另一句。
+	if load != nil {
+		t.Error("报错时不该同时给出一份数据")
+	}
+}

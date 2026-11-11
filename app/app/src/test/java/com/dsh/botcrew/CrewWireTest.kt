@@ -1361,3 +1361,505 @@ class RoutinesBarTest {
         val UTC8: ZoneId = ZoneId.of("Asia/Shanghai")
     }
 }
+
+/**
+ * 「同一张票只挂在最后一条回复上」的批量版（[OutputsCopy.takeLastOfTicket]）。
+ *
+ * 界面按整条时间线算一次（O(n)）；[OutputsCopy.lastOfTicket] 是逐条判法的原形，
+ * 每条各往后扫一遍尾巴（O(n²)），留在这里给测试与自查用。两者必须逐条同答案 ——
+ * 差一格，屏幕上就有一条消息多画或少画一条结果条，而这种错只会被当成「后端乱发」。
+ *
+ * 时间线一律用真实 [CrewWire.parseTimeline] 读出来：票号是解析层从 `ticket_ref` 里
+ * trim 过的，「没有票号」在数据层已经归一成空串。自己 new Message 来测会把这一层绕过去。
+ */
+class LastOfTicketBatchTest {
+
+    /** 把若干条原始 item 读成时间线，顺序就是测试给的顺序。 */
+    private fun timelineOf(vararg items: String): List<Message> =
+        CrewWire.parseTimeline("""{"items":[${items.joinToString(",")}],"bots":[],"default_bot_id":""}""").messages
+
+    /** 一条 Bot 回复。ticket 给空串就是「没带票号」。 */
+    private fun reply(id: String, ticket: String, text: String = "…"): String =
+        if (ticket.isEmpty()) """{"id":"$id","role":"agent","bot_id":"coder","text":"$text"}"""
+        else """{"id":"$id","role":"agent","bot_id":"coder","text":"$text","ticket_ref":"$ticket"}"""
+
+    /** 一条人说的话。人也可以带 ticket_ref（比如回一句「就这张票」），但结果条不归他挂。 */
+    private fun said(id: String, ticket: String, text: String = "…"): String =
+        if (ticket.isEmpty()) """{"id":"$id","role":"user","text":"$text"}"""
+        else """{"id":"$id","role":"user","text":"$text","ticket_ref":"$ticket"}"""
+
+    /**
+     * 批量版与逐条版逐格比对，外加两条形状约束：一位对一条消息、不越界。
+     * 这是本组用例的骨架：每一份时间线都要过这一遍。
+     */
+    private fun assertSameVerdicts(messages: List<Message>) {
+        val flags = OutputsCopy.takeLastOfTicket(messages)
+        assertEquals("批量结果必须与消息一一对应", messages.size, flags.size)
+        for (index in messages.indices) {
+            assertEquals(
+                "第 $index 条（${messages[index].id}）：一次算完与逐条判法不一致",
+                OutputsCopy.lastOfTicket(messages, index),
+                flags[index],
+            )
+        }
+    }
+
+    @Test
+    fun anEmptyTimelineHasNoBarAtAll() {
+        val messages = timelineOf()
+        assertSameVerdicts(messages)
+        // 空时间线：一个 BooleanArray 元素都不该有，调用方 getOrElse 才拿得到 false。
+        assertTrue(OutputsCopy.takeLastOfTicket(messages).isEmpty())
+        assertFalse(OutputsCopy.lastOfTicket(messages, 0))
+    }
+
+    @Test
+    fun aSingleReplyWithATicketIsItsOwnLast() {
+        val messages = timelineOf(reply("r1", "tk-1", "改好了"))
+        assertSameVerdicts(messages)
+        // 只有一条、带票号：没有「后面还有没有同票号」可问，它就是最后一条。
+        assertTrue(OutputsCopy.takeLastOfTicket(messages)[0])
+        assertTrue(OutputsCopy.lastOfTicket(messages, 0))
+        // 一条消息也没有票号：一位都不能亮，绝不因为「前后都没票号」就替它认一张票。
+        val bare = timelineOf(reply("r2", ""))
+        assertSameVerdicts(bare)
+        assertFalse(OutputsCopy.takeLastOfTicket(bare)[0])
+    }
+
+    @Test
+    fun everyTicketKeepsOnlyItsOwnLastReply() {
+        // 同一张票先「收到」、再「开始改」、最后「报结果」：只有最后那条才挂结果条。
+        // 三条都画一遍，屏幕上就是连着三句「1 个文件已放进产出」，看着像交了三回活。
+        val messages = timelineOf(
+            reply("r1", "tk-1", "收到，这就去改"),
+            reply("r2", "tk-1", "开始改了"),
+            reply("r3", "tk-1", "改好了"),
+        )
+        assertSameVerdicts(messages)
+        assertEquals(listOf(false, false, true), OutputsCopy.takeLastOfTicket(messages).toList())
+    }
+
+    @Test
+    fun interleavedTicketsEachKeepTheirOwnLast() {
+        // 两张票交错着说话：各论各的，谁也不能把对方压掉。
+        val messages = timelineOf(
+            reply("r1", "tk-1", "tk-1 收到"),
+            reply("r2", "tk-2", "tk-2 收到"),
+            reply("r3", "tk-1", "tk-1 好了"),
+            reply("r4", "tk-2", "tk-2 也好了"),
+            reply("r5", "", "随口一句"),
+        )
+        assertSameVerdicts(messages)
+        assertEquals(listOf(false, false, true, true, false), OutputsCopy.takeLastOfTicket(messages).toList())
+    }
+
+    @Test
+    fun messagesWithoutATicketNeverHoldOne() {
+        // 没有票号、空白票号、代码卡上才带票号 —— 三种「看起来有票号」的都不算。
+        // 判法只读消息自己那个字段（见 OutputsCopy.barTicket），不拿代码卡里的、也不按时间猜。
+        val messages = timelineOf(
+            reply("r1", "", "在的"),
+            reply("r2", "  ", "空白票号"),
+            """{"id":"r3","role":"agent","bot_id":"coder","text":"改好了",
+               "code":{"path":"a.ts","ticket_ref":"tk-1","lines":[{"text":"const a = 1","kind":"added"}]}}""",
+        )
+        assertSameVerdicts(messages)
+        assertEquals(listOf(false, false, false), OutputsCopy.takeLastOfTicket(messages).toList())
+        assertEquals("", OutputsCopy.barTicket(messages[1]))
+        // 代码卡自己的票号是另一回事（署名与「看看改完的样子」用它），不参与结果条。
+        assertEquals("tk-1", messages[2].code?.ticketRef)
+    }
+
+    @Test
+    fun myOwnMessagesNeitherHoldNorSuppressTheBar() {
+        // 人说的话不挂结果条，所以它带同票号也不算「压住上面那条回复」。
+        val afterBot = timelineOf(
+            reply("r1", "tk-2", "改好了"),
+            said("m1", "tk-2", "@coder 再看看"),
+        )
+        assertSameVerdicts(afterBot)
+        assertEquals(listOf(true, false), OutputsCopy.takeLastOfTicket(afterBot).toList())
+
+        // 反过来：人说的话夹在两条 Bot 回复中间，也不能把上一条的「最后一条」顶掉。
+        val sandwiched = timelineOf(
+            reply("r1", "tk-5", "收到"),
+            said("m1", "tk-5", "快点"),
+            reply("r2", "tk-5", "好了"),
+        )
+        assertSameVerdicts(sandwiched)
+        assertEquals(listOf(false, false, true), OutputsCopy.takeLastOfTicket(sandwiched).toList())
+    }
+
+    @Test
+    fun theEndIsDecidedByListOrderNotByTimestamp() {
+        // 两条同票号回复，前一条的 at 反而更晚：顺序就是列表给的顺序，两端都照它办，
+        // 才不会因为两台机器的时钟差一秒，画出不一样的结果条。
+        val messages = timelineOf(
+            """{"id":"r1","role":"agent","bot_id":"coder","text":"先说一句","ticket_ref":"tk-1","at":"2026-11-11T12:00:00Z"}""",
+            """{"id":"r2","role":"agent","bot_id":"coder","text":"报结果","ticket_ref":"tk-1","at":"2026-11-11T09:00:00Z"}""",
+        )
+        assertSameVerdicts(messages)
+        assertEquals(listOf(false, true), OutputsCopy.takeLastOfTicket(messages).toList())
+    }
+
+    @Test
+    fun theBatchVersionMatchesOnAMixedTimeline() {
+        // 一份把所有断面混在一起的时间线：交错的两张票、同一张票的多条回复、
+        // 人说的话（带票号与不带票号）、空白票号的变形、以及一条没票号的私话。
+        val messages = timelineOf(
+            reply("r1", "tk-1", "收到，这就去改"),
+            said("m1", "", "@coder 快点"),
+            reply("r2", "tk-2", "tk-2 收到"),
+            reply("r3", "tk-1", "改好了"),
+            said("m2", "tk-1", "是你改的吗"),
+            reply("r4", "tk-2", "tk-2 也好了"),
+            reply("r5", " tk-1 ", "tk-1 最后一句"),
+            reply("r6", "", "随口一句"),
+        )
+        assertSameVerdicts(messages)
+        assertEquals(
+            listOf(false, false, false, false, false, true, true, false),
+            OutputsCopy.takeLastOfTicket(messages).toList(),
+        )
+        // 票号两边的空白由解析层 trim 掉：` tk-1 ` 与 `tk-1` 是同一张票。
+        assertEquals("tk-1", messages[6].ticketRef)
+        // 没带票号的那条读出来是空串（不是 null、也不是空白），谁也不参与。
+        assertEquals("", messages[1].ticketRef)
+        // 空白票号同样归一成空串：判断层再 trim 一次，两种写法都挡在门外。
+        assertEquals("", OutputsCopy.barTicket(messages[4].copy(ticketRef = "  ")))
+    }
+
+    @Test
+    fun theBatchIsPureAndRepeatable() {
+        // 结果条判断按时间线的版本记一次（CrewUi 的 resultEnds 用 messages 当 key），
+        // 所以同一个列表问多少遍都得是同一份答案，也不能顺手改动消息本身。
+        val messages = timelineOf(
+            reply("r1", "tk-1", "收到"),
+            reply("r2", "tk-1", "好了"),
+        )
+        val first = OutputsCopy.takeLastOfTicket(messages).toList()
+        val second = OutputsCopy.takeLastOfTicket(messages).toList()
+        assertEquals(first, second)
+        assertEquals(listOf("r1", "r2"), messages.map { it.id })
+        assertEquals(listOf("tk-1", "tk-1"), messages.map { it.ticketRef })
+    }
+}
+
+/**
+ * 子代理树按票的缓存（[AgentsCache]）。
+ *
+ * 它与 [OutputsCache] 是同一套规矩：按票记账、每笔带「第几轮时间线读来的」、
+ * 读不到也记一笔（这一轮不再重发）、取消不记、旧回包不盖新轮次。
+ * 额外多一个 forget —— 子代理卡上有「重试」，那是唯一一个「由人把这一轮的账清掉」的入口。
+ *
+ * 另一条与界面结构绑定的语义：这份账本挂在 CrewRoot 上，切屏（页面重新组合）回来时还在。
+ * 这里用一个「同一份缓存跨两次取用」的用例把它钉住 —— 它要是跟着页面重建，
+ * 切回来第一帧就得重发一遍 /agents，那几百毫秒的空块正是切屏时最容易被看见的半次卡顿。
+ */
+class AgentsCacheTest {
+
+    private fun tree(): List<AgentNode> = AgentWire.parse(
+        """
+        {"ticket_id":"tk-1","agents":[
+          {"id":"worker-tk1","label":"工单","state":"working","children":[
+            {"id":"sub-a","label":"子代理","state":"completed","children":[]}
+          ]}
+        ]}
+        """.trimIndent(),
+    )
+
+    @Test
+    fun anUntouchedTicketHasNothingButStillWantsARead() {
+        val cache = AgentsCache()
+        // get 是个纯查表：没取过就是 null，也不顺手把「读过」记上。
+        assertNull(cache.get("tk-1", 1))
+        assertFalse("没读过不算试过", cache.tried("tk-1", 1))
+        assertTrue("没读过就该去读一次", cache.need("tk-1", 1))
+    }
+
+    @Test
+    fun aTicketWithoutANumberIsNeverRead() {
+        // 空票号：没有票就没有树可读，也不许拿别的票顶替。
+        val cache = AgentsCache()
+        assertFalse(cache.need("", 1))
+        assertFalse(cache.start("", 1))
+        assertNull(cache.get("", 1))
+        assertFalse(cache.tried("", 1))
+    }
+
+    @Test
+    fun oneReadPerTicketPerTimeline() {
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-1", 1))
+        // start 同时挡住并发：表头那趟还没回来时点开卡片，不能再飞出去第二个 /agents。
+        assertFalse("同一轮里不并发发第二个请求", cache.start("tk-1", 1))
+        assertNull("还在读：没有树可画", cache.get("tk-1", 1))
+        assertFalse("正在读不算读过", cache.tried("tk-1", 1))
+
+        cache.finish("tk-1", tree(), 1)
+        // 逐字段比：真的树，不是「有东西」。
+        assertEquals(tree(), cache.get("tk-1", 1))
+        assertEquals("worker-tk1", cache.get("tk-1", 1)?.first()?.id)
+        assertEquals("sub-a", cache.get("tk-1", 1)?.first()?.children?.first()?.id)
+        assertTrue(cache.tried("tk-1", 1))
+        assertFalse("读到了就不再发", cache.need("tk-1", 1))
+        assertFalse("读到了也不许再开一趟", cache.start("tk-1", 1))
+    }
+
+    @Test
+    fun anEmptyTreeIsStillARead() {
+        // 后端给了合法的空树：这叫「读到了、确实没有」，与读不到不是一件事 ——
+        // 但两者都不该每帧重发请求。
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-6", 1))
+        cache.finish("tk-6", emptyList(), 1)
+        assertEquals(emptyList<AgentNode>(), cache.get("tk-6", 1))
+        assertTrue(cache.tried("tk-6", 1))
+        assertFalse("空的树也是读过了", cache.need("tk-6", 1))
+    }
+
+    @Test
+    fun anUnreadableTreeIsRememberedButNotDrawn() {
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-9", 1))
+        cache.finish("tk-9", null, 1)
+        assertTrue("读不到也记一笔", cache.tried("tk-9", 1))
+        assertNull("读不到就没有树可画", cache.get("tk-9", 1))
+        assertFalse("这一轮不再反复请求", cache.need("tk-9", 1))
+        assertFalse(cache.start("tk-9", 1))
+
+        // 时间线又读回来一次（第 2 轮）：这是一份新账，必须重读 ——
+        // worker 可能刚派了新人，一句新话也没说。
+        assertTrue(cache.need("tk-9", 2))
+        assertNull("上一轮的答案不拿来画这一轮", cache.get("tk-9", 2))
+        assertFalse(cache.tried("tk-9", 2))
+    }
+
+    @Test
+    fun aCancelledReadLeavesNoRecord() {
+        // 卡片被组合带走（切屏、滑出列表）时 LaunchedEffect 被取消：
+        // 那不是「读不到」，切回来还得再读一次，否则这张卡会永远停在「读过了、没有」。
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-2", 1))
+        cache.abandon("tk-2", 1)
+        assertFalse("取消不是读不到", cache.tried("tk-2", 1))
+        assertNull(cache.get("tk-2", 1))
+        assertTrue("切回来还要再读一次", cache.need("tk-2", 1))
+        assertTrue(cache.start("tk-2", 1))
+
+        // 第 2 轮正在读时，第 1 轮迟到的取消不能把这一轮的在读记号抹掉 ——
+        // 抹掉就会在同一轮里再发一个请求。
+        assertTrue(cache.start("tk-5", 2))
+        cache.abandon("tk-5", 1)
+        assertFalse("第 2 轮仍在读，不该再发第二个", cache.need("tk-5", 2))
+        assertFalse(cache.start("tk-5", 2))
+    }
+
+    @Test
+    fun anOlderAnswerDoesNotOverwriteTheNewerRound() {
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-5", 1))
+        cache.finish("tk-5", tree(), 1)
+        assertTrue("新一轮时间线要重读", cache.need("tk-5", 2))
+        assertTrue(cache.start("tk-5", 2))
+        // 第 1 轮的请求这会儿才回来：不能把第 2 轮的账改成旧数据，
+        // 更不能把第 2 轮「正在读」的记号抹掉（那会让这一轮永远停在「读过、没有」）。
+        cache.finish("tk-5", null, 1)
+        assertNull("旧一轮的答案不写在第 2 轮上", cache.get("tk-5", 2))
+        assertFalse(cache.tried("tk-5", 2))
+        assertFalse("第 2 轮还在读，不许再发第二个", cache.need("tk-5", 2))
+        // 这一轮自己读回来，才开始算数。
+        cache.finish("tk-5", tree(), 2)
+        assertEquals(tree(), cache.get("tk-5", 2))
+        assertTrue(cache.tried("tk-5", 2))
+    }
+
+    @Test
+    fun retryForgetsTheFailedRoundAndReadsAgain() {
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-3", 4))
+        cache.finish("tk-3", null, 4)
+        assertFalse("失败后这一轮不再自己重发", cache.need("tk-3", 4))
+        // 子代理卡上那个「重试」：先把这一轮的账清掉，再照常走一遍。
+        cache.forget("tk-3")
+        assertFalse("忘掉之后就是没读过", cache.tried("tk-3", 4))
+        assertNull(cache.get("tk-3", 4))
+        assertTrue("按了重试就要能再发一趟", cache.need("tk-3", 4))
+        assertTrue(cache.start("tk-3", 4))
+        cache.finish("tk-3", tree(), 4)
+        assertEquals(tree(), cache.get("tk-3", 4))
+        assertTrue(cache.tried("tk-3", 4))
+    }
+
+    @Test
+    fun forgetAlsoDropsTheInFlightMark() {
+        // 重试是在「读不到」之后按的，但 forget 本身不看状态：正在读时把它清掉，
+        // 下一趟 start 就能重新飞出去 —— 这一格为此会短暂有两个请求在飞。
+        // 这里钉的是「重试一定发得出去」，不是「永远只有一个请求」。
+        val cache = AgentsCache()
+        assertTrue(cache.start("tk-4", 1))
+        assertFalse("还在读", cache.start("tk-4", 1))
+        cache.forget("tk-4")
+        assertTrue("清掉之后能重新开一趟", cache.start("tk-4", 1))
+    }
+
+    @Test
+    fun theCacheOutlivesAScreenSwitch() {
+        // 缓存挂在 CrewRoot 上：切到后台/工作区再回来，页面整段重新组合，
+        // 但这一份账不跟着没。同一轮（时间线没变，generation 不动）回来就能画。
+        val atCrewRoot = AgentsCache()
+        assertTrue(atCrewRoot.start("tk-1", 7))
+        atCrewRoot.finish("tk-1", tree(), 7)
+
+        // 切屏走了又回来：还是同一份缓存、同一轮。
+        assertEquals(tree(), atCrewRoot.get("tk-1", 7))
+        assertFalse("切回来不该在首帧再发一遍请求", atCrewRoot.need("tk-1", 7))
+
+        // 反过来说清楚为什么要上提：缓存若跟着页面重建，回来就是一个空账本，
+        // 那一趟请求又得重发 —— 这正是「切屏第一帧一块空白」的来源。
+        val recreated = AgentsCache()
+        assertNull(recreated.get("tk-1", 7))
+        assertTrue(recreated.need("tk-1", 7))
+    }
+}
+
+/**
+ * 结果条缓存的「待取」与「已试过」（[OutputsCache.pending] / [OutputsCache.tried]）。
+ *
+ * 两句话问的是两件事，混起来两头都错：
+ * - pending：「这一轮还没有答案吗」。界面据此在结果条的位置先占一行高，
+ *   读回来时列表不往上顶一下（滑动中那一下就是一次顿挫）。它不区分「还没发」与「正在读」——
+ *   两种都占。空票号永远不占：没有票号就没有结果条。
+ * - tried：「这一轮读过了没有」。成功、失败都算读过；读过就不再发请求。
+ *   所以一张票可以 pending 而不 tried（还没读），绝不反过来 —— 非空票号下两者恒相反。
+ *
+ * 读不到（null）之后 pending 必须落回 false：占着一块「读不到」的空白是永久的，
+ * 比读回来时动一下难看得多。
+ */
+class OutputsPendingTest {
+
+    private fun view(body: String): OutputsView = OutputsWire.parse(body)
+
+    private val liveBody = """
+        {"items":[
+           {"id":"tk-1|a.png","ticket_id":"tk-1","path":"a.png","title":"a.png","kind":"image","writes":2,"at":"2026-11-11T10:05:00Z"}],
+         "state":"live","counts":{"file":0,"image":1},"ticket_id":"tk-1"}
+    """.trimIndent()
+
+    private val emptyBody = """{"items":[],"state":"empty","counts":{"file":0,"image":0}}"""
+
+    @Test
+    fun anUnreadTicketOccupiesItsRowButHasNotBeenTried() {
+        val cache = OutputsCache()
+        // 还没发请求：这一轮确实没有答案，先占一行高。
+        assertTrue("还没读：先占一行高", cache.pending("tk-1", 1))
+        assertFalse("占着不等于试过", cache.tried("tk-1", 1))
+        assertTrue("还没读过，该去读一次", cache.need("tk-1", 1))
+        assertNull("没有答案就不画", cache.line("tk-1", 1))
+    }
+
+    @Test
+    fun anEmptyTicketNeverOccupiesAnything() {
+        val cache = OutputsCache()
+        assertFalse("空票号不占位", cache.pending("", 1))
+        assertFalse(cache.need("", 1))
+        assertFalse(cache.start("", 1))
+        assertFalse(cache.tried("", 1))
+    }
+
+    @Test
+    fun aReadInFlightStillCountsAsPending() {
+        // pending 不看「有没有人正在读」：正读着同样没有答案，那一行照样要占住。
+        val cache = OutputsCache()
+        assertTrue(cache.start("tk-1", 1))
+        assertTrue("正在读：照样占那一行", cache.pending("tk-1", 1))
+        assertFalse("正在读不算读过", cache.tried("tk-1", 1))
+        assertFalse("同一轮不发第二个请求", cache.need("tk-1", 1))
+
+        cache.finish("tk-1", view(liveBody), 1)
+        assertFalse("读到了就不再占位", cache.pending("tk-1", 1))
+        assertTrue(cache.tried("tk-1", 1))
+        // 有答案了：占位换成真那一行，文案由 counts 拼。
+        assertEquals("1 张图片已放进产出", cache.line("tk-1", 1))
+    }
+
+    @Test
+    fun anUnreadableTicketStopsPendingAndIsNotAskedAgain() {
+        val cache = OutputsCache()
+        assertTrue(cache.start("tk-2", 1))
+        cache.finish("tk-2", null, 1)
+        assertTrue("失败也是读过", cache.tried("tk-2", 1))
+        assertFalse("读不到就不占了（留着是一块永久的空白）", cache.pending("tk-2", 1))
+        assertNull("读不到不画", cache.line("tk-2", 1))
+        assertFalse("这一轮不再反复请求", cache.need("tk-2", 1))
+        assertFalse("也不许在同一个票号上强行开始", cache.start("tk-2", 1))
+        // 下一轮时间线（第 2 轮）又是一份新账：还得读，否则 worker 后来写了文件也看不见。
+        assertTrue(cache.need("tk-2", 2))
+        assertTrue("新一轮要重新占位", cache.pending("tk-2", 2))
+        assertFalse(cache.tried("tk-2", 2))
+    }
+
+    @Test
+    fun emptyOutputsAlsoStopPending() {
+        // 我读到了、确实没有产出：这一轮已经有答案了，别留一行空白。
+        val cache = OutputsCache()
+        assertTrue(cache.start("tk-3", 1))
+        cache.finish("tk-3", view(emptyBody), 1)
+        assertFalse(cache.pending("tk-3", 1))
+        assertTrue(cache.tried("tk-3", 1))
+        assertNull("确实没有产出：不画", cache.line("tk-3", 1))
+        assertFalse("答案是「没有」也不重发", cache.need("tk-3", 1))
+    }
+
+    @Test
+    fun aCancelledReadIsPendingAgainAndWillBeRetried() {
+        // 那一条的消息行被组合带走（滚动、切屏）：取消不是「读不到」。
+        val cache = OutputsCache()
+        assertTrue(cache.start("tk-4", 1))
+        cache.abandon("tk-4", 1)
+        assertFalse("取消不记成读过", cache.tried("tk-4", 1))
+        assertTrue("滚回来还得占位", cache.pending("tk-4", 1))
+        assertTrue("也还得再读一次", cache.need("tk-4", 1))
+        assertTrue(cache.start("tk-4", 1))
+
+        // 第 2 轮正在读时，第 1 轮迟到的取消不能抹掉这一轮的在读记号。
+        assertTrue(cache.start("tk-8", 2))
+        cache.abandon("tk-8", 1)
+        assertFalse("第 2 轮仍在读，不该再发第二个", cache.need("tk-8", 2))
+    }
+
+    @Test
+    fun pendingAndTriedNeverBothLightUpOrGoOutTogether() {
+        // 非空票号下两者恒相反：占位只在「这一轮还没有答案」时出现，
+        // 有答案（成功或失败）就一定不再占位；而没答案就一定会去读。
+        val cache = OutputsCache()
+        val seen = mutableListOf<String>()
+        fun snap(what: String, epoch: Int, pending: Boolean, tried: Boolean) {
+            val atPending = cache.pending("tk-7", epoch)
+            val atTried = cache.tried("tk-7", epoch)
+            seen.add("$what/$epoch")
+            assertEquals("第 $epoch 轮「$what」的待取", pending, atPending)
+            assertEquals("第 $epoch 轮「$what」的已试过", tried, atTried)
+            assertTrue("第 $epoch 轮「$what」：待取与已试过必须相反", atPending != atTried)
+        }
+
+        // 还没发：占位、没试过。
+        snap("还没发", 1, pending = true, tried = false)
+        // 正在读：照样占位，还没试过。
+        cache.start("tk-7", 1)
+        snap("正在读", 1, pending = true, tried = false)
+        // 被取消：回到「还没发」那一档，既不占着旧答案、也不算读过。
+        cache.abandon("tk-7", 1)
+        snap("被取消", 1, pending = true, tried = false)
+        // 读不到：有答案了（答案就是「没有」），不占位、算读过、这一轮不再重发。
+        cache.start("tk-7", 1)
+        cache.finish("tk-7", null, 1)
+        snap("读不到", 1, pending = false, tried = true)
+        assertFalse("这一轮不再反复请求", cache.need("tk-7", 1))
+        // 下一轮时间线：只有旧一轮的账，等于没读过 —— 重新占位、重新去读。
+        assertTrue("新一轮要重读", cache.need("tk-7", 2))
+        snap("新一轮只有旧账", 2, pending = true, tried = false)
+
+        assertEquals(listOf("还没发/1", "正在读/1", "被取消/1", "读不到/1", "新一轮只有旧账/2"), seen)
+    }
+}

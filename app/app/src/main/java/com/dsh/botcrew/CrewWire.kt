@@ -230,6 +230,10 @@ object CrewWire {
                     retryable = task.optBoolean("retryable", false),
                     question = task.optString("question").trim(),
                     options = parseOptions(task),
+                    // 契约 §进度：两个字段要么一起出现，要么一起缺省。optInt 缺省给 0，
+                    // 「没有计划」就落到 totalSteps = 0，正好是「不画进度条」那一档。
+                    totalSteps = task.optInt("total_steps", 0),
+                    stepsDone = task.optInt("steps_done", 0),
                 ),
             )
         }
@@ -305,7 +309,59 @@ data class WorkTicket(
      * 前端不得自己编 A/B，也不得把 question 拆成选项。
      */
     val options: List<AttentionOption> = emptyList(),
+    /**
+     * 这张票计划里的总步数，来自 worker 自己写的待办清单（契约 §进度）。
+     * 后端没下发计划时是 0 —— 没有分母就不画进度条，绝不拿读到的条数当分母。
+     */
+    val totalSteps: Int = 0,
+    /**
+     * 其中已经走完的几步。只在 [totalSteps] 同时出现时有意义；
+     * 后端版本不一时可能越界，画之前由调用方夹一次（与桌面端 progressOf 同口径）。
+     */
+    val stepsDone: Int = 0,
 )
+
+/**
+ * 这张票走到第几步 / 共几步。与桌面端 ui.go 的 progressOf 同一口径。
+ *
+ * 分子分母都来自后端下发的计划（worker 自己写的待办清单）：[WorkTicket.stepsDone] 与
+ * [WorkTicket.totalSteps]。不数事件、不数报告 —— 那些不是计划，画出来的条会永远停在 100%。
+ * 返回 (0, 0) 表示算不出来：没有 total_steps 就没有分母，进度条整条不画。
+ *
+ * 放在这里而不是 CrewUi.kt：和 AnswerCopy / readable 一样是纯文案与口径规则，
+ * 单元测试不必把 Compose 拖进来。
+ */
+internal fun progressOf(ticket: WorkTicket): Pair<Int, Int> {
+    if (ticket.totalSteps <= 0) return 0 to 0
+    // 后端版本可能不一致：走完的步数自行夹到 [0, totalSteps]，宽度不超过 100%。
+    val done = ticket.stepsDone.coerceIn(0, ticket.totalSteps)
+    return done to ticket.totalSteps
+}
+
+/**
+ * 概览行上的「第 N 步 / 共 N 步」。没有计划时不编一句出来 —— 那个 N 没有出处。
+ *
+ * 文案与桌面端 ui.go 的 stepOf 逐字相同：一步没走完说「共 N 步」，走完了说「第 N 步 / 共 N 步」。
+ */
+internal fun stepOf(ticket: WorkTicket): String {
+    val (done, total) = progressOf(ticket)
+    if (total <= 0) return ""
+    // 一步没走完时说「共 N 步」，而不是「第 0 步」。
+    return if (done > 0) "第 $done 步 / 共 $total 步" else "共 $total 步"
+}
+
+/**
+ * 工单卡第二行：「在做 · 林 · 第 1 步 / 共 3 步」。
+ *
+ * 逐段拼、空的段不拼。后端不发 `bot_id` 时 owner 是空串（桌面端 client.go 那侧是 omitempty），
+ * 直接插值会留下「在做 ·  · 共 3 步」这种悬空分隔符。桌面端 ui.go 的同一行也先判 `BotID != ""`。
+ * 三段都可能缺：owner 缺、step 缺，或者两个都缺 —— 那时只剩状态词，不带尾巴。
+ */
+internal fun ticketDetail(state: String, owner: String, step: String): String = buildString {
+    append(state)
+    if (owner.isNotEmpty()) append(" · ").append(owner)
+    if (step.isNotEmpty()) append(" · ").append(step)
+}
 
 /**
  * 「等你决定」卡上的一个答案。

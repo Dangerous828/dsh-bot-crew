@@ -792,3 +792,119 @@ class OutputsBarTest {
         assertTrue(cache.tried("tk-9", 1))
     }
 }
+
+/**
+ * 工单进度（契约 §进度）：分母只能来自后端下发的计划。
+ *
+ * 这几条钉的是同一件事的几面：没计划不画、分子分母都读后端的、越界要夹回来、
+ * 只来一半字段时怎么退化、0 与负数不能当分母、计划改小时进度可以回退（不做单调化），
+ * 以及概览行不会因为某一段空着就留下悬空的分隔符。
+ */
+class TicketProgressTest {
+
+    private fun ticket(json: String): WorkTicket =
+        CrewWire.parseTimeline(
+            """{"items":[],"bots":[],"default_bot_id":"","tasks":[""" + json + "]}"
+        ).tickets.single()
+
+    @Test
+    fun readsTotalStepsAndStepsDone() {
+        val ticket = ticket(
+            """{"id":"tk-1","title":"改首页","state":"working","bot_id":"lin","total_steps":3,"steps_done":1}"""
+        )
+        assertEquals(3, ticket.totalSteps)
+        assertEquals(1, ticket.stepsDone)
+        assertEquals(1 to 3, progressOf(ticket))
+        assertEquals("第 1 步 / 共 3 步", stepOf(ticket))
+    }
+
+    @Test
+    fun aTicketWithoutAPlanHasNoDenominator() {
+        // 后端没发 total_steps / steps_done：两个字段都落到 0，进度条整条不画。
+        val ticket = ticket("""{"id":"tk-2","title":"没计划","state":"working","bot_id":"lin"}""")
+        assertEquals(0, ticket.totalSteps)
+        assertEquals(0, ticket.stepsDone)
+        assertEquals(0 to 0, progressOf(ticket))
+        assertEquals("", stepOf(ticket))
+    }
+
+    @Test
+    fun aContradictoryDoneCountIsClampedInsteadOfOverflowing() {
+        // 后端版本不一致时可能给出比计划还大的步数：宽度不许超过 100%。
+        val over = ticket(
+            """{"id":"tk-3","title":"越界","state":"working","bot_id":"lin","total_steps":2,"steps_done":5}"""
+        )
+        assertEquals(2 to 2, progressOf(over))
+        val negative = ticket(
+            """{"id":"tk-4","title":"负数","state":"working","bot_id":"lin","total_steps":2,"steps_done":-1}"""
+        )
+        assertEquals(0 to 2, progressOf(negative))
+        // 一步没走完只说「共 2 步」，不编一个「第 0 步」。
+        assertEquals("共 2 步", stepOf(negative))
+    }
+
+    @Test
+    fun aHalfSentPlanIsStillNoPlan() {
+        // 契约说两个字段要么一起来、要么一起缺。真遇到只来一半（版本错位）时：
+        // 有 total_steps 没 steps_done，就当「一步没走完」——分母有出处，分子缺省为 0，
+        // 画一条空轨道；反过来只有 steps_done 没有分母，整条不画。
+        val halfA = ticket(
+            """{"id":"tk-6","title":"只给分母","state":"working","bot_id":"lin","total_steps":3}"""
+        )
+        assertEquals(0 to 3, progressOf(halfA))
+        assertEquals("共 3 步", stepOf(halfA))
+        val halfB = ticket(
+            """{"id":"tk-7","title":"只给分子","state":"working","bot_id":"lin","steps_done":2}"""
+        )
+        assertEquals(0 to 0, progressOf(halfB))
+        assertEquals("", stepOf(halfB))
+    }
+
+    @Test
+    fun aZeroOrNegativePlanIsNeverDividedBy() {
+        // total_steps 必须 ≥ 1（契约）。真给了 0 或负数时，宁可当「没有计划」，
+        // 也不许拿它当分母 —— 除以 0 的宽度算出来是 NaN / 无穷，画出来是一条满格或崩掉的条。
+        val zero = ticket(
+            """{"id":"tk-8","title":"零步","state":"working","bot_id":"lin","total_steps":0,"steps_done":0}"""
+        )
+        assertEquals(0 to 0, progressOf(zero))
+        assertEquals("", stepOf(zero))
+        val negative = ticket(
+            """{"id":"tk-9","title":"负数计划","state":"working","bot_id":"lin","total_steps":-2,"steps_done":1}"""
+        )
+        assertEquals(0 to 0, progressOf(negative))
+        assertEquals("", stepOf(negative))
+    }
+
+    @Test
+    fun aFinishedPlanSaysTheLastStep() {
+        // 走完时分子等于分母：条是满的，文案说「第 3 步 / 共 3 步」而不是停在「共 3 步」。
+        val ticket = ticket(
+            """{"id":"tk-10","title":"走完","state":"completed","bot_id":"lin","total_steps":3,"steps_done":3}"""
+        )
+        assertEquals(3 to 3, progressOf(ticket))
+        assertEquals("第 3 步 / 共 3 步", stepOf(ticket))
+    }
+
+    @Test
+    fun theDetailLineNeverLeavesADanglingSeparator() {
+        // 后端不发 bot_id 时 owner 是空串。直接插值会拼出「在做 ·  · 共 3 步」。
+        assertEquals("在做 · 林 · 第 1 步 / 共 3 步", ticketDetail("在做", "林", "第 1 步 / 共 3 步"))
+        assertEquals("在做 · 第 1 步 / 共 3 步", ticketDetail("在做", "", "第 1 步 / 共 3 步"))
+        assertEquals("在做 · 林", ticketDetail("在做", "林", ""))
+        assertEquals("在做", ticketDetail("在做", "", ""))
+    }
+
+    @Test
+    fun aShrinkingPlanMayShowLessProgress() {
+        // 计划被改小是真话：进度回退不单调化，分母跟着变小。
+        val before = ticket(
+            """{"id":"tk-5","title":"改计划","state":"working","bot_id":"lin","total_steps":5,"steps_done":4}"""
+        )
+        val after = ticket(
+            """{"id":"tk-5","title":"改计划","state":"working","bot_id":"lin","total_steps":2,"steps_done":2}"""
+        )
+        assertEquals(4 to 5, progressOf(before))
+        assertEquals(2 to 2, progressOf(after))
+    }
+}

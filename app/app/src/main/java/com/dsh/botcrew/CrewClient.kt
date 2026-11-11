@@ -94,6 +94,15 @@ class CrewClient(
         return ScreenWire.parse(read("/api/mobile/screen$query", "GET"))
     }
 
+    /**
+     * 一张工单交出来的东西（契约 §5.4）。消息结果条只读这一张票 ——
+     * 票号由消息自己带着，读不到也不去问别的票。
+     */
+    suspend fun outputs(ticketId: String): OutputsView {
+        val query = "?ticket=" + URLEncoder.encode(ticketId, "UTF-8")
+        return OutputsWire.parse(read("/api/mobile/outputs$query", "GET"))
+    }
+
     /** 接手：把这个工单停下来。停不下来就抛错，界面照实说，不假装点过了。 */
     suspend fun takeover(ticketId: String) {
         read("/api/mobile/takeover", "POST", JSONObject().put("ticket", ticketId).toString())

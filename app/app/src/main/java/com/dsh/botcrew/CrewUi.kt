@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -147,6 +148,9 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     // 所以那一次读取的结果直接整屏显示；返回时一起清掉，回到队伍不该还挂着旧快照。
     var previewTicket by remember { mutableStateOf<String?>(null) }
     var previewView by remember { mutableStateOf<ScreenView?>(null) }
+    // 第几次把时间线读回来。结果条按票的缓存跟着它清：桌面端也是每读回一次对话就把
+    // perTicket 清空重读 —— worker 可能只写了个文件，一句话也没多说。
+    var timelineEpoch by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
@@ -155,6 +159,7 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
             try {
                 conversation = client.timeline()
                 problem = null
+                timelineEpoch += 1
             } catch (error: Exception) {
                 problem = error.message
             }
@@ -210,6 +215,8 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                 )
                 Screen.Models -> ModelScreen(client, conversation, palette, onBack = { screen = Screen.Crew })
                 Screen.Crew -> CrewScreen(client, conversation, palette, problem, draft, sending,
+                    // 结果条按票的缓存每读回一次时间线就清空重读一次（见 CrewScreen）。
+                    timelineEpoch = timelineEpoch,
                     requestIdFor = { text ->
                         if (pendingSend?.first == text) {
                             pendingSend!!.second
@@ -478,6 +485,8 @@ private fun CrewScreen(
     problem: String?,
     draft: String,
     sending: Boolean,
+    /** 第几次把时间线读回来。变了就按这一轮重读结果条（上一轮的结果不再算数）。 */
+    timelineEpoch: Int,
     /** 同一段草稿重发要沿用同一个幂等键；新草稿换一个。 */
     requestIdFor: (String) -> String,
     onDraft: (String) -> Unit,
@@ -496,6 +505,12 @@ private fun CrewScreen(
     var editing by remember { mutableStateOf<BotCard?>(null) }
     // 撤回失败要在这条消息旁边说，不冒充发送失败。
     var withdrawNote by remember { mutableStateOf<String?>(null) }
+    // 消息结果条按票读产出（契约 §5.4）。它跟着这一页活着：同一张票只读一次，
+    // 读不到的也记一笔；每读回一次时间线就整份重读 —— worker 刚写完文件，结果条该跟着变。
+    val outputs = remember { OutputsCache() }
+    // 读回来要重画：Compose 不认普通表里的变化，靠这个数变一下把这一片重新组合一遍。
+    var outputsTick by remember { mutableStateOf(0) }
+    val outputsRefresh: () -> Unit = { outputsTick += 1 }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize()) {
@@ -610,6 +625,12 @@ private fun CrewScreen(
                                 showName = !sameSpeaker,
                                 // 组内 9、换人 16。第一条上面不留白，否则贴底时首条离底边会多一截。
                                 topGap = if (previous == null) 0.dp else if (sameSpeaker) 9.dp else 16.dp,
+                                // 结果条：这条话带票号才去读那张票的产出；没有票号就什么都不读。
+                                // outputsTick 只用来在读完时把这一片重画一遍。
+                                outputs = outputs,
+                                generation = timelineEpoch,
+                                onOutputsRead = outputsRefresh,
+                                outputsTick = outputsTick,
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {
@@ -1815,6 +1836,17 @@ private fun MessageRow(
     palette: CrewPalette,
     client: CrewClient,
     onScreen: (String, ScreenView) -> Unit,
+    /** 结果条按票缓存：读哪张、读过没有、该画哪句话，都由它一处说了算。 */
+    outputs: OutputsCache,
+    /** 这一轮时间线的代号：变了就重读一次。 */
+    generation: Int,
+    /** 读回来一次，让界面重画一遍（缓存本身不是 Compose 的状态）。 */
+    onOutputsRead: () -> Unit,
+    /**
+     * 只用来触发重画：读一次，让这一片在缓存变化后重新组合。
+     * 它的值没人用，所以要在正文里读一下，否则 Compose 不会把这一格记成依赖。
+     */
+    outputsTick: Int = 0,
     showName: Boolean = true,
     topGap: Dp = 0.dp,
 ) {
@@ -1885,6 +1917,39 @@ private fun MessageRow(
                         onScreen = onScreen,
                     )
                 }
+                // 结果条：「✓ 两张图片已放进产出」。只在「这条话带票号、那张票确实有产出」时画，
+                // 放在代码卡之后，与桌面端同序。line 是纯查表，不发请求。
+                val ticket = OutputsCopy.barTicket(message)
+                // 缓存是普通表，Compose 不会自己知道它变了：读完一次 outputsTick 就加一，
+                // 这一格跟着重算，才读得到新结果。票号与轮次也进键 —— 换了消息或换了轮次要重查。
+                val line = remember(outputsTick, ticket, generation) { outputs.line(ticket, generation) }
+                line?.let {
+                    Spacer(Modifier.height(9.dp))
+                    ResultBar(it, palette)
+                }
+                // 没读过就先要一份；读完之前不画，免得先闪一条空的再变成有内容的。
+                // 读不到的也记一笔（见 OutputsCache）：结果条不会每帧重发请求。
+                // 每读回一次时间线 generation 就加一，这里会跟着重读一次。
+                if (ticket.isNotEmpty()) {
+                    LaunchedEffect(ticket, generation) {
+                        if (!outputs.start(ticket, generation)) return@LaunchedEffect
+                        var view: OutputsView? = null
+                        try {
+                            view = client.outputs(ticket)
+                        } catch (error: CancellationException) {
+                            // 这一条被组合带走了：不是「读不到」，别把它记成读不到。
+                            // 放掉记号，滚回来时还会再读一次。
+                            outputs.abandon(ticket, generation)
+                            throw error
+                        } catch (_: Exception) {
+                            // 读失败就是「这张没有可画的产出」：不画，也不冒充断连。
+                            view = null
+                        }
+                        outputs.finish(ticket, view, generation)
+                        // 读回来要重画：缓存是普通表，界面不会自己知道它变了。
+                        onOutputsRead()
+                    }
+                }
             }
         }
         return
@@ -1908,6 +1973,28 @@ private fun MessageRow(
                 color = palette.userInk,
             )
         }
+    }
+}
+
+/**
+ * 消息结果条：白底细边的一行「✓ 两张图片已放进产出」（契约 §5.4 末节）。
+ *
+ * 与桌面端 resultBar 同一套画法：一行、细边、卡片底，对勾用强调色。
+ * 它只在有结果时被调用 —— 空态、读不到、请求失败都不画这条，见 OutputsCopy.barLine。
+ */
+@Composable
+private fun ResultBar(line: String, palette: CrewPalette) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(palette.card, RoundedCornerShape(8.dp))
+            .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("✓", fontSize = 13.sp, color = palette.accent)
+        Text(line, fontSize = 11.5.sp, color = palette.muted)
     }
 }
 

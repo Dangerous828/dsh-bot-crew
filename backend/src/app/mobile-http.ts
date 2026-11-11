@@ -416,6 +416,11 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const tickets = (wanted.length > 0 ? wanted.flatMap(id => runtime.store.tickets.get(id) ?? []) : runtime.store.tickets.list())
           .filter(ticket => ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team'))
           .slice(0, 12)
+        // 票存在、但它不走手机/队伍这两条通道：这不是「队伍还没有工单」，如实说它不在产出通道里。
+        if (ticketId && tickets.length === 0) {
+          return response(200, { items: [], state: 'empty', counts: { file: 0, image: 0 }, ticket_id: ticketId,
+            reason: '这张票不在产出通道里（只有手机与队伍工单有产出）' })
+        }
         try {
           const view = await readOutputs(tickets.map(ticket => {
             const botId = ticketBot(ticket)

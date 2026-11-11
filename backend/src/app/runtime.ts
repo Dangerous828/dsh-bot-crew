@@ -14,8 +14,8 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, liveTicket, reasonText, runningAssignment, type EngineForSettings, type OutboundMessage, type ReceiveResult, type Ticket,
-  type Trigger } from '../core/index.ts'
+import { Engine, key, liveTicket, reasonText, runningAssignment, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
+  type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -254,17 +254,53 @@ export class Runtime extends Service implements SourceHost {
     return true
   }
 
-  /** 「看它的屏幕」：把这张工单的 worker 会话整理成活动快照；读不到就说读不到。 */
+  /**
+   * 「看它的屏幕」：把这张工单的 worker 会话整理成活动快照；读不到就说读不到。
+   *
+   * 三样一起给，手机才画得出实景而不是一串日志：
+   * - 会话活动（`events`）：先从活的会话读（`inspect`），读不到再读会话持久化的存档 ——
+   *   进程重启过、或者这张票的 worker 已经归档，屏幕上仍然有东西可看；
+   * - 阶段与开工时间（`stage` / `since`）：从工单记录里读，不猜；
+   * - 工作目录：票上的执行目录。
+   *
+   * 三样都读不到时，`screenOf` 会给出那句真实的 reason；这里不编。
+   */
   async screen(ticketId: string): Promise<ScreenSnapshot> {
     const id = ticketId.trim()
-    const ticket = id ? this.store.tickets.get(id) : undefined
-    if (!id || !ticket) return screenOf({ ticketId: id || undefined })
+    if (!id) return screenOf({})
+    const ticket = this.store.tickets.get(id)
+    if (!ticket) return screenOf({ ticketId: id, known: false })
+    // 阶段机读不懂的票不该让整个读屏失败：阶段缺着，行照样给。
+    let stage: string | undefined
+    try { stage = ticketStage(ticket).stage } catch { stage = undefined }
+    const since = runningAssignment(ticket)?.startedAt
+    let events: ScreenEvent[]
+    try { events = await this.screenEvents(id) }
+    catch { return { state: 'unavailable', ticket_id: id, ...(stage ? { stage } : {}), reason: '这张工单的 worker 会话读不出来' } }
+    return screenOf({ ticketId: id, events, cwd: ticket.execution?.directory, stage, since })
+  }
+  /**
+   * 一张工单的 worker 会话事件：先问活着的会话，再退回磁盘上的存档。
+   *
+   * 两道都读不到时抛错，让调用方回一句「读不出来」——不能把「读不到」说成「没有记录」。
+   */
+  private async screenEvents(ticketId: string): Promise<ScreenEvent[]> {
+    const sessionId = workerSessionId(ticketId) as SessionId
     try {
-      const { events } = await this.ctx.sessionController.inspect(workerSessionId(id) as SessionId)
-      return screenOf({ ticketId: id, events: events as unknown as ScreenEvent[], cwd: ticket.execution?.directory })
-    } catch {
-      return { state: 'unavailable', ticket_id: id, reason: '这张工单的 worker 会话读不出来' }
+      const { events } = await this.ctx.sessionController.inspect(sessionId)
+      if (events.length > 0) return events as unknown as ScreenEvent[]
+    } catch { /* 会话已经不在了：下面读存档。 */ }
+    await this.ctx.sessionPersistence.flush().catch(() => undefined)
+    await using handle = await this.ctx.sessionPersistence.open(sessionId, 'read')
+    const events: ScreenEvent[] = []
+    // 存档是分页读的：一直读到空页为止，不假定一页能装完。
+    for (let offset = 0; ; ) {
+      const page = await handle.read(offset, 512)
+      if (page.events.length === 0) break
+      events.push(...page.events as unknown as ScreenEvent[])
+      offset += page.events.length
     }
+    return events
   }
 
   handOff(from: Pick<OutboundMessage, 'id' | 'channel'>, bot_id: string, text: string, origin?: Ticket): boolean {

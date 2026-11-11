@@ -190,6 +190,8 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     client = client,
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
                     ticket = ticketOf(conversation, onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId }),
+                    // 执行器被全局暂停这件事压过单个 Bot 的 activity 词，所以从队伍状态里取。
+                    paused = conversation?.status?.paused == true,
                     palette = palette,
                     onBack = {
                         // 回到哪一屏由进来的人决定：名片进的就回队伍，后台进的就回后台。
@@ -823,9 +825,12 @@ private fun RowScope.SmallCardButton(label: String, palette: CrewPalette, onClic
 /**
  * 工作区：某个 Bot 的屏幕，加上「接手操作」「让它停一下」。
  *
- * 三处都接真接口：读屏如实显示后端给的理由（现在只会是「没有画面源」），
- * 接手真的停这张票，停一下真的暂停执行器并照实说 scope。
- * 画面那块仍然不拿黑白方块拼假浏览器 —— 假画面比空位更坏。
+ * 画面不是像素截帧，是**实景**：它此刻在干什么（后端推出的 activity）、这段从几点开始、
+ * 它刚跑了什么命令、输出了什么、说了什么（契约 §5.1）。画的是真事，不是黑白方块拼出来的假浏览器 ——
+ * 假画面比空位更坏。
+ *
+ * 没有实景时如实报 unavailable：后端给 reason 就写 reason，链路断了就写读不到，
+ * 两种都不是「在加载」。进页面后每几秒重读一次，让它真的在动 —— 一张停住的「实景」等于假画面。
  *
  * bot 为 null 表示从后台进来、还没指定是谁：那时抬头写「工作区」，也不编一个名字。
  * ticket 是这个 Bot 手上最近一张还没结束的票；没有票时接手只能说「它手上没有活儿」。
@@ -835,6 +840,7 @@ private fun WorkspaceScreen(
     client: CrewClient,
     bot: BotCard?,
     ticket: WorkTicket?,
+    paused: Boolean,
     palette: CrewPalette,
     onBack: () -> Unit,
 ) {
@@ -846,14 +852,29 @@ private fun WorkspaceScreen(
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    // 进页面读一次：后端说没有就写没有，读不到就写读不到。不自己编一句。
+    // 进页面读一次，之后每 5 秒重读一次：worker 在跑，屏幕就该跟着动。
+    // 重读失败不把已有的实景擦掉（那会让画面闪成空白）；只有第一次就读不到时才写「读不到」。
     LaunchedEffect(bot?.id, ticket?.id) {
-        try {
-            view = client.screen(ticket?.id)
-            screenProblem = null
-        } catch (error: Exception) {
-            view = null
-            screenProblem = error.message
+        while (true) {
+            try {
+                view = client.screen(ticket?.id)
+                screenProblem = null
+            } catch (error: Exception) {
+                if (view == null) screenProblem = error.message
+            }
+            delay(5_000)
+        }
+    }
+
+    // 按下按钮之后要把屏幕重读一次：停了之后画面不该还写着「正在干活」。
+    fun reread() {
+        scope.launch {
+            try {
+                view = client.screen(ticket?.id)
+                screenProblem = null
+            } catch (error: Exception) {
+                if (view == null) screenProblem = error.message
+            }
         }
     }
 
@@ -950,7 +971,34 @@ private fun WorkspaceScreen(
                     fontFamily = FontFamily.Monospace,
                 )
             }
-            val lines = view?.takeIf { it.live }?.lines.orEmpty()
+            // 实景那一行：它此刻在干什么 + 这段从几点开始。只照后端给的 activity 写（契约 §5.1），
+            // 推不出来就整行不写 —— 不写「未知」，也不从下面的行自己算一遍。
+            val live = view?.takeIf { it.live }
+            val word = live?.let { screenActivityWord(it.activity, paused) }
+            val since = live?.since.orEmpty()
+            if (live != null && (word != null || since.isNotBlank())) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    // 在跑才亮那颗点：灰点表示它现在没在动，「不动」不该画成「在动」。
+                    val working = live.activity == "running" || live.activity == "thinking"
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(if (working) palette.accent else palette.faint),
+                    )
+                    if (word != null) {
+                        Text(word, fontSize = 11.5.sp, fontWeight = FontWeight(560), color = palette.ink)
+                    }
+                    if (since.isNotBlank()) {
+                        Text("· 从 ${screenClock(since)} 起", fontSize = 11.sp, color = palette.faint)
+                    }
+                }
+            }
+            val lines = live?.lines.orEmpty()
             if (lines.isNotEmpty()) {
                 // 活动快照：它刚跑了什么、输出了什么、说了什么。不是截帧，是那件事本身。
                 Column(
@@ -975,6 +1023,11 @@ private fun WorkspaceScreen(
                                 else -> palette.ink
                             },
                         )
+                    }
+                    // 后端说还有多少条没变成行（认不出的类型、超出上限的旧记录）。有就写一句，
+                    // 不把「没展开」悄悄吞掉，也不假装屏幕就这么点内容。
+                    screenHiddenNote(live?.hidden ?: 0)?.let {
+                        Text(it, fontSize = 10.5.sp, color = palette.hint)
                     }
                 }
             } else {
@@ -1017,6 +1070,8 @@ private fun WorkspaceScreen(
                         try {
                             client.takeover(id)
                             touched = WorkspaceCopy.TAKEOVER_DONE
+                            // 停了之后重读：画面不该还写着「正在干活」。
+                            reread()
                         } catch (error: Exception) {
                             touched = WorkspaceCopy.failed(error.message)
                         } finally {
@@ -1030,6 +1085,8 @@ private fun WorkspaceScreen(
                         try {
                             // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
                             touched = WorkspaceCopy.pauseDone(client.pause(ticket?.id))
+                            // 停完重读：画面顶上那一行要说「停住了」，不能还写着「正在干活」。
+                            reread()
                         } catch (error: Exception) {
                             touched = WorkspaceCopy.failed(error.message)
                         } finally {

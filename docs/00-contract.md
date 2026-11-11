@@ -144,38 +144,6 @@
 - **未实现的审批能力不得虚构按钮或审批状态**。
 - 被撤回的消息不出现在 `items`，也不出现在 `queued`。
 
-### 进度：`tasks[].total_steps` · `steps_done`
-
-工单卡上的进度条要一个**分母**。分母只有一个出处：worker 自己写的待办清单
-（DSH 的 `todo_write`，落成 worker 会话的 `todo/write` 事件）。后台把最后一条待办
-的计数记在 Ticket 上，再随 `tasks` 下发：
-
-```jsonc
-{
-  "id": "tk-1",
-  "state": "working",
-  "total_steps": 3,               // 计划里的总步数（待办清单的条数）
-  "steps_done": 1                 // 其中已经走完的步数，0 ≤ steps_done ≤ total_steps
-}
-```
-
-- **两个字段要么一起出现，要么一起不出现。** 没有待办清单 = 没有计划，两个字段都缺省；
-  客户端**不得**拿已发生的事件条数、报告条数、`steps` 的条数当分母 —— 那不是计划，
-  画出来的进度条会永远停在 100%。
-- `total_steps` 是 `≥ 1` 的整数。`steps_done` 后端保证已夹在 `[0, total_steps]` 内，
-  客户端仍应自行夹一次（后端版本可能不一致），宽度不超过 100%。
-- 进度是**只读展示**：它不参与页签归属、不决定 `open` / `retryable`，也不表示工单「完成了几成」。
-  一张票可能计划 3 步、走了 1 步就报 `ready` —— 以 `state` 为准，不以进度为准。
-- worker 每改一次待办就整份重写，后台取**最后一条**，不把历史叠起来。计划被改小时
-  `total_steps` 随之变小（进度条可能因此回退），这是真话，不做单调化。
-- 客户端没有别的进度来源：**不得**新增「进度查询」接口，也不得从 `/api/mobile/work`
-  的 `steps` 反推分母。
-- 手机端这轮**只读不改**：`app/.../CrewWire.kt` 的 `WorkTicket` 还没有 `total_steps` /
-  `steps_done` 两个字段，`CrewUi.kt` 的 `TaskRow` 也没有进度条。要接的时候按本节做：
-  在 `WorkTicket` 上加两个 `Int`，`CrewWire` 里读同名字段（缺省 0），
-  `TaskRow` 里仅当 `totalSteps > 0` 时画一条 3dp 的轨道 + 按比例的填充，
-  与 `desktop/ui.go` 的 `progressOf` 同一口径（分母来自计划，不来自已发生条数）。不新增路由。
-
 ### 等你决定：`tasks[].needs_person` · `question` · `options`
 
 后台卡在等某个人拍板时，`tasks` 里那一项除了 `needs_person`（`stage.action`，取值
@@ -285,9 +253,12 @@
 
 ## 5.1 `GET /api/mobile/screen?ticket=<id>`
 
-「看它的屏幕」返回的是这张工单的**会话活动快照**，不是像素截帧：worker 跑的是终端与文件活，
-有信息量的是它刚执行了什么命令、输出了什么、说了什么。像素画面将来若接，是另一种 `kind`，
-这里的状态与 `reason` 不变。
+「看它的屏幕」返回的是这张工单的**实景**：它此刻在干什么、这一段是从几点开始的、它刚执行了什么命令、
+输出了什么、说了什么。**不是像素截帧** —— worker 跑的是终端与文件活，不跑浏览器，也没有画布可抓。
+所以这里不画「浏览器窗口」的样子，也不摆黑白方块装作画面；有真事就说真事，没有就说没有。
+
+像素画面将来若真的接上（CUA 或有浏览器可抓），是另一种 `kind`（例如 `frame`）加一个 `image` 字段，
+`state` / `reason` / `lines` 这一套不变；在那之前，`kind` 只有 `terminal` 一种。
 
 ```jsonc
 {
@@ -296,7 +267,11 @@
   "ticket_id": "tk-1",
   "live": true,
   "at": "2026-11-10T15:02:11.000Z",   // 最后一条活动的时间
+  "since": "2026-11-10T14:55:02.000Z", // 这次作业开工的时间；没有在跑的作业就不给
+  "stage": "working",                 // working | person | idle | ended（阶段机的原词，不认识就不给）
+  "activity": "running",              // running | thinking | waiting | idle | ended
   "cwd": "/Users/me/Code/dsh-bot-crew",
+  "hidden": 3,                        // 有多少条事件没变成行（认不出的类型 + 超出上限没看的）；省略即一条没丢
   "lines": [
     { "at": "...", "kind": "command", "text": "$ pnpm test" },
     { "at": "...", "kind": "output",  "text": "1429 passed" },
@@ -306,13 +281,44 @@
 }
 ```
 
-- `kind` 只有 `command` / `output` / `said` / `status` 四种；`output` 与 `said` 的区别是
+- `lines[].kind` 只有 `command` / `output` / `said` / `status` 四种；`output` 与 `said` 的区别是
   「命令的输出」还是「它自己说的话」。
-- 只取最近的活动（默认 120 条），单行超过 500 字符截断；命令与输出里的
-  `KEY=value`、`TOKEN: value`、`Bearer xxx` 一律掩码成 `***` 再下发。
-- 没有票号、没有会话、会话里没有可显示的事件时返回 `state: "unavailable"` 与一句真实
-  `reason`（例如「这张工单还没有可读的执行记录」）。不得用「在加载」或空数组冒充有画面。
+- `activity` 是**推出来的、不是猜的**：`stage` 为 `person` / `idle` / `ended` 时直接对应
+  `waiting` / `idle` / `ended`（最后一条活动是什么都不改变这件事）；只有 `stage` 为 `working`（或缺席）时
+  才看最后一行 —— 命令与输出是 `running`，回话是 `thinking`。什么都推不出来时**不给这个字段**，
+  客户端就整行不写，而不是写一个「未知」。客户端不得自己重算这个词。
+- `since` 只在这张票有正在跑的作业时给；`stage` 读不懂就不给。两者都是可选字段，
+  缺了不等于「没有」，只是这一格说不了。
+- `hidden` 只在大于 0 时给。客户端可以据此写一句「另有 N 条没展开」，不许把它当成有画面。
+- 数据来源：先读活着的 worker 会话（`sessionController.inspect`），读不到再读会话持久化存档 ——
+  进程重启过、worker 已归档，屏幕上也还有东西可看。两道都读不到时返回
+  `state: "unavailable"` 与「这张工单的 worker 会话读不出来」，不把「读不到」说成「没有记录」。
+- 只取最近的活动（默认 120 条，上限 500），单行超过 500 字符截断；命令与输出里的
+  `KEY=value`、`TOKEN: value`、`Bearer xxx` 一律掩码成 `***` 再下发。掩码在**后端**做，
+  客户端不得依赖「反正没有凭据」。
+- 以下情况如实返回 `state: "unavailable"` 与一句真实 `reason`，**不得**用「在加载」或空数组冒充：
+  - 没给票号 → 「没有指定是哪张工单」；
+  - 票号在队伍里不存在 → 「队伍里没有这张工单」；
+  - 票在、会话里一条可读事件都没有 → 「这张工单还没有可读的执行记录」；
+  - 会话读得到但没有一行能显示（全是认不出的类型）→ 「执行记录里没有可显示的内容」；
+  - 会话与存档都读不出来 → 「这张工单的 worker 会话读不出来」；
+  - 宿主根本没接这项能力 → 「后端还没有接入画面源」。
 - 认证与其余 `/api/mobile/*` 相同；局域网与中转隧道都走同一道门。
+
+配套的两个动作（同一页上的按钮，语义见 §5.1.1）：
+
+| 动作 | 现在真实做到的事 | 回什么 |
+| --- | --- | --- |
+| `POST /api/mobile/takeover` `{ticket}` | 停掉**这一张**票（`engine.stopTicket`） | `{"ok":true,"stopped":true}`；票不存在 404，引擎不可用 503，停不下来 409 |
+| `POST /api/mobile/pause` `{ticket?}` | **全局**暂停执行器（`settings.pause(true)`）；带上票号只做校验，不会只停那一张 | `{"ok":true,"scope":"executor"}` |
+
+### 5.1.1 工作区画面上「有什么、没有什么」
+
+- **接管操作**现在等于「停这张票」，不是「把控制权交给手机」：手机上还没有能往 worker 终端敲字的通道。
+  所以按钮回话只说「已接手，这个工单停了」，不说「现在归你操作」。
+- **让它停一下**停的是执行器，恢复要去桌面面板。`scope` 字段就是为这句话留的，界面必须把它说出来。
+- 像素级画面、全屏、往终端敲字：**都还没有**。按下去要如实说没接上，不做成看起来能用的形状。
+
 
 ## 5.2 模型：`GET /api/mobile/models` · `GET /api/mobile/efforts` · `POST /api/mobile/model`
 

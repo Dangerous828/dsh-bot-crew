@@ -444,8 +444,9 @@ object WorkspaceCopy {
 data class ScreenLine(val at: String, val kind: String, val text: String)
 
 /**
- * 读屏接口的回答。live 时 lines 是它刚做了什么；unavailable 时 reason 就是手机该显示的那句话。
- * 这里不是像素截帧：worker 干的是终端活，手机看的是那件事本身。
+ * 读屏接口的回答 —— 这张工单的**实景**：它此刻在干什么、这一段从几点开始、它刚做了什么。
+ * live 时 lines 是它刚做了什么；unavailable 时 reason 就是手机该显示的那句话。
+ * 这里不是像素截帧：worker 干的是终端活，手机看的是那件事本身（契约 §5.1）。
  */
 data class ScreenView(
     val state: String,
@@ -453,6 +454,16 @@ data class ScreenView(
     val kind: String = "",
     val cwd: String = "",
     val lines: List<ScreenLine> = emptyList(),
+    /** 最后一条活动的时间。 */
+    val at: String = "",
+    /** 这次作业开工的时间；空表示没有在跑的作业。 */
+    val since: String = "",
+    /** 阶段机的原词：working / person / idle / ended。空表示读不出来。 */
+    val stage: String = "",
+    /** 它此刻在干什么，由后端推出来：running / thinking / waiting / idle / ended。空表示说不了。 */
+    val activity: String = "",
+    /** 有多少条事件没变成行；0 表示一条没丢。 */
+    val hidden: Int = 0,
 ) {
     val live: Boolean get() = state == "live"
 }
@@ -473,9 +484,39 @@ object ScreenWire {
                     if (text.isNotBlank()) add(ScreenLine(line.optString("at", ""), line.optString("kind", ""), text))
                 }
             },
+            // 这四个都是可选字段：缺着就是「这一格说不了」，不补默认词，也不当 0 条丢。
+            at = root.optString("at", ""),
+            since = root.optString("since", ""),
+            stage = root.optString("stage", ""),
+            activity = root.optString("activity", ""),
+            hidden = root.optInt("hidden", 0).coerceAtLeast(0),
         )
     }
 }
+
+/**
+ * 顶上那一行「它此刻在干什么」。**只照后端给的 activity 写**，不自己从 lines 重算 ——
+ * 同一个词在两处各推一遍，迟早会一处说「在跑」一处说「在等」。
+ *
+ * 后端没给 activity（推不出来）就返回 null，让调用方整行不写；也不写「未知」，那是把
+ * 「不知道」画成了一条事实。`paused` 是执行器被全局暂停，它压过其余状态。
+ */
+fun screenActivityWord(activity: String, paused: Boolean): String? {
+    if (paused) return "停住了（执行器被暂停）"
+    return when (activity) {
+        "running" -> "正在干活"
+        "thinking" -> "在想"
+        "waiting" -> "在等你决定"
+        "idle" -> "手上空着"
+        "ended" -> "这张完了"
+        else -> null
+    }
+}
+
+/**
+ * 「另有 N 条没展开」。0 或负数不写 —— 省略就是一条没丢（契约 §5.1 的 hidden）。
+ */
+fun screenHiddenNote(hidden: Int): String? = if (hidden > 0) "另有 $hidden 条没展开" else null
 
 /** 事件时间缩成时分秒；读不出来就原样留着，不编时间。与桌面端同一规矩。 */
 fun screenClock(at: String): String = try {

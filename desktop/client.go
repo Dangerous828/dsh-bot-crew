@@ -460,8 +460,8 @@ func (c *Client) EditMemory(ctx context.Context, name, description, text string)
 
 // SpendStep 是一次模型调用的账。用量与 DSH 的 TokenUsage 同名。
 type SpendStep struct {
-	Turn    int    `json:"turn"`
-	Step    int    `json:"step"`
+	Turn     int    `json:"turn"`
+	Step     int    `json:"step"`
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
 	Usage    struct {
@@ -497,6 +497,49 @@ type Spend struct {
 	Recent           []SpendStep    `json:"recent"`
 }
 
+// ReplySpend 是一条回复的账：答卷的是谁、花了多少、上下文还剩多少。
+type ReplySpend struct {
+	Route         string `json:"route"`
+	InputTokens   int    `json:"input_tokens"`
+	OutputTokens  int    `json:"output_tokens"`
+	TotalTokens   int    `json:"total_tokens"`
+	ContextLeft   *int   `json:"context_left,omitempty"`
+	ContextWindow *int   `json:"context_window,omitempty"`
+}
+
+// Quota 是额度：只报算得出来的那一种（上下文余量）。
+type Quota struct {
+	TightestLeft  *int     `json:"tightest_left,omitempty"`
+	ContextWindow *int     `json:"context_window,omitempty"`
+	UsedRatio     *float64 `json:"used_ratio,omitempty"`
+	WarnRatio     float64  `json:"warn_ratio"`
+}
+
+// ReplySpends 是一张票的逐条用量。
+type ReplySpends struct {
+	Replies []ReplySpend `json:"replies"`
+	Quota   Quota        `json:"quota"`
+	Warning string       `json:"warning,omitempty"`
+}
+
+// ReplySpends 读一张票的逐条用量；`ok` 为 false 表示后端说没有可读的记录。
+func (c *Client) ReplySpends(ctx context.Context, ticketID string) (*ReplySpends, bool, string) {
+	var body struct {
+		Available bool         `json:"available"`
+		Replies   []ReplySpend `json:"replies"`
+		Quota     Quota        `json:"quota"`
+		Warning   string       `json:"warning"`
+		Reason    string       `json:"reason"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/mobile/reply-spend?ticket="+url.QueryEscape(ticketID), nil, &body); err != nil {
+		return nil, false, err.Error()
+	}
+	if !body.Available {
+		return nil, false, body.Reason
+	}
+	return &ReplySpends{Replies: body.Replies, Quota: body.Quota, Warning: body.Warning}, true, ""
+}
+
 // AuditRow 是一张票的来龙去脉：谁派的、谁判的、谁干的、花了多少。
 type AuditRow struct {
 	TicketID    string `json:"ticket_id"`
@@ -507,7 +550,7 @@ type AuditRow struct {
 		At     string `json:"at"`
 		Via    string `json:"via"`
 	} `json:"requested_by"`
-	Judged json.RawMessage `json:"judged"`
+	Judged   json.RawMessage `json:"judged"`
 	WorkedBy struct {
 		Bot         string `json:"bot,omitempty"`
 		Assignments int    `json:"assignments"`

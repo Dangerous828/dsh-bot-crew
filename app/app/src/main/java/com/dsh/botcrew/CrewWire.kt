@@ -1904,3 +1904,76 @@ object VoiceWire {
         return VoiceResult(true, text)
     }
 }
+
+
+/** 一条回复的账：答卷的是谁、花了多少、上下文还剩多少。 */
+data class ReplySpend(
+    val route: String,
+    val inputTokens: Int,
+    val outputTokens: Int,
+    /** null 表示 provider 没公布窗口 —— 这时不写余量，也不猜。 */
+    val contextLeft: Int?,
+)
+
+/** 逐条用量与额度。 */
+data class ReplySpends(
+    val replies: List<ReplySpend>,
+    val tightestLeft: Int?,
+    val contextWindow: Int?,
+    val usedRatio: Double?,
+    val warning: String,
+)
+
+object ReplySpendWire {
+    /**
+     * 读一份 `GET /api/mobile/reply-spend` 的回答。
+     *
+     * 缺 `contextLeft` 就不给这个字段：编一个「还剩 128k」会让人放心地继续聊，
+     * 然后在某一刻突然撞墙。
+     */
+    fun parse(body: String): ReplySpends {
+        val root = JSONObject(body)
+        if (!root.optBoolean("available", false)) return ReplySpends(emptyList(), null, null, null, "")
+        val replies = mutableListOf<ReplySpend>()
+        val array = root.optJSONArray("replies")
+        if (array != null) for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val route = item.optString("route").ifBlank { "unknown/unknown" }
+            replies.add(
+                ReplySpend(
+                    route = route,
+                    inputTokens = item.optInt("input_tokens", 0).coerceAtLeast(0),
+                    outputTokens = item.optInt("output_tokens", 0).coerceAtLeast(0),
+                    contextLeft = item.optInt("context_left", -1).takeIf { it >= 0 },
+                ),
+            )
+        }
+        val quota = root.optJSONObject("quota")
+        return ReplySpends(
+            replies = replies,
+            tightestLeft = quota?.optInt("tightest_left", -1)?.takeIf { it >= 0 },
+            contextWindow = quota?.optInt("context_window", -1)?.takeIf { it >= 0 },
+            usedRatio = quota?.optDouble("used_ratio", -1.0)?.takeIf { it >= 0 },
+            warning = root.optString("warning"),
+        )
+    }
+}
+
+/** 那条小字与那句告急。纯函数，测试直接钉住。 */
+object ReplySpendCopy {
+    /** `magpie/k3 · 进 1.2k 出 300 · 余 120k`；缺的项不写，也不留占位符。 */
+    fun line(spend: ReplySpend): String {
+        val parts = mutableListOf(spend.route, "进 ${compact(spend.inputTokens)} 出 ${compact(spend.outputTokens)}")
+        spend.contextLeft?.let { parts.add("余 ${compact(it)}") }
+        return parts.joinToString(" · ")
+    }
+
+    fun compact(value: Int): String = when {
+        value >= 1_000_000 -> String.format("%.1fM", value / 1_000_000.0)
+        value >= 1_000 -> String.format("%.1fk", value / 1_000.0)
+        else -> value.toString()
+    }
+
+    /** 额度告急那行字；不告急或不知道时是空串（不写一句「额度充足」占位置）。 */
+    fun warning(view: ReplySpends): String = view.warning
+}

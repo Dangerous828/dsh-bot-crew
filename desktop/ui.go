@@ -214,6 +214,7 @@ type app struct {
 	spendNote map[string]string
 	auditOf   map[string]*AuditRow
 	auditNote map[string]string
+	replyOf   map[string]*ReplySpends
 }
 
 // routinesResult 是一次读「常规任务」的结果。view 为 nil 时 note 说的是为什么读不到。
@@ -227,6 +228,7 @@ type spendResult struct {
 	ticket  string
 	spend   *Spend
 	audit   *AuditRow
+	replies *ReplySpends
 	note    string
 	spendOK bool
 }
@@ -796,8 +798,12 @@ func (s *app) drain(c *ui.Context) {
 			if s.auditNote == nil {
 				s.auditNote = map[string]string{}
 			}
+			if s.replyOf == nil {
+				s.replyOf = map[string]*ReplySpends{}
+			}
 			s.spendOf[result.ticket] = result.spend
 			s.auditOf[result.ticket] = result.audit
+			s.replyOf[result.ticket] = result.replies
 			if result.note != "" {
 				s.spendNote[result.ticket] = result.note
 			}
@@ -3635,6 +3641,29 @@ func (s *app) spendRow(c *ui.Context, p Palette, ticketID string) {
 			}
 		})
 	}
+	// 逐条用量：最后一条就是「它刚才那一下」。
+	if replies, ok := s.replyOf[ticketID]; ok && len(replies.Replies) > 0 {
+		last := replies.Replies[len(replies.Replies)-1]
+		ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+			ui.Text(c, "刚才那一下："+replyLine(last)).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
+		})
+		// 额度告急：它自己说得出「快满了、怎么办」，这里原样写出来。
+		if replies.Warning != "" {
+			ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+				ui.Text(c, replies.Warning).FontSize(FontHairline).TextColor(p.Warn).MaxLines(2).Ellipsis("…")
+			})
+		}
+	}
+}
+
+// replyLine 是一条回复底下那行小字：`magpie/k3 · 进 1.2k 出 300 · 余 120k`。
+// 缺的项直接不写，不留占位符 —— 一个空的「余 —」比不写更让人以为坏了。
+func replyLine(spend ReplySpend) string {
+	parts := []string{spend.Route, "进 " + compactTokens(spend.InputTokens) + " 出 " + compactTokens(spend.OutputTokens)}
+	if spend.ContextLeft != nil {
+		parts = append(parts, "余 "+compactTokens(*spend.ContextLeft))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // spendLine 是这一张票的用量那一句。没上报的步数单独写出来 ——

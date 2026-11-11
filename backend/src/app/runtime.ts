@@ -29,13 +29,14 @@ import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } f
 import { routinesView, routineItemOf, type RoutinesView } from './routines.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText } from './followup.ts'
-import { spendOf, type Spend, type SpendEvent } from './spend.ts'
+import { spendOf, stepOf, type Spend, type SpendEvent } from './spend.ts'
 import { auditOf, type AuditRow } from './audit.ts'
 import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from './voice.ts'
 import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './compact-memory.ts'
 import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
 import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
 import { approvalOf, approvalPrompt, type ApprovalDecision } from './approval.ts'
+import { quotaOf, quotaWarning, replySpendOf, type Quota, type ReplySpend } from './quota.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -604,6 +605,48 @@ export class Runtime extends Service implements SourceHost {
     try { events = await this.screenEvents(id) as unknown as SpendEvent[] }
     catch { return undefined }
     return spendOf(events, this.routeOf(id))
+  }
+
+  /**
+   * 逐条用量：这张票每一步用的哪个模型、花了多少、上下文还剩多少。
+   *
+   * 与 `spend()` 的区别是粒度：那个给一张票一个合计，这个给每一步一条 ——
+   * 「它刚才那一下用的谁」问的是后者。
+   *
+   * `contextWindow` 从模型目录里读；provider 没公布就不写余量，不猜。
+   */
+  async replySpends(ticketId: string): Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string } | undefined> {
+    const id = ticketId.trim()
+    if (!id || !this.store.tickets.get(id)) return undefined
+    let events: SpendEvent[]
+    try { events = await this.screenEvents(id) as unknown as SpendEvent[] }
+    catch { return undefined }
+    // 这张票 worker 的默认路由：事件里没带 provider/model 时用它兜底。
+    const fallback = this.routeOf(id)
+    const window = await this.contextWindowOf(fallback.provider, fallback.model)
+    const replies: ReplySpend[] = []
+    for (const event of events) {
+      const step = stepOf(event, fallback)
+      if (!step) continue
+      replies.push(replySpendOf({
+        provider: step.provider, model: step.model, usage: step.usage,
+        ...(window === undefined ? {} : { contextWindow: window }),
+      }))
+    }
+    if (replies.length === 0) return undefined
+    const quota = quotaOf(replies)
+    const warning = quotaWarning(quota)
+    return { replies, quota, ...(warning ? { warning } : {}) }
+  }
+
+  /** 这条路由公布的上下文窗口。目录里没有就说没有 —— 不拿常见的 128k 当默认值。 */
+  private async contextWindowOf(provider?: string, model?: string): Promise<number | undefined> {
+    if (!provider || !model) return undefined
+    try {
+      const info = await this.ctx.llm.resolveModelInfo(provider, model) as { contextWindow?: number } | undefined
+      const window = info?.contextWindow
+      return typeof window === 'number' && window > 0 ? window : undefined
+    } catch { return undefined }
   }
 
   /**

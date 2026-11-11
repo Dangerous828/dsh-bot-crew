@@ -168,6 +168,10 @@ class CrewClient(
         }
     }
 
+    /** 逐条用量：这张票每一步用的谁、多少、上下文还剩多少。 */
+    suspend fun replySpends(ticketId: String): ReplySpends =
+        parse(read("/api/mobile/reply-spend?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"), ReplySpendWire::parse)
+
     /** 忘掉一条记忆。只翻状态，不删行。 */
     suspend fun forgetMemory(name: String) {
         read("/api/mobile/memory", "POST", MemoryWire.forgetBody(name))

@@ -47,6 +47,12 @@ func newApp(client *Client) *app {
 		withdrawn:     make(chan withdrawResult, 4),
 		answered:      make(chan answerResult, 4),
 		steerDone:     make(chan steerResult, 4),
+		// 产出那两条也一样：不 make 的话，右栏会永远停在「正在读产出」。
+		outputsCh: make(chan outputsResult, 4),
+		ticketOut: make(chan ticketOutputsResult, 4),
+		// perTicket 与 loadingTicket 按票建：结果条各记各的，同一张票一次只发一个请求。
+		perTicket:     map[string]*OutputsView{},
+		loadingTicket: map[string]bool{},
 
 		// 代码卡上那两个按钮的结果：不 make 的话，按下去界面会永远停在「采用中…」。
 		adopted:   make(chan adoptResult, 4),

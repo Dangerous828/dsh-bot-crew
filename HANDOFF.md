@@ -49,7 +49,9 @@
 **还没做的**：
 1. ~~左栏四个导航项全是死的~~ —— **已接**：四项都有 `OnClick`，「后台」改为「已选中时才收起」
    （原先是首次点击把它收起来，用户报的就是这个"点什么都没反应"），「模型」走 `modelPane`，
-   「产出」「常规任务」走 `emptyPane` 明确空态。见 `desktop/nav.go` + `desktop/ui.go`。
+   「产出」走 `outputsPane`（2026-11-11 接到后端 `GET /api/mobile/outputs`，有产出就列、没有就空态、
+   读不到就如实说读不到）；「常规任务」仍走 `emptyPane` 明确空态（后端没有这个概念）。
+   见 `desktop/nav.go` + `desktop/ui.go` + `docs/00-contract.md` §5.4。
 2. ~~右栏工单卡整体不可点~~ —— **已接**：卡片本体接管 `s.openWork`，「看它怎么做」那行不再单独抢指针。
 3. **顶部「看它的屏幕」**：`screenReady` 为 false 时点击给提示，这条**是对的**（宁可说没接上，也不装死）。别改。
 4. ~~`s.workError` 字段还不存在~~ —— 已补，连同 `workRow`/`clockOf`

@@ -11,6 +11,7 @@ import { workerSessionId } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
+import type { OutputsTicket, OutputsView } from './outputs.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
 
@@ -27,6 +28,8 @@ interface FetchRegistry {
 type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'models'> & { remote?: DeviceStore
   /** 「看它的屏幕」：宿主把工单的会话整理成快照；没有这项能力的假宿主可以不给。 */
   screen?: (ticketId: string) => Promise<ScreenSnapshot>
+  /** 「产出」：把若干张工单交出来的文件合成一栏；宿主没接时路由如实说读不到。 */
+  outputs?: (tickets: readonly OutputsTicket[]) => Promise<OutputsView>
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
   steer?: (ticketId: string, requestId: string, text: string) => Promise<boolean>
   /** 一条模型路由支持哪些推理档位；不支持的宿主可以不给。 */
@@ -150,12 +153,15 @@ export function declinedRequests(items: TimelineItem[], decisions: readonly { ki
 }
 
 /**
- * 给带了代码块的回话补上 `ticket_ref`：代码卡上的「看看改完的样子」要知道去看哪张票。
+ * 给回话补上 `ticket_ref`：哪条回话是哪张票说的。
+ *
+ * 两个地方要用它，规则同一条：代码卡上的「看看改完的样子」要知道去看哪张票
+ * （契约 §5），消息结果条要知道这段话的产出在哪张票里（契约 §5.4）。
  *
  * 网关写出的回话只记「挂在哪条消息下」（`reply_to: m6`），不记工单 —— 它本来就不该持有任务账。
  * 工单号在这一侧是现成的：最近的决定里，threadKey 的尾号就是队列行号，`ticketId` 就是那张票。
  * 所以这里只做一次对齐，不做推断：行号对不上、决定是被忽略的、票号为空，一律不补。
- * 补不上就让它缺着 —— 客户端据此如实说「这段改动没带工单号」，而不是拿别的票顶替。
+ * 补不上就让它缺着 —— 客户端据此如实说「这段改动没带工单号」/ 不画结果条，而不是拿别的票顶替。
  */
 export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: string; at?: string; threadKey?: string;
   ticketId?: string }[]): Map<string, string> {
@@ -173,8 +179,8 @@ export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: s
   const refs = new Map<string, string>()
   for (const item of items) {
     if (item.role !== 'agent') continue
-    // 只有带改动的回话才是代码卡：别的回话不需要票号，补上去只会多一个用不上的字段。
-    if (!item.code && !item.diff) continue
+    // 每一条回话都对一次：代码卡要它看改动，结果条要它找产出。
+    // 对不上的仍然缺着 —— 这个字段是**来源**，不是猜出来的。
     const row = typeof item.reply_to === 'string' ? /^m(\d+)$/.exec(item.reply_to)?.[1] : undefined
     const found = row ? byRow.get(row) : undefined
     // 网关自己已经给了 ticket_ref 就以它为准：这里只补缺，不改写已有的值。
@@ -185,14 +191,16 @@ export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: s
 }
 
 /**
- * 把 `ticketRefs` 算出来的票号放回条目上。没有代码块的条目不动：
- * 这个字段只服务于代码卡，别的话不需要它。
+ * 把 `ticketRefs` 算出来的票号放回条目上。只补缺、不改写已有的值。
+ *
+ * 这一层以前只认带代码块的回话（那时只有代码卡要票号）。结果条接上之后，
+ * 每条回话都可能被引用，所以不再按代码块过滤：过滤掉的后果是「有产出却永远不画结果条」。
  */
 export function withTicketRefs(items: TimelineItem[], refs: Map<string, string>): TimelineItem[] {
   if (refs.size === 0) return items
   return items.map(item => {
     const ticket = typeof item.id === 'string' ? refs.get(item.id) : undefined
-    if (!ticket || !(item.code || item.diff)) return item
+    if (!ticket) return item
     return { ...item, ticket_ref: ticket }
   })
 }
@@ -290,6 +298,8 @@ const OPERATIONS = {
   // 排队中的消息撤回：只按 request_id 指认，网关自己判定是否还来得及。
   withdraw: { methods: ['POST'] },
   work: { methods: ['GET'], needsTicket: true }, agents: { methods: ['GET'], needsTicket: true },
+  // 「产出」：队伍交出来的文件。不带 `?ticket=` 时列最近几张票的产出，带就只看那一张。
+  outputs: { methods: ['GET'] },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -390,8 +400,35 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
-      || operation === 'steer') {
+      || operation === 'steer' || operation === 'outputs') {
       await runtime.ready
+      if (operation === 'outputs') {
+        // 「产出」：worker 真正写过的文件。宿主没接这项能力时如实说「读不到」，
+        // 不说「没有产出」—— 那是在替队伍编一句话。
+        // runtime.outputs 是实例方法，脱离 this 调会读不到 store，所以先 bind 再调。
+        if (!runtime.outputs) {
+          return response(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 }, reason: '后端还没有接入产出' })
+        }
+        const readOutputs = runtime.outputs.bind(runtime)
+        const wanted = ticketId ? [ticketId] : []
+        if (ticketId && !runtime.store.tickets.get(ticketId)) return response(404, { error: 'No such ticket' })
+        // 不带票号时列最近的几张：产出是「交出来的东西」，不是全部历史。手机与队伍两条通道的票都算。
+        const tickets = (wanted.length > 0 ? wanted.flatMap(id => runtime.store.tickets.get(id) ?? []) : runtime.store.tickets.list())
+          .filter(ticket => ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team'))
+          .slice(0, 12)
+        try {
+          const view = await readOutputs(tickets.map(ticket => {
+            const botId = ticketBot(ticket)
+            return { id: ticket.id, title: ticket.title,
+              ...(botId ? { bot_id: botId } : {}),
+              ...(ticket.execution?.directory ? { cwd: ticket.execution.directory } : {}) }
+          }))
+          return response(200, ticketId ? { ...view, ticket_id: ticketId } : view)
+        } catch {
+          return response(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 },
+            ...(ticketId ? { ticket_id: ticketId } : {}), reason: '产出暂时读不出来' })
+        }
+      }
       if (operation === 'steer') {
         if (!runtime.steer) return response(503, { error: 'Steering is unavailable' })
         const asked = askedBody(body)
@@ -737,6 +774,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 手机工作区：看画面、接手、停一下。画面现在是「诚实的没有」，另外两条动真格。
       connection.fetch.register({ path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      // 产出：队伍交出来的文件（worker 写过的那些）。和 screen 一样是宿主侧纯读，不经过网关。
+      connection.fetch.register({ path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

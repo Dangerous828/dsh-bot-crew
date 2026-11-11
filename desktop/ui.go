@@ -168,6 +168,34 @@ type app struct {
 	botSaving  bool
 	botError   string
 	botSaved   chan botSaveResult
+
+	// 产出：右栏「产出」那一栏，以及消息下面那条结果条，都读同一份。
+	// outputs 是整栏（最近几张票），perTicket 是按票的（结果条用）；
+	// 两份分开存，结果条不该因为整栏没刷新就对不上。
+	// 读不到时 outputsNote 是那句实话，不冒充「没有产出」。
+	outputs     *OutputsView
+	outputsNote string
+	outputsCh   chan outputsResult
+	// loadingOutputs 挡住连点「产出」时叠出来的几个请求。
+	loadingOutputs bool
+	// perTicket 的键是票号；值是 nil 表示「读过了、读不到」，据此不再每帧重发请求。
+	perTicket map[string]*OutputsView
+	// loadingTicket 挡住在途的重复请求：同一张票一次只发一个。
+	loadingTicket map[string]bool
+	ticketOut     chan ticketOutputsResult
+}
+
+// outputsResult 是一次读「产出」整栏的结果。view 为 nil 时 note 说的是为什么读不到。
+type outputsResult struct {
+	view *OutputsView
+	note string
+}
+
+// ticketOutputsResult 是读某一张票产出的结果；票号带回来才知道是哪条消息的结果条。
+// 读不到时 view 为 nil —— 结果条据此什么都不画，也不报错。
+type ticketOutputsResult struct {
+	ticket string
+	view   *OutputsView
 }
 
 // exportResult 是一次导出备份的结果：成功时带回写出去的路径。
@@ -498,6 +526,12 @@ func (s *app) drain(c *ui.Context) {
 				case len(conversation.Messages) > before && s.chatPinned:
 					s.chatScroll.Y = math.MaxFloat32
 				}
+				// 时间线变了，产出也可能变了（worker 刚写完一个文件）。按票缓存的结果条
+				// 与整栏都重读一遍；不清掉就会一直停在上一次。
+				s.perTicket = map[string]*OutputsView{}
+				if s.navTab == navOutput {
+					s.loadOutputs()
+				}
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
 				c.Invalidate()
 			}
@@ -672,6 +706,19 @@ func (s *app) drain(c *ui.Context) {
 				// 没有就说清楚为什么没有。这句话写在标题栏，不挂断连横幅。
 				s.previewNote = result.reason
 			}
+			c.Invalidate()
+		case result := <-s.outputsCh:
+			s.loadingOutputs = false
+			s.outputs, s.outputsNote = result.view, result.note
+			c.Invalidate()
+		case result := <-s.ticketOut:
+			delete(s.loadingTicket, result.ticket)
+			if s.perTicket == nil {
+				s.perTicket = map[string]*OutputsView{}
+			}
+			// 读不到也记一笔（值是 nil），否则每一帧都会重发一次请求。
+			// 结果条据此不画：把「读不到」画成一条成果是最糟的一种假。
+			s.perTicket[result.ticket] = result.view
 			c.Invalidate()
 		case message := <-s.failed:
 			s.problem = message
@@ -1700,6 +1747,11 @@ func (s *app) message(c *ui.Context, p Palette, message Message) {
 			if block := message.Code(); block != nil {
 				s.codeCard(c, p, *block, message.BotID)
 			}
+			// 结果条：这条话带票号、且那张票确实交了东西时才有（契约 §5.4）。
+			// 没有票号就什么都画 —— 按时间猜一张票会把别人的成果挂到这句话下面。
+			if fromBot {
+				s.resultBar(c, p, message)
+			}
 		})
 	})
 }
@@ -2283,7 +2335,9 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 			switch s.navTab {
 			case navModel:
 				s.modelPane(c, p)
-			case navOutput, navRoutine:
+			case navOutput:
+				s.outputsPane(c, p)
+			case navRoutine:
 				s.emptyPane(c, p, s.navTab)
 			default:
 				s.workPane(c, p)
@@ -2635,7 +2689,11 @@ func (s *app) modelRow(c *ui.Context, p Palette, provider string, option ModelOp
 	})
 }
 
-// emptyPane 是「产出」「常规任务」那两栏。它们后端还没有数据 —— 说清楚，不留白。
+// emptyPane 是「产出」和「常规任务」这两栏在没有数据时说的话。
+//
+// 两栏都已经不是死按钮了：「产出」接上了后端（契约 §5.4），这一份只负责
+// 「确实没有」时的那一句话；读不到与还没接上另有两种说法，见 outputsPane。
+// 「常规任务」后端仍然没有这个概念，所以它照旧只说明为什么空着 —— 不编一个列表出来。
 func (s *app) emptyPane(c *ui.Context, p Palette, item navItem) {
 	title, body := emptyCopy(item)
 	_, name := navLabel(item)
@@ -2645,6 +2703,147 @@ func (s *app) emptyPane(c *ui.Context, p Palette, item navItem) {
 		ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
 		ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
 	})
+}
+
+// outputsPane 是右栏「产出」那一栏：有产出就列出来，没有就说明为什么没有。
+//
+// 三种情况分开说（契约 §5.4 的 state）：
+// - live：逐条画。文件名 + 它是哪张票交的 + 写过几次；图片那类多一个标记。
+// - empty：读得到、确实没有 —— 画原有的空态，不补假条目。
+// - unavailable / 读失败：说「读不到」，绝不说「没有」。这两句话差着一整个事实。
+func (s *app) outputsPane(c *ui.Context, p Palette) {
+	_, name := navLabel(navOutput)
+	ui.Text(c, name).FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
+
+	view := s.outputs
+	if view == nil {
+		// 还没读回来。断连时先说断连：那时候「正在读」是句假话。
+		line := "正在读产出…"
+		if s.outputsNote != "" {
+			line = s.outputsNote
+		} else if s.problem != "" {
+			line = "还没连上，读不到产出"
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, line).FontSize(FontSmall).TextColor(p.Faint)
+		})
+		return
+	}
+
+	if view.State != "live" || len(view.Items) == 0 {
+		// empty / unavailable 都在这里。reason 是后端给的那句实话；
+		// 它没给（老后端）时才退回空态原话，绝不在这里自己编一个理由。
+		title, body := emptyCopy(navOutput)
+		if view.Reason != "" && view.State != "empty" {
+			// 读不到不是空态：标题也得跟着说「读不到」，不能借「还没有产出」的壳。
+			title, body = "读不到产出", view.Reason
+		} else if view.Reason != "" {
+			body = view.Reason
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
+			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
+		})
+		return
+	}
+
+	// 栏头那行小结：几张文件、几张图片。用后端的 counts，不自己数一遍
+	// —— 两处算法一旦分叉，人看到的数字就会和列表条数对不上。
+	ui.Text(c, outputSummary(*view)).FontSize(FontSmall).TextColor(p.Faint)
+	ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+		ui.Column(c).Gap(6).Children(func() {
+			for _, item := range view.Items {
+				s.outputRow(c, p, item)
+			}
+		})
+	})
+}
+
+// outputSummary 是「产出」栏头那行字：几张文件、几张图片。都为 0 时返回空串。
+func outputSummary(view OutputsView) string {
+	parts := []string{}
+	if view.Counts.File > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个文件", view.Counts.File))
+	}
+	if view.Counts.Image > 0 {
+		parts = append(parts, fmt.Sprintf("%d 张图片", view.Counts.Image))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// outputRow 是「产出」里的一条。画板里这是「文件名 + 一句来源」的一行，
+// 没有缩略图可画：后台给的是路径，不是像素。
+func (s *app) outputRow(c *ui.Context, p Palette, item OutputItem) {
+	glyph := "▢"
+	if item.Kind == "image" {
+		glyph = "▣"
+	}
+	ui.Row(c).FillWidth().Padding(10).Gap(9).Radius(RadiusItem).
+		BorderWidth(1).BorderColor(p.Line).Background(p.Card).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, glyph).FontSize(FontLabel).TextColor(p.Accent)
+		ui.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
+			// 文件名是这一行最要紧的字；路径整条放在后面当副行，太长就省略。
+			ui.Text(c, item.Title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Ink).
+				MaxLines(1).Ellipsis("…")
+			detail := item.Path
+			if item.Writes > 1 {
+				detail += fmt.Sprintf(" · 写了 %d 次", item.Writes)
+			}
+			if item.TicketTitle != "" {
+				detail += " · " + item.TicketTitle
+			}
+			ui.Text(c, detail).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
+		})
+	})
+}
+
+// resultBar 是挂在一条消息下面那行「✓ 两张图片已放进产出」（契约 §5.4 末节）。
+//
+// 只有这条消息带 ticket_ref、且那张票确实有产出时才画。没有票号就不画 ——
+// 按时间猜一张票，等于把 A 的成果挂到 B 的话下面。读不到也不画：
+// 结果条只在「有事发生」时出现，把故障画成一条成果是最糟的一种假。
+func (s *app) resultBar(c *ui.Context, p Palette, message Message) {
+	ticket := strings.TrimSpace(message.ticketRef())
+	if ticket == "" {
+		return
+	}
+	// 没读过就先要一份；读完之前不画，免得先闪一条空的再变成有内容的。
+	// 记着「试过了」：结果条按票缓存，读不到的那张不会每帧重发请求。
+	if _, tried := s.perTicket[ticket]; !tried {
+		s.loadTicketOutputs(ticket)
+		return
+	}
+	view := s.perTicket[ticket]
+	if view == nil || view.State != "live" || len(view.Items) == 0 {
+		return
+	}
+	line := outputResultLine(*view)
+	if line == "" {
+		return
+	}
+	ui.Row(c).PaddingX(12).PaddingY(9).Gap(8).Radius(RadiusItem).
+		BorderWidth(1).BorderColor(p.Line).Background(p.Card).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "✓").FontSize(FontLabel).TextColor(p.Accent)
+		ui.Text(c, line).FontSize(FontSmall).TextColor(p.Muted)
+	})
+}
+
+// outputResultLine 是结果条上那句话：「N 张图片已放进产出」/「N 个文件已放进产出」。
+// 两类都有时说全，只数一类时只说那一类；一条都没有就返回空串（调用方据此不画）。
+func outputResultLine(view OutputsView) string {
+	file, image := view.Counts.File, view.Counts.Image
+	switch {
+	case file > 0 && image > 0:
+		return fmt.Sprintf("%d 个文件 · %d 张图片已放进产出", file, image)
+	case image > 0:
+		return fmt.Sprintf("%d 张图片已放进产出", image)
+	case file > 0:
+		return fmt.Sprintf("%d 个文件已放进产出", file)
+	default:
+		return ""
+	}
 }
 
 // currentModel 是「现在用的是谁」的一句话。两个来源：目录说过的（刚换完最准），
@@ -2804,6 +3003,61 @@ func (s *app) openWork(ticketID string) {
 		defer cancel()
 		steps, err := s.client.Work(ctx, ticketID)
 		s.steps <- workResult{ticket: ticketID, steps: steps, err: err}
+		s.wake()
+	}()
+}
+
+// loadOutputs 读一遍右栏「产出」。整栏读不到只说这一栏的事，不冒充断连。
+// 在途时不再发第二个：连点这一格不该叠出几个一模一样的请求。
+func (s *app) loadOutputs() {
+	if s.client == nil || s.loadingOutputs {
+		return
+	}
+	s.loadingOutputs = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := s.client.Outputs(ctx, "")
+		result := outputsResult{view: view}
+		if err != nil {
+			// 读失败与「没有产出」是两件事：这条 note 会原样显示，别写成「还没有产出」。
+			result.note = "读不到产出：" + err.Error()
+		}
+		s.outputsCh <- result
+		s.wake()
+	}()
+}
+
+// loadTicketOutputs 读某一张票的产出，给消息下面那条结果条用。
+// 同一张票只读一次：结果条按票号缓存，翻上翻下不该每帧都发一个请求。
+func (s *app) loadTicketOutputs(ticket string) {
+	if s.client == nil || ticket == "" {
+		return
+	}
+	if s.perTicket == nil {
+		s.perTicket = map[string]*OutputsView{}
+	}
+	if s.loadingTicket == nil {
+		s.loadingTicket = map[string]bool{}
+	}
+	if _, seen := s.perTicket[ticket]; seen {
+		return
+	}
+	// 这一张已经发过请求、还没回来：别再发第二个。
+	if s.loadingTicket[ticket] {
+		return
+	}
+	s.loadingTicket[ticket] = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := s.client.Outputs(ctx, ticket)
+		// 读失败就是「这张没有可画的产出」：结果条不画，也不冒充断连。
+		// 具体为什么读不到，右栏「产出」那一栏会说（它读的是同一份接口）。
+		if err != nil {
+			view = nil
+		}
+		s.ticketOut <- ticketOutputsResult{ticket: ticket, view: view}
 		s.wake()
 	}()
 }

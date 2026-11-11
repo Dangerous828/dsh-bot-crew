@@ -12,10 +12,11 @@ const (
 	navBackend navItem = iota
 	// navModel 是「模型」：右栏改成一个选模型的筐，选完就换。
 	navModel
-	// navOutput 是「产出」。后端还没有这份数据，但它不是一个死按钮：
-	// 点开能把话说清楚，比按下去什么都不发生强。
+	// navOutput 是「产出」：队伍交出来的文件（契约 §5.4）。点开时重读一遍 ——
+	// worker 刚写完的文件不会自己长到界面上。
 	navOutput
-	// navRoutine 是「常规任务」，同上。
+	// navRoutine 是「常规任务」。后端还没有这个概念（没有定时/周期任务的账），
+	// 所以它仍然只做一件事：点开把话说清楚。
 	navRoutine
 )
 
@@ -61,7 +62,13 @@ func (s *app) pressNav(item navItem) bool {
 		// 每次打开都重读一遍：模型目录是宿主那边算的，机器上装了新的就会变。
 		s.loadModels()
 		return true
-	case navOutput, navRoutine:
+	case navOutput:
+		s.navTab = item
+		s.backendOpen = true
+		// 每次打开都重读：产出是 worker 干活时一点点长出来的。
+		s.loadOutputs()
+		return true
+	case navRoutine:
 		s.navTab = item
 		s.backendOpen = true
 		return true
@@ -109,14 +116,15 @@ func modelNameOf(option ModelOption) string {
 
 // emptyCopy 是「产出」和「常规任务」两栏里的原话。
 //
-// 这两块后端确实没有数据，所以这里不编、也不留白：说清楚它现在是什么状态、
-// 什么时候会有，比一个假列表诚实。
+// 「产出」现在接上了后端（契约 §5.4）：这里的两句只在 `state: "empty"`
+// ——读得到、确实没有文件改动——时出现；「读不到」另有一句话，不借用这两句。
+// 「常规任务」后端仍然没有这个概念，所以照旧只说明为什么空着。
 func emptyCopy(item navItem) (title, body string) {
 	switch item {
 	case navOutput:
-		return "还没有产出", "这里会列出队伍交出来的成品。现在还没有接上这条路，所以先空着。"
+		return "还没有产出", "队伍还没在工单里写过文件。它写过的文件会出现在这里。"
 	case navRoutine:
-		return "还没有常规任务", "这里会放定时要做的事。现在还没有接上这条路，所以先空着。"
+		return "还没有常规任务", "这里会放定时要做的事。后端还没有这份数据，所以先空着。"
 	default:
 		return "", ""
 	}

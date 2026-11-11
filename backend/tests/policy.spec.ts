@@ -258,6 +258,7 @@ describe('settings migration', () => {
       // 新加的配置块走默认值：旧存档里没有它，迁移不该为它编内容。
       remote: { pairing: 'code', lan: true },
       approval: { mode: 'ask', askWhenBudgetUsed: 0.9 },
+      connections: { connections: [], readOnly: true },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })

@@ -7,6 +7,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
+import { allowedTools, connectionsOf } from './connections.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
@@ -61,6 +62,10 @@ declare module '@deepseek-ai/cordis' {
 const MEMORY_TOOLS = ['memory_write', 'memory_read', 'memory_list', 'memory_search',
   'mcp__magpie__hub_memory__hub_memory_search', 'mcp__magpie__hub_memory__hub_memory_get',
   'mcp__magpie__hub_memory__hub_memory_recent', 'mcp__magpie__hub_memory__hub_memory_list']
+/**
+ * 对外连接的 MCP 工具名由设置决定，不写在这一列里：`connections` 里配了什么，
+ * worker 就多拿到那几个 `mcp__<server>__<tool>`。见 `connections.ts`。
+ */
 const WORK_TOOLS = [...MEMORY_TOOLS, 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
@@ -308,7 +313,10 @@ export class Sessions {
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    // 对外连接的工具由设置决定：配了什么，worker 就多拿那几个。
+    // 只放行宿主真的注册了的（`tools.get` 为假说明那个 MCP 服务器没连上）。
+    const configured = allowedTools(connectionsOf((store.settings() as { connections?: unknown }).connections))
+    const allow = [...WORK_TOOLS, ...configured].filter(name => agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined

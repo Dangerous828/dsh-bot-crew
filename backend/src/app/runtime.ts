@@ -37,6 +37,7 @@ import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.
 import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
 import { approvalOf, approvalPrompt, type ApprovalDecision } from './approval.ts'
 import { quotaOf, quotaWarning, replySpendOf, type Quota, type ReplySpend } from './quota.ts'
+import { connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -522,6 +523,28 @@ export class Runtime extends Service implements SourceHost {
       console.log('[push] %s kind=%s device=%s', outcome.status, notice.kind, outcome.deviceId)
     }
     return outcomes
+  }
+
+  /**
+   * 一次对外连接的工具调用放不放行。
+   *
+   * 读直接放；写返回 `ask`，由调用方把它变成一句「等你点头」。
+   * 光靠 worker 白名单拦不住写 —— 白名单只决定「能拿到哪个工具」，
+   * 发邮件这个动作本身要在这里判。
+   */
+  judgeConnection(server: string, tool: string): ConnectionVerdict {
+    try {
+      const raw = (this.store.settings() as { connections?: unknown }).connections
+      return judgeCall(connectionsOf(raw), server, tool)
+    } catch (error) {
+      // 读不出配置时保守：一律要点头。宁可多问一句，也不要静默发出去。
+      return { action: 'ask', reason: `读不出对外连接设置（${String(error)}），先问你一声` }
+    }
+  }
+
+  /** 写操作被拦下时的那一句话，直接给人看。 */
+  connectionAskText(verdict: ConnectionVerdict): string {
+    return verdict.reason || `要用${verdict.kind ? KIND_NAME[verdict.kind] : '外部服务'}做改动，先问你一声`
   }
 
   /** 已配对的设备。读不到就当没有：推送不该把整个队伍拖垮。 */

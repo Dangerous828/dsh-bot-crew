@@ -96,6 +96,21 @@ export const ApprovalConfigSchema = z.object({
   /** 额度用到多少比例就先问一句。0.9 表示剩不到一成时。 */
   askWhenBudgetUsed: z.number().min(0).max(1).default(0.9),
 }).strict()
+/**
+ * 对外连接：邮箱、日历、文件，都经宿主的 MCP 桥。
+ *
+ * 默认只读：读邮件、看日历直接用；发邮件、改日程、删文件一律先问人 —
+ * 路线图第 4 期说的「读先上，写必须过审批」。`readOnly: false` 是显式放弃这道闸。
+ */
+export const ConnectionsConfigSchema = z.object({
+  connections: z.array(z.object({
+    kind: z.enum(['mail', 'calendar', 'files']),
+    server: z.string().regex(/^[A-Za-z0-9_-]{1,32}$/),
+    readTools: z.array(z.string().min(1)).default([]),
+    writeTools: z.array(z.string().min(1)).optional(),
+  }).strict()).default([]),
+  readOnly: z.boolean().default(true),
+}).strict()
 export const EvalConfigSchema = z.object({
   mode: z.enum(['off', 'observe', 'auto']).default('observe'),
   timeoutSeconds: z.number().int().min(LIMITS.evalTimeoutSeconds.min).max(LIMITS.evalTimeoutSeconds.max).default(120),
@@ -127,6 +142,7 @@ export const SettingsSchema = z.object({
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
   approval: ApprovalConfigSchema.default(() => ApprovalConfigSchema.parse({})),
+  connections: ConnectionsConfigSchema.default(() => ConnectionsConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
   remote: RemoteConfigSchema.default(() => RemoteConfigSchema.parse({})),
 }).strict()

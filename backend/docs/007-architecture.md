@@ -363,6 +363,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写今天真发生过的数、什么也没发生就不发 |
 | `src/app/approval.ts` | 审批三档「做不做」：auto / ask / off 的判定顺序（档位 → 敏感规则 → 额度）、停下来时问什么、认不出的回答一律当「先别做」 |
 | `src/app/quota.ts` | 逐条用量与额度：每条回复的模型与花费、上下文余量（窗口由 provider 公布才有）、最紧那一步的告急；金额余额不在这里算，因为它在会话事件里读不到 |
+| `src/app/connections.ts` | 对外连接（邮箱 / 日历 / 文件）经宿主的 MCP 桥：哪些工具算「读」直接放行、哪些算「写」停下来等人点头、认不出来的按写处理；默认只读，凭据不在这一层 |
 | `src/app/views/memory.ts` | 记忆这一栏的形状：一条记忆在界面上的一行（含来源与是否上行）、三态 `live` / `empty` / `unavailable`，以及按 Bot 过滤时仍数整本账 |
 | `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes only a name, the port, and a stateDir fingerprint — never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
@@ -456,6 +457,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-notices-out.spec.ts` | 通知内容层：按设备铺开与静音过滤、日报只写发生过的数、什么都没发生就不发、晚上九点才说 |
 | `tests/crew-approval.spec.ts` | 审批三档：off 一律问、auto 照做、ask 只停在敏感规则上、额度将尽时先问、判定顺序不会被额度盖掉禁区、三个选项与回答的读法 |
 | `tests/crew-quota.spec.ts` | 逐条用量：路由与花费、只在公布窗口时算余量、输出不占「已用」、超窗不为负、最紧一步决定告急、不知道时不吓人 |
+| `tests/crew-connections.spec.ts` | 对外连接：配了读列表才算读、其余落到写、没配时吃内置白名单、未接入的服务器一律拒、只读开关只影响写、坏条目跳过不拖垮全表 |
 | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
 | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |

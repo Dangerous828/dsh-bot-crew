@@ -345,6 +345,50 @@ func (c *Client) Outputs(ctx context.Context, ticketID string) (*OutputsView, er
 	return &view, nil
 }
 
+// RoutineItem 是「常规任务」里的一条（契约 §5.5）。
+//
+// 它是主人自己写下的账，不是工单：Bot 是负责的那位，Cycle 是周期原词
+// （hourly / daily / weekly，客户端不翻译成别的时间），NextRun 与 Overdue
+// 由后端按周期算出来。后端还没有调度器，所以超时只表示「该跑了，但没人跑」。
+type RoutineItem struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Cycle     string `json:"cycle"`
+	BotID     string `json:"bot_id,omitempty"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt string `json:"created_at"`
+	LastRun   string `json:"last_run,omitempty"`
+	NextRun   string `json:"next_run"`
+	Overdue   bool   `json:"overdue"`
+}
+
+// RoutineCounts 是开着的与关掉的各几条。
+type RoutineCounts struct {
+	Enabled int `json:"enabled"`
+	Paused  int `json:"paused"`
+}
+
+// RoutinesView 是「常规任务」那一栏的一份快照。
+//
+// State 与「产出」同一套三态：live 有账；empty 读得到、确实没有；unavailable 读不到。
+// Runner 恒为 none —— 后端还没有调度器，界面据此不说「已排好」。
+type RoutinesView struct {
+	Items  []RoutineItem `json:"items"`
+	State  string        `json:"state"`
+	Counts RoutineCounts `json:"counts"`
+	Reason string        `json:"reason,omitempty"`
+	Runner string        `json:"runner,omitempty"`
+}
+
+// Routines 读「常规任务」这一栏。
+func (c *Client) Routines(ctx context.Context) (*RoutinesView, error) {
+	var view RoutinesView
+	if err := c.do(ctx, http.MethodGet, "/api/mobile/routines", nil, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
 // BackendStatus is the crew's own health, as the surface reports it.
 type BackendStatus struct {
 	Runtime string `json:"runtime"`

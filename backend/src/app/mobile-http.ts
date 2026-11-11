@@ -12,6 +12,7 @@ import { KV } from '../kv.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
+import type { RoutinesView } from './routines.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
 
@@ -30,6 +31,8 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   screen?: (ticketId: string) => Promise<ScreenSnapshot>
   /** 「产出」：把若干张工单交出来的文件合成一栏；宿主没接时路由如实说读不到。 */
   outputs?: (tickets: readonly OutputsTicket[]) => Promise<OutputsView>
+  /** 「常规任务」：把 KV 里的那张定时账本合成一栏；宿主没接时路由如实说读不到。 */
+  routines?: () => Promise<RoutinesView>
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
   steer?: (ticketId: string, requestId: string, text: string) => Promise<boolean>
   /** 一条模型路由支持哪些推理档位；不支持的宿主可以不给。 */
@@ -300,6 +303,8 @@ const OPERATIONS = {
   work: { methods: ['GET'], needsTicket: true }, agents: { methods: ['GET'], needsTicket: true },
   // 「产出」：队伍交出来的文件。不带 `?ticket=` 时列最近几张票的产出，带就只看那一张。
   outputs: { methods: ['GET'] },
+  // 「常规任务」：定时要做的事的账本。这一轮只读，不改账。
+  routines: { methods: ['GET'] },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -400,8 +405,23 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
-      || operation === 'steer' || operation === 'outputs') {
+      || operation === 'steer' || operation === 'outputs' || operation === 'routines') {
       await runtime.ready
+      if (operation === 'routines') {
+        // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
+        // 不说「还没有常规任务」—— 那是在替队伍编一句话。
+        const readRoutines = runtime.routines?.bind(runtime)
+        if (!readRoutines) {
+          return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
+            runner: 'none', reason: '后端还没有接入常规任务' })
+        }
+        try {
+          return response(200, await readRoutines())
+        } catch {
+          return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
+            runner: 'none', reason: '常规任务暂时读不出来' })
+        }
+      }
       if (operation === 'outputs') {
         // 「产出」：worker 真正写过的文件。宿主没接这项能力时如实说「读不到」，
         // 不说「没有产出」—— 那是在替队伍编一句话。
@@ -781,6 +801,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       // 产出：队伍交出来的文件（worker 写过的那些）。和 screen 一样是宿主侧纯读，不经过网关。
       connection.fetch.register({ path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      // 常规任务：主人写下的定时账本（契约 §5.5）。这一轮只读，不能在这里改账。
+      connection.fetch.register({ path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

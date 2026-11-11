@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,11 @@ func TestEmptyPanesSayWhyTheyAreEmpty(t *testing.T) {
 		if name == "" {
 			t.Fatalf("%v：连名字都没有", item)
 		}
+	}
+	// 常规任务接上后端（契约 §5.5）之后，空态仍要把「到点不会自己跑」说出来：
+	// 让人以为放着它就会跑，比空着更糟。
+	if _, body := emptyCopy(navRoutine); !strings.Contains(body, "调度器") {
+		t.Fatalf("常规任务的空态没说它不会自己跑：%q", body)
 	}
 }
 

@@ -33,4 +33,10 @@ func TestTheChannelsAreWired(t *testing.T) {
 	if s.previewed == nil {
 		t.Fatal("previewed 是 nil：「看看改完的样子」永远等不到结果")
 	}
+	if s.outputsCh == nil {
+		t.Fatal("outputsCh 是 nil：「产出」那一栏会永远停在正在读")
+	}
+	if s.routinesCh == nil {
+		t.Fatal("routinesCh 是 nil：「常规任务」那一栏会永远停在正在读")
+	}
 }

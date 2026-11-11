@@ -20,14 +20,30 @@ data class Message(
     val requestId: String = "",
     /** 这条消息带的代码片段；没有就是 null。字段名后端可能给 code 也可能给 diff。 */
     val code: CodeBlock? = null,
+    /**
+     * 这条消息挂在哪张工单上。只读引用，前台不据此维护任务账（契约 §4）。
+     * 代码块自己带了 ticket_ref 时以代码块为准；这里留着，是为了消息没带代码块时也读得出来。
+     */
+    val ticketRef: String = "",
 )
 
-/** 一条消息里的代码片段：文件名、增删行数、逐行内容与类别。 */
+/**
+ * 一条消息里的代码片段：文件名、增删行数、逐行内容与类别。
+ *
+ * id 是这张卡在本次会话里的稳定标识：后端给了就用后端的，没给就用「票号|文件名」拼一个
+ * （与桌面端 client.go 的 Code() 同一条规矩）。「采用中 / 已采用」与回执都按它各记各的 ——
+ * 同一段对话里并排两张卡，结果不能串台。
+ *
+ * ticketRef 是这段改动属于哪张工单：卡片下面「看看改完的样子」只能看它。
+ * 缺了就说缺了，绝不拿别的票顶替 —— 把 A 的活显示成 B 的结果，比不给看更糟。
+ */
 data class CodeBlock(
     val path: String,
     val added: Int,
     val removed: Int,
     val lines: List<CodeLine>,
+    val id: String = "",
+    val ticketRef: String = "",
 )
 
 /** 代码里的一行。kind 取 added / removed / 空。 */
@@ -72,6 +88,21 @@ object CrewWire {
     fun parseCredential(body: String): Credential? = PairingWire.parseCredential(body)
 
 
+    /**
+     * 消息上那个只读的票号引用。它只用来展示，不据此维护任何任务账。
+     * 缺席或空白都算「没有」，让「没有」只有一种形状 —— 空串。
+     */
+    private fun ticketRefOf(item: JSONObject): String = item.optString("ticket_ref").trim()
+
+    /**
+     * 读出代码块。两种命名都认（`code` / `diff`），两种都读不出来就是没有。
+     *
+     * 三段顺序都是有意的：
+     * 1. 没有 path 也没有行 → 不返回卡片。没有改动就没有「采用」，按钮也不该出现；
+     *    而一个只有文件名的空卡画出来只是一块占位的白。
+     * 2. 票号优先取代码块自己的，其次才取消息上的 `ticket_ref`（契约 §5：两处都可，代码块里的优先）。
+     * 3. id 缺省时用「票号|文件名」拼一个稳定标识；两者都空时只剩文件名，也仍然稳定。
+     */
     private fun parseCode(item: JSONObject): CodeBlock? {
         val block = item.optJSONObject("code") ?: item.optJSONObject("diff") ?: return null
         val raw = block.optJSONArray("lines") ?: JSONArray()
@@ -80,15 +111,69 @@ object CrewWire {
             val line = raw.optJSONObject(i) ?: continue
             lines.add(CodeLine(line.optString("text"), line.optString("kind")))
         }
+        val path = block.optString("path")
         // 没有行内容就只有个文件名，画出来是张空卡 —— 不如不画。
         if (lines.isEmpty()) return null
+        val ticketRef = block.optString("ticket_ref").trim().ifEmpty { ticketRefOf(item) }
+        val id = block.optString("id").trim().ifEmpty { ticketId(ticketRef, path) }
         return CodeBlock(
-            path = block.optString("path"),
+            path = path,
             added = block.optInt("added"),
             removed = block.optInt("removed"),
             lines = lines,
+            id = id,
+            ticketRef = ticketRef,
         )
     }
+
+    /** 与桌面端 client.go 拼法一致：票号 + 竖线 + 文件名。 */
+    private fun ticketId(ticketRef: String, path: String): String = "$ticketRef|$path"
+
+    /**
+     * 读出这张票的备选答案。
+     *
+     * 契约 §5 说得很死：`options` 只在有 `question` 时出现，2–4 条，id 唯一，label ≤80 字。
+     * 这里逐条按契约收，宁可少一条也不画一条点不动的：
+     * - 没有 question 就没有选项（没有要答的题，答案没有意义）；
+     * - 没有 id 的丢（「这张卡上哪个按钮」认不出来，回执会串台）；
+     * - 没有 label 的丢（画出来是一行空白，点下去发的是一句空话）；
+     * - 同一句问题里 id 重复的只留第一条（两次点击会共用一个「正在发」，看着像没反应）；
+     * - label 超长的不截断而是丢掉：截断后的那句话发出去就不是后端给的那个答案了。
+     * 条数不足 2 条时不是「后端给了 1 个选项」，而是这组选项读不成 A/B，按空处理，
+     * 让卡片走「只有一个自写框」那条路 —— 那才是诚实的退路。
+     */
+    private fun parseOptions(task: JSONObject): List<AttentionOption> {
+        if (task.optString("question").isBlank()) return emptyList()
+        val raw = task.optJSONArray("options") ?: return emptyList()
+        val seen = mutableSetOf<String>()
+        val options = mutableListOf<AttentionOption>()
+        for (index in 0 until raw.length()) {
+            val row = raw.optJSONObject(index) ?: continue
+            val id = row.optString("id").trim()
+            val label = row.optString("label").trim()
+            if (id.isEmpty() || label.isEmpty() || label.length > OPTION_LABEL_MAX) continue
+            if (!seen.add(id)) continue
+            options.add(AttentionOption(id, label))
+        }
+        return if (options.size < 2) emptyList() else options
+    }
+
+    /** 契约 §5：label 是一句给人看的话，≤80 字。 */
+    private const val OPTION_LABEL_MAX = 80
+
+    /**
+     * 这张卡此刻问的是哪一组：换了问题或换了选项，签名就跟着变。
+     *
+     * 「已按这个答了」只对得上同一组 —— 否则同一张票换了新题之后，
+     * 上一道题的回执会挂在新问题下面（桌面端 answerSignature 钉的就是这条）。
+     */
+    fun answerSignature(ticket: WorkTicket): String = buildString {
+        append(ticket.question)
+        for (option in ticket.options) append('\u0000').append(option.id).append('\u0000').append(option.label)
+    }
+
+    /** 这张票上这个选项的键：正在发的那一下与结果回来时按它对应上。 */
+    fun answerSlot(ticketId: String, optionId: String): String = "$ticketId|$optionId"
 
     fun parseTimeline(body: String): Conversation {
         val root = JSONObject(body)
@@ -109,6 +194,7 @@ object CrewWire {
                     at = item.optString("at"),
                     requestId = item.optString("request_id"),
                     code = parseCode(item),
+                    ticketRef = ticketRefOf(item),
                 ),
             )
         }
@@ -142,6 +228,8 @@ object CrewWire {
                     open = if (task.has("open")) task.optBoolean("open", true)
                         else task.optString("state") !in setOf("completed", "merged", "closed", "dropped", "stopped"),
                     retryable = task.optBoolean("retryable", false),
+                    question = task.optString("question").trim(),
+                    options = parseOptions(task),
                 ),
             )
         }
@@ -206,7 +294,27 @@ data class WorkTicket(
     val open: Boolean = true,
     /** 后端说可以重试（卡在 failed/blocked，或投递失败）。 */
     val retryable: Boolean = false,
+    /**
+     * 这张票此刻在等的那句话。只有 needs_person = answer 这类「等你回一句」才有；
+     * delivery / review / blocked / failed 这几种「等你」没有问题，那时它是空串，
+     * 卡片只说得清「为什么在等」，不得补一个空问题（契约 §5）。
+     */
+    val question: String = "",
+    /**
+     * 这句话的备选答案，按读的顺序。空表示只有一个自写框 ——
+     * 前端不得自己编 A/B，也不得把 question 拆成选项。
+     */
+    val options: List<AttentionOption> = emptyList(),
 )
+
+/**
+ * 「等你决定」卡上的一个答案。
+ *
+ * id 在这句问题内唯一且稳定（[a-z0-9_-]{1,40}），拿它当「正在发 / 已答过」的键；
+ * label 是一句给人看的话（≤80 字），点下去就把这句原样当回答发回去 —— 选项只是呈现，
+ * 不是审批：回答仍走 §3 的 POST /send，网关不解析选项。
+ */
+data class AttentionOption(val id: String, val label: String)
 
 /** 队伍自己的健康状况。 */
 data class CrewStatus(val runtime: String, val mobile: String, val paused: Boolean) {
@@ -339,6 +447,131 @@ object BotSince {
             }
         }
     }
+}
+
+/**
+ * 「等你决定」卡与代码卡上的文字。
+ *
+ * 全是纯函数，测试直接钉住每一句 —— 这两张卡上最容易出错的地方不是画得丑，
+ * 而是「说了句其实没发生的事」：编一个后端没给的选项、把 A 的工单显示成 B 的结果、
+ * 或者把一次失败写成没反应。
+ */
+object AnswerCopy {
+    /** 后端没给问题时，卡片只能说得清「为什么在等」。这五个词是后台的 stage.action。 */
+    fun waitingWord(action: String): String = when (action) {
+        "delivery" -> "上一轮回话没送到，需要你处理"
+        "review" -> "活干完了，等你过目"
+        "blocked" -> "做不下去，要你松开"
+        "failed" -> "跑失败了，要你处理"
+        // answer 以及将来新加的类别：都落在这一句上，至少说得清在等的是人。
+        else -> "在等你回一句话"
+    }
+
+    /**
+     * 卡片正文：有 question 就读 question，没有才退回 needs_person 的人话。
+     * 与桌面端 pendingCard 同一句（「这张票卡在等你，原因：…」）。
+     */
+    fun body(ticket: WorkTicket): String =
+        ticket.question.ifBlank { "这张票卡在等你，原因：" + waitingWord(ticket.needsPerson) }
+
+    /** 选项左边那个字母：A、B、C…。后端最多给四个，超过 26 只是兜底。 */
+    fun optionMark(index: Int): String = if (index in 0..25) ('A' + index).toString() else "${index + 1}"
+
+    /** 答成功。 */
+    const val ANSWER_DONE = "已按这个答了，队伍下一步会接上"
+
+    /** 答失败。detail 是后端错误体的原文，直译，不粉饰。 */
+    fun answerFailed(detail: String?): String = "没答上：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+}
+
+/**
+ * 代码卡下面那两个按钮的文字与去向。
+ *
+ * 两个按钮都不新开接口（契约 §5）：
+ * - 采用 = 一次表态，走已有的 POST /send 发一句普通消息，点名写这段的那位 Bot；
+ * - 看看改完的样子 = 按这段改动所属工单读 GET /api/mobile/screen?ticket=…。
+ */
+object CodeCopy {
+    /** 没有 path 时，「采用」说的是哪一段。 */
+    private const val THIS_CHANGE = "这段改动"
+
+    /**
+     * 「采用」发出去的那句话：点名写这段的 Bot，带上文件名与增删统计。
+     *
+     * 与桌面端 adoptText 逐字一致 —— 两端发出去的话不一样，Bot 读到的就是两件事：
+     * `@coder（码农） 采用 login.tsx 这段改动，加 8 行、删 4 行，按这个改。`
+     *
+     * 点名用 bot_id：名字可以被改，id 不会；括号里附上人看的名字，两样都有。
+     * 名字与 id 相同时只说一遍（`@coder（coder）` 读起来像写错了）。
+     * 没有增删统计就只说采用了哪段，不编一个「加 0 行」。
+     */
+    fun adoptText(block: CodeBlock, botId: String?, botName: String?): String {
+        val file = block.path.trim().ifEmpty { THIS_CHANGE }
+        val where = buildString {
+            if (!botId.isNullOrBlank()) {
+                append('@').append(botId)
+                val name = botName?.trim().orEmpty()
+                if (name.isNotEmpty() && name != botId) append('（').append(name).append('）')
+                append(' ')
+            }
+        }
+        val summary = changeSummary(block).let { if (it.isEmpty()) "" else "，$it" }
+        return "${where}采用 $file 这段改动$summary，按这个改。"
+    }
+
+    /** 增删行数说成人话；没有统计就什么也不说 —— 不编一个「加 0 行」。 */
+    fun changeSummary(block: CodeBlock): String = when {
+        block.added > 0 && block.removed > 0 -> "加 ${block.added} 行、删 ${block.removed} 行"
+        block.added > 0 -> "加 ${block.added} 行"
+        block.removed > 0 -> "删 ${block.removed} 行"
+        else -> ""
+    }
+
+    const val ADOPT = "采用"
+    const val ADOPTING = "采用中…"
+    const val ADOPTED = "✓ 已采用"
+    const val ADOPT_DONE = "已请它采用这段改动，下一步会按这个改"
+
+    /** 采用失败。和「看看改完的样子」失败分开说，不混成一句。 */
+    fun adoptFailed(detail: String?): String = "没采用成：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+
+    const val PREVIEW = "看看改完的样子"
+
+    /**
+     * 这段改动没带工单号。**绝不拿别的票顶替**（契约 §5）：宁可说看不了，
+     * 也不把 A 的活显示成 B 的结果。与桌面端 preview 那句一致。
+     */
+    const val NO_TICKET = "这段改动没带工单号，看不到它改完的样子；让它再报一次就能看了"
+
+    /** 有票号、读回来了，但这一轮没有可显示的活动。 */
+    const val NO_ACTIVITY = "这张工单暂时没有可显示的活动"
+
+    /** 读屏那条路本身失败了。 */
+    fun previewFailed(detail: String?): String = "读不到「改完的样子」：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+
+    /**
+     * 「看看改完的样子」拿到回答之后，卡片下面该写的那句话。
+     *
+     * 返回 null 表示真的读到了画面 —— 那时由调用方把快照画出来，不写这一行。
+     * 三种「没有」要分开：链路失败、后端给了理由、后端什么都没给。
+     */
+    fun previewNote(view: ScreenView?): String? = when {
+        view == null -> previewFailed(null)
+        view.live && view.lines.isNotEmpty() -> null
+        view.reason.isNotBlank() -> view.reason
+        else -> NO_ACTIVITY
+    }
+}
+
+/**
+ * 消息里带的代码片段要不要配那两个按钮。
+ *
+ * 契约 §5：代码块缺失或为空（path 与 lines 都没有）时不画代码卡，也不画这两个按钮 ——
+ * 没有改动就没有「采用」。按钮是这张卡的一部分，不为它单独下发状态或开关。
+ */
+object CodeCardRules {
+    fun showsButtons(block: CodeBlock?): Boolean =
+        block != null && (block.path.isNotBlank() || block.lines.isNotEmpty())
 }
 
 /** 工作区页里那两个动作。名字就是画板上的字，界面和文案都从这一处取。 */

@@ -1805,3 +1805,29 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
 })
+
+// 桥接开的 worker 会话是机器记账，不是人开的对话。工单结束就归档，DSH 的会话列表里
+// 只留主人自己开的会话；记录不删，「看它的屏幕」和手机时间线仍然直接读它。
+it('archives a finished worker Session so the DSH chat list holds only the person\'s own sessions', async () => {
+  const archived: string[] = []
+  ;(services.workspaceRegistry as Record<string, unknown>).archiveSession = vi.fn(async (id: string) => { archived.push(id) })
+  const { ticket, sessionId } = await acceptedTicket()
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done' })
+  await vi.waitFor(() => expect(archived).toContain(sessionId))
+})
+
+// setup 失败会自己再试：代理掉线、CLI 刚重新登录这类原因会自愈，
+// 不该让队伍一直停着等人手动重启。
+it('retries a pending setup on its own instead of staying paused until a manual restart', async () => {
+  // 这一轮读不到账号（等价于代理挂了或 token 刚轮换）。
+  answers[`${AGENT()} api user`] = new Error('connect ECONNREFUSED 127.0.0.1:7897')
+  const next = await restart({}, { github: { cli: AGENT() } })
+  await next.ready
+  expect(next.configured()).toBe(false)
+  expect(next.setupProblem).toMatchObject({ place: 'github' })
+  // 环境恢复：下一次自动重试（5 秒后）应当把队伍带起来，不需要重启。
+  answers[`${AGENT()} api user`] = '{"login":"agent-bot","id":7}'
+  await vi.waitFor(() => expect(next.configured()).toBe(true), { timeout: 20_000, interval: 250 })
+  expect(next.health.runtime).toMatchObject({ state: 'ready' })
+  await next.stop()
+}, 30_000)

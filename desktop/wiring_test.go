@@ -24,4 +24,7 @@ func TestTheChannelsAreWired(t *testing.T) {
 	if s.steps == nil {
 		t.Fatal("steps 是 nil：工单经过永远显示不出来")
 	}
+	if s.withdrawn == nil {
+		t.Fatal("withdrawn 是 nil：撤回的结果永远送不到界面")
+	}
 }

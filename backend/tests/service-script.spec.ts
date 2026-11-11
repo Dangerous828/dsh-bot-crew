@@ -6,7 +6,9 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+
+vi.setConfig({ testTimeout: 30_000 })
 
 let root: string
 let server: Server | undefined
@@ -27,6 +29,9 @@ const started = (...lines: string[]) => writeFileSync(join(root, 'ps-started.txt
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'service script '))
   mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'))
+  // 隔离的 HOME：中转配置只出现在这个临时目录里，开发机上真实的那份不影响测试。
+  mkdirSync(join(root, 'home', '.config', 'crew-desktop'), { recursive: true })
+  writeFileSync(join(root, 'home', '.config', 'crew-desktop', 'relay.env'), 'CREW_RELAY_URLS=wss://relay.test/tunnel\n')
   copyFileSync(join(import.meta.dirname, '..', 'scripts', 'dsh-superagent'), join(root, 'scripts', 'dsh-superagent'))
   processes()
   program('ps', `list='${root}/ps.txt'; [ -f '${root}/launched' ] && [ -f '${root}/ps-started.txt' ] && list='${root}/ps-started.txt'
@@ -49,7 +54,7 @@ afterEach(() => {
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
-    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
+    { env: { ...process.env, HOME: join(root, 'home'), PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
@@ -70,7 +75,7 @@ it('refuses to stop when two processes serve the profile, before it writes the s
   processes(service(sleeper()), `${sleeper()} node node /opt/dsh --profile=superagent`)
   expect(await run('stop')).toMatchObject({ code: 1, stderr: expect.stringContaining('Multiple dsh-superagent processes found') })
   expect(existsSync(join(control('superagent'), 'manually-stopped'))).toBe(false)
-})
+}, 20_000)
 it('keeps a stop per profile', async () => {
   expect(await run('stop', '--profile', 'one')).toMatchObject({ code: 0, stdout: expect.stringContaining('Automatic recovery is paused') })
   expect(await status('one')).toMatchObject({ manually_stopped: true })
@@ -97,7 +102,10 @@ it('records the service PID at start, and still refuses a second instance the sc
   const checkout = realpathSync(root)
   expect(tmux).toEqual(expect.arrayContaining(['-P', '-F', '#{pane_pid}', '-c', checkout]))
   const log = new RegExp(`>> '${checkout}/\\.artifacts/dsh-superagent-superagent-\\d{8}-\\d{6}-\\d+\\.log' 2>&1$`)
-  expect(tmux.find(word => word.startsWith('umask 077; exec '))).toMatch(log)
+  const command = tmux.find(word => word.includes('umask 077; exec '))
+  expect(command).toMatch(log)
+  // 中转配置在启动前载入；它带着密钥，放在仓库外，命令里只有路径。
+  expect(command).toMatch(new RegExp(`set -a; \\. '${join(root, 'home')}/\\.config/crew-desktop/relay\\.env'; set \\+a; umask 077; exec `))
   const second = sleeper()
   started(service(pid), `${second} node node /opt/dsh --profile superagent`)
   const again = await run('start', '--url', url, '--timeout', '10')

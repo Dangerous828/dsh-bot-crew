@@ -2,7 +2,9 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { repliedTo } from '../src/app/links.ts'
+import { handoffEndNotice } from '../src/app/notices.ts'
 import { inputMessage } from '../src/executor/dsh.ts'
+import type { Ticket, Trigger } from '../src/core/index.ts'
 
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })
@@ -300,4 +302,20 @@ it('tells a worker it may hand back a message beyond its ticket or for another o
   const { sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   expect((h.tools.get(sessionId)!.get('orchestrator_trigger_handback') as unknown as { description: string }).description)
     .toContain('beyond this ticket or for another one')
+})
+
+// handoff 的回执要落在「人发消息的那条会话」；普通工单不该多出这一条。
+// 少了「是不是 handoff」这个判断，ticket id 会被当成消息地址，手机上就多一条对不上号的回复。
+it('answers a handoff where the person asked, and says nothing for an ordinary ticket', () => {
+  const ticket = { id: 't1', assignments: [{ report: { state: 'ready', summary: '改好了' } }] } as unknown as Ticket
+  const origin = (meta: Record<string, unknown>): Trigger => ({
+    id: 'tr1', source: 'team', threads: [{ source: 'team', id: 'team:main:1' }],
+    actor: { source: 'team', id: 'owner' }, human: true, at: '', text: '',
+    channel: { source: 'team', thread: 'team:main:1', address: { conversation: 'main', message: '1', bot_id: 'lead' } },
+    meta: { conversation: 'main', messageId: '1', bot_id: 'lead', ...meta },
+  } as unknown as Trigger)
+  expect(handoffEndNotice(ticket, origin({}))).toBeUndefined()
+  expect(handoffEndNotice(ticket, origin({ handoff_of: 'r1', handoff_for: '1' }))).toMatchObject({
+    kind: 'reply', text: '改好了', channel: { thread: 'team:main:1', address: { conversation: 'main', message: '1' } },
+  })
 })

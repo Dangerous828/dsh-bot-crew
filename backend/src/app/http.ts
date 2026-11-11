@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { recordsExport } from './views/records.ts'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
@@ -17,7 +18,7 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
-import type { Store } from './store.ts'
+import { SCHEMA_VERSION, type Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
@@ -169,6 +170,9 @@ function routes(runtime: HttpHost): Routes {
       return { code: issuePairingCode(devicesOf(runtime), deviceId), deviceId }
     },
     'GET remote/devices': () => ({ devices: devicesOf(runtime).list().map(({ digest: _digest, ...rest }) => rest) }),
+    // 备份：配置、花名册、政策、每张工单的最终状态。会话原文在 ~/.dsh/sessions，
+    // 那份单独拷；这里不收凭据，导出文件可能被放到别处。
+    'GET records/export': () => recordsExport(store, runtime.machine.stateDir, SCHEMA_VERSION),
     'DELETE remote/devices': async ({ body }) => {
       const input = await body(4 * 1024) as { deviceId?: unknown; all?: unknown }
       if (input?.all === true) { devicesOf(runtime).revokeAll(); return { ok: true } }

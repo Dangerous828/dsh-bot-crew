@@ -127,3 +127,27 @@ it('hands the pairing routes their body, parsed or raw', async () => {
   expect(missing.status).toBe(400)
   expect(missing.body.error).toBe('deviceId is required')
 })
+
+// 导出：给的是「重建这份记录需要什么」，凭据一概不在里面。
+it('exports records with the configuration and tickets but without credentials', async () => {
+  const call = serve({
+    machine: { stateDir: '/tmp/export-test' },
+    store: {
+      settings: () => ({ paused: false, sources: { team: { enabled: true, config: {
+        bots: [{ bot_id: 'coder', name: '码农', role: 'default', memory_namespace: 'bot/coder' }], default_bot_id: 'coder' } } },
+      policy: { rules: [] }, eval: {}, executor: { botModels: {} } }),
+      tickets: { list: () => [] },
+    },
+  })
+  const { status, body } = await call('GET', 'records/export')
+  expect(status).toBe(200)
+  expect(body.kind).toBe('dsh-bot-crew-records')
+  expect(body).toHaveProperty('settings')
+  expect(body).toHaveProperty('team')
+  expect(Array.isArray(body.tickets)).toBe(true)
+  // 凭据不属于导出：文件可能被放到别处。
+  const text = JSON.stringify(body)
+  expect(text).not.toContain('digest')
+  expect(text).not.toContain('token')
+  expect(text).not.toContain('credential')
+})

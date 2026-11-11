@@ -21,14 +21,17 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
   expect(registered).toMatchObject([
     { path: '/api/mobile/timeline', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/send', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/withdraw', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/work', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/agents', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/efforts', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered' },
   ])
@@ -47,6 +50,36 @@ it('injects only the server credential and refuses malformed sends before enqueu
     body: JSON.stringify({ text: 'hello', request_id: 'phone-1', mentions: [] }), headers: { 'X-GW-Token': 'server-only-test-token', 'Content-Type': 'application/json' },
   }))
 })
+
+it('withdraws by request id, validating it before the gateway sees it', async () => {
+  const upstream = vi.fn(async () => Response.json({ ok: true, id: 7, request_id: 'phone-1' }))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  for (const value of [undefined, {}, { request_id: 42 }, { request_id: '' }, { request_id: 'x'.repeat(129) }]) {
+    const result = await handler(new Request('http://dsh/api/mobile/withdraw', { method: 'POST', body: JSON.stringify(value) }))
+    expect(result.status).toBe(400)
+  }
+  expect(upstream).not.toHaveBeenCalled()
+  const result = await handler(new Request('http://dsh/api/mobile/withdraw', { method: 'POST',
+    body: JSON.stringify({ request_id: 'phone-1', text: 'ignored' }) }))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toEqual({ ok: true, id: 7, request_id: 'phone-1' })
+  // 只把 request_id 转给网关；客户端多给的字段不越过这条边界。
+  expect(upstream).toHaveBeenCalledWith('http://127.0.0.1:8788/withdraw', expect.objectContaining({
+    method: 'POST', body: JSON.stringify({ request_id: 'phone-1' }),
+  }))
+})
+
+it('keeps the gateway refusal when a withdrawal is too late, and repeats it as 409', async () => {
+  const upstream = vi.fn(async () => Response.json({ error: 'message was already picked up' }, { status: 409 }))
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await handler(new Request('http://dsh/api/mobile/withdraw', { method: 'POST', body: '{"request_id":"phone-1"}' }))
+    // 重复撤回与「已回复/已读走」都是同一类冲突：状态码和网关文案原样交给客户端。
+    expect(result.status).toBe(409)
+    expect(await result.json()).toEqual({ error: 'message was already picked up' })
+  }
+})
+
 it('shows actual runtime state and reports transport failures without secrets', async () => {
   const upstream = vi.fn(async () => Response.json({ items: [{ id: 'm1', text: 'hello' }] }))
   const handler = phoneHandler(host(), undefined, upstream as typeof fetch)
@@ -57,6 +90,17 @@ it('shows actual runtime state and reports transport failures without secrets', 
   const failed = await handler(new Request('http://dsh/api/mobile/timeline'))
   expect(failed.status).toBe(502)
   expect(await failed.text()).not.toContain('private')
+})
+
+it('takes the phone channel state from the Source that actually carries it', async () => {
+  // 队伍里手机消息走 team 源；mobile 源是独立部署才装的。别再对不存在的源兜底报「启动中」。
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  const withTeam = { ...host(), health: { runtime: { state: 'ready' }, team: { state: 'ready', detail: '' } } } as unknown as HttpHost
+  const team = await phoneHandler(withTeam, undefined, upstream as typeof fetch)(new Request('http://dsh/api/mobile/timeline'))
+  expect((await team.json() as { status: { mobile: string } }).status.mobile).toBe('ready')
+  const neither = { ...host(), health: { runtime: { state: 'ready' } } } as unknown as HttpHost
+  const missing = await phoneHandler(neither, undefined, upstream as typeof fetch)(new Request('http://dsh/api/mobile/timeline'))
+  expect((await missing.json() as { status: { mobile: string } }).status.mobile).toBe('missing')
 })
 
 // 消息面的每一条都在 Connection 的 Fetch 上注册，鉴权由 Connection 在调用处理器之前完成。
@@ -75,7 +119,7 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(12)
+  expect(registered.length).toBe(15)
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -156,7 +200,7 @@ it('names the messages the crew read and left, so the phone can tell it apart fr
 // 工作区三个控件与花名册。假宿主只给这一条会用到的那部分能力：真 Runtime 上它们都在，
 // 但测试不必为了一个 stopTicket 把整个引擎搭起来。
 function controlHost(options: { tickets?: Record<string, unknown>; engine?: unknown; settingsControl?: unknown
-  storeSettings?: () => unknown; saveSettings?: (value: unknown) => void } = {}) {
+  storeSettings?: () => unknown; saveSettings?: (value: unknown) => void; screen?: unknown; efforts?: unknown; steer?: unknown } = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(stateDir)
   writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
   const runtime = {
@@ -169,6 +213,9 @@ function controlHost(options: { tickets?: Record<string, unknown>; engine?: unkn
   } as Record<string, unknown>
   if (options.engine) runtime.engine = options.engine
   if (options.settingsControl) runtime.settings = options.settingsControl
+  if (options.screen) runtime.screen = options.screen
+  if (options.efforts) runtime.efforts = options.efforts
+  if (options.steer) runtime.steer = options.steer
   return runtime as unknown as HttpHost
 }
 
@@ -176,7 +223,123 @@ it('says the screen source is missing instead of pretending there is one', async
   const handler = phoneHandler(controlHost(), undefined, vi.fn() as unknown as typeof fetch)
   const result = await handler(new Request('http://dsh/api/mobile/screen?ticket=t1'))
   expect(result.status).toBe(200)
-  expect(await result.json()).toEqual({ state: 'unavailable', reason: '后端还没有画面源，worker 不跑浏览器' })
+  expect(await result.json()).toEqual({ state: 'unavailable', reason: '后端还没有接入画面源' })
+})
+
+it('shows what the worker actually did when the host can read its session', async () => {
+  const snapshot = { state: 'live', kind: 'terminal', ticket_id: 't1', lines: [{ at: '2026-11-10T04:00:00.000Z', kind: 'command', text: '$ pnpm test' }] }
+  const screen = vi.fn(async () => snapshot)
+  const handler = phoneHandler(controlHost({ screen }), undefined, vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/screen?ticket=t1'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toEqual(snapshot)
+  expect(screen).toHaveBeenCalledWith('t1')
+})
+
+it('does not turn an unreadable session into a fake live screen', async () => {
+  const handler = phoneHandler(controlHost({ screen: async () => { throw new Error('gone') } }), undefined,
+    vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/screen?ticket=t1'))
+  expect(await result.json()).toMatchObject({ state: 'unavailable', ticket_id: 't1' })
+})
+
+it('reports the reasoning efforts a model route supports, and refuses to guess them', async () => {
+  const efforts = vi.fn(async () => ({ efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], default: 'low' }))
+  const handler = phoneHandler(controlHost({ efforts }), undefined, vi.fn() as unknown as typeof fetch)
+  const ok = await handler(new Request('http://dsh/api/mobile/efforts?provider=p&model=m'))
+  expect(ok.status).toBe(200)
+  expect(await ok.json()).toEqual({ efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], default: 'low' })
+  expect(efforts).toHaveBeenCalledWith('p', 'm')
+  // 缺 provider/model 时不去问宿主：这是调用方给错了，不是路由坏了。
+  expect((await handler(new Request('http://dsh/api/mobile/efforts?provider=p'))).status).toBe(400)
+  // 宿主没有这项能力时明确说 503，而不是回一个空列表让人以为「没有档位」。
+  const plain = phoneHandler(controlHost(), undefined, vi.fn() as unknown as typeof fetch)
+  expect((await plain(new Request('http://dsh/api/mobile/efforts?provider=p&model=m'))).status).toBe(503)
+})
+
+it('assigns a model to one member and rejects an unknown one', async () => {
+  let saved: { executor?: { botModels?: Record<string, unknown>; model?: unknown } } | undefined
+  const storeSettings = () => ({ paused: false, sources: { team: { config: { bots: [{ bot_id: 'scribbler', name: '写手' }] } } },
+    executor: { model: { provider: 'magpie', model: 'base' }, botModels: {}, maxWorkers: 3, directory: '', prepare: '', blockedCommands: [] } })
+  const runtimeHost = { ...host(), store: { settings: storeSettings, blockRevision: () => 0,
+    tickets: { list: () => [], get: () => undefined } },
+    settings: { save: async (_block: string, value: unknown) => { saved = { executor: value as { botModels?: Record<string, unknown>; model?: unknown } } } } } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+
+  const ok = await handler(new Request('http://dsh/api/mobile/model', { method: 'POST',
+    body: JSON.stringify({ provider: 'magpie', model: 'member-model', bot_id: 'scribbler' }) }))
+  expect(ok.status).toBe(200)
+  expect(await ok.json()).toMatchObject({ ok: true, bot_id: 'scribbler', model: { provider: 'magpie', model: 'member-model' } })
+  expect((saved?.executor?.botModels as Record<string, unknown> | undefined)?.scribbler)
+    .toMatchObject({ provider: 'magpie', model: 'member-model' })
+  // 全场默认没有被动到。
+  expect(saved?.executor?.model).toMatchObject({ provider: 'magpie', model: 'base' })
+  // 拼错/不存在的成员不能悄悄写进一份没人会用的配置。
+  const bad = await handler(new Request('http://dsh/api/mobile/model', { method: 'POST',
+    body: JSON.stringify({ provider: 'magpie', model: 'x', bot_id: 'ghost' }) }))
+  expect(bad.status).toBe(400)
+})
+
+it('lets a member fall back to the crew default by clearing its own model', async () => {
+  let saved: { botModels?: Record<string, unknown> } | undefined
+  const storeSettings = () => ({ paused: false, sources: { team: { config: { bots: [{ bot_id: 'scribbler', name: '写手' }] } } },
+    executor: { model: { provider: 'magpie', model: 'base' }, botModels: { scribbler: { provider: 'magpie', model: 'own' } },
+      maxWorkers: 3, directory: '', prepare: '', blockedCommands: [] } })
+  const runtimeHost = { ...host(), store: { settings: storeSettings, blockRevision: () => 0,
+    tickets: { list: () => [], get: () => undefined } },
+    settings: { save: async (_block: string, value: unknown) => { saved = value as { botModels?: Record<string, unknown> } } } } as unknown as HttpHost
+  const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)
+
+  const cleared = await handler(new Request('http://dsh/api/mobile/model', { method: 'POST',
+    body: JSON.stringify({ provider: '', model: '', bot_id: 'scribbler' }) }))
+  expect(cleared.status).toBe(200)
+  expect(saved?.botModels?.scribbler).toBeUndefined()
+  // 全场默认还在，没人被清掉。
+  expect((saved as { model?: unknown }).model).toMatchObject({ provider: 'magpie', model: 'base' })
+})
+
+it('steers a queued message into the running worker instead of waiting its turn', async () => {
+  const steer = vi.fn(async () => true)
+  const gateway = vi.fn(async (input: string | URL | Request) => {
+    if (String(input).endsWith('/claim')) return Response.json({ ok: true, id: 3, request_id: 'r1', text: '先看这一条' })
+    return Response.json({})
+  })
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1', open: true } }, steer }), 'http://gw',
+    gateway as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST',
+    body: JSON.stringify({ ticket: 't1', request_id: 'r1' }) }))
+  expect(result.status).toBe(200)
+  expect(steer).toHaveBeenCalledWith('t1', 'r1', '先看这一条')
+  // 没有票号或请求号都不去动队列。
+  expect((await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST', body: '{"request_id":"r1"}' }))).status).toBe(400)
+  // 队伍已经读走/回复过：网关的 409 原样交回去，不装作插成功。
+  const late = phoneHandler(controlHost({ tickets: { t1: { id: 't1', open: true } }, steer }), 'http://gw',
+    (async () => Response.json({ error: 'message was already picked up' }, { status: 409 })) as unknown as typeof fetch)
+  const refused = await late(new Request('http://dsh/api/mobile/steer', { method: 'POST',
+    body: JSON.stringify({ ticket: 't1', request_id: 'r2' }) }))
+  expect(refused.status).toBe(409)
+  expect(await refused.json()).toEqual({ error: 'message was already picked up' })
+})
+
+it('sends a fresh message straight into the running worker without queueing it', async () => {
+  const steer = vi.fn(async () => true)
+  let sentBody: unknown
+  const gateway = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith('/send')) {
+      sentBody = JSON.parse(String(init?.body))
+      return Response.json({ ok: true, id: 9, request_id: 's1' })
+    }
+    return Response.json({})
+  })
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1', open: true } }, steer }), 'http://gw',
+    gateway as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST',
+    body: JSON.stringify({ ticket: 't1', request_id: 's1', text: '先看这一条' }) }))
+  expect(result.status).toBe(200)
+  expect(steer).toHaveBeenCalledWith('t1', 's1', '先看这一条')
+  // 走 /send 并带 steer 标记：网关会把它插成已读，路由不会再接一遍。
+  expect(String(gateway.mock.calls[0]![0])).toBe('http://gw/send')
+  expect(sentBody).toMatchObject({ text: '先看这一条', steer: true })
 })
 
 it('takes over exactly the ticket it names, and refuses an unknown one', async () => {
@@ -189,7 +352,7 @@ it('takes over exactly the ticket it names, and refuses an unknown one', async (
   expect(engine.stopTicket).toHaveBeenCalledWith('t1')
   const missing = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST', body: '{"ticket":"t9"}' }))
   expect(missing.status).toBe(404)
-  expect(await missing.json()).toEqual({ error: 'No such ticket' })
+  expect(await missing.json()).toEqual({ error: '找不到这张工单' })
   expect(engine.stopTicket).toHaveBeenCalledTimes(1)
 })
 
@@ -229,11 +392,11 @@ it('reads the crew roster and adds a bot under the same rules the directory enfo
   const duplicate = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
     body: JSON.stringify({ bot_id: 'scribe', name: '另一个' }) }))
   expect(duplicate.status).toBe(400)
-  expect(await duplicate.json()).toEqual({ error: 'Bot already exists' })
+  expect(await duplicate.json()).toEqual({ error: '这个 id 已经有人用了，换一个' })
   const bad = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
     body: JSON.stringify({ bot_id: 'Bad Id', name: 'x' }) }))
   expect(bad.status).toBe(400)
-  expect(await bad.json()).toEqual({ error: 'Invalid bot id' })
+  expect(await bad.json()).toEqual({ error: 'id 只能用英文小写字母、数字、下划线或短横线' })
   expect(saved).toHaveLength(1)
 })
 
@@ -274,4 +437,75 @@ it('makes the first bot the default one, since a directory without a default can
   expect(added.status).toBe(200)
   expect(saved[0]).toMatchObject({ sources: { team: { config: {
     bots: [{ bot_id: 'lead', name: '大哥', role: 'default', memory_namespace: 'bot/lead' }], default_bot_id: 'lead' } } } })
+})
+
+// 人设要能改：bots 只有「加」没有「改」，手机上加错一个字就只能重建一位。
+it('edits a bot\'s name and persona without changing the id its memory hangs on', async () => {
+  const saved: unknown[] = []
+  const handler = phoneHandler(controlHost({
+    storeSettings: () => ({ paused: false, sources: { team: { enabled: true, config: {
+      bots: [{ bot_id: 'coder_1', name: '码农', role: 'default', persona: '写代码', memory_namespace: 'bot/coder_1' }],
+      default_bot_id: 'coder_1' } } } }),
+    saveSettings: value => { saved.push(value) },
+  }), undefined, vi.fn() as unknown as typeof fetch)
+  const edited = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ action: 'edit', bot_id: 'coder_1', name: '码农甲', persona: '写 Rust' }) }))
+  expect(edited.status).toBe(200)
+  expect(saved[0]).toMatchObject({ sources: { team: { config: { bots: [
+    { bot_id: 'coder_1', name: '码农甲', persona: '写 Rust', role: 'default', memory_namespace: 'bot/coder_1' }],
+  default_bot_id: 'coder_1' } } } })
+  // 清空人设是合法的：不是每个人都得有一个人设。
+  const cleared = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ action: 'edit', bot_id: 'coder_1', name: '码农甲', persona: '  ' }) }))
+  expect(cleared.status).toBe(200)
+  expect((saved[1] as { sources: { team: { config: { bots: { persona?: string }[] } } } }).sources.team.config.bots[0])
+    .toMatchObject({ persona: '' })
+  const missing = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ action: 'edit', bot_id: 'nobody', name: 'x' }) }))
+  expect(missing.status).toBe(404)
+})
+
+// 撤一位要走人：撤掉的若是 default，剩下的第一位顶上，目录始终恰好一个 default。
+it('removes a bot, promoting the next one when the removed bot was the default', async () => {
+  const saved: unknown[] = []
+  const handler = phoneHandler(controlHost({
+    storeSettings: () => ({ paused: false, sources: { team: { enabled: true, config: {
+      bots: [{ bot_id: 'lead', name: '大哥', role: 'default', memory_namespace: 'bot/lead' },
+        { bot_id: 'coder', name: '码农', role: 'member', memory_namespace: 'bot/coder' }],
+      default_bot_id: 'lead' } } } }),
+    saveSettings: value => { saved.push(value) },
+  }), undefined, vi.fn() as unknown as typeof fetch)
+  const removed = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ action: 'remove', bot_id: 'lead' }) }))
+  expect(removed.status).toBe(200)
+  expect(saved[0]).toMatchObject({ sources: { team: { config: { bots: [
+    { bot_id: 'coder', name: '码农', role: 'default' }], default_bot_id: 'coder' } } } })
+  const unknown = await handler(new Request('http://dsh/api/mobile/bots', { method: 'POST',
+    body: JSON.stringify({ action: 'remove', bot_id: 'nobody' }) }))
+  expect(unknown.status).toBe(404)
+})
+
+// 手机上显示的每一句错误都该是人话：英文原文（"No such ticket"）让人不知道该改什么。
+it('answers a refusal in words the phone can show, keeping the status code', async () => {
+  const handler = phoneHandler(controlHost(), undefined, vi.fn() as unknown as typeof fetch)
+  const unknown = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST', body: '{"ticket":"nope"}' }))
+  expect(unknown.status).toBe(404)
+  expect(await unknown.json()).toEqual({ error: '找不到这张工单' })
+  // 没有对照条目的错误原样交回：不吞后端的原因，也不编一句更好听的。
+  const badId = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST', body: '{"ticket":""}' }))
+  expect(badId.status).toBe(400)
+  expect((await badId.json() as { error: string }).error).toBe('ticket is required')
+})
+
+// 导出是给人留退路的：里面要有配置与工单，但绝不能有凭据。
+it('exports the records a person would need to rebuild the crew, and no secrets', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-api-')); directories.push(stateDir)
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  const handler = phoneHandler({ ready: Promise.resolve(), machine: { stateDir }, health: {},
+    store: { settings: () => ({ paused: false, sources: { team: { enabled: true, config: {
+      bots: [{ bot_id: 'coder', name: '码农', role: 'default', memory_namespace: 'bot/coder' }], default_bot_id: 'coder' } } } }),
+      tickets: { list: () => [] } } } as unknown as HttpHost, undefined, vi.fn() as unknown as typeof fetch)
+  // 导出走管理面（需要同源），消息面不该暴露它。
+  const viaPhone = await handler(new Request('http://dsh/api/mobile/records/export'))
+  expect(viaPhone.status).toBe(404)
 })

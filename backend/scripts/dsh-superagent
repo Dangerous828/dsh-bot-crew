@@ -375,7 +375,11 @@ def start(args):
             # The emulator reaches this machine's loopback as 10.0.2.2 and sends that name, so the fence has to
             # know it too; without it every request from the emulator is refused after the connection succeeds.
             fences += ['--trusted-host', f'10.0.2.2:{port}']
-        command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open',
+        # 中转的地址与密钥放在仓库外（`relay.env`，600）；启动前载入，隧道才知道往哪连。
+        # 文件不存在就什么都不做：不是每台机器都需要出门。
+        relay_env = Path.home() / '.config' / 'crew-desktop' / 'relay.env'
+        load_relay = ('set -a; . ' + shlex.quote(str(relay_env)) + '; set +a; ') if relay_env.is_file() else ''
+        command = (load_relay + 'umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open',
                  *([ '--trusted-host', lan ] if lan else []), *fences,
                  '--trusted-host', 'muse.kentonnie.top'])
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')

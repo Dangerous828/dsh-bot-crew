@@ -33,15 +33,18 @@
   限流按来源地址计数；这条链路是 Cloudflare → Caddy → relay，所以 relay 优先读
   `CF-Connecting-IP`（Caddy 会原样转过去）。如果换掉 Cloudflare，要确认反代把真实客户端地址
   追加到 `X-Forwarded-For` 的最右段，否则所有手机在中转眼里会是同一个来源。
-- **宿主（Mac）**：Electron 由 Finder 启动，不读 shell 环境，所以走 `launchctl setenv`：
+- **宿主（Mac）**：配置放在仓库外的 `~/.config/crew-desktop/relay.env`（600），键名与 `relay/.env` 一致：
 
   ```sh
-  launchctl setenv CREW_RELAY_URLS "wss://jarvis.kentonnie.top/crew-relay/tunnel"
-  launchctl setenv CREW_RELAY_SECRET "<.env 里的 CREW_RELAY_SECRET>"
-  launchctl setenv CREW_RELAY_INSTANCE "kenton-mac"
+  CREW_RELAY_URLS=wss://jarvis.kentonnie.top/crew-relay/tunnel
+  CREW_RELAY_SECRET=<relay/.env 里的 CREW_RELAY_SECRET>
+  CREW_RELAY_INSTANCE=kenton-mac
   ```
 
-  然后重启 Electron。密钥与 `relay/.env` 必须一致。
+  `backend/scripts/dsh-superagent start|restart` 会在启动 DSH 前载入这份文件，所以跑
+  `./scripts/dsh-superagent restart --profile superagent` 即可连上中转。文件不存在时什么都不做。
+  只有用 Electron/Finder 启动、不经过这个脚本时，才需要改走 `launchctl setenv` 再重启 Electron；
+  两种方式的环境变量名相同，密钥必须与 `relay/.env` 一致。
 - **验收（已实测）**：`/health?detail=1` 返回 `tunnels:1`、`instances:[{instanceId:"kenton-mac"}]`；
   `GET https://jarvis.kentonnie.top/crew-relay/i/kenton-mac/api/mobile/timeline` 带设备凭据返回 200。
 

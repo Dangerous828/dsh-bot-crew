@@ -142,11 +142,15 @@ export function handoffEndNotice(ticket: Ticket, origin: Trigger | undefined): O
   // request came in on. Answer there, or the work finishes somewhere they never look.
   const conversation = origin?.meta?.conversation
   if (typeof conversation !== 'string') return undefined
+  // 只有 handoff 开的票才有这一条。普通票的回话由 Replies 走原消息地址；
+  // 在这里再发一条会把 ticket id 当成消息地址，手机上就多出一条对不上号的回复。
+  const handoffOf = origin?.meta?.handoff_of
+  if (typeof handoffOf !== 'string') return undefined
   const source = origin?.channel?.source
   if (source === undefined) return undefined
   const summary = latestReport(ticket)?.summary?.trim()
   if (!summary) return undefined
-  const message = String(origin?.meta?.handoff_for ?? origin?.meta?.handoff_of ?? ticket.id)
+  const message = String(origin?.meta?.handoff_for ?? handoffOf)
   const channel = { source, thread: `${source}:${String(conversation)}:${message}`,
     address: { conversation, message, bot_id: String(origin?.meta?.bot_id ?? '') } }
   return { id: key('handoff-end', ticket.id), channel: channel as OutboundMessage['channel'], text: summary,

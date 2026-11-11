@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,12 +37,12 @@ type CodeLine struct {
 // Message 是对话里的一条。Role 只有两种：人说的，和队伍里某个 Bot 说的。
 // Extra 兜住这个版本还不认识的字段：后台加了新字段，旧客户端也要原样带回去。
 type Message struct {
-	ID        string `json:"id"`
-	Role      string `json:"role"`
-	BotID     string `json:"bot_id,omitempty"`
-	Text      string `json:"text"`
-	At        string `json:"at"`
-	RequestID string `json:"request_id,omitempty"`
+	ID        string                     `json:"id"`
+	Role      string                     `json:"role"`
+	BotID     string                     `json:"bot_id,omitempty"`
+	Text      string                     `json:"text"`
+	At        string                     `json:"at"`
+	RequestID string                     `json:"request_id,omitempty"`
 	Extra     map[string]json.RawMessage `json:"-"`
 }
 
@@ -162,7 +163,7 @@ type Task struct {
 	// Open 是「还没结束」。页签与徽标按它判，不要解释 State 的词表（终态有五种）。
 	Open bool `json:"open"`
 	// Retryable 是后端说这张票还能再跑一次（卡在 failed/blocked，或投递失败）。
-	Retryable bool `json:"retryable"`
+	Retryable bool   `json:"retryable"`
 	BotID     string `json:"bot_id,omitempty"`
 	// NeedsPerson names what the ticket is waiting for, when it is waiting on a person.
 	NeedsPerson string `json:"needs_person,omitempty"`
@@ -196,18 +197,33 @@ func (c *Client) Agents(ctx context.Context, ticketID string) ([]AgentNode, erro
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("agents: %s", response.Status)
 	}
-	var payload struct{ Agents []AgentNode `json:"agents"` }
+	var payload struct {
+		Agents []AgentNode `json:"agents"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
 	return payload.Agents, nil
 }
 
+// ScreenLine is one line of what a worker did: a command, its output, something it said, or a status change.
+type ScreenLine struct {
+	At   string `json:"at"`
+	Kind string `json:"kind"` // command | output | said | status
+	Text string `json:"text"`
+}
+
 // ScreenView is what the backend says about a ticket's screen right now.
-// Today it answers `unavailable` with the reason it is honest about.
+// `live` carries the activity snapshot; `unavailable` carries the reason it is honest about.
 type ScreenView struct {
-	State  string `json:"state"`
-	Reason string `json:"reason"`
+	State    string       `json:"state"`
+	Kind     string       `json:"kind"`
+	TicketID string       `json:"ticket_id"`
+	Live     bool         `json:"live"`
+	At       string       `json:"at"`
+	Cwd      string       `json:"cwd"`
+	Reason   string       `json:"reason"`
+	Lines    []ScreenLine `json:"lines"`
 }
 
 // Screen asks for a ticket's screen; the backend either shows one or says why it cannot.
@@ -221,6 +237,12 @@ func (c *Client) Screen(ctx context.Context, ticketID string) (*ScreenView, erro
 		return nil, err
 	}
 	return &view, nil
+}
+
+// Pause stops the executor from taking new work. It is the only pause the phone surface has,
+// so the caller must say "全局" when reporting it back.
+func (c *Client) Pause(ctx context.Context) error {
+	return c.do(ctx, http.MethodPost, "/api/mobile/pause", map[string]any{}, nil)
 }
 
 // BackendStatus is the crew's own health, as the surface reports it.
@@ -257,11 +279,13 @@ type Declined struct {
 
 // Client 连一段对话。base 是消息面的根，token 是网关凭据。
 type Client struct {
-	base   string
-	token  string
+	base  string
+	token string
 	// 设备号：独立监听那道门要它配对凭据一起出示。
 	deviceID string
 	http     *http.Client
+	// managementBase 是管理面的根（网页端口）。空表示还没发现，退回消息面（会 404）。
+	managementBase string
 }
 
 // New 造一个客户端。base 形如 http://127.0.0.1:18882。
@@ -269,11 +293,21 @@ func New(base, token, deviceID string) *Client {
 	return &Client{base: base, token: token, deviceID: deviceID, http: &http.Client{Timeout: 15 * time.Second}}
 }
 
+// WithManagement 指向管理面（网页端口）。
+//
+// 管理路由只在那道门上：手机面那个端口（43499 之类）根本不注册
+// `/orchestrator/api/*`，拿它去要设备表或备份只会拿到 404。
+func (c *Client) WithManagement(base string) *Client {
+	clone := *c
+	clone.managementBase = strings.TrimSuffix(base, "/")
+	return &clone
+}
+
 // Timeline 拉整段对话。消息按时间从旧到新。
 func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 	var payload struct {
-		Items []Message `json:"items"`
-		Bots  []BotCard `json:"bots"`
+		Items        []Message     `json:"items"`
+		Bots         []BotCard     `json:"bots"`
 		DefaultBotID string        `json:"default_bot_id"`
 		Model        string        `json:"model"`
 		Tasks        []Task        `json:"tasks"`
@@ -305,6 +339,108 @@ func (c *Client) Send(ctx context.Context, text string, mentions []string) (requ
 	}
 	body := map[string]any{"text": text, "request_id": requestID, "mentions": mentions}
 	return requestID, c.do(ctx, http.MethodPost, "/api/mobile/send", body, nil)
+}
+
+// withdrawPath 是撤回排队消息的那条路。契约集中在这里：
+// POST /api/mobile/withdraw，body {"request_id":"..."}，成功 200，已读/已回复 409。
+const withdrawPath = "/api/mobile/withdraw"
+
+// ErrSteerTooLate 是插队时的 409：这条已被回复、已被读走或已经撤回过，不能再插。
+var ErrSteerTooLate = errors.New("这条已经被队伍读走了，插不进去")
+
+// SteerText 发送即插队：把新写的一句直接交给正在跑的 worker，不经过排队。
+// 网关会把它插成已读，路由不会再把这句当新活接一遍。
+func (c *Client) SteerText(ctx context.Context, ticketID, requestID, text string) error {
+	body, err := json.Marshal(map[string]string{"ticket": ticketID, "request_id": requestID, "text": text})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/mobile/steer", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("连不上队伍（%s）: %w", c.base, err)
+	}
+	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusOK:
+		return nil
+	case response.StatusCode == http.StatusConflict:
+		return ErrSteerTooLate
+	default:
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return fmt.Errorf("队伍返回 %d: %s", response.StatusCode, bytes.TrimSpace(detail))
+	}
+}
+
+// Steer 把一条排队消息直接交给正在跑的 worker：它在下一步边界先读，不等队列轮询。
+func (c *Client) Steer(ctx context.Context, ticketID, requestID string) error {
+	body, err := json.Marshal(map[string]string{"ticket": ticketID, "request_id": requestID})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/mobile/steer", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("连不上队伍（%s）: %w", c.base, err)
+	}
+	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusOK:
+		return nil
+	case response.StatusCode == http.StatusConflict:
+		return ErrSteerTooLate
+	default:
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return fmt.Errorf("队伍返回 %d: %s", response.StatusCode, bytes.TrimSpace(detail))
+	}
+}
+
+// ErrWithdrawalTooLate 是网关的 409：消息已经回复、已被 worker 读走，或已经撤回过。
+// 这不是连接故障，界面据此重读时间线，而不是把它写进断连横幅。
+var ErrWithdrawalTooLate = errors.New("这条已经被队伍读过了，撤不回来")
+
+// Withdraw 撤掉一条还没被队伍读到的排队消息。
+// 409 是「已经读过了，撤不回来」——那不是网络错误，要把话说清楚，
+// 让人知道这条消息不会再消失，而不是以为网络抖了一下。
+func (c *Client) Withdraw(ctx context.Context, requestID string) error {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return fmt.Errorf("没有要撤回的请求号")
+	}
+	body, err := json.Marshal(map[string]string{"request_id": requestID})
+	if err != nil {
+		return fmt.Errorf("编码请求: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+withdrawPath, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("构造请求: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("连不上队伍（%s）: %w", c.base, err)
+	}
+	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusOK:
+		return nil
+	case response.StatusCode == http.StatusConflict:
+		return ErrWithdrawalTooLate
+	default:
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return fmt.Errorf("队伍返回 %d: %s", response.StatusCode, bytes.TrimSpace(detail))
+	}
 }
 
 // SendAgain 用同一个幂等键重发。网关会认出这是同一次发送，不会在对话里留下第二条。
@@ -407,7 +543,11 @@ func (c *Client) Revoke(ctx context.Context, deviceID string) error {
 
 // management 打管理面。它和消息面不是同一条路：要走同源标记，而且只在本机可用。
 func (c *Client) management(ctx context.Context, method, path string, body []byte, into any) error {
-	request, err := http.NewRequestWithContext(ctx, method, c.base+"/orchestrator/api"+path, bytes.NewReader(body))
+	root := c.managementBase
+	if root == "" {
+		root = c.base
+	}
+	request, err := http.NewRequestWithContext(ctx, method, root+"/orchestrator/api"+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -452,7 +592,9 @@ func (c *Client) Work(ctx context.Context, ticketID string) ([]WorkStep, error) 
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("work: %s", response.Status)
 	}
-	var payload struct{ Steps []WorkStep `json:"steps"` }
+	var payload struct {
+		Steps []WorkStep `json:"steps"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
@@ -464,8 +606,22 @@ func (c *Client) Work(ctx context.Context, ticketID string) ([]WorkStep, error) 
 // 模型名单独拿出来是不完整的：同一个名字在不同的 provider 上不是同一个模型，
 // 后端换模型也要两样一起给。所以这一对永远成对出现。
 type ModelChoice struct {
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+// EffortOption 是一个可选推理档位：id 是提交值，name 是给人看的名字。
+type EffortOption struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// EffortsView 是一条模型路由支持的推理档位，以及它的默认值。
+type EffortsView struct {
+	Efforts []EffortOption `json:"efforts"`
+	Default string         `json:"default,omitempty"`
 }
 
 // ModelOption 是目录里的一条：模型 + 它给人看的名字（没有名字就和 id 一样）。
@@ -490,9 +646,10 @@ type ModelFailure struct {
 
 // ModelCatalog 是「能切成什么」加上「现在是什么」。
 type ModelCatalog struct {
-	Current   *ModelChoice    `json:"current,omitempty"`
-	Providers []ModelProvider `json:"providers"`
-	Failures  []ModelFailure  `json:"failures"`
+	Current   *ModelChoice           `json:"current,omitempty"`
+	BotModels map[string]ModelChoice `json:"bot_models,omitempty"`
+	Providers []ModelProvider        `json:"providers"`
+	Failures  []ModelFailure         `json:"failures"`
 }
 
 // Models 读一遍模型目录。
@@ -517,9 +674,22 @@ func (c *Client) Models(ctx context.Context) (*ModelCatalog, error) {
 	return &catalog, nil
 }
 
+// Efforts 问一条模型路由支持哪些推理档位。
+func (c *Client) Efforts(ctx context.Context, provider, model string) (*EffortsView, error) {
+	path := "/api/mobile/efforts?provider=" + url.QueryEscape(provider) + "&model=" + url.QueryEscape(model)
+	var view EffortsView
+	if err := c.do(ctx, http.MethodGet, path, nil, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
 // SwitchModel 换队伍干活用的模型。换完由调用方重新读时间线，让左栏显示跟上。
-func (c *Client) SwitchModel(ctx context.Context, choice ModelChoice) error {
-	body, err := json.Marshal(choice)
+func (c *Client) SwitchModel(ctx context.Context, choice ModelChoice, botID string) error {
+	body, err := json.Marshal(struct {
+		ModelChoice
+		BotID string `json:"bot_id,omitempty"`
+	}{choice, botID})
 	if err != nil {
 		return err
 	}
@@ -545,6 +715,19 @@ func (c *Client) SwitchModel(ctx context.Context, choice ModelChoice) error {
 // management routes require a same-origin loopback Host, which this client never has.
 func (c *Client) Retry(ctx context.Context, ticketID string) error {
 	return c.do(ctx, http.MethodPost, "/api/mobile/retry?ticket="+url.QueryEscape(ticketID), nil, nil)
+}
+
+// EditBot 改一位 Bot 的名字与人设。bot_id 不动：他的记忆挂在它上面。
+//
+// 走 POST + action：DSH 的 Connection 只放行 GET/POST，PUT 到不了插件。
+func (c *Client) EditBot(ctx context.Context, botID, name, persona string) error {
+	return c.do(ctx, http.MethodPost, "/api/mobile/bots",
+		map[string]string{"action": "edit", "bot_id": botID, "name": name, "persona": persona}, nil)
+}
+
+// RemoveBot 撤一位 Bot。后端会把 default 顺延给下一位。
+func (c *Client) RemoveBot(ctx context.Context, botID string) error {
+	return c.do(ctx, http.MethodPost, "/api/mobile/bots", map[string]string{"action": "remove", "bot_id": botID}, nil)
 }
 
 // defaultDeviceID 是这样没给设备号时出示的那个。
@@ -596,4 +779,28 @@ func readable(raw string) string {
 		return raw
 	}
 	return decoded
+}
+
+// ExportRecords 取一份备份：配置、花名册、政策、每张工单的最终状态。
+// 走管理面 —— 它要求同源本机，导出文件不该能从手机那一侧拉走。
+func (c *Client) ExportRecords(ctx context.Context) ([]byte, error) {
+	root := c.managementBase
+	if root == "" {
+		root = c.base
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, root+"/orchestrator/api/records/export", nil)
+	if err != nil {
+		return nil, fmt.Errorf("构造请求: %w", err)
+	}
+	request.Header.Set("x-orchestrator-request", "1")
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("连不上队伍（%s）: %w", c.base, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return nil, fmt.Errorf("导出失败（%d）：%s", response.StatusCode, bytes.TrimSpace(detail))
+	}
+	return io.ReadAll(response.Body)
 }

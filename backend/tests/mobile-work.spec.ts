@@ -40,8 +40,8 @@ it('registers the work routes on the same authenticated carrier as the rest', ()
   const ctx = { inject: (_deps: string[], action: (scope: unknown) => void) => action(child) }
   registerMobileHttp(ctx as never, host())
   expect(registered.map(route => route.path)).toEqual([
-    '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models',
-    '/api/mobile/model', '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/takeover', '/api/mobile/retry',
+    '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/withdraw', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models', '/api/mobile/efforts',
+    '/api/mobile/model', '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/takeover', '/api/mobile/retry', '/api/mobile/steer',
     '/api/mobile/pause', '/api/mobile/bots',
   ])
 })
@@ -168,6 +168,26 @@ it('reports a sent message with no reply yet as still queued', async () => {
   expect({ status: response.status, error: body.error }).toEqual({ status: 200, error: undefined })
   // m1 was answered, m3 was not: only m3 can still be withdrawn.
   expect(body.queued).toEqual(['req-2'])
+})
+
+it('drops a request from queued once the gateway accepts its withdrawal', async () => {
+  let withdrawn = false
+  const upstream = vi.fn(async (input: string | URL | Request) => {
+    if (String(input).endsWith('/withdraw')) {
+      withdrawn = true
+      return Response.json({ ok: true, id: 1, request_id: 'req-1' })
+    }
+    return Response.json({ items: withdrawn ? [] : [
+      { id: 'm1', role: 'user', text: '这条反悔了', request_id: 'req-1', at: new Date().toISOString() },
+    ] })
+  })
+  const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
+  const timeline = async () => await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as { queued?: string[] }
+  expect((await timeline()).queued).toEqual(['req-1'])
+  const result = await handler(new Request('http://dsh/api/mobile/withdraw', { method: 'POST', body: '{"request_id":"req-1"}' }))
+  expect(result.status).toBe(200)
+  // 网关接受撤回后，时间线里不再有这条，queued 自然也不再包含它。
+  expect((await timeline()).queued).toEqual([])
 })
 
 it('stops offering a withdraw once the crew has had time to pick the message up', () => {

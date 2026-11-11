@@ -1,6 +1,14 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/egoist/mygo/ui"
+)
 
 // 左栏那四项，按下去都必须有看得见的反应。
 //
@@ -106,7 +114,7 @@ func TestSwitchingAModelShowsUpEverywhere(t *testing.T) {
 	s.conversation = &Conversation{Model: "m1"}
 	s.modelNote = "正在换…"
 
-	s.applyModel(ModelChoice{Provider: "dsh", Model: "m2"})
+	s.applyModel(modelSwitchResult{choice: ModelChoice{Provider: "dsh", Model: "m2"}})
 
 	if s.models.Current.Model != "m2" {
 		t.Fatalf("目录里现在用的是 %s", s.models.Current.Model)
@@ -130,5 +138,72 @@ func TestEmptyPanesSayWhyTheyAreEmpty(t *testing.T) {
 		if name == "" {
 			t.Fatalf("%v：连名字都没有", item)
 		}
+	}
+}
+
+// 模型面板：每位成员可以有自己的路由，推理档位按当前作用域那条路由显示。
+func TestEachMemberCanUseItsOwnModelAndEffort(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.models = &ModelCatalog{
+		Current:   &ModelChoice{Provider: "magpie", Model: "kimi/k3"},
+		BotModels: map[string]ModelChoice{"scribbler": {Provider: "magpie", Model: "kimi/k3.1-pro", ReasoningEffort: "high"}},
+		Providers: []ModelProvider{{ID: "magpie", Name: "Magpie", Models: []ModelOption{{ID: "kimi/k3"}, {ID: "kimi/k3.1-pro"}}}},
+	}
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "scribbler", Name: "写手"}}}
+	s.modelScope = "scribbler"
+	s.efforts = &EffortsView{Efforts: []EffortOption{{ID: "low", Name: "Low"}, {ID: "high", Name: "High"}}, Default: "low"}
+
+	if got := s.currentModel(); got != "kimi/k3.1-pro · magpie · high" {
+		t.Fatalf("成员的作用域读到的是 %q", got)
+	}
+	if s.routeForScope().Model != "kimi/k3.1-pro" {
+		t.Fatalf("成员路由 = %+v", s.routeForScope())
+	}
+	// 换回全员后读的是全场默认，而不是上一位成员的。
+	s.modelScope = ""
+	if got := s.currentModel(); got != "kimi/k3 · magpie" {
+		t.Fatalf("全员的作用域读到的是 %q", got)
+	}
+}
+
+// 「跟随全员」真的会把成员路由清掉，而不是只在界面上变一下。
+func TestFallingBackToTheCrewDefaultClearsTheMembersRoute(t *testing.T) {
+	posted := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/mobile/models":
+			_, _ = w.Write([]byte(`{"current":{"provider":"magpie","model":"base"},"bot_models":{"scribbler":{"provider":"magpie","model":"own"}},"providers":[]}`))
+		case "/api/mobile/efforts":
+			_, _ = w.Write([]byte(`{"efforts":[]}`))
+		case "/api/mobile/model":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			posted <- body
+			_, _ = w.Write([]byte(`{"ok":true,"bot_id":"scribbler"}`))
+		default:
+			_, _ = w.Write([]byte(`{"items":[],"tasks":[],"bots":[{"bot_id":"scribbler","name":"写手"}]}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	s := newApp(New(server.URL, "secret", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "scribbler", Name: "写手"}}}
+	s.models = &ModelCatalog{Current: &ModelChoice{Provider: "magpie", Model: "base"},
+		BotModels: map[string]ModelChoice{"scribbler": {Provider: "magpie", Model: "own"}}}
+	s.modelScope = "scribbler"
+	s.navTab = navModel
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1280, 746)
+	tt.Frame()
+	if _, ok := tt.Find("跟随全员"); !ok {
+		t.Fatalf("有成员路由时应该出现「跟随全员」；画的是 %v", tt.Texts())
+	}
+	tt.Click("跟随全员")
+	select {
+	case body := <-posted:
+		if body["bot_id"] != "scribbler" || body["model"] != "" {
+			t.Fatalf("提交的是 %v", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("点了「跟随全员」却没有提交")
 	}
 }

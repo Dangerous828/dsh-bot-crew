@@ -294,6 +294,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   // 配对面在面板里只作展示：测试关心的是面板能不能读设备表，配对流程本身有自己的测试。
   'POST remote/pairing': { body: true, answer: async () => ({ code: '000000', deviceId: 'test' }) },
   'GET remote/devices': { answer: async () => ({ devices: [] }) },
+  // 备份导出在面板里只验形状：能拿到一份带 kind 与 settings 的记录就够。
+  'GET records/export': { answer: async () => ({ kind: 'dsh-bot-crew-records', version: 11, exportedAt: '', stateDir: '',
+    settings: { paused: false, policy: {}, eval: {}, executor: {} }, team: {}, tickets: [] }) },
   'DELETE remote/devices': { body: true, answer: async () => ({ ok: true as const }) },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },

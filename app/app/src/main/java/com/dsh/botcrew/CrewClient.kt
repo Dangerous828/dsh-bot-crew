@@ -38,9 +38,46 @@ class CrewClient(
         read("/api/mobile/send", "POST", CrewWire.sendBody(text, mentions, requestId))
     }
 
-    /** 一次切模型。provider 必填，光有模型名不知道往哪连。 */
-    suspend fun switchModel(provider: String, model: String) {
-        read("/api/mobile/model", "POST", """{"provider":"$provider","model":"$model"}""")
+    /** 撤回一条还在排队、没被队伍读走的消息。已经读走/回复的由后端拒绝。 */
+    suspend fun withdraw(requestId: String) {
+        read("/api/mobile/withdraw", "POST", JSONObject().put("request_id", requestId).toString())
+    }
+
+    /** 插队：把排队中的一条直接交给正在跑的工单，它在下一步边界先读。 */
+    suspend fun steer(ticketId: String, requestId: String) {
+        read("/api/mobile/steer", "POST",
+            JSONObject().put("ticket", ticketId).put("request_id", requestId).toString())
+    }
+
+    /** 发送即插队：新写的一句不进队列，直接交给正在跑的工单。 */
+    suspend fun steerText(ticketId: String, requestId: String, text: String) {
+        read("/api/mobile/steer", "POST",
+            JSONObject().put("ticket", ticketId).put("request_id", requestId).put("text", text).toString())
+    }
+
+    /** 可选模型目录：能连的 provider、每种的模型，以及每位成员当前的路由。 */
+    suspend fun models(): ModelCatalog = ModelWire.parseCatalog(read("/api/mobile/models", "GET"))
+
+    /** 某个模型的推理档位。拉不到就抛错，界面照实说，不自己编档位。 */
+    suspend fun efforts(provider: String, model: String): Efforts {
+        val query = "?provider=" + URLEncoder.encode(provider, "UTF-8") + "&model=" + URLEncoder.encode(model, "UTF-8")
+        return ModelWire.parseEfforts(read("/api/mobile/efforts$query", "GET"))
+    }
+
+    /**
+     * 一次切模型。provider 必填，光有模型名不知道往哪连。
+     * botId 为空是全员；`model` 为空且带 botId 表示这一位改回跟随全员。
+     */
+    suspend fun switchModel(
+        provider: String,
+        model: String,
+        botId: String? = null,
+        reasoningEffort: String? = null,
+    ) {
+        val body = JSONObject().put("provider", provider).put("model", model)
+        if (!botId.isNullOrBlank()) body.put("bot_id", botId)
+        if (!reasoningEffort.isNullOrBlank()) body.put("reasoningEffort", reasoningEffort)
+        read("/api/mobile/model", "POST", body.toString())
     }
 
     /** 一张工单下的代理树。客户端只读，不据此维护状态。 */
@@ -51,7 +88,7 @@ class CrewClient(
     suspend fun work(ticketId: String): List<WorkStep> =
         WorkWire.parse(read("/api/mobile/work?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"))
 
-    /** 它此刻的屏幕。现在后端只会回 unavailable 和理由，界面照着写，不自己编。 */
+    /** 它此刻的屏幕：有活动快照就显示快照，没有时后端会给理由，界面照着写，不自己编。 */
     suspend fun screen(ticketId: String?): ScreenView {
         val query = if (ticketId.isNullOrBlank()) "" else "?ticket=" + URLEncoder.encode(ticketId, "UTF-8")
         return ScreenWire.parse(read("/api/mobile/screen$query", "GET"))
@@ -71,6 +108,21 @@ class CrewClient(
     /** 加一位 Bot。id 不合规或重名由后端判，错误原样带回去显示。 */
     suspend fun createBot(botId: String, name: String, persona: String = "") {
         read("/api/mobile/bots", "POST", BotsWire.createBody(botId, name, persona))
+    }
+
+    /**
+     * 改一位的名字与人设。bot_id 不动 —— 记忆命名空间挂在它上面。
+     *
+     * 走 POST + action：消息面由 DSH 的 Connection 转发，它只放行 GET/POST，
+     * PUT/DELETE 根本到不了插件（上一步就是这么静默失败的）。
+     */
+    suspend fun editBot(botId: String, name: String, persona: String) {
+        read("/api/mobile/bots", "POST", BotsWire.editBody(botId, name, persona))
+    }
+
+    /** 撤一位。后端会把 default 顺延给下一位。 */
+    suspend fun removeBot(botId: String) {
+        read("/api/mobile/bots", "POST", BotsWire.removeBody(botId))
     }
 
     /** 让一张失败/卡住的票再跑一次。走消息面：手机到不了管理面（它要求本机同源）。 */

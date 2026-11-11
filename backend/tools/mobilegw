@@ -48,10 +48,17 @@ def db():
         mentions TEXT,text TEXT NOT NULL,at TEXT NOT NULL,url TEXT,reply_to INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY AUTOINCREMENT,conversation TEXT NOT NULL,
         to_msg INTEGER,rkey TEXT UNIQUE,text TEXT NOT NULL,at TEXT NOT NULL,bot_id TEXT)''')
-    if 'request_id' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+    columns = {row[1] for row in c.execute('PRAGMA table_info(messages)')}
+    if 'request_id' not in columns:
         c.execute('ALTER TABLE messages ADD COLUMN request_id TEXT')
-    if 'mentions' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+    if 'mentions' not in columns:
         c.execute('ALTER TABLE messages ADD COLUMN mentions TEXT')
+    # A message stops being withdrawable once a Source has pulled it (`read_at`) or a reply hangs
+    # under it. `withdrawn_at` keeps the row so the same request_id cannot quietly reappear.
+    if 'read_at' not in columns:
+        c.execute('ALTER TABLE messages ADD COLUMN read_at TEXT')
+    if 'withdrawn_at' not in columns:
+        c.execute('ALTER TABLE messages ADD COLUMN withdrawn_at TEXT')
     if 'bot_id' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
         c.execute('ALTER TABLE replies ADD COLUMN bot_id TEXT')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS messages_request_id ON messages(conversation, request_id)')
@@ -84,6 +91,22 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _body(self):
+        """Decode the JSON body. On a client error answer here and return (False, None)."""
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            self._send(400, {'error': 'invalid content length'})
+            return False, None
+        if length < 0 or length > MAX_BODY:
+            self._send(413, {'error': 'request too large'})
+            return False, None
+        try:
+            return True, json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {'error': 'invalid JSON'})
+            return False, None
+
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
@@ -94,7 +117,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(404, {'error': 'not found'})
         c = db()
         try:
-            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions FROM messages WHERE conversation=? ORDER BY id', (CONV,)).fetchall()
+            # A withdrawn message is gone from the conversation: it never reached a worker, so the
+            # phone must neither show it nor keep offering it in `queued`.
+            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (CONV,)).fetchall()
             reps = c.execute('SELECT id,to_msg,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id', (CONV,)).fetchall()
         finally:
             c.close()
@@ -103,28 +128,63 @@ class H(BaseHTTPRequestHandler):
                     'mentions': [x for x in ((m['mentions'] or '').split(',')) if x]}) for m in msgs]
         entries += [(r['to_msg'] or 0, 1, r['id'], {'role': 'agent', 'text': r['text'],
                      'at': r['at'], 'id': 'r%d' % r['id'],
-                     **({'bot_id': r['bot_id']} if r['bot_id'] else {})}) for r in reps]
-        # Sort by the message a reply hangs under, then by position, then by row id. A handoff between bots
-        # keys its replies by a text id rather than a number, so the first element can be a str or an int;
-        # comparing the two raises, and the handler then dies with no response at all. Normalize to text.
-        entries.sort(key=lambda item: (tie_key(item[0]), item[1], item[2]))
+                     # 回复挂在哪条消息下要交给客户端：没有它，界面分不清哪句在回哪句，
+                     # `queued` 也没法判断一条消息是不是已经被答过了。
+                     **({'bot_id': r['bot_id']} if r['bot_id'] else {}),
+                     **({'reply_to': 'm%d' % r['to_msg']} if isinstance(r['to_msg'], int) else
+                        ({'reply_to': r['to_msg']} if r['to_msg'] else {}))})
+                    for r in reps]
+        # 按发生时间排，而不是按「挂在哪条消息下」分组：分组会把 23:47 那条的回复
+        # 排到 23:54 的消息之前，屏幕上就成了「回答和消息对不上」。
+        # at 是同一格式的带偏移时间串，可直接比较；同一秒内用户消息在前、回复在后。
+        entries.sort(key=lambda item: (item[3]['at'], item[1], tie_key(item[2])))
         return self._send(200, {'items': [item[3] for item in entries]})
 
+    def _claim(self):
+        """Take a message out of the queue for a steer without answering it.
+
+        A steer is the owner jumping the line: the text goes straight to the running worker's next
+        step, so the queue must not hand the same message to the router later. Marking it read is
+        what `pull` already does; this endpoint just does it for one request id and returns the text.
+        Answering is a different thing: a replied message cannot be claimed.
+        """
+        ok, body = self._body()
+        if not ok:
+            return
+        request_id = body.get('request_id') if isinstance(body, dict) else None
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            return self._send(400, {'error': 'request_id is required'})
+        c = db()
+        try:
+            row = c.execute('SELECT id,text,read_at,withdrawn_at FROM messages WHERE conversation=? AND request_id=?',
+                            (CONV, request_id)).fetchone()
+            if not row or row['withdrawn_at']:
+                return self._send(404, {'error': 'no such message'})
+            answered = c.execute('SELECT 1 FROM replies WHERE conversation=? AND to_msg=? LIMIT 1', (CONV, row['id'])).fetchone()
+            if answered:
+                return self._send(409, {'error': 'message was already answered'})
+            if row['read_at']:
+                return self._send(409, {'error': 'message was already picked up'})
+            c.execute('BEGIN IMMEDIATE')
+            c.execute('UPDATE messages SET read_at=datetime(\'now\') WHERE id=? AND read_at IS NULL', (row['id'],))
+            c.commit()
+            return self._send(200, {'ok': True, 'id': row['id'], 'request_id': request_id, 'text': row['text']})
+        finally:
+            c.close()
+
     def do_POST(self):
+        path = urlsplit(self.path).path
         if not self._auth():
             return self._send(401, {'error': 'unauthorized'})
-        if urlsplit(self.path).path != '/send':
+        if path == '/withdraw':
+            return self._withdraw()
+        if path == '/claim':
+            return self._claim()
+        if path != '/send':
             return self._send(404, {'error': 'not found'})
-        try:
-            length = int(self.headers.get('Content-Length', '0'))
-        except ValueError:
-            return self._send(400, {'error': 'invalid content length'})
-        if length < 0 or length > MAX_BODY:
-            return self._send(413, {'error': 'message too large'})
-        try:
-            body = json.loads(self.rfile.read(length))
-        except (ValueError, UnicodeDecodeError):
-            return self._send(400, {'error': 'invalid JSON'})
+        ok, body = self._body()
+        if not ok:
+            return
         if not isinstance(body, dict) or not isinstance(body.get('text'), str) or not body['text'].strip():
             return self._send(400, {'error': 'text must be a nonempty string'})
         if body.get('sender', 'owner') != 'owner':
@@ -149,13 +209,59 @@ class H(BaseHTTPRequestHandler):
                 # Distinct dispatch threads let the router decide whether this is
                 # new work or a follow-up; one shared thread would fan every new
                 # request into whichever old Ticket subscribed to that thread.
-                cursor = c.execute('INSERT INTO messages(conversation,thread,sender,bot,mentions_me,mentions,text,at,request_id) VALUES(?,?,?,?,?,?,?,?,?)',
-                                   (CONV, None, 'owner', 0, 1, ','.join(mentions), text, now(), request_id))
+                # `steer` means this message went straight to a running worker: insert it
+                # already read, so `pull` never routes the same text a second time.
+                stamp = now() if body.get('steer') is True else None
+                cursor = c.execute('INSERT INTO messages(conversation,thread,sender,bot,mentions_me,mentions,text,at,request_id,read_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                                   (CONV, None, 'owner', 0, 1, ','.join(mentions), text, now(), request_id, stamp))
                 mid = cursor.lastrowid
             c.commit()
         finally:
             c.close()
         return self._send(200, {'ok': True, 'id': mid, 'request_id': request_id})
+
+    def _withdraw(self):
+        """Take back a message nobody has consumed yet.
+
+        A message is still withdrawable only while both things are true: no reply hangs under it
+        (it was answered) and no Source has pulled it (`read_at` is empty). Once either happened the
+        work is already in flight, so deleting it would silently disagree with the worker. Refuse
+        instead, and keep the row behind `withdrawn_at` so the same request_id cannot come back.
+        """
+        ok, body = self._body()
+        if not ok:
+            return
+        request_id = body.get('request_id') if isinstance(body, dict) else None
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            return self._send(400, {'error': 'invalid request_id'})
+        c = db()
+        try:
+            # One writer at a time: a Source's pull and this check must not interleave, or a message
+            # could be withdrawn after the worker has already been handed it.
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT id,read_at,withdrawn_at FROM messages WHERE conversation=? AND request_id=?',
+                            (CONV, request_id)).fetchone()
+            if row is None:
+                c.rollback()
+                return self._send(404, {'error': 'no such message'})
+            if row['withdrawn_at']:
+                c.rollback()
+                return self._send(409, {'error': 'message already withdrawn'})
+            if c.execute('SELECT 1 FROM replies WHERE conversation=? AND to_msg=? LIMIT 1',
+                         (CONV, row['id'])).fetchone():
+                c.rollback()
+                return self._send(409, {'error': 'message was already answered'})
+            if row['read_at']:
+                c.rollback()
+                return self._send(409, {'error': 'message was already picked up'})
+            c.execute('UPDATE messages SET withdrawn_at=? WHERE id=?', (now(), row['id']))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
+        return self._send(200, {'ok': True, 'id': row['id'], 'request_id': request_id})
 
 
 if __name__ == '__main__':

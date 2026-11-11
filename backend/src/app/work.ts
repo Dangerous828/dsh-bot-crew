@@ -113,10 +113,19 @@ function liveSessionIds(agents: AgentRegistry): string[] {
  * Changes the model the crew's workers run on. `provider` is required because a model name alone names nothing the
  * runtime can reach; `reasoningEffort` is kept from the current setting unless the caller names a new one.
  */
-export function switchModel(settings: Settings, requested: { provider: string; model: string; reasoningEffort?: string }): Settings {
-  const previous = settings.executor.model
-  return { ...settings, executor: { ...settings.executor, model: {
+export function switchModel(settings: Settings, requested: { provider: string; model: string; reasoningEffort?: string; bot_id?: string }): Settings {
+  // 指定成员时改的是那位成员的模型；没指定才是全场默认。空 effort 从旧值继承，
+  // 这样换模型不会把之前选好的推理档位悄悄丢掉。
+  const previous = requested.bot_id
+    ? settings.executor.botModels?.[requested.bot_id]
+    : settings.executor.model
+  const selected = {
     provider: requested.provider, model: requested.model,
     ...requested.reasoningEffort ?? previous?.reasoningEffort ? { reasoningEffort: requested.reasoningEffort ?? previous?.reasoningEffort } : {},
-  } } }
+  }
+  if (requested.bot_id) {
+    return { ...settings, executor: { ...settings.executor,
+      botModels: { ...settings.executor.botModels, [requested.bot_id]: selected } } }
+  }
+  return { ...settings, executor: { ...settings.executor, model: selected } }
 }

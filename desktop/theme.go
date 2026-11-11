@@ -50,6 +50,10 @@ type Palette struct {
 	Pressed ui.Color
 	// PressedSoft 是没选中的页签被按住时的底：轨道里浮起一层很淡的色，别压过选中项。
 	PressedSoft ui.Color
+	// WarmBase 是「等你决定」卡的底：比 WarmSoft 再暖一档、几乎就是页底色。
+	// 画板用 #FDF9F4（亮色）/ 暖深（暗色），和普通的 WeakSoft 区分开 ——
+	// 它是「需要你动手」的那一块，不该和警告徽标同色。
+	WarmBase ui.Color
 }
 
 // LightPalette 是暖白底的一套。
@@ -61,6 +65,10 @@ var LightPalette = Palette{
 	UserBubble: ui.Hex("#2C2A26"), UserInk: ui.Hex("#FBF9F6"),
 	Selected: ui.Hex("#F3F0EA"), AccentSoft: ui.Hex("#EAF1EC"), WarnSoft: ui.Hex("#F6EEE6"),
 	Code: ui.Hex("#F5F2EC"),
+	// 花名册的第二档淡底、警告/失败的边线与脚注底。画板里它们在亮色下与主档几乎同色，
+	// 暗色下才明显分层；这里两套都给实值，零值等于透明，画出来会少一整块。
+	SelectedAlt: ui.Hex("#F3F0EA"), AccentSoft2: ui.Hex("#EAF1EC"), WarnSoft2: ui.Hex("#F6EEE6"),
+	WarnEdge: ui.Hex("#E9D9C9"), DangerEdge: ui.Hex("#E5C4C4"), Footer: ui.Hex("#F8F5F1"),
 	// 以下四个是从画板的实际计算样式里取的，源码里 grep 不到但它们真的画出来了。
 	Hint:       ui.Hex("#A9A294"), // 比 Faint 再淡一档：占位、极弱说明
 	DangerSoft: ui.Hex("#FDF6F6"), // 失败卡的底
@@ -71,6 +79,7 @@ var LightPalette = Palette{
 	Track:       ui.Hex("#EFEBE5"), // 页签条整条（画板 Desktop.dc.html:252）
 	Pressed:     ui.Hex("#E3DED6"), // 选中项被按住
 	PressedSoft: ui.Hex("#E7E3DC"), // 未选中项被按住
+	WarmBase:    ui.Hex("#FDF9F4"), // 「等你决定」卡底（画板 Desktop.dc.html:200）
 }
 
 // DarkPalette 是深墨底的一套。强调色提亮一档，否则它和底色糊在一起。
@@ -80,15 +89,19 @@ var DarkPalette = Palette{
 	Accent: ui.Hex("#5FBFA8"), AccentInk: ui.Hex("#10201C"),
 	Warn: ui.Hex("#E0A574"), Danger: ui.Hex("#E58A80"),
 	UserBubble: ui.Hex("#3B3942"), UserInk: ui.Hex("#F2EFEA"),
-	Selected: ui.Hex("#2E2C34"), AccentSoft: ui.Hex("#1D2F2A"), WarnSoft: ui.Hex("#33291F"),
-	Code: ui.Hex("#1E1D23"),
-	Hint: ui.Hex("#6E6960"), DangerSoft: ui.Hex("#2A2022"), Raised: ui.Hex("#1B1A1F"),
+	Selected: ui.Hex("#2A2830"), AccentSoft: ui.Hex("#1E3A34"), WarnSoft: ui.Hex("#3A2A1C"),
+	Code:        ui.Hex("#1E1D23"),
+	SelectedAlt: ui.Hex("#2A2830"), AccentSoft2: ui.Hex("#1E3A34"), WarnSoft2: ui.Hex("#3A2A1C"),
+	WarnEdge: ui.Hex("#4A3A28"), DangerEdge: ui.Hex("#55302F"), Footer: ui.Hex("#25242A"),
+	Hint: ui.Hex("#6E6960"), DangerSoft: ui.Hex("#2A1E1E"), Raised: ui.Hex("#1D1C21"),
 	InkStrong: ui.Hex("#FFFFFF"),
 	// 暗色：轨道与选中项照画板（Desktop-dark.dc.html:252 的 #2A2830 / #232228），
 	// 按住的两层按同族取，选中项比卡片再深一点才分得出来。
 	Track:       ui.Hex("#2A2830"),
 	Pressed:     ui.Hex("#1B1A20"),
 	PressedSoft: ui.Hex("#35333B"),
+	// 画板暗色里「等你决定」卡是暖深 #241F1A；比 WarnSoft 更深，压在卡片上不发光。
+	WarmBase: ui.Hex("#241F1A"),
 }
 
 // PaletteFor 按是否深色返回对应的一套。
@@ -108,22 +121,24 @@ func ThemeColors(t *ui.Theme) Palette {
 // 不要在调用点写裸数字 —— 那样改一处就得全文件找一遍。
 const (
 	// 字号
-	FontHairline = 10.5 // 职能、时间戳
-	FontTiny     = 11.0 // 标签、徽标
-	FontSmall    = 11.5 // 次要说明
-	FontBody     = 12.0 // 状态行
-	FontBodyWide = 12.5 // 输入框、正文旁注
-	FontLabel    = 13.0 // 导航项
-	FontName     = 13.5 // 花名册的名字
-	FontText     = 14.0 // 消息正文
-	FontHeader   = 14.5 // 栏标题
-	FontTitle    = 15.0 // 页面标题
-	FontDisplay  = 15.5 // 主标题（设计稿里有，界面还没到）
-	FontGlyph    = 17.0 // 加号、图标字（同上）
-	FontIcon     = 16.0 // 导航图标（画板里图标字是 16px）
-	FontDot      = 6.0  // 状态点（5px 的点用 6px 的字画）
-	FontMini     = 9.0  // 极小的说明字（配对区的附注）
-	FontCode     = 22.0 // 配对码那种要一眼看清的数字
+	FontHairline   = 10.5 // 职能、时间戳
+	FontTiny       = 11.0 // 标签、徽标
+	FontSmall      = 11.5 // 次要说明
+	FontBody       = 12.0 // 状态行
+	FontBodyWide   = 12.5 // 输入框、正文旁注
+	FontLabel      = 13.0 // 导航项
+	FontName       = 13.5 // 花名册的名字
+	FontText       = 14.0 // 消息正文
+	FontHeader     = 14.5 // 栏标题
+	FontTitle      = 15.0 // 页面标题
+	FontDisplay    = 15.5 // 主标题（设计稿里有，界面还没到）
+	FontGlyph      = 17.0 // 加号、图标字（同上）
+	FontIcon       = 16.0 // 导航图标（画板里图标字是 16px）
+	FontRosterIcon = 24.0 // 左栏标题的虚线圆图标（画板 24px）
+	FontEmptyIcon  = 26.0 // 空态图标（画板 64×64 框内 26px）
+	FontDot        = 6.0  // 状态点（5px 的点用 6px 的字画）
+	FontMini       = 9.0  // 极小的说明字（配对区的附注）
+	FontCode       = 22.0 // 配对码那种要一眼看清的数字
 	// 圆角
 	RadiusTiny   = 2  // 进度条、细条
 	RadiusDot    = 5  // 小圆点
@@ -132,6 +147,10 @@ const (
 	RadiusButton = 9  // 标题栏那个 109×31 的按钮（画板实测）
 	RadiusCard   = 10 // 右栏工单卡（画板实测 10，不是 9）
 	RadiusPane   = 11 // 花名册条目、头像块
+	// 空态有两个虚线框，尺寸与圆角都不同，别混用：
+	// 左栏「队伍还是空的」是 52×52 / 16；中栏「还没有人说话」是 64×64 / 20。
+	RadiusFolder    = 20 // 中栏空态那个虚线头像框（画板 64×64）
+	RadiusFolderSml = 16 // 左栏空态那个虚线加号框（画板 52×52）
 	RadiusBig    = 13 // 输入区
 	RadiusBubble = 15 // 消息气泡
 	RadiusTail   = 4  // 气泡靠说话人那一侧的尖角
@@ -152,7 +171,10 @@ const (
 	AvatarSmall  = 36  // 花名册头像
 	AvatarHdr    = 38  // 标题栏头像（画板实测）
 	ContentMax   = 718 // 中栏（画板实测）
-	ContentInset = 75  // 中栏内容左边距（404 − 329）
+	ContentInset = 75  // 中栏**正文**左边距（404 − 329）：36 + 头像 28 + 间距 11
+	// MessageInset 是消息行（含头像）的左右内缩。画板里消息行从 36 起，
+	// 正文落在 75 是因为头像和间距把它推过去的 —— 别把 75 当成行的起点。
+	MessageInset = 36
 
 	// 右栏那条分段控件。数字全来自 designs/personal-agent/桌面亮色-坐标.md「右栏」：
 	// 标签栏（整条）下内边距 3（52 − 49）、高 32（95 − 49 − 12 的余量即 32）、

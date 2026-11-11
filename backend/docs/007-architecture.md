@@ -343,7 +343,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
-| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline and idempotent sends; also the work, agent-tree, model and pairing routes; server-side gateway credentials |
+| `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline, idempotent sends and the withdrawal of a still-queued message; also the work, agent-tree, model and pairing routes; server-side gateway credentials |
+| `src/app/screen.ts` | The phone's "看画面" snapshot: the worker session's recent commands, output, speech and status, trimmed and secret-masked; a pure function over session events, not a screenshot |
 | `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
@@ -453,8 +454,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
-| `tests/mobile-http.spec.ts` | Connection Fetch registration, validated sends, server-only credentials and transport errors |
-| `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation |
+| `tests/mobile-http.spec.ts` | Connection Fetch registration, validated sends and withdrawals, server-only credentials, transport errors, and the gateway's 409 refusal kept intact |
+| `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation; a withdrawn request leaving `queued` |
+| `tests/screen.spec.ts` | The screen snapshot: why there is nothing to show, the kinds of event lines, the tail limit and secret masking |
 | `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
 | `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, port reporting, forwarding after the gate |
 | `tests/phone-gate.spec.ts` | The shared phone gate on both entries, and the pairing throttle's window and address aggregation |

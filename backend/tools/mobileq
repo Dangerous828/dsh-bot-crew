@@ -59,10 +59,17 @@ def conn(p):
             bot_id TEXT
         )"""
     )
-    if 'request_id' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+    columns = {row[1] for row in c.execute('PRAGMA table_info(messages)')}
+    if 'request_id' not in columns:
         c.execute('ALTER TABLE messages ADD COLUMN request_id TEXT')
-    if 'mentions' not in {row[1] for row in c.execute('PRAGMA table_info(messages)')}:
+    if 'mentions' not in columns:
         c.execute('ALTER TABLE messages ADD COLUMN mentions TEXT')
+    # `pull` stamps `read_at`, which is what tells the withdraw endpoint the worker has it.
+    # `withdrawn_at` hides a message a person took back before anyone read it.
+    if 'read_at' not in columns:
+        c.execute('ALTER TABLE messages ADD COLUMN read_at TEXT')
+    if 'withdrawn_at' not in columns:
+        c.execute('ALTER TABLE messages ADD COLUMN withdrawn_at TEXT')
     if 'bot_id' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
         c.execute('ALTER TABLE replies ADD COLUMN bot_id TEXT')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS messages_request_id ON messages(conversation, request_id)')
@@ -91,11 +98,27 @@ def msg_json(r):
 
 def cmd_pull(c, args):
     after = int(args.after or 0)
+    # One writer at a time: the withdraw check and this hand-over must not interleave, or a message
+    # could be taken back after the worker has already received it.
+    c.execute("BEGIN IMMEDIATE")
     rows = c.execute(
-        "SELECT * FROM messages WHERE id > ? ORDER BY id ASC", (after,)
+        # read_at 也是「不再交付」：claim 把一条消息交给插队路径后，pull 不能再送一遍。
+        "SELECT * FROM messages WHERE id > ? AND withdrawn_at IS NULL AND read_at IS NULL ORDER BY id ASC", (after,)
     ).fetchall()
     items = [msg_json(r) for r in rows]
-    nxt = items[-1]["id"] if items else after
+    # Handing a message to a Source is the read: stamping it here is what lets the withdraw
+    # endpoint refuse with "already picked up" instead of guessing from age.
+    if rows:
+        c.execute(
+            "UPDATE messages SET read_at=? WHERE read_at IS NULL AND id IN (%s)"
+            % ",".join("?" * len(rows)),
+            (now(), *[r["id"] for r in rows]),
+        )
+    # The cursor moves past withdrawn rows too: they will never be delivered, and re-scanning them
+    # on every poll forever is the only other option. The write lock above keeps this MAX stable.
+    last = c.execute("SELECT MAX(id) AS id FROM messages WHERE id > ?", (after,)).fetchone()["id"]
+    c.commit()
+    nxt = last if last is not None else after
     out = {"me": ME, "items": items, "next": nxt}
     print(json.dumps(out, ensure_ascii=False))
     return 0
@@ -138,7 +161,7 @@ def cmd_thread(c, args):
     # preceding conversation (including bot replies). Never expose later human
     # requests as evidence for an earlier Trigger.
     rows = c.execute(
-        'SELECT * FROM (SELECT * FROM messages WHERE conversation=? AND id<=? ORDER BY id DESC LIMIT 100) ORDER BY id',
+        'SELECT * FROM (SELECT * FROM messages WHERE conversation=? AND id<=? AND withdrawn_at IS NULL ORDER BY id DESC LIMIT 100) ORDER BY id',
         (conv, root),
     ).fetchall()
     ids = {r['id'] for r in rows}

@@ -28,23 +28,42 @@ func effectiveDeviceID(device string) string {
 // 表现就是「数据早到了，界面却一直停在正在读…」。
 func newApp(client *Client) *app {
 	return &app{
-		client:  client,
-		arrived: make(chan *Conversation, 4),
-		failed:  make(chan string, 4),
-		sent:    make(chan string, 4),
-		tree:    make(chan []AgentNode, 4),
-		paired:  make(chan Credential, 4),
+		client:     client,
+		arrived:    make(chan *Conversation, 4),
+		failed:     make(chan string, 4),
+		sent:       make(chan string, 4),
+		tree:       make(chan []AgentNode, 4),
+		paired:     make(chan Credential, 4),
 		pairFailed: make(chan string, 4),
-		steps:   make(chan workResult, 4),
+		steps:      make(chan workResult, 4),
 		// 模型那两条也在这里 make：忘掉一条，切模型就会永远停在「正在换…」。
 		modelList:     make(chan *ModelCatalog, 4),
-		modelSwitched: make(chan ModelChoice, 4),
+		modelSwitched: make(chan modelSwitchResult, 4),
+		effortsCh:     make(chan *EffortsView, 4),
 		modelError:    make(chan string, 4),
 		retryErrorCh:  make(chan string, 4),
 		screenNoteCh:  make(chan string, 4),
+		screenCh:      make(chan *ScreenView, 4),
+		withdrawn:     make(chan withdrawResult, 4),
+		steerDone:     make(chan steerResult, 4),
+		pauseDone:     make(chan pauseResult, 2),
+		botSaved:      make(chan botSaveResult, 2),
+		devicesCh:     make(chan devicesResult, 4),
+		revoking:      map[string]bool{},
+		exportCh:      make(chan exportResult, 2),
+		// 宽度先落在设计稿的两个值上；拖过之后只记在内存里。
+		sidebarWidth: SidebarWidth,
+		backendWidth: BackendWidth,
 		// 打开窗口先看到「后台」那一栏，它是对外最早能看懂的一块。
 		navTab:      navBackend,
 		backendOpen: true,
+		// 凭据已经在手上时直接说「已配对」：那块地方让给模型列表，不再占一整块。
+		pairingNote: func() string {
+			if client != nil && client.deviceID != "" && client.token != "" {
+				return "已配对 · 这台已能直连"
+			}
+			return ""
+		}(),
 	}
 }
 
@@ -204,7 +223,17 @@ func main() {
 
 	// 所有通道都要 make：nil 通道上的发送会永久阻塞，
 	// 表现就是「数据早到了，界面却一直停在正在读…」。
-	s := newApp(New(located.Base, located.Token, located.Device))
+	client := New(located.Base, located.Token, located.Device)
+	// 设备表与备份在管理面上，而管理面是网页端口，不是消息面那个。发现到整支队伍时
+	// 就把它指过去；只给了消息面地址（环境变量）时留空，那些按钮会如实报 404。
+	if located.Target.WebPort > 0 {
+		host := "127.0.0.1"
+		if parsed, err := url.Parse(located.Base); err == nil && parsed.Hostname() != "" {
+			host = parsed.Hostname()
+		}
+		client = client.WithManagement("http://" + net.JoinHostPort(host, strconv.Itoa(located.Target.WebPort)))
+	}
+	s := newApp(client)
 	s.target = located.Target
 	s.endpoint = located.Base
 	mygo.App.WhenReady(func() {

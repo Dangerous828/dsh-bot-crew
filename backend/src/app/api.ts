@@ -40,6 +40,8 @@ export interface Api {
   'POST executor/pause': { body: { paused: boolean }; response: { paused: boolean } }
   'PUT settings/:block': { body: { value: unknown; revision: number }; response: { revision: number; restarting: boolean } }
   'GET policy/history': { response: HistoryView }
+  /** 备份导出：配置、花名册、政策、每张工单的最终状态。不收凭据。 */
+  'GET records/export': { response: Record<string, unknown> }
   'POST policy-sync/:id': { response: { policy: unknown } }
   'POST setup/check': { response: { restarting: true } }
   'GET models': { response: ModelCatalog }

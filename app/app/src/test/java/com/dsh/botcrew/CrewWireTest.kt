@@ -48,6 +48,15 @@ class CrewWireTest {
     }
 
     @Test
+    fun keepsTheRequestIdSoAQueuedMessageCanBeWithdrawn() {
+        val body = """{"items":[{"id":"m1","role":"user","text":"改一下","request_id":"req-1","at":"2026-11-09T10:00:00Z"}],
+            "bots":[],"default_bot_id":"","tasks":[],"status":{},"queued":["req-1"],"declined":[]}"""
+        val conversation = CrewWire.parseTimeline(body)
+        assertEquals("req-1", conversation.messages[0].requestId)
+        assertEquals(listOf("req-1"), conversation.queued)
+    }
+
+    @Test
     fun buildsASendBodyWithAnIdempotencyKey() {
         val body = CrewWire.sendBody("在吗", listOf("scribbler"), "req-1")
         val parsed = JSONObject(body)
@@ -253,11 +262,26 @@ class LiveShapeTest {
 class ControlSurfaceWireTest {
     @Test
     fun readsTheScreenAnswerAsTheBackendWroteIt() {
-        val view = ScreenWire.parse("""{"state":"unavailable","reason":"后端还没有画面源：worker 不跑浏览器"}""")
+        val view = ScreenWire.parse("""{"state":"unavailable","reason":"这张工单还没有可读的执行记录"}""")
         assertEquals("unavailable", view.state)
-        assertEquals("后端还没有画面源：worker 不跑浏览器", view.reason)
+        assertEquals("这张工单还没有可读的执行记录", view.reason)
         // 空对象也算「没有」：默认态是 unavailable，不是 live。
         assertEquals("unavailable", ScreenWire.parse("{}").state)
+    }
+
+    @Test
+    fun readsTheActivitySnapshotLineByLine() {
+        val view = ScreenWire.parse("""{"state":"live","kind":"terminal","live":true,"cwd":"/tmp/work",
+            "lines":[{"at":"2026-11-10T10:00:00Z","kind":"command","text":"$ pnpm test"},
+                     {"at":"2026-11-10T10:00:05Z","kind":"output","text":"1429 passed"},
+                     {"at":"","kind":"said","text":"  "}]}""")
+        assertEquals(true, view.live)
+        assertEquals("/tmp/work", view.cwd)
+        // 空白行不画：留着只会让屏幕中间多一条空缝。
+        assertEquals(2, view.lines.size)
+        assertEquals("command", view.lines[0].kind)
+        assertEquals("$ pnpm test", view.lines[0].text)
+        assertEquals("1429 passed", view.lines[1].text)
     }
 
     @Test
@@ -275,6 +299,34 @@ class ControlSurfaceWireTest {
         val conversation = CrewWire.parseTimeline("""{"items":[],"bots":[],"default_bot_id":"",
           "tasks":[{"id":"t1","title":"改一行","state":"work","bot_id":"coder_1"}]}""")
         assertEquals("coder_1", conversation.tickets.single().botId)
+    }
+
+    @Test
+    fun readsTheModelCatalogTheBackendSends() {
+        val catalog = ModelWire.parseCatalog("""
+            {"current":{"provider":"magpie","model":"openconsole/deepseek-v4.1-flash","reasoningEffort":"high"},
+             "bot_models":{"coder":{"provider":"deepseek-official","model":"deepseek-v4-pro"}},
+             "providers":[{"id":"magpie","name":"Magpie",
+               "models":[{"id":"openconsole/deepseek-v4.1-flash","name":"DeepSeek V4.1","description":"fast"}]}],
+             "failures":[{"id":"broken","name":"Broken"}]}
+        """.trimIndent())
+        assertEquals("magpie", catalog.current?.provider)
+        assertEquals("high", catalog.current?.reasoningEffort)
+        assertEquals("deepseek-v4-pro", catalog.choiceFor("coder")?.model)
+        // 没单配的成员跟随全员。
+        assertTrue(catalog.followsCrew("scribbler"))
+        assertEquals("magpie", catalog.choiceFor("scribbler")?.provider)
+        assertEquals(1, catalog.providers.size)
+        assertEquals("fast", catalog.providers.single().models.single().description)
+        assertEquals("Broken", catalog.failures.single().name)
+    }
+
+    @Test
+    fun readsEffortsAndTheirDefault() {
+        val efforts = ModelWire.parseEfforts("""{"efforts":[{"id":"low","name":"低"},{"id":"high","name":"高"}],"default":"low"}""")
+        assertEquals(2, efforts.efforts.size)
+        assertEquals("低", efforts.efforts[0].name)
+        assertEquals("low", efforts.default)
     }
 }
 
@@ -296,5 +348,31 @@ class ReadableTextTest {
     fun keepsTheOriginalWhenItCannotBeDecoded() {
         // 坏掉的序列不能被吞成空串。
         assertEquals("100%zz", readable("100%zz"))
+    }
+}
+
+class BotEditBodyTest {
+    @Test
+    fun anEditSendsThePersonaEvenWhenEmpty() {
+        // 新建时空人设不上送（省一个键）；改的时候空人设必须上送 —— 那是「把人设删掉」。
+        val body = JSONObject(BotsWire.editBody("coder", "码农甲", ""))
+        assertEquals("coder", body.getString("bot_id"))
+        assertEquals("码农甲", body.getString("name"))
+        assertTrue(body.has("persona"))
+        assertEquals("", body.getString("persona"))
+    }
+}
+
+class BotActionBodyTest {
+    @Test
+    fun editsAndRemovalsCarryAnActionBecauseTheSurfaceOnlyTakesPost() {
+        // DSH 的 Connection 只放行 GET/POST；用 PUT/DELETE 会被挡在插件外面，
+        // 界面看起来「点了没反应」。两种写操作都带上 action。
+        val edit = JSONObject(BotsWire.editBody("coder", "码农", "写代码"))
+        assertEquals("edit", edit.getString("action"))
+        assertEquals("coder", edit.getString("bot_id"))
+        val remove = JSONObject(BotsWire.removeBody("coder"))
+        assertEquals("remove", remove.getString("action"))
+        assertEquals("coder", remove.getString("bot_id"))
     }
 }

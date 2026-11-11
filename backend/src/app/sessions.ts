@@ -150,7 +150,15 @@ export class Sessions {
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    let model = role === 'orchestrator' ? settings.eval.model : settings.executor.model
+    if (role === 'worker') {
+      // 成员模型：同一张票的 Bot 有自己的路由时用它，否则回到全场默认。
+      const ticketId = ticketOfSession(id)
+      const ticket = ticketId ? this.host.store.tickets.get(ticketId) : undefined
+      const botId = String((ticket?.channels[0]?.address as { bot_id?: unknown } | undefined)?.bot_id ?? '')
+      if (botId && settings.executor.botModels?.[botId]) model = settings.executor.botModels[botId]!
+    }
+    await initializeRoleModel(ctx, result.agent, model)
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })

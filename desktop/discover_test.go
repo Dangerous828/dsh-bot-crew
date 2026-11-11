@@ -130,9 +130,9 @@ func TestLoadCredentialTreatsBrokenFilesAsUnpaired(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "credential.json")
 	for _, body := range []string{
-		"{",                                         // 半截 JSON
+		"{", // 半截 JSON
 		`{"deviceId":"a","token":"","base":"http://x"}`, // 凭据是空的
-		`{"deviceId":"a","token":"t"}`,                 // 没有地址就不知道该连哪
+		`{"deviceId":"a","token":"t"}`,                  // 没有地址就不知道该连哪
 	} {
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
@@ -169,9 +169,10 @@ func TestDiscoverFindsProfilesAndPrefersALiveCrew(t *testing.T) {
 	if found[0].Profile != "desktop" || found[0].Base != "http://127.0.0.1:43499" {
 		t.Errorf("picked %+v", found[0])
 	}
-	// 没有 webserver 段时用 dsh 的默认端口：管理面只认回环，这个默认足够出码。
-	if found[0].WebPort != 3080 {
-		t.Errorf("webPort = %d, want 3080", found[0].WebPort)
+	// 探测到活队伍之后，网页端口要按「同进程里真答管理面的那个」走；
+	// 只剩 profile 里的默认值（3080）就说明没探到，导出与设备表会打错端口。
+	if found[0].WebPort == 0 || found[0].WebPort == found[0].LanPort {
+		t.Errorf("webPort = %d（LanPort %d）：应该解析出同进程的网页端口", found[0].WebPort, found[0].LanPort)
 	}
 
 	// 一个都不活：返回空，界面据此说「没找到在跑的队伍」。
@@ -182,5 +183,20 @@ func TestDiscoverFindsProfilesAndPrefersALiveCrew(t *testing.T) {
 	both := discover(profiles, func(int) bool { return true })
 	if len(both) != 2 || both[0].Profile != "desktop" {
 		t.Errorf("order = %+v", both)
+	}
+}
+
+// 发现到的队伍必须带着「真正答管理面」的那个端口。
+//
+// profile 里写的通常是默认 3080，而管理面在同进程的另一个端口上；不解析这一层，
+// 设备表与备份就会打到一个不存在的端口上，界面上看起来是「读不到设备」。
+func TestDiscoveredCrewCarriesThePortThatAnswersManagement(t *testing.T) {
+	for _, target := range discover(profilesDir(), dialAlive) {
+		if target.WebPort == 0 {
+			t.Errorf("%s 的 WebPort 是 0", target.Profile)
+		}
+		if target.WebPort == target.LanPort {
+			t.Errorf("%s 的 WebPort 与 LanPort 相同（%d）：管理面不在消息面那个端口上", target.Profile, target.LanPort)
+		}
 	}
 }

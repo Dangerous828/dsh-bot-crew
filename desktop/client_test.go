@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"io"
-	"strings"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -104,7 +104,9 @@ func TestUnknownMessageFieldsSurvive(t *testing.T) {
 func TestRetryReusesTheRequestID(t *testing.T) {
 	var seen []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ RequestID string `json:"request_id"` }
+		var body struct {
+			RequestID string `json:"request_id"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -414,12 +416,13 @@ func TestLeavesOrdinaryTextAlone(t *testing.T) {
 	}
 }
 
-// 屏幕接口：带票号去问，回来的 unavailable + reason 原样读出来。
-func TestScreenAsksForTheTicketAndReadsTheReason(t *testing.T) {
+// 屏幕接口：带票号去问，reason 和活动快照都要读出来。
+func TestScreenAsksForTheTicketAndReadsWhatCameBack(t *testing.T) {
 	var path, query string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path, query = r.URL.Path, r.URL.RawQuery
-		_, _ = w.Write([]byte(`{"state":"unavailable","reason":"后端还没有画面源，worker 不跑浏览器"}`))
+		_, _ = w.Write([]byte(`{"state":"live","kind":"terminal","ticket_id":"tk 9","live":true,
+			"cwd":"/tmp/work","lines":[{"at":"2026-11-10T10:00:00Z","kind":"command","text":"$ pnpm test"}]}`))
 	}))
 	t.Cleanup(server.Close)
 
@@ -430,7 +433,71 @@ func TestScreenAsksForTheTicketAndReadsTheReason(t *testing.T) {
 	if path != "/api/mobile/screen" || query != "ticket=tk+9" {
 		t.Errorf("asked %q?%s", path, query)
 	}
-	if view.State != "unavailable" || view.Reason != "后端还没有画面源，worker 不跑浏览器" {
+	if view.State != "live" || view.Cwd != "/tmp/work" || len(view.Lines) != 1 {
+		t.Fatalf("view = %+v", view)
+	}
+	if line := view.Lines[0]; line.Kind != "command" || line.Text != "$ pnpm test" {
+		t.Errorf("line = %+v", line)
+	}
+}
+
+// 推理档位：带 provider/model 去问，把适配器给出的档位原样读回来。
+func TestEffortsReadsWhatTheRouteSupports(t *testing.T) {
+	var path, query string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, query = r.URL.Path, r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"efforts":[{"id":"low","name":"Low"},{"id":"high","name":"High","description":"slower"}],"default":"low"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	view, err := New(server.URL, "secret", "").Efforts(context.Background(), "magpie", "kimi/k3")
+	if err != nil {
+		t.Fatalf("Efforts: %v", err)
+	}
+	if path != "/api/mobile/efforts" || query != "provider=magpie&model=kimi%2Fk3" {
+		t.Errorf("asked %q?%s", path, query)
+	}
+	if len(view.Efforts) != 2 || view.Efforts[1].Description != "slower" || view.Default != "low" {
 		t.Errorf("view = %+v", view)
+	}
+}
+
+// 指定成员时把 bot_id 一起交给后端：只换那一位，不动全场默认。
+func TestSwitchingOneMembersModelSendsItsBotID(t *testing.T) {
+	var sent map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&sent)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	if err := New(server.URL, "secret", "").SwitchModel(context.Background(),
+		ModelChoice{Provider: "magpie", Model: "kimi/k3", ReasoningEffort: "high"}, "scribbler"); err != nil {
+		t.Fatalf("SwitchModel: %v", err)
+	}
+	if sent["bot_id"] != "scribbler" || sent["reasoningEffort"] != "high" || sent["provider"] != "magpie" {
+		t.Errorf("sent = %v", sent)
+	}
+}
+
+// 管理面与消息面是两个端口：设备表、备份只在管理面上。
+// 拿消息面端口去要它们只会 404 —— 桌面端发现队伍时必须把管理面地址接上。
+func TestManagementRequestsGoToTheManagementPort(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.Header.Get("x-orchestrator-request") != "1" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(`{"devices":[]}`))
+	}))
+	defer server.Close()
+	c := New("http://127.0.0.1:1", "t", "d").WithManagement(server.URL)
+	if _, err := c.Devices(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/orchestrator/api/remote/devices" {
+		t.Errorf("请求打到了 %q，应该走管理面", gotPath)
 	}
 }

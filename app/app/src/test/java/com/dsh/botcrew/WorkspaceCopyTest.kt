@@ -17,17 +17,11 @@ class WorkspaceCopyTest {
 
     @Test
     fun theScreenAreaWritesTheBackendsOwnReason() {
-        // 后端说没有画面源，那一行就写它给的理由，不自己再编一句。
-        assertEquals("后端还没有画面源：worker 不跑浏览器", WorkspaceCopy.screenText("后端还没有画面源：worker 不跑浏览器"))
+        // 后端说没有可读记录，那一行就写它给的理由，不自己再编一句。
+        assertEquals("这张工单还没有可读的执行记录", WorkspaceCopy.screenText("这张工单还没有可读的执行记录"))
         // 没有理由（比如字段缺席）才落到兜底，且兜底说的是「读不到」，不是「没有」。
         assertEquals("读不到它的画面", WorkspaceCopy.screenText(""))
         assertEquals("读不到它的画面", WorkspaceCopy.screenText(null))
-    }
-
-    @Test
-    fun theEntryPointAdmitsItDoesNotHaveTheScreenYet() {
-        // 和桌面端同一句话：同一件事两端不该说两种话。
-        assertEquals("还看不到它的屏幕：这一步还没接上", WorkspaceCopy.NOT_READY)
     }
 
     @Test

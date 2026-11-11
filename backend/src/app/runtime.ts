@@ -24,6 +24,7 @@ import { environmentOf, ticketEnvironment, type Variable } from './execution-env
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
+import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -52,19 +53,14 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
-/** How many of the crew's finished tickets the chat list keeps visible, so its entry opens on recent work. */
-const RECENT_CREW_TICKETS = 2
 /**
- * Whether a finishing ticket is old enough to archive its worker.
+ * Why a finished worker session is archived at once.
  *
- * The crew's entry must not open empty: the two most recent tickets stay in the list, and everything older is
- * archived. Ids are compared as a set, so a ticket that ends twice (a resume that ends again) still counts once.
+ * Every worker session this plugin creates is machinery, not a conversation a person started: the crew is read
+ * through the desktop window or the phone, never through the DSH chat list. Leaving them there fills the list
+ * with one entry per errand ("回答仓库根目录 README…") and hides the person's own work. Archiving keeps the
+ * transcript — the crew's screen and timeline read the session directly — and only removes it from the list.
  */
-const pastTheRecent = (store: Pick<Store, 'tickets'>, ticketId: string): boolean => {
-  const ended = store.tickets.list().filter(ticket => ticket.ended !== undefined)
-    .sort((a, b) => (b.ended?.at ?? '').localeCompare(a.ended?.at ?? ''))
-  return ended.findIndex(ticket => ticket.id === ticketId) >= RECENT_CREW_TICKETS
-}
 const now = (): string => new Date().toISOString()
 /**
  * How many notes a chain of crew mates may pass before the next one is refused. Two bots left to answer each other never
@@ -118,6 +114,8 @@ export class Runtime extends Service implements SourceHost {
   private readonly disposers: (() => void)[] = []
   private releaseLock?: () => Promise<void>
   private closingFlag = false
+  /** 待命期间重跑 setup 的定时器；关掉 runtime 时必须清掉，否则会对着已释放的锁再跑一次。 */
+  private setupRetry?: ReturnType<typeof setTimeout>
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
@@ -197,15 +195,11 @@ export class Runtime extends Service implements SourceHost {
           // the conversation the handoff came from, under the bot that did the work.
           const handoffReply = ended ? handoffEndNotice(ended, store.triggers.get(ended.origin.triggerId)) : undefined
           if (handoffReply) outbox.send(handoffReply)
-          // A finished ticket's worker is done, and leaving its Session in the list means the crew slowly fills
-          // the chat list with one entry per errand. Archive it: the transcript is kept and can be reopened, but
-          // the crew reads as the one place it is instead of as everything it has ever done.
-          // A finished ticket's worker is done, and keeping it in the list means the crew slowly fills the chat list
-          // with one entry per errand. Archive it, but keep the two most recent: the entry is where a person looks to
-          // see what the crew just did, and an archive that starts empty has nothing to show. The transcript is kept
-          // either way, so this only decides what the list opens on.
+          // 桥接产生的 worker 会话不是人开的对话：它是这台机器替主人干活的过程记录。留在 DSH 的会话列表里
+          // 就变成「每跑一个活多一条」，把主人自己开的会话顶下去。工单结束就归档 —— 归档不删记录，
+          // 桌面端「看它的屏幕」和手机时间线都是直接读会话，不受影响；DSH 列表里只留人自己开的会话。
           const archiving = ctx.workspaceRegistry.archiveSession
-          if (event.type === 'ticket.ended' && typeof archiving === 'function' && pastTheRecent(store, event.data.ticketId)) {
+          if (event.type === 'ticket.ended' && typeof archiving === 'function') {
             void archiving.call(ctx.workspaceRegistry, workerSessionId(event.data.ticketId) as SessionId, { stopActivity: true })
               .catch(() => undefined)
           }
@@ -248,6 +242,31 @@ export class Runtime extends Service implements SourceHost {
    * on the same request. An id the roster does not hold is dropped rather than guessed at, so work is never filed
    * under a bot that does not exist.
    */
+  /**
+   * 插队：把一句排队中的话直接交给正在跑的 worker，它在下一步边界先读到。
+   * 不中断当前命令；工单已经结束/不存在时返回 false，调用方据此回 409。
+   */
+  async steer(ticketId: string, requestId: string, text: string): Promise<boolean> {
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket || ticket.ended || !liveTicket(ticket)) return false
+    const note = `主人插话（请优先处理，当前步骤做完后立刻回应）：${text}`
+    await this.sessions.prompt(workerSessionId(ticketId), key('crew-steer', ticketId, requestId), note, 'steer')
+    return true
+  }
+
+  /** 「看它的屏幕」：把这张工单的 worker 会话整理成活动快照；读不到就说读不到。 */
+  async screen(ticketId: string): Promise<ScreenSnapshot> {
+    const id = ticketId.trim()
+    const ticket = id ? this.store.tickets.get(id) : undefined
+    if (!id || !ticket) return screenOf({ ticketId: id || undefined })
+    try {
+      const { events } = await this.ctx.sessionController.inspect(workerSessionId(id) as SessionId)
+      return screenOf({ ticketId: id, events: events as unknown as ScreenEvent[], cwd: ticket.execution?.directory })
+    } catch {
+      return { state: 'unavailable', ticket_id: id, reason: '这张工单的 worker 会话读不出来' }
+    }
+  }
+
   handOff(from: Pick<OutboundMessage, 'id' | 'channel'>, bot_id: string, text: string, origin?: Ticket): boolean {
     const { store } = this
     // Whose request this really is: the actor whose trigger opened the ticket being handed off.
@@ -349,6 +368,15 @@ export class Runtime extends Service implements SourceHost {
   checkSetup(): void { this.setup.check() }
   /** What the crew could switch to. The phone and the desktop both need this before they can offer a choice. */
   models(): ReturnType<HttpHost['models']> { return this.ctx.sessionController.modelCatalog() }
+  /** 一条 provider/model 路由支持哪些推理档位，按适配器现查；没有就是没有，不编一列。 */
+  async efforts(provider: string, model: string): Promise<{ efforts: { id: string; name: string; description?: string }[]; default?: string }> {
+    const info = await this.ctx.llm.resolveModelInfo(provider, model)
+    const efforts = (info.reasoning?.efforts ?? []).map(effort => ({
+      id: String(effort.id), name: effort.name,
+      ...(effort.description ? { description: effort.description } : {}),
+    }))
+    return { efforts, ...(info.reasoning?.defaultEffort ? { default: String(info.reasoning.defaultEffort) } : {}) }
+  }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }
@@ -358,9 +386,22 @@ export class Runtime extends Service implements SourceHost {
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
+    // Only once: a retry re-runs setup, not the routes (a second registration would collide).
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    await this.finishSetup()
+  }
+  /**
+   * Run setup and, once it holds, start the loops.
+   *
+   * Setup fails for reasons that repair themselves: a proxy that is down, a CLI being re-authenticated, a repository
+   * that just became readable. Until this could be retried, the crew stayed paused until someone restarted it by hand,
+   * so a short outage looked like a stopped product. The retry only recovers a pending crew — it never takes a working
+   * one down — and stops on its own once setup holds or the runtime closes.
+   */
+  private async finishSetup(): Promise<void> {
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
+      this.retrySetup()
       return
     }
     this.sessions.install()
@@ -374,6 +415,17 @@ export class Runtime extends Service implements SourceHost {
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
+  /** Retry a pending setup on a short timer; each failure schedules the next. */
+  private retrySetup(delay = 5_000): void {
+    if (this.closing()) return
+    this.setupRetry = setTimeout(() => {
+      this.setupRetry = undefined
+      if (this.closing()) return
+      void this.finishSetup().catch(error => {
+        this.runtimeHealth.set({ state: 'error', detail: String(error), at: now() })
+      })
+    }, delay)
+  }
   private httpHost(): HttpHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
@@ -386,7 +438,9 @@ export class Runtime extends Service implements SourceHost {
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
-    this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
+    this.closingFlag = true
+    if (this.setupRetry !== undefined) { clearTimeout(this.setupRetry); this.setupRetry = undefined }
+    const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]

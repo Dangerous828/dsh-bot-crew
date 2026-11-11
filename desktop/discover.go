@@ -138,6 +138,9 @@ func discover(profiles string, alive func(port int) bool) []crewTarget {
 	for _, target := range found {
 		target.Found = alive(target.LanPort)
 		if target.Found {
+			// profile 里写的网页端口常常只是默认值（3080），真正答管理面的是同进程里
+			// 另一个端口。发现了活队伍就顺手问一次，免得设备表与备份打到错的端口上。
+			target.WebPort = webPortNear(target.LanPort, target.WebPort)
 			live = append(live, target)
 		}
 	}

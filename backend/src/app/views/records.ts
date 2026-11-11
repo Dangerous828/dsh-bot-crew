@@ -208,3 +208,29 @@ export function decisionView(view: Snapshot, decision: Decision) {
     ticketTitle: decision.ticketId ? store.tickets.get(decision.ticketId)?.title : undefined }
 }
 export type DecisionView = ReturnType<typeof decisionView>
+
+/**
+ * 导出这份记录：配置、花名册、政策、以及每张工单的最终状态。
+ *
+ * 备份要能拿回来重放，所以导的是「重建这件事需要什么」，不是数据库文件：
+ * 会话记录（DSH 的 transcript）本来就在 `~/.dsh/sessions` 下，单独拷那一份就行。
+ * 密钥、设备凭据摘要、配对凭据一概不进导出 —— 它们不该离开这台机器。
+ */
+export function recordsExport(store: Store, stateDir: string, version: number): Record<string, unknown> {
+  const settings = store.settings()
+  const tickets = store.tickets.list().map(ticket => ({
+    id: ticket.id, title: ticket.title, createdAt: ticket.createdAt, updatedAt: ticket.updatedAt,
+    mandate: ticket.mandate, channels: ticket.channels, ended: ticket.ended,
+    assignments: ticket.assignments.map(item => ({ state: item.state, createdAt: item.createdAt, endedAt: item.endedAt,
+      ...item.report ? { report: item.report } : {} })),
+  }))
+  return {
+    kind: 'dsh-bot-crew-records',
+    version,
+    exportedAt: new Date().toISOString(),
+    stateDir,
+    settings: { paused: settings.paused, policy: settings.policy, eval: settings.eval, executor: settings.executor },
+    team: (settings.sources?.team?.config ?? {}) as Record<string, unknown>,
+    tickets,
+  }
+}

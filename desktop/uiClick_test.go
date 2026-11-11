@@ -2,6 +2,7 @@ package main
 
 import (
 	"image"
+	"strings"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -32,7 +33,7 @@ func hoverCursor(tt *ui.Tester, text string) (ui.Cursor, bool) {
 // workPaneIn 把右栏单独放进一扇窗里画，量到的就是右栏这一块。
 func workPaneIn(s *app, p Palette) *ui.Tester {
 	tt := ui.NewTester(func(c *ui.Context) {
-		ui.Row(c).Width(393).FillHeight().PaddingX(16).PaddingY(22).Background(p.Surface).Children(func() {
+		ui.Column(c).Width(393).FillHeight().PaddingX(16).PaddingY(22).Background(p.Surface).Children(func() {
 			s.workPane(c, p)
 		})
 	}, 393, 500)
@@ -120,15 +121,18 @@ func TestPressingATabShowsIt(t *testing.T) {
 func TestTheEmptyPaneTellsDisconnectFromEmpty(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))
 	tt := workPaneIn(s, PaletteFor(false))
-	if !tt.HasText("这一栏还是空的。") {
-		t.Errorf("连上了但没有工单，应该写「这一栏还是空的。」；现在画的是 %v", tt.Texts())
+	if !tt.HasText("进行中没有工单。") {
+		t.Errorf("连上了但没有工单，应该写「进行中没有工单。」；现在画的是 %v", tt.Texts())
+	}
+	if !tt.HasText("0 张") {
+		t.Errorf("空栏也要有张数：现在画的是 %v", tt.Texts())
 	}
 
 	s.problem = "dial tcp: connection refused"
 	tt = workPaneIn(s, PaletteFor(false))
 	tt.Frame()
-	if tt.HasText("这一栏还是空的。") {
-		t.Error("断连时也写「这一栏还是空的」，等于说「没有工单」，可数据没读到")
+	if tt.HasText("进行中没有工单。") {
+		t.Error("断连时也写「进行中没有工单」，等于说「没有工单」，可数据没读到")
 	}
 	if !tt.HasText("还没连上，读不到工单") {
 		t.Errorf("断连时应该说读不到工单；现在画的是 %v", tt.Texts())
@@ -175,7 +179,7 @@ func TestEveryClickableShowsThePointer(t *testing.T) {
 		s := withTask()
 		p := PaletteFor(false)
 		tt := ui.NewTester(func(c *ui.Context) {
-			ui.Row(c).Width(393).FillHeight().PaddingX(16).PaddingY(22).Background(p.Surface).Children(func() {
+			ui.Column(c).Width(393).FillHeight().PaddingX(16).PaddingY(22).Background(p.Surface).Children(func() {
 				s.workPane(c, p)
 			})
 		}, 393, 700)
@@ -245,7 +249,7 @@ func TestEveryClickableShowsThePointer(t *testing.T) {
 func TestClickingABotReturnsToTheConversation(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))
 	s.conversation = &Conversation{
-		Bots: []BotCard{{ID: "lead", Name: "大哥"}, {ID: "scribe", Name: "写手"}},
+		Bots:         []BotCard{{ID: "lead", Name: "大哥"}, {ID: "scribe", Name: "写手"}},
 		DefaultBotID: "lead",
 	}
 	s.backendOpen = true
@@ -319,5 +323,225 @@ func TestTheSidebarCanCollapseAndReopen(t *testing.T) {
 	tt.Frame()
 	if s.sidebarClosed {
 		t.Error("点了窄边，左栏没有展开")
+	}
+}
+
+// 「看它的屏幕」读回来后，中间栏显示的是它跑过的命令；点返回回到对话。
+func TestTheScreenPaneShowsWhatTheWorkerDid(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.screen = &ScreenView{State: "live", Cwd: "/tmp/work", Lines: []ScreenLine{
+		{At: "2026-11-10T10:00:00Z", Kind: "command", Text: "$ pnpm test"},
+		{At: "2026-11-10T10:00:05Z", Kind: "output", Text: "1429 passed"},
+	}}
+	p := PaletteFor(false)
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Row(c).Width(720).FillHeight().Background(p.Surface).Children(func() { s.conversationPane(c, p) })
+	}, 720, 700)
+	tt.Frame()
+
+	shown := strings.Join(tt.Texts(), "\n")
+	if !strings.Contains(shown, "$ pnpm test") {
+		t.Fatalf("屏幕画出来了，却没有显示它跑过的命令：%q", tt.Texts())
+	}
+	if !strings.Contains(shown, "1429 passed") {
+		t.Fatalf("输出那一行也没了：%q", tt.Texts())
+	}
+	if _, found := tt.Find("返回对话"); !found {
+		t.Fatal("找不到返回对话")
+	}
+	tt.Click("返回对话")
+	tt.Frame()
+	if s.screen != nil {
+		t.Error("点了返回，画面还挂着")
+	}
+}
+
+// 左栏标题栏的「+」是加一位 Bot 的入口：有 Bot 时也能点，切到模型页。
+func TestThePlusInTheTitleOpensTheModelPage(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("+"); err != nil {
+		t.Fatalf("找不到标题栏的「+」：%v", err)
+	}
+	tt.Frame()
+	if s.navTab != navModel {
+		t.Errorf("点了「+」之后在第 %v 页，应该切到模型页（加一位 Bot）", s.navTab)
+	}
+}
+
+// 全屏看屏幕：左右两栏收掉，画面占满窗户；退出后两栏回来。
+func TestTheScreenCanTakeTheWholeWindow(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	s.screen = &ScreenView{State: "live", Cwd: "/tmp/work", Lines: []ScreenLine{
+		{At: "2026-11-10T10:00:00Z", Kind: "command", Text: "$ pnpm test"},
+	}}
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if !tt.HasText("我的队伍") {
+		t.Fatalf("还没全屏时左栏应该在；画的是 %v", tt.Texts())
+	}
+	if err := tt.Click("全屏"); err != nil {
+		t.Fatalf("找不到「全屏」：%v", err)
+	}
+	tt.Frame()
+	if !s.screenFull {
+		t.Fatal("点了「全屏」，状态没变")
+	}
+	if tt.HasText("我的队伍") {
+		t.Error("全屏后左栏还画着：窗口没有让给屏幕")
+	}
+	if !tt.HasText("它在做什么") {
+		t.Errorf("全屏后看不到屏幕面板；画的是 %v", tt.Texts())
+	}
+	if err := tt.Click("退出全屏"); err != nil {
+		t.Fatalf("找不到「退出全屏」：%v", err)
+	}
+	tt.Frame()
+	if s.screenFull {
+		t.Error("点了「退出全屏」，状态没回来")
+	}
+	if !tt.HasText("我的队伍") {
+		t.Error("退出全屏后左栏没有回来")
+	}
+	// 返回对话要把全屏状态一起复位，下次打开不会直接占满窗口。
+	tt.Click("全屏")
+	tt.Frame()
+	tt.Click("返回对话")
+	tt.Frame()
+	if s.screen != nil || s.screenFull {
+		t.Errorf("返回对话后 screen=%v full=%v，应该都清掉", s.screen, s.screenFull)
+	}
+}
+
+// 点花名册上的「改」打开编辑层：名字与人设都在，草稿来自当前名单。
+func TestEditingABotShowsHisCurrentWords(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{
+		Bots: []BotCard{{ID: "coder", Name: "码农", Persona: "写代码先看现有约定。"}}, DefaultBotID: "coder",
+	}
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1100, 700)
+	tt.Frame()
+	if err := tt.Click("改"); err != nil {
+		t.Fatalf("花名册上没有「改」：%v", err)
+	}
+	tt.Frame()
+	if s.editingBot != "coder" {
+		t.Fatalf("点「改」之后编辑的是 %q，应该是 coder", s.editingBot)
+	}
+	if s.botName != "码农" || s.botPersona != "写代码先看现有约定。" {
+		t.Errorf("草稿是 %q / %q，应该来自当前名单", s.botName, s.botPersona)
+	}
+	if !tt.HasText("改这一位") {
+		t.Errorf("编辑层没画出来；画的是 %v", tt.Texts())
+	}
+	// 取消要真的关掉，并且不改任何东西。
+	if err := tt.Click("取消"); err != nil {
+		t.Fatalf("找不到取消：%v", err)
+	}
+	tt.Frame()
+	if s.editingBot != "" {
+		t.Error("点了取消，编辑层还开着")
+	}
+}
+
+// 名字空了不许发：本地就挡住，不发一趟无意义的请求。
+func TestAnEmptyNameIsRefusedBeforeSending(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "coder", Name: "码农"}}, DefaultBotID: "coder"}
+	s.editBot(BotCard{ID: "coder", Name: "码农"})
+	s.botName = "   "
+	s.saveBot()
+	if s.botError == "" {
+		t.Error("空名字没有报错")
+	}
+	if s.botSaving {
+		t.Error("空名字不该发出请求")
+	}
+}
+
+// 已配对的设备要看得见：手机丢了才知道该撤哪一台。
+// 之前客户端有 Devices/Revoke，界面上却从来没有这块 —— 等于没有。
+func TestThePairedDevicesAreListedAndRevocable(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	s.backendOpen = true
+	s.devicesTried = true
+	s.devices = []PairedDevice{
+		{DeviceID: "d1", Name: "Kenton 的手机", Platform: "android", PairedAt: "2026-11-10T12:00:00Z"},
+		{DeviceID: "d2", Name: "旧手机", Platform: "ios", PairedAt: "2026-11-01T09:00:00Z"},
+	}
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1280, 714)
+	tt.Frame()
+	for _, name := range []string{"Kenton 的手机", "旧手机"} {
+		if !tt.HasText(name) {
+			t.Errorf("设备「%s」没出现在右栏；画的是 %v", name, tt.Texts())
+		}
+	}
+	// 每台一个「撤掉」。
+	count := 0
+	for _, text := range tt.Texts() {
+		if text == "撤掉" {
+			count++
+		}
+	}
+	if count < 2 {
+		t.Errorf("两台设备应该有 %d 个「撤掉」，实际 %d 个", 2, count)
+	}
+}
+
+// 读设备失败要说出来，不能安静地把整块藏掉 —— 那样人以为没有设备配过。
+func TestAFailedDeviceListSaysSo(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	s.backendOpen = true
+	s.devicesTried = true
+	s.devicesNote = "读不到已配对的设备：management route refused"
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1280, 714)
+	tt.Frame()
+	if !tt.HasText("读不到已配对的设备：management route refused") {
+		t.Errorf("读设备失败没说出来；画的是 %v", tt.Texts())
+	}
+}
+
+// 第一次打开时，空态要说清「怎么开始」，而不是只留一句「还没有人说话」。
+func TestTheEmptyConversationTeachesTheFirstStep(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Row(c).Width(718).FillHeight().Background(PaletteFor(false).Surface).Children(func() {
+			s.conversationPane(c, PaletteFor(false))
+		})
+	}, 718, 700)
+	tt.Frame()
+	for _, step := range []string{"在下面说一句话，或者 @ 某一位", "右栏能看到进度", "它会记住你们的对话"} {
+		if !tt.HasText(step) && !strings.Contains(strings.Join(tt.Texts(), "\n"), step) {
+			t.Errorf("空态缺这一步引导：%q；画的是 %v", step, tt.Texts())
+		}
+	}
+	// 有一句话之后就不该再教了：那是打扰。
+	s.conversation.Messages = []Message{{ID: "m1", Text: "你好", At: "2026-11-11T00:00:00Z"}}
+	tt.Frame()
+	if strings.Contains(strings.Join(tt.Texts(), "\n"), "它会记住你们的对话") {
+		t.Error("已经有消息了还在显示新手指引")
+	}
+}
+
+// 备份要有入口：右栏给一个「导出备份」，成功后说清存到哪了。
+func TestTheRecordsCanBeExportedFromTheBackendPane(t *testing.T) {
+	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	s.conversation = &Conversation{Bots: []BotCard{{ID: "lead", Name: "大哥"}}, DefaultBotID: "lead"}
+	s.backendOpen = true
+	s.devicesTried = true
+	s.exportNote = "已备份到 /Users/me/Desktop/crew-backup-20261111-110000.json"
+	tt := ui.NewTester(func(c *ui.Context) { s.view(c) }, 1280, 714)
+	tt.Frame()
+	if !tt.HasText("导出备份") {
+		t.Errorf("右栏没有「导出备份」；画的是 %v", tt.Texts())
+	}
+	if !tt.HasText("已备份到 /Users/me/Desktop/crew-backup-20261111-110000.json") {
+		t.Errorf("导出的结果没说清存到哪；画的是 %v", tt.Texts())
 	}
 }

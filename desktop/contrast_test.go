@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -86,6 +87,26 @@ func TestAccentOnItsSoftBackground(t *testing.T) {
 		}
 		if got := contrast(c.p.Warn, c.p.WarnSoft2); got < 3 {
 			t.Errorf("%s/警告压在淡底上: 对比度 %.2f，低于 3", c.name, got)
+		}
+	}
+}
+
+// 调色板的每个字段都必须是不透明的。
+//
+// 漏赋值时 ui.Color 是零值：alpha=0，画出来什么都没有。花名册选中底、头像块、
+// 警告边线就这么一起消失过一次，而对比度测试按 RGB 计算，看不出来。
+func TestEveryPaletteColorIsOpaque(t *testing.T) {
+	for _, entry := range []struct {
+		name string
+		p    Palette
+	}{{"亮", LightPalette}, {"暗", DarkPalette}} {
+		value := reflect.ValueOf(entry.p)
+		kind := value.Type()
+		for i := 0; i < value.NumField(); i++ {
+			color := value.Field(i).Interface().(ui.Color)
+			if color.A != 255 {
+				t.Errorf("%s/%s 的 alpha 是 %d，画出来是透明的；补上实值", entry.name, kind.Field(i).Name, color.A)
+			}
 		}
 	}
 }

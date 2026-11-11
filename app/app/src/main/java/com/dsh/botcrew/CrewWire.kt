@@ -10,7 +10,15 @@ import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 
 /** 一条消息。角色只有两种：人说的，和队伍里某个 Bot 说的。 */
-data class Message(val id: String, val fromBot: Boolean, val botId: String?, val text: String, val at: String)
+data class Message(
+    val id: String,
+    val fromBot: Boolean,
+    val botId: String?,
+    val text: String,
+    val at: String,
+    /** 自己发的消息的幂等键；撤回排队中的消息要用它。 */
+    val requestId: String = "",
+)
 
 /**
  * 名片上能看到的那些字。它是呈现，不持有任何任务状态。
@@ -68,6 +76,7 @@ object CrewWire {
                     botId = botId,
                     text = readable(item.optString("text")),
                     at = item.optString("at"),
+                    requestId = item.optString("request_id"),
                 ),
             )
         }
@@ -348,15 +357,6 @@ object WorkspaceCopy {
     /** 读屏接口本身读不到时的兜底：仍然说清是「读不到」，不是「没有」。 */
     const val SCREEN_UNREAD = "读不到它的画面"
 
-    /**
-     * 点一下入口时的实话。和桌面端（desktop/ui.go 里 screenReady 为 false 那一支）
-     * 同一句话 —— 同一件事两端不该说两种话。
-     *
-     * 手机这边的入口是打开这一页，看见空位比一句一闪而过的提示更清楚，所以界面暂时没有
-     * 引用它；留着是因为桌面端那句话要有可对照的源，测试也钉着它。
-     */
-    const val NOT_READY = "还看不到它的屏幕：这一步还没接上"
-
     /** 接手的说明。它说的是设计里的约定（接手后 Bot 停在原地），不是此刻在发生的事。 */
     const val TAKEOVER_NOTE = "接手后它就不动了，把手机放下才算还给它"
 
@@ -408,18 +408,48 @@ object WorkspaceCopy {
     }
 }
 
-/** 读屏接口的回答。live 才有 frames；unavailable 时 reason 就是手机该显示的那句话。 */
-data class ScreenView(val state: String, val reason: String)
+/** 它执行过的一行：命令 / 输出 / 回话 / 状态。 */
+data class ScreenLine(val at: String, val kind: String, val text: String)
+
+/**
+ * 读屏接口的回答。live 时 lines 是它刚做了什么；unavailable 时 reason 就是手机该显示的那句话。
+ * 这里不是像素截帧：worker 干的是终端活，手机看的是那件事本身。
+ */
+data class ScreenView(
+    val state: String,
+    val reason: String,
+    val kind: String = "",
+    val cwd: String = "",
+    val lines: List<ScreenLine> = emptyList(),
+) {
+    val live: Boolean get() = state == "live"
+}
 
 object ScreenWire {
     fun parse(body: String): ScreenView {
         val root = JSONObject(body)
+        val lines = root.optJSONArray("lines")
         return ScreenView(
             state = root.optString("state", "unavailable"),
             reason = root.optString("reason", ""),
+            kind = root.optString("kind", ""),
+            cwd = root.optString("cwd", ""),
+            lines = buildList {
+                if (lines != null) for (index in 0 until lines.length()) {
+                    val line = lines.optJSONObject(index) ?: continue
+                    val text = line.optString("text", "")
+                    if (text.isNotBlank()) add(ScreenLine(line.optString("at", ""), line.optString("kind", ""), text))
+                }
+            },
         )
     }
 }
+
+/** 事件时间缩成时分秒；读不出来就原样留着，不编时间。与桌面端同一规矩。 */
+fun screenClock(at: String): String = try {
+    Instant.parse(at).atZone(ZoneId.systemDefault()).toLocalTime()
+        .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+} catch (_: DateTimeParseException) { at }
 
 object BotsWire {
     /** 与后端 crew/directory.ts 的 BOT_ID、以及 TeamConfig 的 schema 同一形状。 */
@@ -431,6 +461,92 @@ object BotsWire {
         // 空人设不上送：后端会把空串写成 persona: ""，配置里多一个没用的键。
         if (persona.isNotBlank()) body.put("persona", persona)
         return body.toString()
+    }
+
+    /** 改人设：和新建不同，空人设要显式上送 —— 那是「把他说的话删掉」，不是「没填」。 */
+    fun editBody(botId: String, name: String, persona: String): String =
+        JSONObject().put("action", "edit").put("bot_id", botId).put("name", name).put("persona", persona).toString()
+
+    /** 撤一位：同样走 action，因为 Connection 只认 POST。 */
+    fun removeBody(botId: String): String = JSONObject().put("action", "remove").put("bot_id", botId).toString()
+}
+
+/** 一条模型路由：provider 决定去哪儿，reasoningEffort 是可选档位。 */
+data class ModelChoice(val provider: String, val model: String, val reasoningEffort: String? = null)
+
+data class ModelOption(val id: String, val name: String, val description: String? = null)
+data class ModelProvider(val id: String, val name: String, val models: List<ModelOption>)
+
+/** 读不出来的 provider：让人知道「这家连不上」，而不是以为它本来就没有模型。 */
+data class ModelFailure(val id: String, val name: String)
+
+data class ModelCatalog(
+    val current: ModelChoice?,
+    val botModels: Map<String, ModelChoice>,
+    val providers: List<ModelProvider>,
+    val failures: List<ModelFailure>,
+) {
+    /** 这个作用域现在用的路由：botId 为空是全员，否则是这一位；没单配就跟随全员。 */
+    fun choiceFor(botId: String?): ModelChoice? = if (botId.isNullOrEmpty()) current else botModels[botId] ?: current
+
+    /** 这一位是不是没有自己的路由，跟着全员走。 */
+    fun followsCrew(botId: String?): Boolean = !botId.isNullOrEmpty() && botModels[botId] == null
+}
+
+/** 一个推理档位。id 是提交给后端的那一个，name 只用来给人看。 */
+data class EffortOption(val id: String, val name: String)
+data class Efforts(val efforts: List<EffortOption>, val default: String? = null)
+
+object ModelWire {
+    private fun choice(value: JSONObject?): ModelChoice? {
+        if (value == null) return null
+        val provider = value.optString("provider").orEmpty()
+        val model = value.optString("model").orEmpty()
+        if (provider.isEmpty() || model.isEmpty()) return null
+        val effort = value.optString("reasoningEffort").takeIf { it.isNotEmpty() }
+        return ModelChoice(provider, model, effort)
+    }
+
+    fun parseCatalog(body: String): ModelCatalog {
+        val root = JSONObject(body)
+        val providers = mutableListOf<ModelProvider>()
+        val groups = root.optJSONArray("providers") ?: JSONArray()
+        for (index in 0 until groups.length()) {
+            val group = groups.optJSONObject(index) ?: continue
+            val models = mutableListOf<ModelOption>()
+            val options = group.optJSONArray("models") ?: JSONArray()
+            for (position in 0 until options.length()) {
+                val option = options.optJSONObject(position) ?: continue
+                val id = option.optString("id").takeIf { it.isNotEmpty() } ?: continue
+                models.add(ModelOption(id, option.optString("name", id),
+                    option.optString("description").takeIf { it.isNotEmpty() }))
+            }
+            providers.add(ModelProvider(group.optString("id"), group.optString("name", group.optString("id")), models))
+        }
+        val failures = mutableListOf<ModelFailure>()
+        val broken = root.optJSONArray("failures") ?: JSONArray()
+        for (index in 0 until broken.length()) {
+            val item = broken.optJSONObject(index) ?: continue
+            val id = item.optString("id").takeIf { it.isNotEmpty() } ?: continue
+            failures.add(ModelFailure(id, item.optString("name", id)))
+        }
+        val botModels = mutableMapOf<String, ModelChoice>()
+        root.optJSONObject("bot_models")?.let { saved ->
+            for (id in saved.keys()) choice(saved.optJSONObject(id))?.let { botModels[id] = it }
+        }
+        return ModelCatalog(choice(root.optJSONObject("current")), botModels, providers, failures)
+    }
+
+    fun parseEfforts(body: String): Efforts {
+        val root = JSONObject(body)
+        val list = mutableListOf<EffortOption>()
+        val options = root.optJSONArray("efforts") ?: JSONArray()
+        for (index in 0 until options.length()) {
+            val item = options.optJSONObject(index) ?: continue
+            val id = item.optString("id").takeIf { it.isNotEmpty() } ?: continue
+            list.add(EffortOption(id, item.optString("name", id)))
+        }
+        return Efforts(list, root.optString("default").takeIf { it.isNotEmpty() })
     }
 }
 

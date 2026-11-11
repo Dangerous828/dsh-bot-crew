@@ -132,12 +132,130 @@
 {
   "items": [ /* 上面的 timeline 项 */ ],
   "tasks":  [ /* 后台 Ticket 的只读投影，字段由后台给什么就展示什么 */ ],
+  "queued": [ "request_id" ],      // 已接受、还没有回复、仍可尝试撤回的消息
+  "declined": [                    // 后台看过并决定不动手的消息，带一句理由
+    { "request_id": "...", "reason": "..." }
+  ],
   "status": { "runtime": "observe|auto|off", "mobile": "on|off", "paused": false }
 }
 ```
 
 - 页面 `stop` 时不轮询；不强制每条更新滚到底；未知字段必须保留、不得丢弃。
 - **未实现的审批能力不得虚构按钮或审批状态**。
+- 被撤回的消息不出现在 `items`，也不出现在 `queued`。
+
+### 撤回排队消息：`POST /api/mobile/withdraw`
+
+```jsonc
+{ "request_id": "uuid-v4" }        // 必填，与 /send 用的是同一个值
+```
+
+成功：`200 {"ok":true,"id":"<message-id>","request_id":"<同值>"}`。
+撤回后这条消息从 `GET /timeline` 的 `items` 消失，`queued` 也不再包含它。
+
+失败（错误体与 §6 一致，客户端只展示文本）：
+
+| HTTP | 何时 | `error` 文本 |
+| --- | --- | --- |
+| 400 | 缺 `request_id`、不是字符串、为空或超过 128 字符 | `request_id is required` |
+| 404 | 这个对话里没有该 `request_id` | `no such message` |
+| 409 | 已经回复 / 已被 worker 读走 / 已经撤回过 | `message was already answered` / `message was already picked up` / `message already withdrawn` |
+| 401 · 502 · 503 | 与其余消息面路由相同（未认证 / 后台不可用 / 暂停或过载） | — |
+
+判定规则：
+
+- 可撤回 = **尚未被回复**（没有 reply 挂在消息下）**且尚未被读走**（队列 `pull` 还没把它交给任何 Source）。
+- 已经进入 worker 的消息不允许删除：后台可能正在做这件事，删掉会让界面与后台的账分叉。网关返回 409，不静默成功。
+- 撤回是标记而不是物理删除：`request_id` 仍被占用，之后用同一个 `request_id` 重发不会把消息复活
+  （同文返回首次结果，异文仍按 §6 的 `conflict` 拒绝）。
+- 客户端展示的撤回入口可以按时间窗先收窄，但最终以网关判定为准；收到 409 时应刷新时间线，而不是假定撤回成功。
+
+## 5.1 `GET /api/mobile/screen?ticket=<id>`
+
+「看它的屏幕」返回的是这张工单的**会话活动快照**，不是像素截帧：worker 跑的是终端与文件活，
+有信息量的是它刚执行了什么命令、输出了什么、说了什么。像素画面将来若接，是另一种 `kind`，
+这里的状态与 `reason` 不变。
+
+```jsonc
+{
+  "state": "live",             // live | unavailable
+  "kind": "terminal",
+  "ticket_id": "tk-1",
+  "live": true,
+  "at": "2026-11-10T15:02:11.000Z",   // 最后一条活动的时间
+  "cwd": "/Users/me/Code/dsh-bot-crew",
+  "lines": [
+    { "at": "...", "kind": "command", "text": "$ pnpm test" },
+    { "at": "...", "kind": "output",  "text": "1429 passed" },
+    { "at": "...", "kind": "said",    "text": "看完了" },
+    { "at": "...", "kind": "status",  "text": "这一轮结束" }
+  ]
+}
+```
+
+- `kind` 只有 `command` / `output` / `said` / `status` 四种；`output` 与 `said` 的区别是
+  「命令的输出」还是「它自己说的话」。
+- 只取最近的活动（默认 120 条），单行超过 500 字符截断；命令与输出里的
+  `KEY=value`、`TOKEN: value`、`Bearer xxx` 一律掩码成 `***` 再下发。
+- 没有票号、没有会话、会话里没有可显示的事件时返回 `state: "unavailable"` 与一句真实
+  `reason`（例如「这张工单还没有可读的执行记录」）。不得用「在加载」或空数组冒充有画面。
+- 认证与其余 `/api/mobile/*` 相同；局域网与中转隧道都走同一道门。
+
+## 5.2 模型：`GET /api/mobile/models` · `GET /api/mobile/efforts` · `POST /api/mobile/model`
+
+```jsonc
+// GET /api/mobile/models
+{
+  "current": { "provider": "magpie", "model": "workbuddy/deepseek-v4.1-flash" },
+  "bot_models": { "coder": { "provider": "magpie", "model": "workbuddy/glm-5.3", "reasoningEffort": "high" } },
+  "providers": [ { "id": "...", "name": "...", "models": [ { "id": "...", "name": "...", "description": "..." } ] } ],
+  "failures": [ { "id": "...", "name": "..." } ]
+}
+```
+
+- `current` 是全场默认；`bot_models` 是每位成员自己的路由，缺省表示跟随全员。
+- `providers` 只列读得出来的模型；`failures` 只列名字，不把内网地址或凭据带上屏。
+
+```jsonc
+// GET /api/mobile/efforts?provider=<id>&model=<id>
+{ "efforts": [ { "id": "off", "name": "Off" }, { "id": "high", "name": "High", "description": "..." } ], "default": "low" }
+```
+
+- 档位由适配器现查；这条路由不支持就是空数组，不编一列猜测值。
+
+```jsonc
+// POST /api/mobile/model
+{ "provider": "<id>", "model": "<id>", "reasoningEffort": "high", "bot_id": "coder" }
+```
+
+- 带 `bot_id` 时只改这位成员的模型；不带则是全场默认。`bot_id` 必须是花名册里存在的 id。
+- 成员提交 `model: ""`（provider 可为空）表示删掉成员自己的路由，回到全场默认；
+  全场默认不允许提交空模型。
+- 换模型沿用旧值未显式给出的 `reasoningEffort`；路由由 `Settings.save` 在落盘前验证。
+
+## 5.3 插队：`POST /api/mobile/steer`
+
+把一条**还在排队**的消息直接交给正在跑的 worker：它在下一步边界先读到这句，不等队列轮询；
+当前正在执行的命令不会被中断。
+
+```jsonc
+{ "ticket": "tk-1", "request_id": "uuid-v4", "text": "可选：新写的一句" }
+```
+
+- 带 `text`：**发送即插队**。这句先以「已读」写进网关时间线（路由不会再当新活接一遍），
+  再 steer 给 worker；返回 `{"ok":true,...}`。
+- 不带 `text`：针对队列里已有的那条 `request_id`，先 claim（标记读走）再 steer；两个都必填。
+
+成功：`200 {"ok":true,"ticket":"tk-1","request_id":"uuid-v4"}`。
+
+判定与顺序：
+
+- 工单必须仍在跑；已结束/不存在 → 409 `Ticket is not running`。
+- 先从网关队列**认领**这条消息（标记读走）。认领成功才说明它还没被路由读过，因此不会送两遍；
+  认领失败原样透传网关的 404 / 409（`no such message` / `message was already answered` /
+  `message was already picked up`）。
+- 认领后把它作为 steer 投递给 `worker-<ticket>`，消息前会加一句「主人插话（请优先处理…）」。
+- 已回复、已被读走、已撤回过都不能插队，返回 409 并提示刷新时间线。
 
 ## 6. 错误码
 
@@ -145,7 +263,8 @@
 | --- | --- | --- |
 | `bad_request` | 400 | 缺字段 / 格式错 |
 | `unauthorized` | 401 | 未通过宿主已认证入口 |
-| `conflict` | 409 | `request_id` 已存在且内容不同 |
+| `not_found` | 404 | 指定的 `request_id`（或工单）不存在 |
+| `conflict` | 409 | `request_id` 已存在且内容不同；撤回时消息已回复、已被读走或已经撤回过 |
 | `too_large` | 413 | 正文超限 |
 | `upstream` | 502 | 后台不可用 |
 | `unavailable` | 503 | 暂停 / 过载 |

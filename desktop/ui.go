@@ -3,7 +3,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -27,20 +31,27 @@ type app struct {
 	failed  chan string
 	// sent 把「这次发出去的原文」带回主线程：只有输入框里还是这句时才清空，
 	// 否则会把用户刚打的新内容抹掉。
-	sent chan string
-	tree    chan []AgentNode
-	paired  chan Credential
+	sent   chan string
+	tree   chan []AgentNode
+	paired chan Credential
 	// 配对失败单独一条：它不该写成「连不上队伍」，那是连接问题，不是配对问题。
 	pairFailed chan string
-	steps   chan workResult
+	steps      chan workResult
 	// modelList 是模型目录回来了；modelSwitched 是换成功了。
 	// 两份分开：读失败和换失败要说的不是一句话。
 	modelList     chan *ModelCatalog
-	modelSwitched chan ModelChoice
+	modelSwitched chan modelSwitchResult
+	// efforts 是当前作用域那条路由的推理档位；effortsCh 把异步结果带回主线程。
+	efforts   *EffortsView
+	effortsCh chan *EffortsView
+	// modelScope 是「这次换模型应用给谁」：空串是全场，否则是 bot_id。
+	modelScope string
 	// modelError 与 failed 分开：模型目录/切换失败只该写在模型栏里。
 	modelError chan string
 	// screenNoteCh 是屏幕接口的返回：它是「暂时没有」，不是断连。
 	screenNoteCh chan string
+	// screenCh 是读到的活动快照；主线程拿它把中间栏换成画面。
+	screenCh chan *ScreenView
 	// 重试失败也一样：只影响这张票，不冒充断连。
 	retryErrorCh chan string
 	retryError   string
@@ -57,22 +68,37 @@ type app struct {
 
 	// 打开的那张工单和它的过程。过程带着票号回来，所以点开 A 之后又点 B，A 的结果不会冒充成 B 的。
 	openTicket string
-	// screenNote 是「看它的屏幕」给出的实话（后端还没有画面源），与连接故障分开显示。
+	// screenNote 是「看它的屏幕」给出的实话（没有记录、读不出来），与连接故障分开显示。
 	screenNote string
+	// screen 非空时，中间栏显示这张票的活动快照，而不是对话。
+	screen *ScreenView
+	// screenFull 是屏幕模式再放大：藏起左右两栏，把整扇窗留给它在做什么。
+	// 只在 screen 非空时有意义；返回对话时会一起复位。
+	screenFull bool
 	// selectedBot 是左栏点中的那位。点它既是选人，也是回到对话主界面。
 	selectedBot string
 	// sidebarClosed 是左栏收起。零值 false = 默认展开，和以前一样。
 	sidebarClosed bool
+	// sidebarWidth / backendWidth 是三栏现在的宽度。它们只在这次运行里记着，
+	// 不落盘：拖宽了下次启动回到设计稿的宽度，不比「记住上次随手一拖」差。
+	sidebarWidth float32
+	backendWidth float32
 	// services 是 mygo 的窗口服务，后台 goroutine 靠它请求重画。
 	services ui.Services
-	// screenReady 是「看它的屏幕」能不能用。后端还没有这条路，先摆着。
-	screenReady bool
 	// backendTab 是右栏「后台」那一档里当前在看哪一页：进行中 / 待你 / 已完成。
 	backendTab int
 	// navTab 是左栏点开的是哪一项。默认停在「后台」，所以打开窗口看到的就是那一栏。
 	navTab navItem
 	// backendOpen 是右栏在不在。「后台」再点一次收起来，中间的对话就占满整扇窗。
 	backendOpen bool
+
+	// chatScroll 记着消息流滚到哪了。聊天是「越新越靠下」：
+	// 每次数据回来先把 Y 顶到最底，否则打开窗口看到的是最早那几条，
+	// 而人关心的是刚发生的。TrackScroll 会把它夹在内容范围内，越界无害。
+	chatScroll ui.ScrollState
+	// chatPinned 是「跟着底部走」。用户主动往上翻看历史时置 false，
+	// 新消息就不再把视图拽回底部 —— 那会让人正在读的一段被抢走。
+	chatPinned bool
 
 	// models 是能切成什么。没读过就是 nil，界面上说「正在读」而不是「没有」。
 	models      *ModelCatalog
@@ -83,6 +109,84 @@ type app struct {
 	// workError 是这次读经过失败的实话。和 problem 分开：一条票读不出来
 	// 不该让整个界面顶部挂一条红横幅。
 	workError string
+
+	// 撤回排队消息。withdrawing 是正在撤的那几个请求号，防止连点发两次；
+	// withdrawError 只写在排队那一块，不能冒充连接故障。
+	withdrawing   map[string]bool
+	withdrawError string
+	withdrawn     chan withdrawResult
+
+	// 插队：把排队中的一句直接交给正在跑的 worker。
+	steering  map[string]bool
+	steerNote string
+	steerDone chan steerResult
+
+	// 全部暂停：pausing 挡住连点，pauseNote 只说暂停这件事的结果，不冒充断连。
+	pausing   bool
+	pauseNote string
+	pauseDone chan pauseResult
+
+	// 已配对的设备：配对一次之后谁还能进来的清单。读不到就空着，不挡住别的。
+	devices      []PairedDevice
+	devicesNote  string
+	devicesTried bool
+	devicesCh    chan devicesResult
+	revoking     map[string]bool
+
+	// 导出备份：exporting 挡住连点，exportNote 说清存到哪了（或为什么没成）。
+	exporting  bool
+	exportNote string
+	exportCh   chan exportResult
+
+	// 改人设：editingBot 是打开的那一位的 bot_id（空表示没开）。
+	// botForm 是编辑层里的草稿；botSaving 挡住连点，botError 只写在编辑层里。
+	editingBot string
+	botName    string
+	botPersona string
+	botSaving  bool
+	botError   string
+	botSaved   chan botSaveResult
+}
+
+// exportResult 是一次导出备份的结果：成功时带回写出去的路径。
+type exportResult struct {
+	path string
+	err  error
+}
+
+// devicesResult 是一次读设备清单的结果；revoke 的结果也走这条通道。
+type devicesResult struct {
+	list []PairedDevice
+	err  error
+}
+
+// botSaveResult 是一次改人设的结果。id 带回来才知道关的是哪一层。
+type botSaveResult struct {
+	id  string
+	err error
+}
+
+// modelSwitchResult 带回换模型的结果和作用域：没有 botID 就是全场默认。
+type modelSwitchResult struct {
+	choice ModelChoice
+	botID  string
+}
+
+// steerResult 是一次插队的结果；请求号带回来才知道是哪一条回来了。
+type steerResult struct {
+	requestID string
+	err       error
+}
+
+// pauseResult 是一次「全部暂停」的结果。
+type pauseResult struct {
+	err error
+}
+
+// withdrawResult 是一次撤回的结果。请求号带回来，才知道该从 withdrawing 里删哪一条。
+type withdrawResult struct {
+	requestID string
+	err       error
 }
 
 // workResult 是哪张票的过程。没有票号就没法判断这份结果还该不该显示。
@@ -91,6 +195,27 @@ type workResult struct {
 	steps  []WorkStep
 	err    error
 }
+
+// 三栏宽度的边界。左/右栏各有一个上下限，中栏永远吃剩下的宽度。
+// 数字不是设计稿上的：设计稿只给了 329 / 393 两个落点，范围是给拖拽留的余量。
+const (
+	sidebarMinWidth = 220.0
+	sidebarMaxWidth = 420.0
+	backendMinWidth = 300.0
+	backendMaxWidth = 520.0
+	// middleMinWidth 是中间对话栏尽量保留的宽度。窗口太窄时先压两边的栏。
+	middleMinWidth = 260.0
+	// railWidth 是收起后那条窄边的宽度，和 roster/backendPane 里写的一致。
+	railWidth = 30.0
+	// splitLine 是 ui.Split 画的那条 1px 分隔线。
+	splitLine = 1.0
+	// splitFloor 是 ui.Split 自己允许的最小 pane（主题 Space(10) = 40）。
+	splitFloor = 40.0
+
+	// queuedPreviewCount 是最多列几条排队消息；queuedPreviewRunes 是一条摘要最多几个字。
+	queuedPreviewCount = 3
+	queuedPreviewRunes = 28
+)
 
 // wake 让窗口尽快画下一帧。后台 goroutine 把一个结果放进通道之后必须调用：
 // 不调的话通道里的结果要等到用户碰一下窗口才被 drain 收走，界面就停在「正在读…」。
@@ -138,7 +263,7 @@ func (s *app) send() {
 			s.wake()
 			return
 		}
-		s.sent <- text // 主线程确认这句真的发出去了，再清输入框
+		s.sent <- text   // 主线程确认这句真的发出去了，再清输入框
 		s.arrived <- nil // 只用来触发一次重读，让刚发的话尽快出现
 		s.wake()
 		s.refresh()
@@ -190,12 +315,110 @@ func (s *app) view(c *ui.Context) {
 	s.services = c.Services()
 	s.drain(c)
 	p := ThemeColors(c.Theme())
+	// 先把宽度按当前窗口尺寸收进有效范围，再建分隔条：窗口缩过之后，
+	// 上次拖出来的宽度不能把中间那栏挤成负数。
+	s.fitPaneWidths(c)
 	// 根容器必须自己上底色：不上就是 mygo 的默认深色，亮色主题下顶上会漏出一条黑边。
 	ui.Row(c).Fill().FillWidth().FillHeight().Gap(0).Background(p.Surface).Children(func() {
-		s.roster(c, p)
-		s.conversationPane(c, p)
-		s.backendPane(c, p)
+		// 全屏看屏幕时只剩中间这一栏：左右两栏收掉，画面拿到整扇窗。
+		if s.screenFull && s.screen != nil {
+			s.conversationPane(c, p)
+			return
+		}
+		s.panes(c, p)
+		// ui.Split 在构建时才把这一帧的拖拽写回宽度；再收一次，
+		// 免得下一帧拿着越界的值去排版。
+		s.fitPaneWidths(c)
+		if s.editingBot != "" {
+			s.botEditor(c, p)
+		}
 	})
+}
+
+// panes 是三栏本身。展开的栏之间用 ui.Split 隔开：它自带一条 1px 的线，
+// 外面覆着 6px 的拖拽手柄（主题 Space(1.5)），指针是左右调整光标。
+// 收起的一侧只留 railWidth 那条窄边，不参与拖拽。
+func (s *app) panes(c *ui.Context, p Palette) {
+	if s.sidebarClosed {
+		s.roster(c, p)
+		s.centerAndBackend(c, p)
+		return
+	}
+	ui.Split(c, &s.sidebarWidth,
+		func() { s.roster(c, p) },
+		func() { s.centerAndBackend(c, p) },
+	).Grow(1).FillHeight().SplitReset(SidebarWidth)
+}
+
+// centerAndBackend 是「中栏 + 右栏」。右栏要定宽、中栏吃剩余，
+// 所以把右栏当成 Split 的第一栏，并把方向反过来（第一栏落在右侧）。
+func (s *app) centerAndBackend(c *ui.Context, p Palette) {
+	if !s.backendOpen {
+		// 收起时两块仍然是同一条横排：不包一层 Row，中间那栏会按内容高度塌下去，
+		// 输入框跑到标题下面，下方留一大片空。
+		ui.Row(c).Grow(1).FillHeight().Direction(ui.LeftToRight).Children(func() {
+			s.conversationPane(c, p)
+			s.backendPane(c, p)
+		})
+		return
+	}
+	// 方向要在建子元素之前给：ui.Split 的拖拽方向在构建时读一次，
+	// 建完再 Direction 只会把布局翻过来，拖拽仍按从左到右算（实测会拖反）。
+	ui.Row(c).Direction(ui.RightToLeft).Grow(1).FillHeight().Children(func() {
+		ui.Split(c, &s.backendWidth,
+			func() { s.backendPane(c, p) },
+			func() { s.conversationPane(c, p) },
+		).Grow(1).FillHeight().SplitReset(BackendWidth)
+	})
+}
+
+// fitPaneWidths 把两栏宽度夹回各自的范围，并保证两边加起来给中栏留下足够的宽度。
+func (s *app) fitPaneWidths(c *ui.Context) {
+	width, _ := c.Size()
+	if s.sidebarWidth <= 0 {
+		s.sidebarWidth = SidebarWidth
+	}
+	if s.backendWidth <= 0 {
+		s.backendWidth = BackendWidth
+	}
+	if width <= 0 {
+		return
+	}
+	// 两条分隔线都要占位；可用宽度是窗口减去它们和中栏想保住的那一份。
+	available := width - middleMinWidth - 2*splitLine
+	// 右栏先按最小值预留，左栏定下来之后右栏再按左栏的实际宽度算。
+	// 两边都用同一个 available，不会出现「各自都以为自己放得下」而把中栏挤没。
+	rightReserve := float32(backendMinWidth)
+	if !s.backendOpen {
+		rightReserve = railWidth
+	}
+	s.sidebarWidth = fitPane(s.sidebarWidth, sidebarMinWidth, sidebarMaxWidth, available-rightReserve)
+	leftReserve := s.sidebarWidth
+	if s.sidebarClosed {
+		leftReserve = railWidth
+	}
+	s.backendWidth = fitPane(s.backendWidth, backendMinWidth, backendMaxWidth, available-leftReserve)
+}
+
+// fitPane 在放得下时把 v 夹在 [lo, hi]；窗口窄到连下限都放不下时，
+// 先把中栏保住，把这一栏让到还剩多少就多宽（但不小于 ui.Split 的 40）。
+func fitPane(v, lo, hi, room float32) float32 {
+	if room < splitFloor {
+		room = splitFloor
+	}
+	if hi > room {
+		hi = room
+	}
+	if hi < lo {
+		return room
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // drain 把后台线程交回来的结果收进状态。
@@ -207,7 +430,21 @@ func (s *app) drain(c *ui.Context) {
 		select {
 		case conversation := <-s.arrived:
 			if conversation != nil {
+				before := 0
+				if s.conversation != nil {
+					before = len(s.conversation.Messages)
+				}
 				s.conversation, s.problem = conversation, ""
+				// 聊天是「越新越靠下」：第一次读到时直接落到最底，之后只有
+				// 用户本来就在底部（没往上翻）才跟着新消息走。往上翻着读历史
+				// 时把视图拽回底部，等于把人正在看的一段抢走。
+				switch {
+				case before == 0:
+					s.chatPinned = true
+					s.chatScroll.Y = math.MaxFloat32
+				case len(conversation.Messages) > before && s.chatPinned:
+					s.chatScroll.Y = math.MaxFloat32
+				}
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
 				c.Invalidate()
 			}
@@ -246,6 +483,10 @@ func (s *app) drain(c *ui.Context) {
 			c.Invalidate()
 		case catalog := <-s.modelList:
 			s.models, s.modelsError, s.modelNote = catalog, "", ""
+			s.loadEfforts()
+			c.Invalidate()
+		case view := <-s.effortsCh:
+			s.efforts = view
 			c.Invalidate()
 		case message := <-s.modelError:
 			s.modelsError, s.modelNote = message, ""
@@ -256,9 +497,63 @@ func (s *app) drain(c *ui.Context) {
 		case note := <-s.screenNoteCh:
 			s.screenNote = note
 			c.Invalidate()
-		case choice := <-s.modelSwitched:
+		case result := <-s.exportCh:
+			s.exporting = false
+			if result.err != nil {
+				s.exportNote = "没导出成功：" + result.err.Error()
+			} else {
+				s.exportNote = "已备份到 " + result.path
+			}
+			c.Invalidate()
+		case result := <-s.devicesCh:
+			s.devicesTried = true
+			s.revoking = map[string]bool{}
+			if result.err != nil {
+				s.devicesNote = "读不到已配对的设备：" + result.err.Error()
+			} else {
+				s.devices = result.list
+				s.devicesNote = ""
+			}
+			c.Invalidate()
+		case result := <-s.botSaved:
+			s.botSaving = false
+			if result.err != nil {
+				s.botError = result.err.Error()
+			} else {
+				// 存住了才关层：否则人会以为改了却没生效。
+				s.editingBot = ""
+				s.botError = ""
+				go s.refresh()
+			}
+			c.Invalidate()
+		case result := <-s.pauseDone:
+			s.pausing = false
+			if result.err != nil {
+				s.pauseNote = "没停下来：" + result.err.Error()
+			} else {
+				s.pauseNote = "已让它停一下（全局执行器，恢复要去面板）"
+				go s.refresh()
+			}
+			c.Invalidate()
+		case result := <-s.steerDone:
+			delete(s.steering, result.requestID)
+			if result.err != nil {
+				s.steerNote = "插队没成功：" + result.err.Error()
+				if errors.Is(result.err, ErrSteerTooLate) {
+					go s.refresh()
+				}
+			} else {
+				s.steerNote = "已插话，队伍做完当前这一步会先处理这句"
+				go s.refresh()
+			}
+			c.Invalidate()
+		case view := <-s.screenCh:
+			s.screen = view
+			s.screenNote = ""
+			c.Invalidate()
+		case result := <-s.modelSwitched:
 			// 换成了：目录里记下新的这一个，左栏和右栏都跟着改，不用等人再点一次刷新。
-			s.applyModel(choice)
+			s.applyModel(result)
 			c.Invalidate()
 		case text := <-s.sent:
 			// 只清掉「刚发出去的那一句」；用户在这期间又打了字就留着。
@@ -266,6 +561,23 @@ func (s *app) drain(c *ui.Context) {
 				s.input = ""
 			}
 			c.Invalidate()
+		case result := <-s.withdrawn:
+			delete(s.withdrawing, result.requestID)
+			if result.err != nil {
+				// 撤回失败只写在排队那一块：其他消息照样能发，不该挂断连横幅。
+				// 409 多半是队伍已经答过/读走了：重读一次时间线，排队那条才不会一直挂着。
+				s.withdrawError = result.err.Error()
+				if errors.Is(result.err, ErrWithdrawalTooLate) {
+					go s.refresh()
+				}
+				c.Invalidate()
+				continue
+			}
+			s.withdrawError = ""
+			c.Invalidate()
+			// 撤掉了就重读一次，让那条从队列里消失；重读本身失败会走 failed，
+			// 那时才轮到全局横幅说话。
+			s.refresh()
 		case message := <-s.failed:
 			s.problem = message
 			s.sending = false
@@ -294,87 +606,146 @@ func (s *app) roster(c *ui.Context, p Palette) {
 	}
 	// 只给 Width，不给 FillWidth：两个一起写是互相打架的（一个说「父容器多宽我多宽」），
 	// 定宽栏要的是 Width 这一条。
-	ui.Column(c).Width(SidebarWidth).FillHeight().PaddingX(14).PaddingY(22).Gap(18).Background(p.Card).Children(func() {
-		// 标题行：图标 + 名字 + 收起。
-		ui.Row(c).FillWidth().AlignItems(ui.Center).PaddingX(8).Children(func() {
-			ui.Text(c, "◎").FontSize(FontIcon).TextColor(p.Ink)
-			ui.Text(c, "我的队伍").FontSize(FontTitle).FontWeight(WeightTitle).LetterSpacing(-0.15).TextColor(p.Ink)
-			ui.Row(c).Grow(1)
-			// 一个「«」字太小，不好点：给它一圈 padding，点击挂在整块上。
-			ui.Row(c).Padding(6).Radius(RadiusButton).Background(p.Card).Cursor(ui.CursorPointer).
-				OnClick(func() { s.sidebarClosed = true }).Children(func() {
-				ui.Text(c, "«").FontSize(FontBodyWide).TextColor(p.Faint)
+	// Split 自带的 Divider 只是一条可拖的空盒子，不上色；画板里的 1px 边线得自己画。
+	// 左栏在右缘画，右栏在左缘画，这样收起/展开两端边界都一样清楚。
+	ui.Row(c).Width(s.sidebarWidth).FillHeight().Gap(0).Children(func() {
+		ui.Column(c).Grow(1).FillHeight().PaddingX(14).PaddingY(22).Gap(18).Background(p.Card).Children(func() {
+			// 标题行：图标 + 名字 + 收起。
+			ui.Row(c).FillWidth().AlignItems(ui.Center).PaddingX(8).Gap(9).Children(func() {
+				ui.Text(c, "◎").FontSize(FontRosterIcon).TextColor(p.Ink)
+				// 标题与两个按钮抢一行：栏拖窄时标题先省略，按钮不能再被挤出去。
+				ui.Text(c, "我的队伍").FontSize(FontDisplay).FontWeight(WeightTitle).LetterSpacing(-0.15).
+					TextColor(p.Ink).MaxLines(1).Ellipsis("…")
+				ui.Row(c).Grow(1)
+				// 标题栏的「+」是加一位 Bot 的入口，和「«」并排：28×28，细边框。
+				ui.Row(c).Width(28).Height(28).Radius(RadiusButton).BorderWidth(1).BorderColor(p.Line).
+					AlignItems(ui.Center).Justify(ui.Center).Cursor(ui.CursorPointer).
+					OnClick(func() { s.navTab = navModel }).Children(func() {
+					ui.Text(c, "+").FontSize(FontBodyWide).TextColor(p.Faint)
+				})
+				// 一个「«」字太小，不好点：给它一圈 padding，点击挂在整块上。
+				ui.Row(c).Padding(6).Radius(RadiusButton).Background(p.Card).Cursor(ui.CursorPointer).
+					OnClick(func() { s.sidebarClosed = true }).Children(func() {
+					ui.Text(c, "«").FontSize(FontBodyWide).TextColor(p.Faint)
+				})
 			})
-		})
 
-		ui.Column(c).FillWidth().Gap(2).Children(func() {
-			if s.conversation == nil || len(s.conversation.Bots) == 0 {
-				ui.Text(c, "队伍还是空的。").FontSize(FontBody).TextColor(p.Faint)
-				return
-			}
-			for i, bot := range s.conversation.Bots {
-				bot := bot
-				// 选中态用底色分层，不加边框：设计稿靠色块而不是线。
-				selected := s.selectedBot == bot.ID || (s.selectedBot == "" && i == 0)
-				item := ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).Padding(11).Radius(RadiusPane).
-					Cursor(ui.CursorPointer)
-				if selected {
-					item = item.Background(p.SelectedAlt)
+			ui.Column(c).FillWidth().Gap(2).Children(func() {
+				if s.conversation == nil || len(s.conversation.Bots) == 0 {
+					ui.Column(c).FillWidth().Gap(12).Padding(11).Children(func() {
+						// 画板这里是 52×52 虚线圈、圆角 16；圆角 20 那个是中栏的 64×64 空态，别混用。
+						ui.Column(c).Width(52).Height(52).Radius(RadiusFolderSml).
+							BorderWidth(1).BorderColor(p.Line).Background(p.Surface).
+							AlignItems(ui.Center).PaddingY(9).Children(func() {
+							ui.Text(c, "+").FontSize(FontGlyph).TextColor(p.Faint)
+						})
+						ui.Text(c, "队伍还是空的。").FontSize(FontBody).TextColor(p.Muted)
+						ui.Text(c, "加一位 Bot，他从今天起会记住\n你们的每一次对话。").
+							FontSize(FontBody).TextColor(p.Faint)
+						ui.Row(c).PaddingX(12).PaddingY(7).Radius(RadiusButton).Background(p.Accent).
+							Cursor(ui.CursorPointer).Children(func() {
+							ui.Text(c, "加第一位").FontSize(FontBodyWide).TextColor(p.AccentInk)
+						}).OnClick(func() { s.navTab = navModel })
+					})
+					return
 				}
-				// 点人 = 选他 + 回到对话主界面。右栏收起，中间那栏自己长满。
-				// 之前这一行没有点击，点了没反应，看起来像「回不到主界面」。
-				item = item.OnClick(func() {
-					s.selectedBot = bot.ID
-					s.backendOpen = false
-				})
-				item.Children(func() {
-					// 36px 头像块，圆角 11：取名字首字。强调色与警告色交替，让人一眼分得开。
-					soft, tint := p.AccentSoft2, p.Accent
-					if i == 2 {
-						soft, tint = p.WarnSoft2, p.Warn
+				for i, bot := range s.conversation.Bots {
+					bot := bot
+					// 选中态用底色分层，不加边框：设计稿靠色块而不是线。
+					selected := s.selectedBot == bot.ID || (s.selectedBot == "" && i == 0)
+					item := ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).Padding(11).Radius(RadiusPane).
+						Cursor(ui.CursorPointer)
+					if selected {
+						item = item.Background(p.SelectedAlt)
 					}
-					ui.Column(c).Width(AvatarSmall).Radius(RadiusPane).Background(soft).
-						AlignItems(ui.Center).PaddingY(8).Children(func() {
-						ui.Text(c, firstRune(bot.Name)).FontSize(FontHeader).FontWeight(WeightFigure).TextColor(tint)
+					// 点人 = 选他 + 回到对话主界面。右栏收起，中间那栏自己长满。
+					// 之前这一行没有点击，点了没反应，看起来像「回不到主界面」。
+					item = item.OnClick(func() {
+						s.selectedBot = bot.ID
+						s.backendOpen = false
 					})
-					ui.Column(c).Grow(1).Gap(2).Children(func() {
-						ui.Row(c).Gap(6).AlignItems(ui.Baseline).Children(func() {
-							ui.Text(c, bot.Name).FontSize(FontName).FontWeight(WeightName).TextColor(p.Ink)
-							if bot.Persona != "" {
-								// 职能跟名字同一行，弱一档：它是「他是什么人」，不是状态。
-								ui.Text(c, bot.Persona).FontSize(FontHairline).TextColor(p.Faint).Ellipsis("…")
-							}
+					item.Children(func() {
+						// 36px 头像块，圆角 11：取名字首字。选中的实心强调色，其余淡底 ——
+						// 画板用实心/淡底区分「他在这」和「他在名单里」。
+						soft, tint := p.AccentSoft2, p.Accent
+						if selected {
+							soft, tint = p.Accent, p.AccentInk
+						} else if i == 2 {
+							soft, tint = p.WarnSoft2, p.Warn
+						}
+						ui.Column(c).Width(AvatarSmall).Height(AvatarSmall).Radius(RadiusPane).Background(soft).
+							AlignItems(ui.Center).PaddingY(8).Children(func() {
+							ui.Text(c, firstRune(bot.Name)).FontSize(FontHeader).FontWeight(WeightFigure).TextColor(tint)
 						})
-						// 状态行：一个 5px 圆点 + 一句话。点用颜色表态，比纯文字快。
-						ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-							// 5px 的圆点：用方块别用字形 —— 字形的点跟字号走，大小不受控。
-							ui.Column(c).Width(5).Height(5).Radius(RadiusDot).
-								Background(s.stateColor(p, bot.ID))
-							ui.Text(c, s.stateOf(bot.ID)).FontSize(FontBody).TextColor(p.Muted)
+						// MinWidth(0)：栏拖窄时这一列跟着缩，名字保留、人设先省略，
+						// 而不是把两段字一起推到栏外被硬裁（那看起来就是「没自适应」）。
+						ui.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
+							ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Baseline).Children(func() {
+								ui.Text(c, strings.TrimSpace(bot.Name)).FontSize(FontName).FontWeight(WeightName).
+									TextColor(p.Ink).NoWrap()
+								ui.Row(c).Grow(1).MinWidth(0).ClipX().Children(func() {
+									if bot.Persona != "" {
+										// 职能跟名字同一行，弱一档：它是「他是什么人」，不是状态。
+										ui.Text(c, clipRunes(bot.Persona, 12)).FontSize(FontHairline).
+											TextColor(p.Faint).NoWrap().Ellipsis("…")
+									}
+								})
+							})
+							// 状态行：一个 5px 圆点 + 一句话。点用颜色表态，比纯文字快。
+							ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+								// 5px 的圆点：用方块别用字形 —— 字形的点跟字号走，大小不受控。
+								ui.Column(c).Width(5).Height(5).Radius(RadiusDot).
+									Background(s.stateColor(p, bot.ID))
+								// 待命是弱信息：画板里它在 Faint 一档，在跑的才用 Muted。
+								stateTint := p.Muted
+								if s.stateColor(p, bot.ID) == p.Hint {
+									stateTint = p.Faint
+								}
+								ui.Text(c, s.stateOf(bot.ID)).FontSize(FontBody).TextColor(stateTint)
+							})
 						})
+						// 「改」：点人不该只等于「选他」。这一格把「改这一位」从只有手机能做的事
+						// 补到桌面上；它在悬停时才明显，不抢花名册本身的注意力。
+						bot := bot
+						ui.Row(c).PaddingX(6).PaddingY(4).Radius(RadiusChip).Cursor(ui.CursorPointer).
+							Children(func() {
+								ui.Text(c, "改").FontSize(FontMini).TextColor(p.Faint)
+							}).OnClick(func() { s.editBot(bot) })
 					})
-				})
-			}
-		})
+				}
+			})
 
-		// 「今天由谁接手」：一句话说清当前这轮谁在跑。
-		ui.Column(c).FillWidth().Gap(7).PaddingX(8).Children(func() {
-			ui.Text(c, "今天由谁接手").FontSize(FontTiny).FontWeight(WeightName).LetterSpacing(0.55).TextColor(p.Faint)
-			ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "✓").FontSize(FontLabel).TextColor(p.Accent)
-				ui.Text(c, s.handover()).FontSize(FontBody).TextColor(p.Ink)
+			// 「今天由谁接手」：一句话说清当前这轮谁在跑。
+			ui.Column(c).FillWidth().Gap(7).PaddingX(8).Children(func() {
+				ui.Text(c, "今天由谁接手").FontSize(FontTiny).FontWeight(WeightName).LetterSpacing(0.55).TextColor(p.Faint)
+				ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "✓").FontSize(FontLabel).TextColor(p.Accent)
+					ui.Text(c, s.handover()).FontSize(FontBody).TextColor(p.Ink)
+				})
+			})
+
+			// 底部导航：分隔线之上。mygo 没有单边边框，用一条 1px 的线代替。
+			ui.Column(c).FillWidth().Height(1).Background(p.Line)
+			// 画板四行的行距是 37–39：行本身（PaddingY 9 + 13px 字）已约 36–38 高，
+			// 行与行之间只隔 2，不是再加一段 10。
+			ui.Column(c).FillWidth().Gap(2).PaddingY(14).Children(func() {
+				for _, item := range navOrder {
+					s.navRow(c, p, item)
+				}
 			})
 		})
-
-		// 底部导航：分隔线之上。mygo 没有单边边框，用一条 1px 的线代替。
-		ui.Column(c).FillWidth().Height(1).Background(p.Line)
-		// 行距 10：一行「图标 + 13px 字」在 PaddingY 里各挣 11，合计 39；画板实测 38–39。
-		ui.Column(c).FillWidth().Gap(10).PaddingY(14).Children(func() {
-			for _, item := range navOrder {
-				s.navRow(c, p, item)
-			}
-		})
+		ui.Column(c).Width(1).FillHeight().Background(p.Line)
 	})
+}
+
+// clipRunes 把一段话截到 n 个字以内。花名册的职能是数据里的自由文本，
+// 长的会顶出栏外 —— 与其让它压住别人的一列，不如截断并留一个省略号。
+func clipRunes(text string, n int) string {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) <= n {
+		return string(runes)
+	}
+	return string(runes[:n]) + "…"
 }
 
 // firstRune 取名字的第一个字当头像个字。「林」取「林」，英文名取首字母。
@@ -463,13 +834,15 @@ func (s *app) navRow(c *ui.Context, p Palette, item navItem) {
 	if here {
 		tint, glyphTint = p.Ink, p.Accent
 	}
-	row := ui.Row(c).FillWidth().AlignItems(ui.Center).PaddingX(8).PaddingY(9).
+	// ClipX：栏拖到最窄时，右端那点说明（张数 / 当前模型）宁可被裁掉，也不能把行撑出栏外。
+	row := ui.Row(c).FillWidth().MinWidth(0).ClipX().AlignItems(ui.Center).PaddingX(8).PaddingY(9).
 		Radius(RadiusItem).Gap(8).Cursor(ui.CursorPointer)
 	if here {
 		row = row.Background(p.SelectedAlt)
 	}
 	row.Children(func() {
-		ui.Row(c).Width(AvatarSmall).AlignItems(ui.Center).Children(func() {
+		// 图标本身 16 宽：套一个 36 宽的空槽会把文字推到 19px 以外，和画板的两列感一样。
+		ui.Row(c).Width(FontIcon).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, glyph).FontSize(FontIcon).TextColor(glyphTint)
 		})
 		ui.Text(c, text).FontSize(FontLabel).TextColor(tint)
@@ -548,36 +921,49 @@ func stateWord(state string) string {
 func (s *app) conversationPane(c *ui.Context, p Palette) {
 	// MinWidth(0)：Grow(1) 的地板默认是「内容最窄能到多少」，这一栏里有代码卡和长消息，
 	// 那个值能到八九百。窗口缩窄时两侧定宽的栏就守不住了。地板给 0，缩窄由这一栏让。
-	ui.Column(c).Grow(1).MinWidth(0).FillWidth().FillHeight().Gap(0).Background(p.Surface).Children(func() {
+	// 右栏是 RightToLeft 建的，方向会顺着继承下来；中间栏自己声明从左到右，
+	// 否则标题栏、输入框、气泡两侧会整个镜像过来（按钮跑到左边，发送键在输入框左边）。
+	// ClipX：中栏内容（输入框占位文案、标题栏按钮）有固有宽度，不加这一条它们会把整栏的
+	// 最小宽度顶到 300+，右栏拖窄时被这一栏反向挤压 —— 看起来就是「拖了不生效、还不自适应」。
+	ui.Column(c).Grow(1).MinWidth(0).FillWidth().FillHeight().Gap(0).ClipX().
+		Direction(ui.LeftToRight).Background(p.Surface).Children(func() {
 		if s.problem != "" {
-			// 断连时先把话说清楚，别让人对着空白猜。横幅要能指路：
-			// 连的是哪一支、机器上到底有没有队伍，以及下一步该点哪儿。
-			ui.Column(c).FillWidth().PaddingX(22).PaddingY(8).Background(p.WarnSoft).Gap(2).Children(func() {
-				where := s.endpoint
-				if where == "" {
-					ui.Text(c, "没找到在跑的队伍").FontSize(FontBody).TextColor(p.Danger)
-				} else {
-					// 连的是哪一支要说出来：保存的凭据或环境变量可能指向别处，
-					// 光说「没找到在跑的队伍」会让人以为连的是本机那个。
-					ui.Text(c, "连不上 "+where+"："+s.problem).FontSize(FontBody).TextColor(p.Danger)
-				}
-				hint := "右栏「配对手机」可以重新配一次"
-				if where != "" && !s.target.Found {
-					hint = "这台机器上没发现正在跑的队伍；" + hint
-				}
-				ui.Text(c, hint).FontSize(FontMini).TextColor(p.Muted)
+			// 断连：一行说清现状与后果，右边给「重试」。连的是哪一支仍写出来，
+			// 但不再摆成两行说教 —— 画板这里是一条能重试的横幅。
+			ui.Column(c).FillWidth().Children(func() {
+				ui.Row(c).FillWidth().PaddingX(28).PaddingY(9).Gap(9).
+					AlignItems(ui.Center).Background(p.DangerSoft).Children(func() {
+					ui.Text(c, "⚠").FontSize(FontBody).TextColor(p.Danger)
+					line := "连不上队伍 —— 已经读到的消息还在，等连上了会自动续上"
+					if s.endpoint != "" {
+						line = "连不上 " + s.endpoint + " —— 已经读到的消息还在，等连上了会自动续上"
+					}
+					ui.Text(c, line).FontSize(FontBody).TextColor(p.Danger)
+					ui.Row(c).Grow(1)
+					ui.Text(c, "重试").FontSize(FontSmall).TextColor(p.Danger).
+						Cursor(ui.CursorPointer).OnClick(s.refresh)
+				})
+				ui.Column(c).FillWidth().Height(1).Background(p.DangerEdge)
 			})
 		}
 		// 标题栏：头像 + 名字·职能 + 刷新。画板里是 718×75 的白色带，上下留白 18。
 		ui.Row(c).FillWidth().PaddingX(28).PaddingY(18).Gap(11).AlignItems(ui.Center).
 			Background(p.Card).Children(func() {
-			ui.Column(c).Width(AvatarHdr).Radius(RadiusPane).Background(p.AccentSoft).
+			ui.Column(c).Width(AvatarHdr).Height(AvatarHdr).Radius(RadiusPane).Background(p.Accent).
 				AlignItems(ui.Center).PaddingY(9).Children(func() {
-				ui.Text(c, firstRune(s.title())).FontSize(FontTitle).FontWeight(WeightFigure).TextColor(p.Accent)
+				ui.Text(c, firstRune(s.title())).FontSize(FontTitle).FontWeight(WeightFigure).TextColor(p.AccentInk)
 			})
 			ui.Column(c).Gap(2).Children(func() {
 				ui.Text(c, s.title()).FontSize(FontHeader).FontWeight(WeightTitle).TextColor(p.Ink)
-				ui.Text(c, s.subtitle()).FontSize(FontBody).TextColor(p.Faint)
+				// 状态点：在跑是强调色，其余用 Hint。点比文字更快说明「现在动没动」。
+				ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+					dot := p.Hint
+					if s.anyRunning() {
+						dot = p.Accent
+					}
+					ui.Column(c).Width(5).Height(5).Radius(RadiusDot).Background(dot)
+					ui.Text(c, s.subtitle()).FontSize(FontBody).TextColor(p.Faint)
+				})
 				if s.screenNote != "" {
 					ui.Text(c, s.screenNote).FontSize(FontMini).TextColor(p.Faint)
 				}
@@ -585,54 +971,42 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 			ui.Row(c).Grow(1)
 			// 「看它的屏幕」：画板 109×31、圆角 9、白底细边。
 			//
-			// 画板里它是一扇窗；现在后端还没有对应的接口（要接浏览器的 CDP 截图，
-			// 是另一件事）。所以它只画出来、按下去给一句实话 —— 不留一个点了没动静的按钮。
-			screenTint := p.Muted
-			if !s.screenReady {
-				screenTint = p.Hint
-			}
+			// 画板里它是一扇窗：按下就换成这张票此刻的会话快照（命令、输出、回话）。
+			// 没有记录时后端如实说原因；那是功能说明，不能写进 s.problem。
 			// 指针换手、点击接线都挂在这一层 Row 上：mygo 里 Cursor 与 OnClick 都是
 			// Element 上的方法，包着字的容器挂一次就够，里面那几个字不用再接一遍。
-			ui.Row(c).PaddingX(13).PaddingY(7).Radius(RadiusButton).Background(p.Card).
-				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
-				ui.Text(c, "▭ 看它的屏幕").FontSize(FontBodyWide).TextColor(screenTint)
-			}).OnClick(func() {
-				if s.screenReady {
-					return
-				}
-				// 去问后端，而不是自己编一句「还没接上」。后端会如实回答
-				// {state:"unavailable", reason:"后端还没有画面源，worker 不跑浏览器"}；
-				// 这是一条功能说明，不是连接故障，绝不能写进 s.problem。
-				ticketID := ""
-				if s.conversation != nil && len(s.conversation.Tasks) > 0 {
-					ticketID = s.conversation.Tasks[0].ID
-				}
-				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
-					view, err := s.client.Screen(ctx, ticketID)
-					switch {
-					case err != nil:
-						s.screenNoteCh <- "读不到屏幕：" + err.Error()
-					case view.State == "unavailable" && view.Reason != "":
-						s.screenNoteCh <- view.Reason
-					default:
-						s.screenNoteCh <- "屏幕暂时只有状态：" + view.State
-					}
-					s.wake()
-				}()
-			})
-			ui.Row(c).PaddingX(9).PaddingY(7).Radius(RadiusButton).
-				Cursor(ui.CursorPointer).Children(func() {
+			ui.Row(c).Width(109).Height(31).Radius(RadiusButton).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, "▭ 看它的屏幕").FontSize(FontBodyWide).NoWrap().TextColor(p.Ink)
+			}).OnClick(s.lookAtScreen)
+			ui.Row(c).Width(32).Height(32).Radius(RadiusButton).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).Children(func() {
 				ui.Text(c, "···").FontSize(FontBodyWide).TextColor(p.Faint)
 			}).OnClick(s.refresh)
 		})
 		// 画板的 header 带一条 border-bottom。mygo 没有单边边框，用 1px 的线代替 ——
 		// 少了这条，标题栏和消息区会糊成一片，暗色下尤其像「整块空的」。
 		ui.Column(c).FillWidth().Height(1).Background(p.Line)
-		s.stream(c, p)
+		if s.screen != nil {
+			s.screenPanel(c, p)
+		} else {
+			s.stream(c, p)
+		}
 		s.composer(c, p)
 	})
+}
+
+// anyRunning 是队伍里有没有还开着的票。标题栏的状态点、输入区那行说明都按它说真话。
+func (s *app) anyRunning() bool {
+	if s.conversation == nil {
+		return false
+	}
+	for _, task := range s.conversation.Tasks {
+		if task.Open {
+			return true
+		}
+	}
+	return false
 }
 
 // subtitle 是标题下面那行小字：谁在跑。
@@ -647,17 +1021,180 @@ func (s *app) subtitle() string {
 	if who == "" {
 		who = s.conversation.DefaultBotID
 	}
-	return "和 " + s.nameOf(who) + " 说话"
+	return "和" + s.nameOf(who) + "说话"
 }
 
 func (s *app) title() string {
-	if s.conversation != nil && len(s.conversation.Messages) > 0 {
-		last := s.conversation.Messages[len(s.conversation.Messages)-1]
-		if last.Role == "agent" {
-			return s.nameOf(last.BotID) + " 在回你"
+	if s.conversation != nil {
+		if len(s.conversation.Messages) > 0 {
+			last := s.conversation.Messages[len(s.conversation.Messages)-1]
+			if last.Role == "agent" {
+				return s.nameOf(last.BotID) + " 在回你"
+			}
+		}
+		// 没有正在回话的 Bot 时写这位的名字：标题说的是「和谁」，不是「这是什么控件」。
+		who := s.selectedBot
+		if who == "" {
+			who = s.conversation.DefaultBotID
+		}
+		if who != "" {
+			return s.nameOf(who)
 		}
 	}
 	return "对话"
+}
+
+// runningTicket 找一张正在跑的票：插队要交给它。
+func (s *app) runningTicket() (string, bool) {
+	if s.conversation == nil {
+		return "", false
+	}
+	for _, task := range s.conversation.Tasks {
+		if task.Open {
+			return task.ID, true
+		}
+	}
+	return "", false
+}
+
+// sendSteer 发送即插队：输入框里这句不进队列，直接交给正在跑的工单。
+func (s *app) sendSteer(ticketID string) {
+	text := s.input
+	if s.client == nil || text == "" || s.sending || s.problem != "" {
+		return
+	}
+	s.sending = true
+	requestID, idErr := newRequestID()
+	if idErr != nil {
+		s.modelError <- "插队没成功：" + idErr.Error()
+		return
+	}
+	go func() {
+		defer func() { s.sending = false }()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := s.client.SteerText(ctx, ticketID, requestID, text); err != nil {
+			s.modelError <- "插队没成功：" + err.Error()
+			s.wake()
+			return
+		}
+		s.sent <- text
+		s.steerNote = "已插话，队伍做完当前这一步会先处理这句"
+		s.wake()
+		s.refresh()
+	}()
+}
+
+// steer 把一条排队消息交给正在跑的 worker。
+func (s *app) steer(requestID, ticketID string) {
+	if s.client == nil || s.steering[requestID] {
+		return
+	}
+	if s.steering == nil {
+		s.steering = map[string]bool{}
+	}
+	s.steering[requestID] = true
+	s.steerNote = ""
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		s.steerDone <- steerResult{requestID: requestID, err: s.client.Steer(ctx, ticketID, requestID)}
+		s.wake()
+	}()
+}
+
+// lookAtScreen 读这张票此刻在做什么。有快照就换中间栏；没有就说清楚为什么没有。
+func (s *app) lookAtScreen() {
+	if s.client == nil {
+		return
+	}
+	ticketID := ""
+	if s.conversation != nil && len(s.conversation.Tasks) > 0 {
+		ticketID = s.conversation.Tasks[0].ID
+	}
+	if ticketID == "" {
+		// 手上没有票就没有可看的过程。这句话是界面状态，不是接口错误。
+		s.screenNote = "现在没有在跑的工单，等它接活后这里会显示它在做什么"
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		view, err := s.client.Screen(ctx, ticketID)
+		switch {
+		case err != nil:
+			s.screenNoteCh <- "读不到屏幕：" + err.Error()
+		case view.State == "live" && len(view.Lines) > 0:
+			s.screenCh <- view
+		case view.Reason != "":
+			s.screenNoteCh <- view.Reason
+		default:
+			s.screenNoteCh <- "这张工单暂时没有可显示的活动"
+		}
+		s.wake()
+	}()
+}
+
+// screenPanel 是「看它的屏幕」的画面：它刚跑了什么、输出了什么、说了什么。
+// 不是像素截帧 —— worker 干的是终端活，这里显示的是那件事本身。
+func (s *app) screenPanel(c *ui.Context, p Palette) {
+	view := s.screen
+	ui.Column(c).Grow(1).FillWidth().MinWidth(0).Background(p.Surface).Children(func() {
+		ui.Row(c).FillWidth().PaddingX(ContentInset).PaddingY(10).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Column(c).Gap(2).Children(func() {
+				ui.Text(c, "它在做什么").FontSize(FontBodyWide).FontWeight(WeightName).TextColor(p.Ink)
+				where := view.Cwd
+				if where == "" {
+					where = "执行记录"
+				}
+				ui.Text(c, where).FontSize(FontMini).TextColor(p.Faint)
+			})
+			ui.Row(c).Grow(1)
+			ui.Row(c).PaddingX(9).PaddingY(5).Radius(RadiusButton).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, "刷新").FontSize(FontMini).TextColor(p.Muted)
+			}).OnClick(s.lookAtScreen)
+			// 全屏：左右两栏收掉，画面占满窗口；再点一次放回来。
+			ui.Row(c).PaddingX(9).PaddingY(5).Radius(RadiusButton).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+				label := "全屏"
+				if s.screenFull {
+					label = "退出全屏"
+				}
+				ui.Text(c, label).FontSize(FontMini).TextColor(p.Muted)
+			}).OnClick(func() { s.screenFull = !s.screenFull })
+			ui.Row(c).PaddingX(9).PaddingY(5).Radius(RadiusButton).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, "返回对话").FontSize(FontMini).TextColor(p.Muted)
+			}).OnClick(func() { s.screen = nil; s.screenFull = false })
+		})
+		ui.Column(c).FillWidth().Height(1).Background(p.Line)
+		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+			ui.Column(c).PaddingX(ContentInset).PaddingY(10).Gap(4).Children(func() {
+				for _, line := range view.Lines {
+					kindColor := p.Ink
+					switch line.Kind {
+					case "command":
+						kindColor = p.Accent
+					case "said":
+						kindColor = p.Muted
+					case "status":
+						kindColor = p.Faint
+					}
+					ui.Text(c, screenTime(line.At)+"  "+line.Text).FontSize(FontMini).TextColor(kindColor)
+				}
+			})
+		})
+	})
+}
+
+// screenTime 把事件时间缩成 时:分:秒；读不出来就原样留着，不编时间。
+func screenTime(at string) string {
+	when, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return at
+	}
+	return when.Local().Format("15:04:05")
 }
 
 func (s *app) stream(c *ui.Context, p Palette) {
@@ -668,20 +1205,53 @@ func (s *app) stream(c *ui.Context, p Palette) {
 		ui.Column(c).Grow(1).FillWidth().PaddingX(ContentInset).PaddingY(16).
 			Children(func() { ui.Text(c, "正在读对话…").FontSize(FontBody).TextColor(p.Faint) })
 	case len(s.conversation.Messages) == 0:
-		// 空态：还没人说话。
-		ui.Column(c).Grow(1).FillWidth().PaddingX(ContentInset).PaddingY(16).Children(func() {
-			ui.Text(c, "还没有人说话。在下面写一句试试。").FontSize(FontBody).TextColor(p.Faint)
+		// 空态居中：画板里它落在消息区正中，不是贴着标题栏左上角。
+		ui.Column(c).Grow(1).FillWidth().Center().Gap(10).PaddingX(ContentInset).Children(func() {
+			ui.Column(c).Width(64).Height(64).Radius(RadiusFolder).BorderWidth(1).
+				BorderColor(p.Line).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				ui.Text(c, "···").FontSize(FontEmptyIcon).TextColor(p.Faint)
+			})
+			ui.Text(c, "还没有人说话").FontSize(FontTitle).FontWeight(WeightName).TextColor(p.Muted)
+			ui.Text(c, "在下面写一句，他就会记得。").FontSize(FontLabel).TextColor(p.Hint)
+			// 第一次打开的人不知道该干什么。三句话说清「这是什么、怎么开始、它会记住」，
+			// 而不是让他对着一片空白猜。这不是教程，是入口本身：每句都对应界面上真有的东西。
+			ui.Column(c).Gap(6).PaddingY(8).Children(func() {
+				s.firstStep(c, p, "1", "在下面说一句话，或者 @ 某一位")
+				s.firstStep(c, p, "2", "它接活后，右栏能看到进度，点开能看它在干什么")
+				s.firstStep(c, p, "3", "它会记住你们的对话，下次接着聊")
+			})
 		})
 	default:
-		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
-			ui.Column(c).PaddingX(ContentInset).PaddingY(10).Gap(10).Children(func() {
+		// 「跟不跟底部」按上一帧的实际位置判：离底超过一截说明用户正往上读历史，
+		// 这时候新消息不该把视图拽走。顶到底时差值是 0，自然继续跟随。
+		// 只在真的量到过内容高度（MaxY > 0）时才判，否则第一帧会被误判成「翻上去了」。
+		if s.chatScroll.MaxY > 0 {
+			s.chatPinned = s.chatScroll.MaxY-s.chatScroll.Y < 40
+		}
+		ui.Scroll(c).Grow(1).FillWidth().TrackScroll(&s.chatScroll).Children(func() {
+			// 左右内缩都是 36，不是 75。
+			//
+			// 画板里 75 是**正文**的 x（404 − 329），而正文前面还有 28 的头像和
+			// 11 的间距：36 + 28 + 11 = 75。之前把 75 当成了消息行的起点，
+			// 于是头像和正文一起右移 39px，整片消息离栏边太远 —— 这是「看着不对」
+			// 里最显眼的一处。
+			// 间距 20 是画板的节奏（每条消息之间一段呼吸），单条消息自己的
+			// 上下 PaddingY 只留一点点，两处都放大就会稀成一片。
+			ui.Column(c).PaddingX(MessageInset).PaddingY(10).Gap(20).Children(func() {
 				for _, message := range s.conversation.Messages {
 					s.message(c, p, message)
 				}
+				// 卡片的缩进已经在 message/subagentCard/pendingCard 里算好，
+				// 这里不再 PaddingX —— 外面加一次、里面再加一次就是双重缩进。
 				// 子代理卡跟在这一段之后：它说的是「这段话派下去谁在跑」。
 				// 设计稿把它放在消息流里，不是右栏 —— 右栏放的是工单，是另一件事。
 				if tree := s.agents; len(tree) > 0 {
 					s.subagentCard(c, p, tree)
+				}
+				// 等你要拍板的活：画板把它摆在消息流末尾，是这一轮对话的落点，
+				// 不是右栏的一张卡。右栏只回答「有哪些票」，这里回答「现在要你做什么」。
+				for _, task := range s.pendingDecisions() {
+					s.pendingCard(c, p, task)
 				}
 			})
 		})
@@ -694,8 +1264,13 @@ func (s *app) subagentCard(c *ui.Context, p Palette, tree []AgentNode) {
 	// 递归数：嵌套的子代理也算，否则「已完成」把还在跑的层级也吞进去。
 	running := countRunning(tree)
 	done := total - running
-	ui.Row(c).FillWidth().PaddingX(ContentInset).Children(func() {
-		ui.Column(c).MaxWidth(ContentMax).FillWidth().Radius(RadiusPane).
+	// 与消息对齐：stream 已经给了 36 的内缩，这里只要让出头像那一列（28 + 11）。
+	//
+	// 卡用 Grow(1) 而不是 FillWidth()：在 Row 里，FillWidth 的子项要等 Row
+	// 先定宽才能算自己的高度，结果整张卡的高度被算成表头那一行 —— 下面的分身形
+	// 全被裁掉，看起来像「只派了一个人」。
+	ui.Row(c).FillWidth().PaddingStart(39).Children(func() {
+		ui.Column(c).Grow(1).Radius(RadiusPane).
 			Background(p.Card).BorderWidth(1).BorderColor(p.Line).Children(func() {
 			// 表头：左「N 个子代理」，右「x 在跑 · y 已完成」。
 			ui.Row(c).FillWidth().Padding(12).AlignItems(ui.Center).Children(func() {
@@ -776,53 +1351,213 @@ func countAgents(tree []AgentNode) int {
 	return n
 }
 
-func (s *app) message(c *ui.Context, p Palette, message Message) {
-	fromBot := message.Role == "agent"
-	// 消息落在一条左右不对称的栏里：左边距 75、右边距 36，和画板一致。
-	row := ui.Row(c).FillWidth().PaddingX(36).PaddingY(9)
-	if !fromBot {
-		// 自己发的话靠右。
-		row = row.Justify(ui.End)
+// pendingDecisions 是「卡在等你」的那几张票：消息流末尾要请人拍板的那些。
+//
+// 只取真的在等具体决定的（NeedsPerson 有值且不是失败）。失败的票是要人处理，
+// 但不是「二选一」；它在右栏的失败卡里已经有自己的位置。
+func (s *app) pendingDecisions() []Task {
+	if s.conversation == nil {
+		return nil
 	}
-	row.Children(func() {
-		ui.Column(c).MaxWidth(ContentMax).Gap(6).Children(func() {
-			// 自己发的话不标名字：靠右对齐已经说明是谁了（画板也是这样）。
-			// 只在有 Bot 或时间需要标明时才画这一行，否则会多出一条空白。
-			when := shortTime(message.At)
-			if fromBot || when != "" {
-				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					if fromBot {
-						ui.Text(c, s.nameOf(message.BotID)).FontSize(FontSmall).FontWeight(WeightName).TextColor(p.Accent)
-					}
-					if when != "" {
-						ui.Text(c, when).FontSize(FontHairline).TextColor(p.Faint)
+	var out []Task
+	for _, task := range s.conversation.Tasks {
+		if task.Open && task.NeedsPerson != "" && task.NeedsPerson != "failed" {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+// pendingCard 是「等你决定」：赭色边、浅暖底、两个选项 + 一句自写。
+//
+// 画板的意图是「后台已经在等，不是在聊天里问」—— 所以它是一个能直接答的块，
+// 不是一段叙述。后端目前只给「在等什么」（needs_person），不给选项列表，
+// 所以这里只摆出现在真有的东西：等的原因 + 能不能现在回。不编 A/B 选项。
+func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
+	ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).PaddingY(6).Children(func() {
+		// 与 Bot 消息同一列头像：这张卡是那位 Bot 在等你。
+		s.messageAvatar(c, p, task.BotID)
+		ui.Column(c).Grow(1).MinWidth(0).Gap(8).Children(func() {
+			if s.botTurnStartOfTask(task) {
+				ui.Row(c).Gap(7).AlignItems(ui.Baseline).Children(func() {
+					ui.Text(c, s.nameOf(task.BotID)).FontSize(FontSmall).
+						FontWeight(WeightName).TextColor(p.Ink)
+					if role := s.roleOf(task.BotID); role != "" {
+						ui.Text(c, role).FontSize(FontHairline).TextColor(p.Faint)
 					}
 				})
 			}
-			// 气泡：右下角收成 4px 当尖角（设计稿 `15px 15px 4px`），指向发出它的那一侧。
-			//
-			// 自己发的话压深底、字反白；Bot 的话在浅底上、字用正常墨色。
-			// 这两件事必须一起定，分开写就会有一边读不清 —— 暗色主题下尤其明显。
-			var bubble ui.Element
-			textColor := p.Ink
-			if fromBot {
-				bubble = ui.Column(c).PaddingX(15).PaddingY(11).Radius(RadiusBubble).
-					Background(p.Surface)
-			} else {
-				bubble = ui.Column(c).PaddingX(15).PaddingY(11).
-					Radius(RadiusBubble, RadiusBubble, RadiusTail, RadiusBubble).
-					Background(p.UserBubble)
-				textColor = p.UserInk
-			}
-			bubble.Children(func() {
-				ui.Text(c, message.Text).FontSize(FontText).TextColor(textColor)
+			// 不加 FillWidth：在 Row 里嵌套 Column 时它会让这一列的宽度等待
+			// Row 的测量结果，高度被压成一条 —— 卡里只剩下「等你决定」几个字。
+			// Grow(1) 已经把这列吃满剩余宽度。
+			ui.Column(c).Grow(1).Padding(13).Radius(RadiusPane).
+				Background(p.WarmBase).BorderWidth(1).BorderColor(p.WarnEdge).
+				Gap(9).Children(func() {
+				ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+					// 赭色的惊叹号圆环：和左栏状态点同一种语言。
+					ui.Text(c, "◷").FontSize(FontSmall).TextColor(p.Warn)
+					ui.Text(c, "等你决定").FontSize(FontSmall).FontWeight(WeightFigure).
+						LetterSpacing(0.35).TextColor(p.Warn)
+				})
+				ui.Text(c, task.NeedsPerson).FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
+				if waited := s.waitedFor(task); waited != "" {
+					ui.Text(c, "已经等了 "+waited).FontSize(FontHairline).TextColor(p.Faint)
+				}
+				// 回一句就落在同一段对话里：直接聚焦输入框，不再多造一个输入层。
+				ui.Row(c).Gap(7).Children(func() {
+					ui.Row(c).Grow(1).PaddingX(11).PaddingY(8).Radius(RadiusItem).
+						Background(p.Card).BorderWidth(1).BorderColor(p.WarnEdge).
+						Cursor(ui.CursorPointer).OnClick(func() {
+						// 点「自己写一句」= 把这句在等的话带进输入框，省得人再想上下文。
+						if s.input == "" {
+							s.input = "@" + s.nameOf(task.BotID) + " "
+						}
+						s.navTab = navBackend
+					}).Children(func() {
+						ui.Text(c, "自己写一句…").FontSize(FontBody).TextColor(p.Hint)
+					})
+					ui.Row(c).PaddingX(13).PaddingY(8).Radius(RadiusItem).
+						Background(p.Warn).Cursor(ui.CursorPointer).Center().Children(func() {
+						ui.Text(c, "回").FontSize(FontBody).TextColor(p.AccentInk)
+					}).OnClick(func() {
+						if s.input == "" {
+							s.input = "@" + s.nameOf(task.BotID) + " "
+						}
+					})
+				})
 			})
-			// 消息带代码就画代码卡：设计稿里它挂在正文下面，和气泡同宽。
+		})
+	})
+}
+
+// botTurnStartOfTask 用在没有消息 ID 的卡上：这张票是那位 Bot 这一轮的落点。
+// 同一个人在消息流里已经说过话就不必再标一次名字，但票与发言是两种条目，
+// 分开判断容易错位，所以这里保守地标出来。
+func (s *app) botTurnStartOfTask(task Task) bool { return true }
+
+func (s *app) message(c *ui.Context, p Palette, message Message) {
+	fromBot := message.Role == "agent"
+	// 画板的中栏是「头像 + 正文」的排版，不是「一排气泡」：
+	//
+	//   林 [28×28 头像]  输入框间距 12px，按钮贴底……
+	//                    [代码卡]
+	//
+	// Bot 的话没有底色也没有气泡 —— 它是一条发言，不是一张卡片。只有自己
+	// 发的才做成右侧深色气泡（右下角收 4px 尖角）。以前两头都画成气泡，
+	// 结果一屏全是圆角块，层级全靠底色深浅区分，读起来像两块对等的面板。
+	//
+	// 缩进不在这里加：stream 已经给了 MessageInset(36) 的内缩，
+	// 头像 28 + 间距 11 之后正文正好落在画板的 75 上。
+	row := ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start)
+	if fromBot {
+		row = row.PaddingY(4)
+	} else {
+		row = row.PaddingY(2).Justify(ui.End)
+	}
+	row.Children(func() {
+		if fromBot {
+			s.messageAvatar(c, p, message.BotID)
+		}
+		// 正文栏：头像 28 + 间距 11 之外，右边留 36 给栏边。
+		ui.Column(c).Grow(1).MinWidth(0).Gap(9).Children(func() {
+			if fromBot {
+				// 画板的 Bot 发言只有「头像 + 正文」，没有名字行也没有角色行 ——
+				// 头像本身已经说明了是谁。连续几段同一个人发言时，再加名字会把
+				// 消息流读成一连串带标题的段落，Rhythm 就散了。
+				ui.Text(c, message.Text).FontSize(FontText).LineHeight(1.6).TextColor(p.Ink)
+			} else {
+				// 自己发的话：右侧深色气泡，右下角收成 4px 尖角（画板 `15px 15px 4px`）。
+				// 气泡独占一行、不撑满剩余宽度：MaxWidth 是测量出的上限，
+				// 里面再包一层 Row(Justify End) 让短句只占自己那一截。
+				ui.Row(c).FillWidth().Justify(ui.End).Children(func() {
+					ui.Column(c).PaddingX(15).PaddingY(11).MaxWidthPercent(76).
+						Radius(RadiusBubble, RadiusBubble, RadiusTail, RadiusBubble).
+						Background(p.UserBubble).Children(func() {
+						ui.Text(c, message.Text).FontSize(FontText).LineHeight(1.55).TextColor(p.UserInk)
+					})
+				})
+			}
+			// 消息带代码就画代码卡：设计稿里它挂在正文下面、与正文同宽。
 			if block := message.Code(); block != nil {
-				ui.Row(c).FillWidth().Children(func() { s.codeCard(c, p, *block) })
+				s.codeCard(c, p, *block)
 			}
 		})
 	})
+}
+
+// messageAvatar 是消息左侧那个 28×28 的方块头像。
+//
+// 画板里它是**实心**的：绿底白字（周是赭底白字）。淡底那种是花名册里
+// 「在名单上但没选中」的表示，用在消息流里会让每一行都像未选中状态。
+func (s *app) messageAvatar(c *ui.Context, p Palette, botID string) {
+	fill, tint := p.Accent, p.AccentInk
+	if isWarnBot(botID) {
+		fill, tint = p.Warn, p.AccentInk
+	}
+	ui.Column(c).Width(28).Height(28).Radius(RadiusButton).Background(fill).
+		AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+		ui.Text(c, firstRune(s.nameOf(botID))).FontSize(FontBody).FontWeight(WeightFigure).TextColor(tint)
+	})
+}
+
+// botTurnStart 判断这条 Bot 消息是不是「这个人这一轮的第一句」。
+//
+// 连续同一个人的发言只在第一句标名字：画板里几段林的话连排时，名字只在
+// 换人时出现一次，否则每一句都顶一行名字，读起来像好几拨人在轮流说。
+func (s *app) botTurnStart(message Message) bool {
+	if s.conversation == nil {
+		return true
+	}
+	index := -1
+	for i, candidate := range s.conversation.Messages {
+		if candidate.ID == message.ID {
+			index = i
+			break
+		}
+	}
+	// 找不到（比如消息是刚追加的）：保守地标出来，宁可多标一次也不藏掉是谁说的。
+	if index <= 0 {
+		return true
+	}
+	previous := s.conversation.Messages[index-1]
+	return previous.Role != "agent" || previous.BotID != message.BotID
+}
+
+// roleOf 是花名册里那半句「前端 · 话少，先验再说」的前半截。
+// 人设是自由文本，取第一个分隔符前的部分当职能；没有就不显示。
+func (s *app) roleOf(botID string) string {
+	if s.conversation == nil {
+		return ""
+	}
+	for _, bot := range s.conversation.Bots {
+		if bot.ID != botID {
+			continue
+		}
+		persona := strings.TrimSpace(bot.Persona)
+		if persona == "" {
+			return ""
+		}
+		for _, sep := range []string{"，", ",", "。", "；", "·"} {
+			if head, _, found := strings.Cut(persona, sep); found {
+				head = strings.TrimSpace(head)
+				if len([]rune(head)) <= 8 {
+					return head
+				}
+			}
+		}
+		return clipRunes(persona, 8)
+	}
+	return ""
+}
+
+// isWarnBot 把某几位固定交给赭色系，用来在看代码卡、长消息时区分是谁说的。
+// 画板里「周」用赭、其余用绿：这是有意的语义分色，不是随机配色。
+func isWarnBot(botID string) bool {
+	switch botID {
+	case "zhou", "business", "market":
+		return true
+	}
+	return false
 }
 
 // codeCard 是消息里的代码片段：文件名 + 增删统计 + 逐行高亮。
@@ -863,7 +1598,7 @@ func (s *app) nameOf(botID string) string {
 	if s.conversation != nil {
 		for _, bot := range s.conversation.Bots {
 			if bot.ID == botID {
-				return bot.Name
+				return strings.TrimSpace(bot.Name)
 			}
 		}
 	}
@@ -873,12 +1608,119 @@ func (s *app) nameOf(botID string) string {
 	return botID
 }
 
+// queuedPreview 是排队中的一条消息。请求号用来撤回，正文从时间线里按 request_id 对回来。
+type queuedPreview struct {
+	RequestID string
+	Text      string
+}
+
+// queuedPreviews 把 conversation.Queued 里的请求号对回正文，最多取最近 limit 条。
+//
+// Queued 只给请求号；正文在 items 里（同一条消息带着 request_id 和 text）。
+// 所以这里不改后端协议，只在客户端把两张表接起来。对不上的就留空，
+// 由 queuedSummary 说「还没读回来」，而不是编一句假话。
+func queuedPreviews(conversation *Conversation, limit int) []queuedPreview {
+	if conversation == nil || len(conversation.Queued) == 0 {
+		return nil
+	}
+	textOf := make(map[string]string, len(conversation.Messages))
+	for _, message := range conversation.Messages {
+		if message.RequestID == "" {
+			continue
+		}
+		// 同一次发送可能被读到不止一次；先读到的那条就是原文。
+		if _, seen := textOf[message.RequestID]; !seen {
+			textOf[message.RequestID] = message.Text
+		}
+	}
+	ids := conversation.Queued
+	if limit > 0 && len(ids) > limit {
+		ids = ids[len(ids)-limit:]
+	}
+	out := make([]queuedPreview, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, queuedPreview{RequestID: id, Text: textOf[id]})
+	}
+	return out
+}
+
+// queuedSummary 把一条排队消息压成一行字。换行与连续空白先抹平，
+// 太长才截断 —— 摘要只用来认出是哪一句，完整正文还在消息流里。
+func queuedSummary(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return "（正文还没读回来）"
+	}
+	runes := []rune(text)
+	if limit > 0 && len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return text
+}
+
+// withdraw 撤回一条还没被读到的排队消息。结果走通道回主线程，
+// 不在工作线程上碰 s.withdrawError / s.withdrawing。
+func (s *app) withdraw(requestID string) {
+	requestID = strings.TrimSpace(requestID)
+	if s.client == nil || requestID == "" || s.withdrawing[requestID] {
+		return
+	}
+	if s.withdrawing == nil {
+		s.withdrawing = make(map[string]bool)
+	}
+	// 通道在 newApp 里 make；这里兜一下手工构造的 app，免得发送永久阻塞。
+	if s.withdrawn == nil {
+		s.withdrawn = make(chan withdrawResult, 4)
+	}
+	s.withdrawing[requestID] = true
+	s.withdrawError = ""
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s.withdrawn <- withdrawResult{requestID: requestID, err: s.client.Withdraw(ctx, requestID)}
+		s.wake()
+	}()
+}
+
 func (s *app) composer(c *ui.Context, p Palette) {
-	// 排队中的消息也能看见：说了会排在后面，就得让它在这里排着，并且能撤。
-	if s.conversation != nil && len(s.conversation.Queued) > 0 {
-		ui.Row(c).Padding(12).Gap(8).Background(p.Surface).Children(func() {
+	// 排队中的消息也能看见：说了会排在后面，就得让人认得出排的是哪几句，并且能撤。
+	if previews := queuedPreviews(s.conversation, queuedPreviewCount); len(previews) > 0 {
+		ui.Column(c).FillWidth().PaddingX(ContentInset).PaddingY(8).Gap(6).Children(func() {
 			ui.Text(c, fmt.Sprintf("%d 条排队中，等队伍读完手上这一步", len(s.conversation.Queued))).
 				FontSize(FontTiny).TextColor(p.Faint)
+			for _, preview := range previews {
+				preview := preview
+				ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).PaddingX(10).PaddingY(5).
+					Radius(RadiusItem).Background(p.Surface).Children(func() {
+					ui.Text(c, queuedSummary(preview.Text, queuedPreviewRunes)).
+						FontSize(FontTiny).TextColor(p.Muted)
+					ui.Row(c).Grow(1)
+					// 插队只在有工单正在跑时才有意义：它把话交给那位 worker 的下一步。
+					if ticketID, ok := s.runningTicket(); ok && !s.steering[preview.RequestID] {
+						ui.Row(c).PaddingX(8).PaddingY(3).Radius(RadiusChip).Background(p.AccentSoft).
+							Cursor(ui.CursorPointer).Children(func() {
+							ui.Text(c, "插队").FontSize(FontTiny).TextColor(p.Accent)
+						}).OnClick(func() { s.steer(preview.RequestID, ticketID) })
+					}
+					ui.Row(c).PaddingX(8).PaddingY(3).Radius(RadiusChip).Background(p.Card).
+						BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).
+						Children(func() {
+							ui.Text(c, "撤回").FontSize(FontTiny).TextColor(p.Warn)
+						}).OnClick(func() { s.withdraw(preview.RequestID) })
+				})
+			}
+		})
+	}
+	// 撤回失败的话独立一行：409 之后时间线会重读，排队块可能已经空了，
+	// 但那句「没撤成」还得让人看见。
+	if s.withdrawError != "" {
+		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
+			ui.Text(c, "撤回没成功："+s.withdrawError).FontSize(FontTiny).TextColor(p.Danger)
+		})
+	}
+	if s.steerNote != "" {
+		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
+			ui.Text(c, s.steerNote).FontSize(FontTiny).TextColor(p.Faint)
 		})
 	}
 	// 读过但不动手的那几条也要说一声，否则屏幕上只有自己说的话，分不清「还在想」和「不会回」。
@@ -889,23 +1731,136 @@ func (s *app) composer(c *ui.Context, p Palette) {
 				FontSize(FontTiny).TextColor(p.Faint)
 		})
 	}
-	// 输入区：画板里圆角 13、白底细边、上下留白，和消息流的左边距对齐。
-	ui.Row(c).FillWidth().PaddingX(ContentInset).PaddingY(12).Gap(8).Background(p.Card).Children(func() {
-		placeholder := "跟队伍说点什么"
+	// 输入区：画板里整块落在页面底上（不是另一条横带），左右各内缩 28；
+	// 输入卡圆角 13、白底细边，发送键是框内右端 32×32 的圆角按钮。
+	ui.Column(c).FillWidth().PaddingX(28).PaddingY(20).Gap(7).Background(p.Surface).Children(func() {
+		placeholder := "跟队伍说点什么，或者交给别人"
 		if s.problem != "" {
 			placeholder = "连上之后才能发"
 		}
-		ui.Row(c).Grow(1).Radius(RadiusBig).Background(p.Surface).
-			BorderWidth(1).BorderColor(p.Line).PaddingX(13).PaddingY(9).Children(func() {
+		ui.Row(c).FillWidth().Radius(RadiusBig).Background(p.Card).
+			BorderWidth(1).BorderColor(p.Line).PaddingX(13).PaddingY(9).Gap(8).
+			AlignItems(ui.Center).Children(func() {
 			ui.TextInput(c, &s.input).Placeholder(placeholder).Grow(1).
 				PlaceholderColor(p.Faint).OnSubmit(func() { s.send() })
+			if s.sending {
+				ui.Text(c, "发送中…").FontSize(FontTiny).TextColor(p.Faint)
+			} else {
+				// 有工单在跑时，还多一条「插队」：这句不等排队，直接交给它下一步。
+				if s.input != "" {
+					if ticketID, ok := s.runningTicket(); ok {
+						ui.Row(c).PaddingX(9).Height(32).Radius(RadiusCard).Background(p.AccentSoft).
+							Center().Cursor(ui.CursorPointer).Children(func() {
+							ui.Text(c, "插队").FontSize(FontSmall).TextColor(p.Accent)
+						}).OnClick(func() { s.sendSteer(ticketID) })
+					}
+				}
+				ui.Row(c).Width(32).Height(32).Radius(RadiusCard).Background(p.Accent).
+					Center().Cursor(ui.CursorPointer).Children(func() {
+					ui.Text(c, "↑").FontSize(FontGlyph).TextColor(p.AccentInk)
+				}).OnClick(s.send)
+			}
 		})
-		if s.sending {
-			ui.Text(c, "发送中…").FontSize(FontTiny).TextColor(p.Faint)
-		} else if ui.PrimaryButton(c, "发送").Background(p.Accent).Clicked() {
-			s.send()
-		}
+		// 这句说明的是异步队伍的语义：你现在发的话排在哪。
+		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+			ui.Column(c).Width(5).Height(5).Radius(RadiusDot).
+				Background(func() ui.Color {
+					if s.anyRunning() {
+						return p.Accent
+					}
+					return p.Hint
+				}())
+			ui.Text(c, s.queueLine()).FontSize(FontTiny).TextColor(p.Faint)
+		})
 	})
+}
+
+// queueLine 说清这句话会插队还是排队。
+func (s *app) queueLine() string {
+	if s.conversation == nil {
+		return "正在读队伍的状态"
+	}
+	if s.conversation.Status.Paused {
+		return "队伍已暂停，发出去的话会先排队"
+	}
+	for _, task := range s.conversation.Tasks {
+		if task.Open {
+			return s.nameOf(task.BotID) + "在跑，你现在发的话会排在它这一步之后"
+		}
+	}
+	return "都在待命，发出去就会接上"
+}
+
+// pauseAll 停整个执行器。现在手机面只有这一种暂停，按钮上写「全部」而不是「这一张」。
+// editBot 打开某一位的编辑层，草稿从当前的名单里取。
+func (s *app) editBot(bot BotCard) {
+	s.editingBot = bot.ID
+	s.botName = strings.TrimSpace(bot.Name)
+	s.botPersona = bot.Persona
+	s.botError = ""
+	s.botSaving = false
+}
+
+// saveBot 把编辑层里的名字与人设发出去。成功后才关层；失败原样写在层里。
+func (s *app) saveBot() {
+	if s.client == nil || s.botSaving || s.editingBot == "" {
+		return
+	}
+	name := strings.TrimSpace(s.botName)
+	if name == "" {
+		s.botError = "名字不能为空"
+		return
+	}
+	s.botSaving = true
+	s.botError = ""
+	id, persona := s.editingBot, strings.TrimSpace(s.botPersona)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		s.botSaved <- botSaveResult{id: id, err: s.client.EditBot(ctx, id, name, persona)}
+		s.wake()
+	}()
+}
+
+func (s *app) pauseAll() {
+	if s.client == nil || s.pausing {
+		return
+	}
+	s.pausing = true
+	s.pauseNote = ""
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		s.pauseDone <- pauseResult{err: s.client.Pause(ctx)}
+		s.wake()
+	}()
+}
+
+// taskCountLine 是右栏栏头那一行：永远有张数，有票时再补在跑/失败。
+func (s *app) taskCountLine() string {
+	total, running, failed := 0, 0, 0
+	if s.conversation != nil {
+		total = len(s.conversation.Tasks)
+		for _, task := range s.conversation.Tasks {
+			if task.Open {
+				running++
+			}
+			if task.NeedsPerson == "failed" {
+				failed++
+			}
+		}
+	}
+	if total == 0 {
+		return "0 张"
+	}
+	line := fmt.Sprintf("%d 张", total)
+	if running > 0 {
+		line += fmt.Sprintf(" · %d 在跑", running)
+	}
+	if failed > 0 {
+		line += fmt.Sprintf(" · %d 失败", failed)
+	}
+	return line
 }
 
 // backendPane 是右栏：工单是唯一的工作状态主体，这里只是它的只读投影。
@@ -926,39 +1881,103 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 		})
 		return
 	}
-	ui.Column(c).Width(BackendWidth).FillHeight().PaddingX(16).PaddingY(22).Gap(14).Background(p.Surface).Children(func() {
-		ui.Row(c).FillWidth().Children(func() {
+	// 右栏左缘那条线：方向是 RightToLeft，外层再明确一次从左到右，线才落在左缘。
+	// 宽度交给 ui.Split 给的 pane，不再写一次 Width：两处都写时，Split 夹过之后的值
+	// 和这里写的值会差几像素，内容右对齐到栏外，看起来就是「拖窄后不跟着自适应」。
+	ui.Row(c).FillWidth().FillHeight().Direction(ui.LeftToRight).Gap(0).Children(func() {
+		ui.Column(c).Width(1).FillHeight().Background(p.Line)
+		ui.Column(c).Grow(1).FillHeight().PaddingX(16).PaddingY(22).Gap(14).Background(p.Raised).Children(func() {
+			switch s.navTab {
+			case navModel:
+				s.modelPane(c, p)
+			case navOutput, navRoutine:
+				s.emptyPane(c, p, s.navTab)
+			default:
+				s.workPane(c, p)
+			}
+			s.pairing(c, p)
+			// 底部那块贴底：整队是否在跑、队列多长、一键停。数据都来自同一份时间线。
 			ui.Row(c).Grow(1)
-			ui.Text(c, "收起 ›").FontSize(FontTiny).TextColor(p.Faint).Cursor(ui.CursorPointer).
-				OnClick(func() { s.backendOpen = false })
+			ui.Column(c).FillWidth().Gap(8).Children(func() {
+				ui.Text(c, s.crewStateLine()).FontSize(FontSmall).TextColor(p.Muted)
+				if s.pauseNote != "" {
+					ui.Text(c, s.pauseNote).FontSize(FontTiny).TextColor(p.Faint)
+				}
+				paused := s.conversation != nil && s.conversation.Status.Paused
+				label := "全部暂停"
+				if paused {
+					label = "已暂停（去面板恢复）"
+				}
+				ui.Row(c).FillWidth().Height(32).Radius(RadiusItem).Background(p.Card).
+					BorderWidth(1).BorderColor(p.Line).Center().
+					Cursor(ui.CursorPointer).Children(func() {
+					ui.Text(c, label).FontSize(FontBodyWide).TextColor(p.Muted)
+				}).OnClick(s.pauseAll)
+			})
 		})
-		switch s.navTab {
-		case navModel:
-			s.modelPane(c, p)
-		case navOutput, navRoutine:
-			s.emptyPane(c, p, s.navTab)
-		default:
-			s.workPane(c, p)
-		}
-		s.pairing(c, p)
 	})
+}
+
+// crewStateLine 是右栏底部那行状态：整队在不在跑、手上几件、排了几条。
+func (s *app) crewStateLine() string {
+	if s.conversation == nil {
+		return "正在读队伍的状态"
+	}
+	if s.conversation.Status.Paused {
+		return "队伍已暂停 · 恢复要去面板"
+	}
+	open := 0
+	for _, task := range s.conversation.Tasks {
+		if task.Open {
+			open++
+		}
+	}
+	line := "队伍就绪 · 空闲"
+	if open > 0 {
+		line = fmt.Sprintf("队伍就绪 · %d 张在跑", open)
+	}
+	if queued := len(s.conversation.Queued); queued > 0 {
+		line += fmt.Sprintf(" · %d 条排队", queued)
+	}
+	return line
+}
+
+// emptyTabTitle 说清是「这一档没有」，而不是「一张工单都没有」。
+func (s *app) emptyTabTitle() string {
+	switch s.backendTab {
+	case 1:
+		return "没有等你的工单。"
+	case 2:
+		return "还没有完成的工单。"
+	default:
+		return "进行中没有工单。"
+	}
+}
+
+// collapseButton 是右栏标题行右端的「收起 ›」：收起不是消失，留一条窄边能再展开。
+func (s *app) collapseButton(c *ui.Context, p Palette) {
+	ui.Text(c, "收起 ›").FontSize(FontTiny).TextColor(p.Faint).Cursor(ui.CursorPointer).
+		OnClick(func() { s.backendOpen = false })
 }
 
 // workPane 是「后台」那一栏：栏头、三个标签、工单卡。
 func (s *app) workPane(c *ui.Context, p Palette) {
 	// 栏头：标题 + 张数。
 	ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "后台").FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
-		if s.conversation != nil && len(s.conversation.Tasks) > 0 {
-			ui.Text(c, fmt.Sprintf("%d 张", len(s.conversation.Tasks))).
-				FontSize(FontTiny).TextColor(p.Faint)
-		}
+		ui.Text(c, "后台").FontSize(FontBodyWide).FontWeight(WeightTitle).TextColor(p.Ink)
+		// 张数一直在，哪怕 0 张：空栏也要说「0 张」，不留一块来历不明的空白。
+		// 有票时再补「x 在跑 · y 失败」——画板用这一行当栏头的第二层信息，
+		// 而且靠右对齐：Grow 放在标题与它之间，不是放在它和收起之间。
+		ui.Row(c).Grow(1)
+		ui.Text(c, s.taskCountLine()).FontSize(FontSmall).TextColor(p.Faint)
+		s.collapseButton(c, p)
 	})
 
 	// 标签：进行中 / 待你 / 已完成。画板里它是一条分段控件：
 	// 轨道 360×32、底色 Track、圆角 8；里面三个胶囊各 115×26、圆角 6、间隔 4，
 	// 选中的那个抬成白底（暗色按画板用 Card），没选中的透明。
 	// 坐标见 designs/personal-agent/桌面亮色-坐标.md「右栏」。
+	// 每个页签吃等分的宽度：栏被拖窄时固定 115 会顶出栏外，右端那个字被窗口裁掉。
 	ui.Row(c).FillWidth().Height(TabHeight).Padding(TabBarInset).Gap(TabGap).
 		AlignItems(ui.Center).Radius(RadiusItem).Background(p.Track).Children(func() {
 		for i, label := range []string{"进行中", "待你", "已完成"} {
@@ -978,9 +1997,18 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 		// 空和读不到是两件事：断连时列表同样是空的，那时候写「这一栏还是空的」
 		// 等于告诉人「没有工单」，可数据根本还没回来。分清楚再说。
 		if s.problem != "" {
-			ui.Text(c, "还没连上，读不到工单").FontSize(FontBody).TextColor(p.Faint)
+			ui.Column(c).FillWidth().Grow(1).Center().Children(func() {
+				ui.Text(c, "还没连上，读不到工单").FontSize(FontBody).TextColor(p.Faint)
+			})
 		} else {
-			ui.Text(c, "这一栏还是空的。").FontSize(FontBody).TextColor(p.Faint)
+			ui.Column(c).FillWidth().Grow(1).Center().Gap(8).Children(func() {
+				ui.Column(c).Width(22).Height(22).Radius(RadiusItem).BorderWidth(1).
+					BorderColor(p.Line).AlignItems(ui.Center).PaddingY(2).Children(func() {
+					ui.Text(c, "▤").FontSize(FontBody).TextColor(p.Faint)
+				})
+				ui.Text(c, s.emptyTabTitle()).FontSize(FontLabel).FontWeight(WeightName).TextColor(p.Muted)
+				ui.Text(c, "队伍接到的活会出现在这里。").FontSize(FontBody).TextColor(p.Hint)
+			})
 		}
 	} else {
 		ui.Scroll(c).Grow(1).FillWidth().Children(func() {
@@ -988,16 +2016,9 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 				for _, task := range tasks {
 					s.taskCard(c, p, task)
 				}
-				// 他派了谁：只跟第一张在跑的工单，层级靠缩进。
-				if tree := s.agents; len(tree) > 0 {
-					ui.Column(c).Gap(5).PaddingY(6).Children(func() {
-						ui.Text(c, "他派了谁").FontSize(FontTiny).FontWeight(WeightName).
-							LetterSpacing(0.55).TextColor(p.Faint)
-						for _, node := range tree {
-							s.agentRow(c, p, node, 0)
-						}
-					})
-				}
+				// 这里不再画「他派了谁」：画板的右栏只有工单卡。子代理树属于
+				// 「这段话派下去谁在跑」，归消息流里那张卡；两处都画一遍，
+				// 右栏就变成第二份工单详情，和「一张票 = 一行」的密度对不上了。
 			})
 		})
 	}
@@ -1011,11 +2032,16 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 //
 // 画板给的数：胶囊 115×26、圆角 6、选中白底、未选中透明、字 11.5。
 func (s *app) backendTabCell(c *ui.Context, p Palette, label string, active bool, press func()) {
-	cell := ui.Row(c).Width(TabWidth).Height(TabHeight).Radius(RadiusChip).
-		Center().Cursor(ui.CursorPointer)
+	// 轨道本身 32 高、上下各 3 的衬：胶囊只有 26，不跟着轨道长满。
+	// 宽度按等分吃满轨道：定宽 115 在窗口拖窄（或右栏拖窄）时会把三个字一起顶出栏外，
+	// 连带把整列内容撑宽，右栏看起来就「没有自适应」。
+	// MinWidth(0)：等分时不能被「进行中」这三个字的固有宽度顶住。
+	cell := ui.Row(c).Grow(1).MinWidth(0).Height(TabHeight - 2*TabBarInset).Radius(RadiusChip).
+		Center().ClipX().Cursor(ui.CursorPointer)
 	// 底色：选中抬一层，按下去再压一层；没选中的平时透明，按住才浮起一点。
 	soft, tint := ui.Transparent, p.Faint
-	weight := WeightName
+	// 未选中是常规字重（400）；只有选中那个才加粗，画板用这一档区分。
+	weight := 400
 	switch {
 	case active && cell.Pressed():
 		soft, tint, weight = p.Pressed, p.Ink, WeightLabel
@@ -1035,10 +2061,12 @@ func (s *app) backendTabCell(c *ui.Context, p Palette, label string, active bool
 // 免得人以为它本来就没有模型。
 func (s *app) modelPane(c *ui.Context, p Palette) {
 	ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "模型").FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
+		ui.Text(c, "模型").FontSize(FontBodyWide).FontWeight(WeightTitle).TextColor(p.Ink)
 		if s.models != nil {
 			ui.Text(c, fmt.Sprintf("%d 家", len(s.models.Providers))).FontSize(FontTiny).TextColor(p.Faint)
 		}
+		ui.Row(c).Grow(1)
+		s.collapseButton(c, p)
 	})
 
 	// 正在用的是谁，摆在最上面：换模型之前先得知道现在是什么。
@@ -1052,6 +2080,45 @@ func (s *app) modelPane(c *ui.Context, p Palette) {
 	if s.modelNote != "" {
 		ui.Text(c, s.modelNote).FontSize(FontMini).TextColor(p.Faint)
 	}
+	// 这次换模型应用给谁：全员默认，或者某一位成员。
+	ui.Column(c).FillWidth().Gap(5).Children(func() {
+		ui.Text(c, "应用给").FontSize(FontTiny).FontWeight(WeightName).LetterSpacing(0.55).TextColor(p.Faint)
+		// 换行排：栏拖窄时作用域 chip 会换到下一行，而不是一起挤出栏外。
+		ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+			s.scopeChip(c, p, "全员", "")
+			if s.modelScope != "" {
+				// 这一位有自己的路由时，给一条退回全场默认的路。
+				if _, own := s.modelsForScope(); own {
+					s.scopeChip(c, p, "跟随全员", s.modelScope+"-clear")
+				}
+			}
+			if s.conversation != nil {
+				for _, bot := range s.conversation.Bots {
+					s.scopeChip(c, p, strings.TrimSpace(bot.Name), bot.ID)
+				}
+			}
+		})
+	})
+	// 推理档位：路由支持什么就问什么，不摆一排猜出来的按钮。
+	ui.Column(c).FillWidth().Gap(5).Children(func() {
+		ui.Text(c, "推理档位").FontSize(FontTiny).FontWeight(WeightName).LetterSpacing(0.55).TextColor(p.Faint)
+		switch {
+		case s.efforts == nil:
+			ui.Text(c, "正在读这条路由支持的档位…").FontSize(FontTiny).TextColor(p.Faint)
+		case len(s.efforts.Efforts) == 0:
+			ui.Text(c, "这条路由没有可选档位。").FontSize(FontTiny).TextColor(p.Faint)
+		default:
+			ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+				current := s.routeForScope().ReasoningEffort
+				if current == "" {
+					current = s.efforts.Default
+				}
+				for _, effort := range s.efforts.Efforts {
+					s.effortChip(c, p, effort, effort.ID == current)
+				}
+			})
+		}
+	})
 	switch {
 	case s.models == nil:
 		ui.Text(c, "正在读能选哪些…").FontSize(FontBody).TextColor(p.Faint)
@@ -1081,11 +2148,67 @@ func (s *app) modelPane(c *ui.Context, p Palette) {
 	})
 }
 
+// scopeChip 是「这次换模型应用给谁」的一个选择。
+func (s *app) scopeChip(c *ui.Context, p Palette, label, botID string) {
+	active := s.modelScope == botID
+	// 未选中也要有实底：透明背景不会进入命中链，点上去没有反应。
+	soft, tint := p.Card, p.Muted
+	if active {
+		soft, tint = p.AccentSoft, p.Accent
+	}
+	ui.Row(c).PaddingX(10).PaddingY(5).Radius(RadiusChip).Background(soft).
+		Cursor(ui.CursorPointer).Children(func() {
+		ui.Text(c, label).FontSize(FontSmall).TextColor(tint)
+	}).OnClick(func() {
+		if strings.HasSuffix(botID, "-clear") {
+			scope := strings.TrimSuffix(botID, "-clear")
+			s.modelScope = scope
+			s.switchTo(ModelChoice{})
+			s.wake()
+			return
+		}
+		if s.modelScope == botID {
+			return
+		}
+		s.modelScope = botID
+		s.modelNote = ""
+		s.loadEfforts()
+		s.wake()
+		s.wake()
+	})
+}
+
+// effortChip 是一个推理档位。点它就用这条路由 + 这个档位重新提交。
+func (s *app) effortChip(c *ui.Context, p Palette, effort EffortOption, active bool) {
+	soft, tint := p.Card, p.Muted
+	if active {
+		soft, tint = p.AccentSoft, p.Accent
+	}
+	ui.Row(c).PaddingX(10).PaddingY(5).Radius(RadiusChip).
+		BorderWidth(1).BorderColor(p.Line).Background(soft).
+		Cursor(ui.CursorPointer).Children(func() {
+		ui.Text(c, effort.Name).FontSize(FontSmall).TextColor(tint)
+	}).OnClick(func() {
+		if s.routeForScope().ReasoningEffort == effort.ID {
+			return
+		}
+		choice := s.routeForScope()
+		if choice.Provider == "" || choice.Model == "" {
+			return
+		}
+		choice.ReasoningEffort = effort.ID
+		s.switchTo(choice)
+		s.wake()
+	})
+}
+
 // modelRow 是一个能选的模型。整行都能点。
 func (s *app) modelRow(c *ui.Context, p Palette, provider string, option ModelOption) {
-	picked := chosenModel(s.models.Current, provider, option.ID)
+	route := s.routeForScope()
+	picked := route.Provider == provider && route.Model == option.ID
+	// 每行都有实底：透明行不在命中链里，点模型会没反应。
 	row := ui.Row(c).FillWidth().Gap(9).AlignItems(ui.Center).PaddingX(10).PaddingY(9).
-		Radius(RadiusItem).Cursor(ui.CursorPointer)
+		Radius(RadiusItem).Background(p.Card).Cursor(ui.CursorPointer)
 	if picked {
 		row = row.Background(p.SelectedAlt)
 	}
@@ -1134,14 +2257,15 @@ func (s *app) emptyPane(c *ui.Context, p Palette, item navItem) {
 // currentModel 是「现在用的是谁」的一句话。两个来源：目录说过的（刚换完最准），
 // 以及时间线带回来的那个（还没读过目录时用它）。
 func (s *app) currentModel() string {
-	if s.models != nil && s.models.Current != nil {
-		choice := s.models.Current
+	if choice := s.routeForScope(); choice.Model != "" {
+		line := choice.Model
 		if choice.Provider != "" && choice.Provider != choice.Model {
-			return choice.Model + " · " + choice.Provider
+			line += " · " + choice.Provider
 		}
-		if choice.Model != "" {
-			return choice.Model
+		if choice.ReasoningEffort != "" {
+			line += " · " + choice.ReasoningEffort
 		}
+		return line
 	}
 	if s.conversation != nil && s.conversation.Model != "" {
 		return s.conversation.Model
@@ -1287,32 +2411,90 @@ func (s *app) switchTo(choice ModelChoice) {
 	if s.client == nil {
 		return
 	}
+	scope := s.modelScope
 	s.modelNote = "正在换…"
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if err := s.client.SwitchModel(ctx, choice); err != nil {
+		if err := s.client.SwitchModel(ctx, choice, scope); err != nil {
 			// 换模型失败只影响模型栏，不该冒充断连、更不该锁住输入框。
 			s.modelError <- err.Error()
 			s.wake()
 			return
 		}
-		s.modelSwitched <- choice
+		s.modelSwitched <- modelSwitchResult{choice: choice, botID: scope}
 		s.wake()
 	}()
 }
 
+// loadEfforts 问当前作用域那条路由支持哪些推理档位。换作用域/换模型后都要重读。
+func (s *app) loadEfforts() {
+	route := s.routeForScope()
+	if s.client == nil || route.Provider == "" || route.Model == "" {
+		s.efforts = nil
+		return
+	}
+	s.efforts = nil
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := s.client.Efforts(ctx, route.Provider, route.Model)
+		if err != nil {
+			s.modelError <- "读不到推理档位：" + err.Error()
+			s.wake()
+			return
+		}
+		s.effortsCh <- view
+		s.wake()
+	}()
+}
+
+// modelsForScope 报告这个成员有没有自己的一条路由。
+func (s *app) modelsForScope() (ModelChoice, bool) {
+	if s.models == nil || s.modelScope == "" {
+		return ModelChoice{}, false
+	}
+	choice, ok := s.models.BotModels[s.modelScope]
+	return choice, ok && choice.Model != ""
+}
+
+// routeForScope 是这个作用域此刻在用的模型：成员有自己的路由用它，否则回到全场默认。
+func (s *app) routeForScope() ModelChoice {
+	if s.models != nil {
+		if s.modelScope != "" {
+			if choice, ok := s.models.BotModels[s.modelScope]; ok {
+				return choice
+			}
+		}
+		if s.models.Current != nil {
+			return *s.models.Current
+		}
+	}
+	return ModelChoice{}
+}
+
 // applyModel 把「现在用的是谁」改成刚换上的那一个。
-func (s *app) applyModel(choice ModelChoice) {
+func (s *app) applyModel(result modelSwitchResult) {
 	if s.models == nil {
 		s.models = &ModelCatalog{}
 	}
-	chosen := choice
-	s.models.Current = &chosen
-	s.modelNote = ""
-	if s.conversation != nil {
-		s.conversation.Model = choice.Model
+	chosen := result.choice
+	if result.botID != "" && chosen.Model == "" {
+		// 空模型 = 跟随全员：删掉这一位自己的路由。
+		delete(s.models.BotModels, result.botID)
+	} else if result.botID != "" {
+		if s.models.BotModels == nil {
+			s.models.BotModels = map[string]ModelChoice{}
+		}
+		s.models.BotModels[result.botID] = chosen
+	} else {
+		s.models.Current = &chosen
+		if s.conversation != nil {
+			s.conversation.Model = chosen.Model
+		}
 	}
+	s.modelNote = ""
+	s.loadEfforts()
 }
 
 // shownTasks 是当前标签下的工单。
@@ -1356,9 +2538,20 @@ func (s *app) progressOf(task Task) (int, int) {
 
 // stepOf 从已读到的经过里取「第几步」，没有就说没有。
 func (s *app) stepOf(task Task) string {
+	// 只在这张卡被展开、steps 真的读过之后才有「第几步」可说。
+	// 概览行不主动去拉：一张卡一次请求，右栏一屏六七张就是六七次往返，
+	// 而画板那里本来也只有第一张在跑的有进度。
+	if s.openTicket != task.ID {
+		return ""
+	}
 	steps := s.stepsFor(task.ID)
 	if len(steps) == 0 {
 		return ""
+	}
+	// 后端给了总步数才写「第 N 步 / 共 M 步」；只给到过的步数就只写「第 N 步」，
+	// 不拿已读条数当分母 —— 那会让进度看起来永远快到头。
+	if task.TotalSteps > 0 {
+		return fmt.Sprintf("第 %d 步 / 共 %d 步", len(steps), task.TotalSteps)
 	}
 	return fmt.Sprintf("第 %d 步", len(steps))
 }
@@ -1416,10 +2609,70 @@ func (s *app) agentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 // 点一下全自动：本机出一支码，立刻用码换凭据，凭据写进 ~/.config 后下次启动直接读。
 // 不再要求人去别处看图念数字，也不再要求先设三个环境变量。
 func (s *app) pairing(c *ui.Context, p Palette) {
-	ui.Text(c, "手机").FontSize(FontHairline).Bold().TextColor(p.Muted)
-	ui.Text(c, "这一台与队伍配一次，之后两边都免配置。").FontSize(FontMini).TextColor(p.Faint)
-	// 默认主色是系统蓝，和队伍配色不是一套。
-	if ui.PrimaryButton(c, "配对手机").Background(p.Accent).Clicked() {
+	// 打开这一栏就读一次设备清单：配过谁、谁还能进来，是这一块的另一半。
+	s.loadDevices()
+	// 第一行：手机状态 + 一个按钮。配对不是右栏的主角，模型列表要留出高度。
+	ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Column(c).Grow(1).Gap(2).Children(func() {
+			ui.Text(c, "手机").FontSize(FontHairline).Bold().TextColor(p.Muted)
+			note := s.pairingNote
+			if note == "" {
+				note = "这一台与队伍配一次，之后两边都免配置。"
+			}
+			ui.Text(c, note).FontSize(FontMini).TextColor(p.Faint)
+		})
+		ui.Row(c).PaddingX(10).PaddingY(6).Radius(RadiusChip).Background(p.Card).
+			BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+			ui.Text(c, "配对手机").FontSize(FontSmall).TextColor(p.Muted)
+		}).OnClick(s.pairNow)
+	})
+	// 已配对的设备：每台一行，右端一个「撤掉」。手机丢了就用它 —— 之前这份清单只在
+	// 客户端里有方法、界面上从来没露过面，等于没有。
+	if s.devicesNote != "" {
+		ui.Text(c, s.devicesNote).FontSize(FontMini).TextColor(p.Danger)
+	}
+	// 导出备份：一份配置与历史，落到桌面上，人可以自己收着。
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).PaddingY(4).Children(func() {
+		label := "导出备份"
+		if s.exporting {
+			label = "导出中…"
+		}
+		ui.Row(c).PaddingX(10).PaddingY(5).Radius(RadiusChip).Background(p.Card).
+			BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+			ui.Text(c, label).FontSize(FontMini).TextColor(p.Muted)
+		}).OnClick(s.exportRecords)
+	})
+	if s.exportNote != "" {
+		ui.Text(c, s.exportNote).FontSize(FontMini).TextColor(p.Faint).NoWrap().Ellipsis("…")
+	}
+	for _, device := range s.devices {
+		device := device
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).PaddingY(5).Children(func() {
+			ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
+				ui.Text(c, device.Name).FontSize(FontMini).TextColor(p.Muted).NoWrap().Ellipsis("…")
+				detail := device.Platform
+				if device.PairedAt != "" {
+					if at, err := time.Parse(time.RFC3339, device.PairedAt); err == nil {
+						detail += " · " + at.Local().Format("01-02 15:04")
+					}
+				}
+				ui.Text(c, detail).FontSize(FontMini).TextColor(p.Faint).NoWrap()
+			})
+			label := "撤掉"
+			if s.revoking[device.DeviceID] {
+				label = "撤销中…"
+			}
+			ui.Row(c).PaddingX(8).PaddingY(4).Radius(RadiusChip).Background(p.Card).
+				BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, label).FontSize(FontMini).TextColor(p.Danger)
+			}).OnClick(func() { s.revokeDevice(device.DeviceID) })
+		})
+	}
+}
+
+// pairNow 走一次配对；按钮那一行只管外观，动作在这里。
+func (s *app) pairNow() {
+	{
 		if s.target.LanPort == 0 {
 			s.pairingNote = "没找到在跑的队伍：先把它启动起来再点"
 			return
@@ -1443,9 +2696,6 @@ func (s *app) pairing(c *ui.Context, p Palette) {
 			s.paired <- credential
 			s.wake()
 		}()
-	}
-	if s.pairingNote != "" {
-		ui.Text(c, s.pairingNote).FontSize(FontMini).TextColor(p.Faint)
 	}
 }
 
@@ -1507,4 +2757,159 @@ func clockOf(at string) string {
 		return at[i+1 : i+6]
 	}
 	return at
+}
+
+
+// botEditor 是改人设的那一层：名字、人设、保存/取消。
+//
+// 盖在整扇窗上（Absolute + Fill），背后压一层半透明底，点击底板等于取消。
+// 写的是真接口：成功才关，失败原样写在层里，不假装保存过。
+func (s *app) botEditor(c *ui.Context, p Palette) {
+	bot := s.botNamed(s.editingBot)
+	ui.Column(c).Absolute().FillWidth().FillHeight().Left(0).Top(0).
+		Background(p.Surface.Alpha(0.55)).
+		Center().Children(func() {
+		ui.Column(c).Width(420).Gap(11).Padding(20).Radius(RadiusFolder).
+			Background(p.Card).BorderWidth(1).BorderColor(p.Line).Children(func() {
+			ui.Text(c, "改这一位").FontSize(FontHeader).FontWeight(WeightTitle).TextColor(p.Ink)
+			ui.Text(c, "bot/"+s.editingBot).FontSize(FontMini).TextColor(p.Faint)
+
+			ui.Text(c, "名字").FontSize(FontTiny).FontWeight(WeightName).TextColor(p.Faint)
+			ui.TextInput(c, &s.botName).FillWidth().FontSize(FontBodyWide)
+
+			ui.Text(c, "人设（他怎么说话、擅长什么）").FontSize(FontTiny).FontWeight(WeightName).TextColor(p.Faint)
+			ui.Column(c).FillWidth().Height(96).Padding(9).Radius(RadiusItem).
+				BorderWidth(1).BorderColor(p.Line).Background(p.Surface).Children(func() {
+				ui.TextInput(c, &s.botPersona).FillWidth().FontSize(FontBodyWide)
+			})
+			ui.Text(c, "留空就是没有特别的人设，他会照队伍默认的方式说话。").
+				FontSize(FontMini).TextColor(p.Faint)
+
+			if s.botError != "" {
+				ui.Row(c).FillWidth().Padding(8).Radius(RadiusItem).Background(p.DangerSoft).Children(func() {
+					ui.Text(c, "没改成功："+s.botError).FontSize(FontMini).TextColor(p.Danger)
+				})
+			}
+			ui.Row(c).FillWidth().Gap(7).Children(func() {
+				ui.Row(c).PaddingX(14).PaddingY(9).Radius(RadiusButton).Background(p.Card).
+					BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).
+					OnClick(func() { s.editingBot = ""; s.botError = "" }).Children(func() {
+					ui.Text(c, "取消").FontSize(FontBodyWide).TextColor(p.Muted)
+				})
+				ui.Row(c).Grow(1).Height(36).Radius(RadiusButton).Background(p.Accent).
+					Center().Cursor(ui.CursorPointer).OnClick(s.saveBot).Children(func() {
+					label := "保存"
+					if s.botSaving {
+						label = "保存中…"
+					}
+					ui.Text(c, label).FontSize(FontBodyWide).FontWeight(WeightName).TextColor(p.AccentInk)
+				})
+			})
+		})
+	})
+	_ = bot
+}
+
+// botNamed 按 id 找花名册里的那一位；找不到返回零值（编辑层照样能开，只是名字空着）。
+func (s *app) botNamed(id string) BotCard {
+	if s.conversation == nil {
+		return BotCard{ID: id}
+	}
+	for _, bot := range s.conversation.Bots {
+		if bot.ID == id {
+			return bot
+		}
+	}
+	return BotCard{ID: id}
+}
+
+// loadDevices 读一次已配对的设备。只读一次：它是一份快照，不是每秒要刷的状态。
+func (s *app) loadDevices() {
+	if s.client == nil || s.devicesTried {
+		return
+	}
+	s.devicesTried = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		list, err := s.client.Devices(ctx)
+		s.devicesCh <- devicesResult{list: list, err: err}
+		s.wake()
+	}()
+}
+
+// revokeDevice 撤掉一台设备。撤掉之后它那份凭据立刻作废，手机丢了就用它。
+func (s *app) revokeDevice(deviceID string) {
+	if s.client == nil || s.revoking[deviceID] {
+		return
+	}
+	if s.revoking == nil {
+		s.revoking = map[string]bool{}
+	}
+	s.revoking[deviceID] = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.client.Revoke(ctx, deviceID); err != nil {
+			s.devicesCh <- devicesResult{err: err}
+			s.wake()
+			return
+		}
+		// 撤成功之后重读一遍：清单要和后端一致，不能靠本地删一行猜。
+		list, err := s.client.Devices(ctx)
+		s.devicesCh <- devicesResult{list: list, err: err}
+		s.wake()
+	}()
+}
+
+// firstStep 是空态里的引导一行：一个序号 + 一句话。
+func (s *app) firstStep(c *ui.Context, p Palette, step, text string) {
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Column(c).Width(18).Height(18).Radius(RadiusDot).Background(p.AccentSoft).
+			AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+			ui.Text(c, step).FontSize(FontHairline).TextColor(p.Accent)
+		})
+		ui.Text(c, text).FontSize(FontBody).TextColor(p.Faint)
+	})
+}
+
+// exportRecords 导一份备份到 ~/Desktop（没有 Desktop 就落主目录）。
+//
+// 导出走管理面，只在本机可用：备份是一整份配置与历史，不该能从手机那一侧拉走。
+// 写不成就照实说，不假装存过。
+func (s *app) exportRecords() {
+	if s.client == nil || s.exporting {
+		return
+	}
+	s.exporting = true
+	s.exportNote = ""
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		raw, err := s.client.ExportRecords(ctx)
+		if err != nil {
+			s.exportCh <- exportResult{err: err}
+			s.wake()
+			return
+		}
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			s.exportCh <- exportResult{err: homeErr}
+			s.wake()
+			return
+		}
+		dir := filepath.Join(home, "Desktop")
+		if info, statErr := os.Stat(dir); statErr != nil || !info.IsDir() {
+			dir = home
+		}
+		name := "crew-backup-" + time.Now().Format("20060102-150405") + ".json"
+		path := filepath.Join(dir, name)
+		if writeErr := os.WriteFile(path, raw, 0o600); writeErr != nil {
+			s.exportCh <- exportResult{err: writeErr}
+			s.wake()
+			return
+		}
+		s.exportCh <- exportResult{path: path}
+		s.wake()
+	}()
 }

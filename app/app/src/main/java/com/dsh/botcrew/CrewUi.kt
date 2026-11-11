@@ -107,7 +107,7 @@ val DarkPalette = CrewPalette(
  *
  * 从队伍进去时记下是谁的屏幕 —— 张冠李戴比进不去更糟，所以这个值一路带到工作区页。
  */
-private enum class Screen { Crew, Backend, Workspace }
+private enum class Screen { Crew, Backend, Workspace, Models }
 
 /**
  * 该 Bot 手上最近那张还没结束的票：接手与暂停都只对这张有意义。
@@ -186,6 +186,7 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                         onScreen = null
                     },
                 )
+                Screen.Models -> ModelScreen(client, conversation, palette, onBack = { screen = Screen.Crew })
                 Screen.Crew -> CrewScreen(client, conversation, palette, problem, draft, sending,
                     requestIdFor = { text ->
                         if (pendingSend?.first == text) {
@@ -197,6 +198,7 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
                     // 发出去了才丢掉幂等键：失败重发必须还在。
                     { draft = it }, { sending = it }, { pendingSend = null; refresh() }, { problem = it },
                     onBackend = { screen = Screen.Backend },
+                    onModels = { screen = Screen.Models },
                     onWorkspace = { bot ->
                         onScreen = bot
                         screen = Screen.Workspace
@@ -451,10 +453,15 @@ private fun CrewScreen(
     onSent: () -> Unit,
     onFailed: (String) -> Unit,
     onBackend: () -> Unit,
+    onModels: () -> Unit,
     onWorkspace: (BotCard?) -> Unit,
 ) {
     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
     var profile by remember { mutableStateOf<BotCard?>(null) }
+    // 正在改人设的那一位。null 表示编辑层没开。
+    var editing by remember { mutableStateOf<BotCard?>(null) }
+    // 撤回失败要在这条消息旁边说，不冒充发送失败。
+    var withdrawNote by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     Column(modifier = Modifier.fillMaxSize()) {
@@ -483,6 +490,7 @@ private fun CrewScreen(
                 palette = palette,
                 onClick = { onWorkspace(null) },
             )
+            TextButton(onClick = onModels) { Text("模型", color = palette.accent) }
             TextButton(onClick = onBackend) { Text("后台", color = palette.accent) }
         }
         // 页头那 1 的下边线。画板把它画在页头这一块上，不画在内容上。
@@ -527,11 +535,22 @@ private fun CrewScreen(
                     }
                     val shownProfile = profile
                     if (shownProfile != null) {
-                        BotCardSheet(shownProfile, shown, palette, onTalk = { profile = null }, onClose = { profile = null }) {
+                        BotCardSheet(shownProfile, shown, palette, onTalk = { profile = null },
+                            onClose = { profile = null }, onEdit = {
+                                // 名片让位给编辑层：两个都是铺满整屏的浮层，同时画会互相压住。
+                                profile = null
+                                editing = shownProfile
+                            }) {
                             // 进工作区前先把名片收起来：否则从屏幕页退回来时还压着一张卡。
                             profile = null
                             onWorkspace(it)
                         }
+                    }
+                    val shownEditor = editing
+                    if (shownEditor != null) {
+                        BotEditorSheet(client, shownEditor, palette,
+                            onClose = { editing = null },
+                            onSaved = { editing = null; profile = null; onSent() })
                     }
                     LazyColumn(
                         state = listState,
@@ -565,9 +584,49 @@ private fun CrewScreen(
                     LaunchedEffect(shown.messages.size) {
                         if (shown.messages.isNotEmpty()) listState.animateScrollToItem(shown.messages.size - 1)
                     }
+                    // 排队中的消息要能撤回：按 request_id 把正文找回来，读不到就显示占位，不编内容。
+                    val queued = shown.queued.map { requestId ->
+                        requestId to (shown.messages.firstOrNull { it.requestId == requestId }?.text ?: "这条消息")
+                    }
                     // 连不上就别让人发：发出去也到不了，还让人以为发了。
-                    Composer(draft, shown.queued.size, shown.declined.lastOrNull()?.reason, sending, palette,
-                        enabled = problem == null, onChange = onDraft) {
+                    Composer(draft, queued, shown.declined.lastOrNull()?.reason, withdrawNote, sending, palette,
+                        enabled = problem == null, onChange = onDraft,
+                        steerTicketId = shown.tickets.firstOrNull { it.open }?.id,
+                        onSteer = { requestId, ticketId ->
+                            scope.launch {
+                                withdrawNote = try {
+                                    client.steer(ticketId, requestId)
+                                    "已插话，队伍做完当前这一步会先处理这句"
+                                } catch (error: Exception) {
+                                    error.message ?: "插队没成功"
+                                }
+                            }
+                        },
+                        onWithdraw = { requestId ->
+                            scope.launch {
+                                withdrawNote = try {
+                                    client.withdraw(requestId)
+                                    onSent()
+                                    null
+                                } catch (error: Exception) {
+                                    error.message ?: "撤回没成功"
+                                }
+                            }
+                        },
+                        onSteerText = { ticketId ->
+                            val text = draft
+                            val requestId = requestIdFor(text)
+                            scope.launch {
+                                withdrawNote = try {
+                                    client.steerText(ticketId, requestId, text)
+                                    onDraft("")
+                                    onSent()
+                                    "已插话，队伍做完当前这一步会先处理这句"
+                                } catch (error: Exception) {
+                                    error.message ?: "插队没成功"
+                                }
+                            }
+                        }) {
                         val text = draft
                         val requestId = requestIdFor(text)
                         onSending(true)
@@ -607,6 +666,7 @@ private fun BotCardSheet(
     palette: CrewPalette,
     onTalk: () -> Unit,
     onClose: () -> Unit,
+    onEdit: () -> Unit,
     onWorkspace: (BotCard) -> Unit,
 ) {
     // 画板实测：卡片最大 330、圆角 18、白底、边框 #EDE8E1、阴影往下 18。
@@ -706,7 +766,7 @@ private fun BotCardSheet(
                     Text("跟他说话", fontSize = 13.5.sp, fontWeight = FontWeight(550), color = palette.surface)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    SmallCardButton("改人设", palette) { }
+                    SmallCardButton("改人设", palette, onEdit)
                     // 原先这里是「看他的记忆」：点了没有任何反应，和「改人设」一样是一块
                     // 做了样子的空地。换成工作区入口 —— 它点下去至少有一句实话，
                     // 而且是「跟他说话」旁边最自然的一件事：看着它干活。
@@ -870,29 +930,59 @@ private fun WorkspaceScreen(
                     )
                 }
                 Spacer(Modifier.width(5.dp))
+                val cwd = view?.takeIf { it.live }?.cwd.orEmpty()
                 Text(
-                    // 地址只有真有画面时才有意义。现在没有，就只说这是它的屏幕。
-                    "它的屏幕",
+                    // 有快照时才写工作目录；没有就只说这是它的屏幕，不编一个路径。
+                    cwd.ifBlank { "它的屏幕" },
                     fontSize = 10.5.sp,
                     color = palette.faint,
                     fontFamily = FontFamily.Monospace,
                 )
             }
-            // 这里本该放它的画面。后端说没有就写没有，读不到就写读不到 —— 两种都不是「在加载」。
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(palette.surface, RoundedCornerShape(10.dp)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    screenProblem ?: WorkspaceCopy.screenText(view?.reason),
-                    fontSize = 13.sp,
-                    color = palette.muted,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 18.dp),
-                )
+            val lines = view?.takeIf { it.live }?.lines.orEmpty()
+            if (lines.isNotEmpty()) {
+                // 活动快照：它刚跑了什么、输出了什么、说了什么。不是截帧，是那件事本身。
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .background(palette.surface, RoundedCornerShape(10.dp))
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    lines.forEach { line ->
+                        Text(
+                            "${screenClock(line.at)}  ${line.text}",
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = when (line.kind) {
+                                "command" -> palette.accent
+                                "said" -> palette.muted
+                                "status" -> palette.faint
+                                else -> palette.ink
+                            },
+                        )
+                    }
+                }
+            } else {
+                // 没有可显示的活动。后端说没有就写没有，读不到就写读不到 —— 两种都不是「在加载」。
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .background(palette.surface, RoundedCornerShape(10.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        screenProblem ?: WorkspaceCopy.screenText(view?.reason),
+                        fontSize = 13.sp,
+                        color = palette.muted,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 18.dp),
+                    )
+                }
             }
         }
 
@@ -1313,23 +1403,55 @@ private fun MessageRow(
 @Composable
 private fun Composer(
     draft: String,
-    queued: Int,
+    queued: List<Pair<String, String>>,
     declinedReason: String?,
+    withdrawNote: String?,
     sending: Boolean,
     palette: CrewPalette,
     enabled: Boolean,
     onChange: (String) -> Unit,
+    steerTicketId: String?,
+    onSteer: (String, String) -> Unit,
+    onWithdraw: (String) -> Unit,
+    onSteerText: (String) -> Unit,
     onSend: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        if (queued > 0) {
-            // 排队的消息要看得见，否则发出去像石沉大海。
+        if (queued.isNotEmpty()) {
+            // 排队的消息要看得见，否则发出去像石沉大海；还要能撤回。
             Text(
-                "$queued 条排队中，等队伍读完手上这一步",
+                "${queued.size} 条排队中，等队伍读完手上这一步",
                 fontSize = 11.sp,
                 color = palette.faint,
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp),
             )
+            queued.take(3).forEach { (requestId, text) ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text.lineSequence().first().take(24),
+                        fontSize = 11.sp,
+                        color = palette.muted,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // 有工单在跑时才能插队：它把话交给那张票的 worker 下一步。
+                    if (steerTicketId != null) {
+                        TextButton(onClick = { onSteer(requestId, steerTicketId) }) {
+                            Text("插队", color = palette.accent, fontSize = 11.sp)
+                        }
+                    }
+                    TextButton(onClick = { onWithdraw(requestId) }) {
+                        Text("撤回", color = palette.accent, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+        withdrawNote?.let {
+            Text(it, fontSize = 11.sp, color = palette.danger, modifier = Modifier.padding(start = 16.dp, top = 2.dp))
         }
         if (!declinedReason.isNullOrBlank()) {
             // 读过但不动手的那条也要说一声：屏幕上只有自己说的话时，分不清「还在想」和「不会回」。
@@ -1340,12 +1462,22 @@ private fun Composer(
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp),
             )
         }
-        ComposerRow(draft, sending, palette, enabled, onChange, onSend)
+        ComposerRow(draft, sending, palette, enabled, onChange, onSend,
+            steerTicketId = steerTicketId, onSteerText = onSteerText)
     }
 }
 
 @Composable
-private fun ComposerRow(draft: String, sending: Boolean, palette: CrewPalette, enabled: Boolean, onChange: (String) -> Unit, onSend: () -> Unit) {
+private fun ComposerRow(
+    draft: String,
+    sending: Boolean,
+    palette: CrewPalette,
+    enabled: Boolean,
+    onChange: (String) -> Unit,
+    onSend: () -> Unit,
+    steerTicketId: String?,
+    onSteerText: (String) -> Unit,
+) {
     // 输入区：画板里圆角 13、白底细边、上下留白。默认的 OutlinedTextField
     // 是直角加厚边框，和整页的圆润调子对不上，所以自己给形状和颜色。
     Row(
@@ -1375,6 +1507,12 @@ private fun ComposerRow(draft: String, sending: Boolean, palette: CrewPalette, e
             ),
             modifier = Modifier.weight(1f),
         )
+        if (steerTicketId != null && draft.isNotBlank() && enabled && !sending) {
+            // 有工单在跑时，这句可以不经排队、直接交给它的下一步。
+            TextButton(onClick = { onSteerText(steerTicketId) }) {
+                Text("插队", color = palette.accent, fontSize = 11.sp)
+            }
+        }
         Box(modifier = Modifier.padding(start = 8.dp)) {
             Button(
                 enabled = enabled && draft.isNotBlank() && !sending,
@@ -1387,6 +1525,329 @@ private fun ComposerRow(draft: String, sending: Boolean, palette: CrewPalette, e
                     disabledContentColor = palette.faint,
                 ),
             ) { Text(if (sending) "发送中" else "发送", fontSize = 13.sp) }
+        }
+    }
+}
+
+/**
+ * 模型：全员用哪家、每位成员单独用哪家，以及这家模型的推理档位。
+ *
+ * 手机上没有第四块页签 —— 它是从队伍页头进来的临时一屏，返回就回到对话。
+ * 一切以后端为准：目录、成员路由、档位都是读回来的；点一下才提交，失败就照实写。
+ */
+@Composable
+private fun ModelScreen(
+    client: CrewClient,
+    conversation: Conversation?,
+    palette: CrewPalette,
+    onBack: () -> Unit,
+) {
+    var catalog by remember { mutableStateOf<ModelCatalog?>(null) }
+    var efforts by remember { mutableStateOf<Efforts?>(null) }
+    // null 是全员；否则是这一位的 bot_id。
+    var scope by remember { mutableStateOf<String?>(null) }
+    var note by remember { mutableStateOf<String?>(null) }
+    // 读失败与切失败是两件事：读不到目录时不能说成「没切成功」。
+    var loadTrouble by remember { mutableStateOf<String?>(null) }
+    var trouble by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val coroutine = rememberCoroutineScope()
+    val scroll = rememberScrollState()
+    val bots = conversation?.bots.orEmpty()
+
+    suspend fun reload(scopeId: String?) {
+        val loaded = client.models()
+        catalog = loaded
+        loadTrouble = null
+        val choice = loaded.choiceFor(scopeId)
+        efforts = if (choice == null) null else try {
+            client.efforts(choice.provider, choice.model)
+        } catch (_: Exception) { null }
+    }
+
+    LaunchedEffect(scope) {
+        loadTrouble = null
+        try { reload(scope) } catch (error: Exception) { loadTrouble = error.message }
+    }
+
+    fun scopeLabel(id: String?): String = if (id == null) "全员" else bots.firstOrNull { it.id == id }?.name ?: id
+
+    fun switchTo(provider: String, model: String, effort: String? = null) {
+        if (busy) return
+        busy = true
+        note = null
+        trouble = null
+        val forScope = scope
+        coroutine.launch {
+            try {
+                client.switchModel(provider, model, forScope, effort)
+                reload(forScope)
+                note = if (forScope == null) "全员已切到 $model" else "${scopeLabel(forScope)} 已切到 $model（下个工单生效）"
+            } catch (error: Exception) {
+                trouble = error.message
+            }
+            busy = false
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(palette.card)
+                .padding(start = 6.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = onBack) { Text("返回", color = palette.accent) }
+            Text("模型", fontSize = 20.sp, fontWeight = FontWeight(660), color = palette.ink)
+            Spacer(Modifier.weight(1f))
+            if (busy) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = palette.accent, strokeWidth = 2.dp)
+        }
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+
+        Column(
+            modifier = Modifier.weight(1f).verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            val current = catalog?.choiceFor(scope)
+            Text("作用", fontSize = 11.sp, color = palette.faint)
+            Row(
+                modifier = Modifier.fillMaxWidth().background(palette.segment, RoundedCornerShape(9.dp)).padding(3.dp),
+            ) {
+                SegmentChip("全员", scope == null, palette) { scope = null }
+                for (bot in bots) SegmentChip(bot.name, scope == bot.id, palette) { scope = bot.id }
+            }
+            Text(
+                when {
+                    current == null -> "还没有选模型"
+                    scope == null -> "${current.provider} · ${current.model}"
+                    catalog?.followsCrew(scope) == true -> "跟随全员：${current.provider} · ${current.model}"
+                    else -> "单独使用：${current.provider} · ${current.model}"
+                },
+                fontSize = 12.sp,
+                color = palette.muted,
+            )
+            if (scope != null && catalog?.followsCrew(scope) == false) {
+                TextButton(onClick = {
+                    if (busy) return@TextButton
+                    busy = true
+                    val forScope = scope
+                    coroutine.launch {
+                        try {
+                            // 空 model 且带 bot_id：后端清掉这一位的单独路由。
+                            client.switchModel("", "", forScope, null)
+                            reload(forScope)
+                            note = "${scopeLabel(forScope)} 改回跟随全员"
+                        } catch (error: Exception) {
+                            trouble = error.message
+                        }
+                        busy = false
+                    }
+                }) { Text("改回跟随全员", color = palette.accent, fontSize = 12.sp) }
+            }
+
+            val loaded = efforts
+            if (loaded != null && loaded.efforts.isNotEmpty() && current != null) {
+                Text("推理档位", fontSize = 11.sp, color = palette.faint)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (effort in loaded.efforts) {
+                        val chosen = current.reasoningEffort == effort.id ||
+                            (current.reasoningEffort == null && loaded.default == effort.id)
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (chosen) palette.accentSoft else palette.card)
+                                .border(1.dp, if (chosen) palette.accent else palette.line, RoundedCornerShape(8.dp))
+                                .clickable(enabled = !busy) { switchTo(current.provider, current.model, effort.id) }
+                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                        ) {
+                            Text(effort.name, fontSize = 12.sp,
+                                fontWeight = if (chosen) FontWeight(600) else FontWeight.Normal,
+                                color = if (chosen) palette.accent else palette.muted)
+                        }
+                    }
+                }
+            }
+
+            val loadedCatalog = catalog
+            when {
+                loadedCatalog == null && loadTrouble == null -> Text("正在读模型…", fontSize = 12.sp, color = palette.faint)
+                loadedCatalog != null -> {
+                    for (provider in loadedCatalog.providers) {
+                        Text(provider.name, fontSize = 11.sp, color = palette.faint, modifier = Modifier.padding(top = 6.dp))
+                        for (model in provider.models) {
+                            ModelRow(
+                                model = model,
+                                selected = current?.provider == provider.id && current.model == model.id,
+                                palette = palette,
+                                enabled = !busy,
+                                onClick = { switchTo(provider.id, model.id) },
+                            )
+                        }
+                    }
+                    for (failure in loadedCatalog.failures) {
+                        Text("${failure.name} 暂时连不上", fontSize = 11.sp, color = palette.danger)
+                    }
+                }
+            }
+        }
+
+        note?.let { Text(it, fontSize = 11.sp, color = palette.faint, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
+        loadTrouble?.let { Text("读不到模型：$it", fontSize = 11.sp, color = palette.danger, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
+        trouble?.let { Text("没切成功：$it", fontSize = 11.sp, color = palette.danger, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
+    }
+}
+
+@Composable
+private fun ModelRow(
+    model: ModelOption,
+    selected: Boolean,
+    palette: CrewPalette,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) palette.accentSoft else palette.card)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(model.name, fontSize = 13.sp, color = if (selected) palette.accent else palette.ink)
+            model.description?.let { Text(it, fontSize = 11.sp, color = palette.faint) }
+        }
+        if (selected) Text("✓", fontSize = 14.sp, color = palette.accent)
+    }
+}
+
+/**
+ * 改一位 Bot：名字与人设。bot_id 只读 —— 记忆挂在它上面，改了等于换人。
+ *
+ * 写的是真接口：PUT /api/mobile/bots。成功后才关，失败原样写出来，不假装保存过。
+ */
+@Composable
+private fun BotEditorSheet(
+    client: CrewClient,
+    bot: BotCard,
+    palette: CrewPalette,
+    onClose: () -> Unit,
+    onSaved: () -> Unit,
+) {
+    var name by remember(bot.id) { mutableStateOf(bot.name) }
+    var persona by remember(bot.id) { mutableStateOf(bot.persona) }
+    var trouble by remember(bot.id) { mutableStateOf<String?>(null) }
+    var busy by remember(bot.id) { mutableStateOf(false) }
+    // 撤人不可逆：第一次按只是把话问出来，第二次才真删。
+    var confirmingRemove by remember(bot.id) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val scroll = rememberScrollState()
+
+    fun save() {
+        if (busy) return
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) {
+            trouble = "名字不能为空"
+            return
+        }
+        busy = true
+        trouble = null
+        scope.launch {
+            try {
+                client.editBot(bot.id, trimmed, persona.trim())
+                onSaved()
+            } catch (error: Exception) {
+                trouble = error.message
+            }
+            busy = false
+        }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize().background(palette.surface.copy(alpha = 0.55f)).clickable(onClick = onClose),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 20.dp).widthIn(max = 360.dp).fillMaxWidth()
+                .shadow(18.dp, RoundedCornerShape(18.dp))
+                .background(palette.card, RoundedCornerShape(18.dp))
+                .border(1.dp, palette.line, RoundedCornerShape(18.dp))
+                .clickable(enabled = false) {}
+                .verticalScroll(scroll)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("改这一位", fontSize = 18.sp, fontWeight = FontWeight(660), color = palette.ink)
+            Text("bot/${bot.id}", fontSize = 11.sp, color = palette.faint, fontFamily = FontFamily.Monospace)
+
+            Text("名字", fontSize = 11.sp, fontWeight = FontWeight(600), color = palette.faint)
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = palette.accent, unfocusedBorderColor = palette.line,
+                    focusedContainerColor = palette.surface, unfocusedContainerColor = palette.surface,
+                ),
+            )
+
+            Text("人设（他怎么说话、擅长什么）", fontSize = 11.sp, fontWeight = FontWeight(600), color = palette.faint)
+            OutlinedTextField(
+                value = persona,
+                onValueChange = { persona = it },
+                minLines = 4,
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = palette.accent, unfocusedBorderColor = palette.line,
+                    focusedContainerColor = palette.surface, unfocusedContainerColor = palette.surface,
+                ),
+            )
+            Text("留空就是没有特别的人设，他会照队伍默认的方式说话。", fontSize = 11.sp, color = palette.faint)
+
+            trouble?.let { Text("没改成功：$it", fontSize = 11.sp, color = palette.danger) }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                SmallCardButton("取消", palette, onClose)
+                Box(
+                    modifier = Modifier.weight(1f).background(palette.accent, RoundedCornerShape(10.dp))
+                        .clickable(enabled = !busy, onClick = { save() }).padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(if (busy) "保存中…" else "保存", fontSize = 13.5.sp, fontWeight = FontWeight(550),
+                        color = palette.surface)
+                }
+            }
+
+            // 撤掉这一位：不可逆，所以要两步 —— 第一次按只是把话问出来。
+            if (confirmingRemove) {
+                Text("撤掉「${bot.name}」？他的记忆留在本机，但队伍里不再有他。", fontSize = 12.sp,
+                    color = palette.warn)
+            }
+            Box(
+                modifier = Modifier.fillMaxWidth()
+                    .background(if (confirmingRemove) palette.danger else palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, if (confirmingRemove) palette.danger else palette.line, RoundedCornerShape(10.dp))
+                    .clickable(enabled = !busy) {
+                        if (!confirmingRemove) { confirmingRemove = true; return@clickable }
+                        busy = true
+                        scope.launch {
+                            try {
+                                client.removeBot(bot.id)
+                                onSaved()
+                            } catch (error: Exception) {
+                                trouble = error.message
+                                busy = false
+                                confirmingRemove = false
+                            }
+                        }
+                    }
+                    .padding(vertical = 11.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(if (confirmingRemove) "确认撤掉" else "撤掉这一位", fontSize = 13.sp,
+                    color = if (confirmingRemove) palette.surface else palette.danger)
+            }
         }
     }
 }

@@ -430,8 +430,11 @@ export class Runtime extends Service implements SourceHost {
   private async archiveFinishedWorkers(): Promise<void> {
     const archiving = this.ctx.workspaceRegistry.archiveSession
     if (typeof archiving !== 'function') return
+    // 归档失败不能挡住启动（少隐藏一条会话，队伍照常干活），但也不能像从前那样静默吞掉：
+    // 这条 .catch 曾经把「归档从来没成功过」藏了一个月，没人看得出来。
     const archive = (sessionId: string): Promise<void> =>
-      archiving.call(this.ctx.workspaceRegistry, sessionId as SessionId, { stopActivity: true }).catch(() => undefined)
+      archiving.call(this.ctx.workspaceRegistry, sessionId as SessionId, { stopActivity: true })
+        .catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not archive worker Session %s: %s', sessionId, String(error)) })
     for (const ticket of this.store.tickets.list()) {
       if (ticket.ended !== undefined) await archive(workerSessionId(ticket.id))
     }

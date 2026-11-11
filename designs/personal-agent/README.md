@@ -62,7 +62,7 @@ sh ../scripts/shot.sh /tmp/now.png                # 按窗口 ID 单张抓
 | | 插队（跳过排队） | 桌面/手机排队条与输入框旁的「插队」 | 已实现：新写一句可发送即插队（网关标记已读，不重复路由）；队列里还没被读走的也能插；已在处理中的会如实拒绝 |
 | | 模型 / 推理档位 / 成员模型 | 桌面 `modelPane`，后端 `/api/mobile/models`、`/efforts`、`/model` | 已实现：可切全场或某位成员的模型，档位由适配器现查；成员可「跟随全员」 |
 | | 「看它的屏幕」按钮 | 桌面/手机调用 `GET /api/mobile/screen` | 已实现：显示该工单的会话活动快照（命令/输出/回话/状态，已掩码与截断）；没有记录时如实给原因 |
-| | 模型切换标签 | 桌面 `modelPane` + `POST /api/mobile/model` | 已实现（桌面）；手机端只有客户端方法，没有 UI |
+| | 模型切换标签 | 桌面 `modelPane` + 手机 `app/.../CrewUi.kt` 的 `ModelScreen`；后端 `/api/mobile/models`、`/efforts`、`/model` | 两端都实现：从队伍页头进「模型」一屏，可切全员或某一位成员的模型、选推理档位、一键改回跟随全员 |
 | `Desktop-dark.dc.html` | 同一套结构，暗色 | `desktop/theme.go` 的 `DarkPalette`，`ThemeColors` 跟随系统 | 已实现 |
 | `Desktop-empty.dc.html` | 队伍为空、后台 0 张 | `desktop/ui.go` 的空态分支 | 已实现 |
 | `Desktop-offline.dc.html` | 断连横幅 + 重试 + 输入框禁用 | `desktop/ui.go` 的 `problem` 横幅与 `composer` | 已实现 |

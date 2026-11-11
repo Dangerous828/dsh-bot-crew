@@ -85,3 +85,43 @@ func TestMemoryClientRoundTrip(t *testing.T) {
 		t.Fatalf("forget request: %s", seen[1])
 	}
 }
+
+// 成本那一句：没上报的步数必须写出来，「读不到」绝不能写成 0。
+func TestSpendLineKeepsUnaccountedStepsVisible(t *testing.T) {
+	if got := spendLine(nil); got != "用量：没有模型调用记录" {
+		t.Fatalf("nil: %q", got)
+	}
+	spend := &Spend{StepCount: 3, InputTokens: 1200, OutputTokens: 300, TotalTokens: 1500, UnaccountedSteps: 1}
+	if got := spendLine(spend); !strings.Contains(got, "1 步没有上报") {
+		t.Fatalf("unaccounted must show: %q", got)
+	}
+	clean := &Spend{StepCount: 1, InputTokens: 10, OutputTokens: 5, TotalTokens: 15}
+	if got := spendLine(clean); strings.Contains(got, "没有上报") {
+		t.Fatalf("clean spend should not mention unaccounted: %q", got)
+	}
+}
+
+func TestCompactTokens(t *testing.T) {
+	for value, want := range map[int]string{0: "0", 999: "999", 1200: "1.2k", 1_500_000: "1.5M"} {
+		if got := compactTokens(value); got != want {
+			t.Fatalf("%d: %q != %q", value, got, want)
+		}
+	}
+}
+
+// 审计那一句缺什么就不说，不替它编。
+func TestAuditLineSaysWhatIsMissing(t *testing.T) {
+	row := &AuditRow{}
+	row.RequestedBy.Via = "routine"
+	row.Judged = []byte(`"unrecorded"`)
+	line := auditLine(row)
+	if !strings.Contains(line, "到点派的") || !strings.Contains(line, "没有裁决记录") || !strings.Contains(line, "还没派人做") {
+		t.Fatalf("auditLine: %q", line)
+	}
+	withDecision := &AuditRow{}
+	withDecision.Judged = []byte(`{"outcome":"accept"}`)
+	withDecision.WorkedBy.Bot = "lead"
+	if got := auditLine(withDecision); !strings.Contains(got, "判为 accept") || !strings.Contains(got, "由 lead 做") {
+		t.Fatalf("with decision: %q", got)
+	}
+}

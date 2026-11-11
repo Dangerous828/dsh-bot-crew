@@ -8,6 +8,8 @@
     <!-- Android 13+ 把「发现附近的网络设备」单列成运行时权限；只声明不给，NSD 会静默找不到任何服务。 -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- 语音输入：录音后交给宿主本机识别，音频不出这台电脑。Android 6+ 需要运行时授权。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="Bot 队伍"

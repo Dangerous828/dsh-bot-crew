@@ -458,6 +458,101 @@ func (c *Client) EditMemory(ctx context.Context, name, description, text string)
 	return c.do(ctx, http.MethodPost, "/api/mobile/memory", body, nil)
 }
 
+// SpendStep 是一次模型调用的账。用量与 DSH 的 TokenUsage 同名。
+type SpendStep struct {
+	Turn    int    `json:"turn"`
+	Step    int    `json:"step"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Usage    struct {
+		InputTokens  int `json:"inputTokens"`
+		OutputTokens int `json:"outputTokens"`
+		TotalTokens  int `json:"totalTokens"`
+	} `json:"usage"`
+}
+
+// SpendByModel 是按模型分的合计。
+type SpendByModel struct {
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	Steps        int    `json:"steps"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+	TotalTokens  int    `json:"total_tokens"`
+}
+
+// Spend 是一张票花了多少。
+//
+// `UnaccountedSteps` 不为 0 时，合计只覆盖「报了用量的那几步」—— 有的 provider 不上报，
+// 这个数写出来，读的人才知道这个合计能信到什么程度。
+type Spend struct {
+	StepCount        int            `json:"step_count"`
+	InputTokens      int            `json:"input_tokens"`
+	OutputTokens     int            `json:"output_tokens"`
+	TotalTokens      int            `json:"total_tokens"`
+	CacheReadTokens  int            `json:"cache_read_tokens"`
+	ReasoningTokens  int            `json:"reasoning_tokens"`
+	UnaccountedSteps int            `json:"unaccounted_steps"`
+	ByModel          []SpendByModel `json:"by_model"`
+	Recent           []SpendStep    `json:"recent"`
+}
+
+// AuditRow 是一张票的来龙去脉：谁派的、谁判的、谁干的、花了多少。
+type AuditRow struct {
+	TicketID    string `json:"ticket_id"`
+	Title       string `json:"title"`
+	RequestedBy struct {
+		Source string `json:"source"`
+		Actor  string `json:"actor"`
+		At     string `json:"at"`
+		Via    string `json:"via"`
+	} `json:"requested_by"`
+	Judged json.RawMessage `json:"judged"`
+	WorkedBy struct {
+		Bot         string `json:"bot,omitempty"`
+		Assignments int    `json:"assignments"`
+		StartedAt   string `json:"started_at,omitempty"`
+	} `json:"worked_by"`
+	Spent *Spend `json:"spent,omitempty"`
+	Ended *struct {
+		At      string `json:"at"`
+		By      string `json:"by"`
+		Outcome string `json:"outcome"`
+	} `json:"ended,omitempty"`
+}
+
+// Spend 读一张票的成本账；`ok` 为 false 表示后端说没有可读的记录。
+func (c *Client) Spend(ctx context.Context, ticketID string) (*Spend, bool, string) {
+	var body struct {
+		Available bool   `json:"available"`
+		Spend     *Spend `json:"spend"`
+		Reason    string `json:"reason"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/mobile/spend?ticket="+url.QueryEscape(ticketID), nil, &body); err != nil {
+		return nil, false, err.Error()
+	}
+	if !body.Available || body.Spend == nil {
+		return nil, false, body.Reason
+	}
+	return body.Spend, true, ""
+}
+
+// Audit 读一张票的审计账。
+func (c *Client) Audit(ctx context.Context, ticketID string) (*AuditRow, bool, string) {
+	var body struct {
+		Available bool      `json:"available"`
+		Audit     *AuditRow `json:"audit"`
+		Reason    string    `json:"reason"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/mobile/audit?ticket="+url.QueryEscape(ticketID), nil, &body); err != nil {
+		return nil, false, err.Error()
+	}
+	if !body.Available || body.Audit == nil {
+		return nil, false, body.Reason
+	}
+	return body.Audit, true, ""
+}
+
 // BackendStatus is the crew's own health, as the surface reports it.
 type BackendStatus struct {
 	Runtime string `json:"runtime"`

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -205,12 +206,29 @@ type app struct {
 	memoryNote    string
 	memoryCh      chan memoryResult
 	loadingMemory bool
+
+	// 成本与审计：按票展开时读一次，按票缓存。「读不到」也记一笔（值是 nil），
+	// 否则每帧都会重发一个请求。
+	spendCh   chan spendResult
+	spendOf   map[string]*Spend
+	spendNote map[string]string
+	auditOf   map[string]*AuditRow
+	auditNote map[string]string
 }
 
 // routinesResult 是一次读「常规任务」的结果。view 为 nil 时 note 说的是为什么读不到。
 type routinesResult struct {
 	view *RoutinesView
 	note string
+}
+
+// spendResult 是一次读某张票成本账的结果。note 在 ok 为 false 时说为什么读不到。
+type spendResult struct {
+	ticket  string
+	spend   *Spend
+	audit   *AuditRow
+	note    string
+	spendOK bool
 }
 
 // memoryResult 是一次读「记忆」整栏的结果。view 为 nil 时 note 说的是为什么读不到。
@@ -764,6 +782,26 @@ func (s *app) drain(c *ui.Context) {
 			s.loadingRoutine = false
 			s.routines, s.routinesNote = result.view, result.note
 			c.Invalidate()
+		case result := <-s.spendCh:
+			// 两种结果都记：读不到也记一笔，否则每一帧都会重发一次请求。
+			if s.spendOf == nil {
+				s.spendOf = map[string]*Spend{}
+			}
+			if s.auditOf == nil {
+				s.auditOf = map[string]*AuditRow{}
+			}
+			if s.spendNote == nil {
+				s.spendNote = map[string]string{}
+			}
+			if s.auditNote == nil {
+				s.auditNote = map[string]string{}
+			}
+			s.spendOf[result.ticket] = result.spend
+			s.auditOf[result.ticket] = result.audit
+			if result.note != "" {
+				s.spendNote[result.ticket] = result.note
+			}
+			c.Invalidate()
 		case result := <-s.memoryCh:
 			s.loadingMemory = false
 			s.memory, s.memoryNote = result.view, result.note
@@ -1042,7 +1080,12 @@ func (s *app) navRow(c *ui.Context, p Palette, item navItem) {
 	row.Children(func() {
 		// 图标本身 16 宽：套一个 36 宽的空槽会把文字推到 19px 以外，和画板的两列感一样。
 		ui.Row(c).Width(FontIcon).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, glyph).FontSize(FontIcon).TextColor(glyphTint)
+			// 有 SVG 图标就画图标；没有才退回字形。两者不能同时画，否则一格两枚。
+			if name := navIcon(item); name != "" {
+				icon(c, name, glyphTint, FontIcon)
+			} else {
+				ui.Text(c, glyph).FontSize(FontIcon).TextColor(glyphTint)
+			}
 		})
 		ui.Text(c, text).FontSize(FontLabel).TextColor(tint)
 		ui.Row(c).Grow(1)
@@ -3556,9 +3599,103 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 			for _, step := range s.stepsFor(ticketID) {
 				s.workRow(c, p, step)
 			}
+			s.spendRow(c, p, ticketID)
 		}
 	})
 	card.OnClick(func() { s.openWork(ticketID) })
+}
+
+// spendRow 是展开后那一行账：这条花了多少、谁派的谁判的谁干的。
+//
+// 读不到就说读不到（「用量读不到」），绝不写 0 —— 0 会被读成「它没花」。
+func (s *app) spendRow(c *ui.Context, p Palette, ticketID string) {
+	spend, hasSpend := s.spendOf[ticketID]
+	audit, hasAudit := s.auditOf[ticketID]
+	if !hasSpend && !hasAudit {
+		note := s.spendNote[ticketID]
+		if note == "" {
+			return
+		}
+		ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+			ui.Text(c, note).FontSize(FontHairline).TextColor(p.Faint)
+		})
+		return
+	}
+	if hasAudit {
+		ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+			ui.Text(c, auditLine(audit)).FontSize(FontHairline).TextColor(p.Faint).MaxLines(2).Ellipsis("…")
+		})
+	}
+	if hasSpend {
+		ui.Row(c).FillWidth().PaddingStart(12).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, spendLine(spend)).FontSize(FontHairline).TextColor(p.Faint)
+			ui.Row(c).Grow(1)
+			if worst := worstModel(spend); worst != "" {
+				ui.Text(c, worst).FontSize(FontHairline).TextColor(p.Hint).MaxLines(1).Ellipsis("…")
+			}
+		})
+	}
+}
+
+// spendLine 是这一张票的用量那一句。没上报的步数单独写出来 ——
+// 「一共 1.2k，其中 3 步不知道花了多少」比一个干净的合计诚实。
+func spendLine(spend *Spend) string {
+	if spend == nil || spend.StepCount == 0 {
+		return "用量：没有模型调用记录"
+	}
+	line := "用量 " + compactTokens(spend.TotalTokens) + "（进 " + compactTokens(spend.InputTokens) +
+		" · 出 " + compactTokens(spend.OutputTokens) + "）"
+	if spend.UnaccountedSteps > 0 {
+		line += "，其中 " + strconv.Itoa(spend.UnaccountedSteps) + " 步没有上报"
+	}
+	return line
+}
+
+// compactTokens 把 token 数写成人看的样子：1200 → 1.2k，1500000 → 1.5M。
+func compactTokens(value int) string {
+	switch {
+	case value >= 1_000_000:
+		return strconv.FormatFloat(float64(value)/1_000_000, 'f', 1, 64) + "M"
+	case value >= 1_000:
+		return strconv.FormatFloat(float64(value)/1_000, 'f', 1, 64) + "k"
+	default:
+		return strconv.Itoa(value)
+	}
+}
+
+// worstModel 是占步数最多的那条路由：一票换过模型时，这个数最该先看见。
+func worstModel(spend *Spend) string {
+	if spend == nil || len(spend.ByModel) == 0 {
+		return ""
+	}
+	top := spend.ByModel[0]
+	return top.Provider + "/" + top.Model + " · " + strconv.Itoa(top.Steps) + " 步"
+}
+
+// auditLine 把审计账写成一句话：谁派的 · 判成什么 · 谁在做 · 花了多少。
+func auditLine(row *AuditRow) string {
+	if row == nil {
+		return ""
+	}
+	via := map[string]string{"person": "人说的", "rule": "规则推的", "routine": "到点派的", "bot": "Bot 说的"}[row.RequestedBy.Via]
+	if via == "" {
+		via = "来源不明"
+	}
+	judged := "没有裁决记录"
+	// `judged` 是 `{...}` 或字符串 `"unrecorded"`：只有后者才写「没有记录」。
+	if len(row.Judged) > 0 && row.Judged[0] == '{' {
+		var value struct {
+			Outcome string `json:"outcome"`
+		}
+		if err := json.Unmarshal(row.Judged, &value); err == nil && value.Outcome != "" {
+			judged = "判为 " + value.Outcome
+		}
+	}
+	who := "还没派人做"
+	if row.WorkedBy.Bot != "" {
+		who = "由 " + row.WorkedBy.Bot + " 做"
+	}
+	return via + " · " + judged + " · " + who
 }
 
 // openWork 去读一张票的执行经过。同一时刻只读一张，所以先记下是哪张。
@@ -3574,6 +3711,23 @@ func (s *app) openWork(ticketID string) {
 		defer cancel()
 		steps, err := s.client.Work(ctx, ticketID)
 		s.steps <- workResult{ticket: ticketID, steps: steps, err: err}
+		s.wake()
+	}()
+	// 展开时顺手读一次成本与审计：这两样不随每帧变，只在展开时读一次就够。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		result := spendResult{ticket: ticketID}
+		spend, ok, reason := s.client.Spend(ctx, ticketID)
+		if ok {
+			result.spend = spend
+		} else {
+			result.note = reason
+		}
+		if audit, auditOK, _ := s.client.Audit(ctx, ticketID); auditOK {
+			result.audit = audit
+		}
+		s.spendCh <- result
 		s.wake()
 	}()
 }

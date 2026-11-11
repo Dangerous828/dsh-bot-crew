@@ -804,7 +804,7 @@ private fun CrewScreen(
                         requestId to (shown.messages.firstOrNull { it.requestId == requestId }?.text ?: "这条消息")
                     }
                     // 连不上就别让人发：发出去也到不了，还让人以为发了。
-                    Composer(draft, queued, shown.declined.lastOrNull()?.reason, withdrawNote, sending, palette,
+                    Composer(client, draft, queued, shown.declined.lastOrNull()?.reason, withdrawNote, sending, palette,
                         enabled = problem == null, onChange = onDraft,
                         steerTicketId = shown.tickets.firstOrNull { it.open }?.id,
                         onSteer = { requestId, ticketId ->
@@ -2762,6 +2762,7 @@ private fun isWarnBot(botId: String?): Boolean = when (botId) {
 
 @Composable
 private fun Composer(
+    client: CrewClient,
     draft: String,
     queued: List<Pair<String, String>>,
     declinedReason: String?,
@@ -2822,13 +2823,120 @@ private fun Composer(
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp),
             )
         }
-        ComposerRow(draft, sending, palette, enabled, onChange, onSend,
+        ComposerRow(client, draft, sending, palette, enabled, onChange, onSend,
             steerTicketId = steerTicketId, onSteerText = onSteerText)
     }
 }
 
+/**
+ * 输入区最左边那枚麦克风：按一下开始录，再按一下结束并认字。
+ *
+ * 认出来的话**追加**到草稿，不直接发出去 —— 认错一个字是常事，
+ * 直接发出去就是把错的当成你说的。
+ *
+ * 没有麦克风时这枚键不画：画一个按不动的按钮，比不画更像坏了。
+ */
+@Composable
+private fun VoiceButton(
+    client: CrewClient,
+    palette: CrewPalette,
+    enabled: Boolean,
+    onText: (String) -> Unit,
+    onBusy: (Boolean) -> Unit,
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    val recorder = remember { VoiceRecorder() }
+    var recording by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var startedAt by remember { mutableStateOf(0L) }
+    var note by remember { mutableStateOf<String?>(null) }
+    val canRecord = remember { recorder.available() }
+
+    // Android 6+ 录音一律运行时授权；没有捷径。
+    val permission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { granted -> note = if (granted) null else VoiceCopy.NEED_PERMISSION }
+
+    if (!canRecord) {
+        Text(VoiceCopy.NO_MIC, fontSize = 11.sp, color = palette.faint)
+        return
+    }
+
+    TextButton(
+        enabled = enabled && !busy,
+        onClick = {
+            if (recording) {
+                // 停：把采到的字节包成 WAV 交给后端认字。
+                recording = false
+                busy = true
+                onBusy(true)
+                val elapsed = System.currentTimeMillis() - startedAt
+                val wav = recorder.stop()
+                note = VoiceCopy.TRANSCRIBING
+                scope.launch {
+                    try {
+                        if (VoiceCopy.tooShort(elapsed)) {
+                            note = VoiceCopy.TOO_SHORT
+                        } else {
+                            val result = client.voice(wav)
+                            if (result.available) {
+                                onText(result.text)
+                                note = VoiceCopy.INSERTED
+                            } else {
+                                note = result.reason
+                            }
+                        }
+                    } finally {
+                        busy = false
+                        onBusy(false)
+                    }
+                }
+                return@TextButton
+            }
+            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.RECORD_AUDIO,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                permission.launch(android.Manifest.permission.RECORD_AUDIO)
+                return@TextButton
+            }
+            if (recorder.start()) {
+                startedAt = System.currentTimeMillis()
+                recording = true
+                note = VoiceCopy.LISTENING
+            } else {
+                note = VoiceCopy.NO_MIC
+            }
+        },
+    ) {
+        Text(
+            when {
+                busy -> "…"
+                recording -> "■"
+                else -> "●"
+            },
+            fontSize = 13.sp,
+            color = when {
+                recording -> palette.danger
+                busy -> palette.faint
+                else -> palette.accent
+            },
+        )
+    }
+    note?.let {
+        Text(it, fontSize = 11.sp, color = if (recording) palette.accent else palette.faint, maxLines = 1)
+    }
+}
+
+/**
+ * 输入那一行：麦克风 · 输入框 · 可选的「插队」· 发送。
+ *
+ * 语音与发送共用同一份草稿：认出来的字先落进草稿，让人看一眼再发。
+ */
 @Composable
 private fun ComposerRow(
+    client: CrewClient,
     draft: String,
     sending: Boolean,
     palette: CrewPalette,
@@ -2838,12 +2946,21 @@ private fun ComposerRow(
     steerTicketId: String?,
     onSteerText: (String) -> Unit,
 ) {
+    var listening by remember { mutableStateOf(false) }
     // 输入区：画板里圆角 13、白底细边、上下留白。默认的 OutlinedTextField
     // 是直角加厚边框，和整页的圆润调子对不上，所以自己给形状和颜色。
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // 麦克风在最左边：输入框右边已经是发送键，语音再挤进去会让人按错。
+        VoiceButton(client, palette, enabled = enabled && !sending && !listening,
+            onText = { said ->
+                // 追加而不是替换：人可能已经打了一半，语音只补后半句。
+                val joined = if (draft.isBlank()) said else draft.trimEnd() + " " + said
+                onChange(joined)
+            },
+            onBusy = { listening = it })
         // 画板：输入框是**浅灰底、无边框**（#F3F0EA / 暗色 #2A2830），圆角 12；
         // 发送键是框内右侧 30×30 的绿方块。之前做成了白底 + 细边，
         // 在这张暖白页面上等于没有分界，看不出哪里能打字。

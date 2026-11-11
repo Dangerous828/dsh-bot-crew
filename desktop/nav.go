@@ -27,6 +27,24 @@ const (
 var navOrder = []navItem{navBackend, navModel, navOutput, navRoutine, navMemory}
 
 // navLabel 是这一项上写的字。图标字和文字分开写：图标换字号时才不会把文字也带歪。
+// navIcon 是这一项用的图标名（`icons` 里那几条路径之一）；认不出就退回空串，由调用方画字形。
+func navIcon(item navItem) string {
+	switch item {
+	case navBackend:
+		return "layers"
+	case navModel:
+		return "sliders"
+	case navOutput:
+		return "folder"
+	case navRoutine:
+		return "clock"
+	case navMemory:
+		return "bookmark"
+	default:
+		return ""
+	}
+}
+
 func navLabel(item navItem) (glyph, text string) {
 	switch item {
 	case navModel:

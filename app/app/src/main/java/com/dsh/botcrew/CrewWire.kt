@@ -1879,3 +1879,28 @@ object MemoryCopy {
         return "${calendar.get(java.util.Calendar.MONTH) + 1} 月 ${calendar.get(java.util.Calendar.DAY_OF_MONTH)} 日"
     }
 }
+
+
+/** 一次语音识别的结果：认出来了给文字，认不出来给一句人话原因。 */
+data class VoiceResult(val available: Boolean, val text: String, val reason: String = "")
+
+object VoiceWire {
+    /**
+     * 读 `/api/mobile/voice` 的回答。
+     *
+     * 空正文、坏 JSON、认出来但是空串，都算「没认出来」并给一句原因：
+     * 把空串当成功塞进输入框，用户会以为自己的话被吞了。
+     */
+    fun parse(body: String): VoiceResult {
+        val root = try {
+            JSONObject(body)
+        } catch (_: Exception) {
+            return VoiceResult(false, "", "后端回的不是 JSON")
+        }
+        val available = root.optBoolean("available", false)
+        val text = root.optString("text").trim()
+        if (!available) return VoiceResult(false, "", root.optString("reason").ifBlank { "没认出来" })
+        if (text.isEmpty()) return VoiceResult(false, "", "没听出字来")
+        return VoiceResult(true, text)
+    }
+}

@@ -16,6 +16,7 @@ import type { RoutinesView } from './routines.ts'
 import type { MemoryView } from './views/memory.ts'
 import type { AuditRow } from './audit.ts'
 import type { Spend } from './spend.ts'
+import type { Transcript } from './voice.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
@@ -43,6 +44,8 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   spend?: (ticketId: string) => Promise<Spend | undefined>
   /** 审计账：谁派的、谁判的、谁干的、花了多少，一票一行。 */
   audit?: (ticketId: string) => Promise<AuditRow | undefined>
+  /** 语音：把一段 WAV 转成文字。宿主没有识别能力时如实回 `available: false`。 */
+  transcribe?: (audio: Uint8Array, signal: AbortSignal) => Promise<Transcript>
   forgetMemory?: (name: string) => boolean
   editMemory?: (name: string, patch: { description?: string; body?: string; importance?: number }) => boolean
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
@@ -322,6 +325,8 @@ const OPERATIONS = {
   // 钱与账：一张票花了多少、这条链谁派的谁判的谁干的。都是只读。
   spend: { methods: ['GET'], needsTicket: true },
   audit: { methods: ['GET'], needsTicket: true },
+  // 语音输入：body 是原始 WAV 字节，回一段文字。识别失败时说清是哪一种失败。
+  voice: { methods: ['POST'] },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -423,7 +428,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
       || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory'
-      || operation === 'spend' || operation === 'audit') {
+      || operation === 'spend' || operation === 'audit' || operation === 'voice') {
       await runtime.ready
       if (operation === 'routines') {
         // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
@@ -438,6 +443,17 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         } catch {
           return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
             runner: 'none', reason: '常规任务暂时读不出来' })
+        }
+      }
+      if (operation === 'voice') {
+        // 语音输入：body 就是录音本身（不是 JSON、不是 base64 —— 多一层编码就多一次出错的机会）。
+        const transcribeVoice = runtime.transcribe?.bind(runtime)
+        if (!transcribeVoice) return response(200, { available: false, reason: '后端还没有接入语音识别' })
+        const raw = await incoming.arrayBuffer()
+        try {
+          return response(200, await transcribeVoice(new Uint8Array(raw), incoming.signal))
+        } catch (error) {
+          return response(200, { available: false, reason: error instanceof Error ? error.message : '识别没成功' })
         }
       }
       if (operation === 'spend' || operation === 'audit') {
@@ -912,6 +928,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       // 成本与审计：一张票花了多少、这条链谁派的谁判的谁干的。只读。
       connection.fetch.register({ path: '/api/mobile/spend', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/audit', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      // 语音输入：body 是原始 WAV。识别失败时说清是哪一种失败。
+      connection.fetch.register({ path: '/api/mobile/voice', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

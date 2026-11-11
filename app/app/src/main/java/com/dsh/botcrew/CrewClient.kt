@@ -139,6 +139,35 @@ class CrewClient(
         return parse(read("/api/mobile/memory$query", "GET"), MemoryWire::parse)
     }
 
+    /**
+     * 语音输入：把一段 WAV 交给后端，换回一句话。
+     *
+     * body 就是录音本身，不 base64、不包 JSON —— 多一层编码就多一次「为什么是乱码」的机会。
+     * 识别不了时后端回一个带 `available: false` 的 JSON，这里原样读成 VoiceResult。
+     */
+    suspend fun voice(wav: ByteArray): VoiceResult = withContext(Dispatchers.IO) {
+        val connection = (URL(base + "/api/mobile/voice").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            // 录一分钟要认一会儿：读超时比别处长。
+            connectTimeout = 15_000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "audio/wav")
+            setRequestProperty("X-GW-Token", token)
+            deviceId?.let { setRequestProperty("x-crew-device", it) }
+            if (deviceId != null) setRequestProperty("x-crew-credential", token)
+        }
+        try {
+            connection.outputStream.use { it.write(wav) }
+            val text = connection.inputStream.bufferedReader().use { it.readText() }
+            VoiceWire.parse(text)
+        } catch (error: Exception) {
+            VoiceResult(available = false, text = "", reason = error.message ?: "语音没发出去")
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     /** 忘掉一条记忆。只翻状态，不删行。 */
     suspend fun forgetMemory(name: String) {
         read("/api/mobile/memory", "POST", MemoryWire.forgetBody(name))

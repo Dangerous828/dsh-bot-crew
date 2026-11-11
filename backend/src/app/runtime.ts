@@ -31,6 +31,7 @@ import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText } from './followup.ts'
 import { spendOf, type Spend, type SpendEvent } from './spend.ts'
 import { auditOf, type AuditRow } from './audit.ts'
+import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from './voice.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -518,6 +519,18 @@ export class Runtime extends Service implements SourceHost {
     const route = this.store.settings().executor?.model
     if (route?.provider && route?.model) return { provider: route.provider, model: route.model }
     return {}
+  }
+
+  /**
+   * 语音输入：把一段录音转成文字。
+   *
+   * 认字交给宿主（`speechToText`，本地识别，不出本机）；这里只负责认得出能力有没有、
+   * 录音合不合规。宿主没装语音插件时如实回「没有」—— 按钮按了没反应比说「没有」难查得多。
+   */
+  async transcribe(audio: Uint8Array, signal: AbortSignal): Promise<Transcript> {
+    // 每次现取：宿主装上/卸下语音插件都不需要重启队伍。
+    const host = this.ctx.get('speechToText') as SpeechHost | undefined
+    return transcribeAudio(host, audio, signal)
   }
 
   /** 花名册里的 Bot id，按主人写的顺序。 */

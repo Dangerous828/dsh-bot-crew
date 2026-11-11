@@ -151,6 +151,148 @@ class TicketAndStatusTest {
         assertEquals(emptyList<AgentNode>(), AgentWire.parse("""{"ticket_id":"tk1","agents":[]}"""))
     }
 
+    // 后端给了 elapsed_seconds 就接住，一层层都接住：子代理的子代理也带耗时。
+    @Test
+    fun readsTheElapsedSecondsTheBackendSent() {
+        val body = """
+            {"ticket_id":"tk1","agents":[
+              {"id":"worker-tk1","label":"工单","state":"completed","elapsed_seconds":42,"children":[
+                {"id":"sub-a","label":"子代理","state":"completed","elapsed_seconds":65.5,"children":[]}
+              ]}
+            ]}
+        """.trimIndent()
+        val tree = AgentWire.parse(body)
+        assertEquals(42.0, tree[0].elapsedSeconds)
+        assertEquals(65.5, tree[0].children[0].elapsedSeconds)
+        // 一句话也要对得上：有值才画「· 42 秒」，量级与画板一致。
+        assertEquals("已完成 · 42 秒", AgentCopy.status(tree[0], working = false))
+        // 65.5 正好练到进位：与桌面端 `int(seconds + 0.5)` 同一个取法，65.5 → 66 → 「1 分 6 秒」。
+        assertEquals("已完成 · 1 分 6 秒", AgentCopy.status(tree[0].children[0], working = false))
+    }
+
+    // 后端今天还不发这个字段：缺席就是 null，界面上不画那一截，绝不编一个数。
+    @Test
+    fun aNodeWithoutElapsedHasNone() {
+        val body = """
+            {"ticket_id":"tk1","agents":[
+              {"id":"worker-tk1","label":"工单","state":"completed","children":[
+                {"id":"sub-a","label":"子代理","state":"completed","elapsed_seconds":null,"children":[]}
+              ]}
+            ]}
+        """.trimIndent()
+        val tree = AgentWire.parse(body)
+        // 字段缺席，与显式给 null，是同一件事：都没有值。
+        assertNull(tree[0].elapsedSeconds)
+        assertNull(tree[0].children[0].elapsedSeconds)
+        assertEquals("已完成", AgentCopy.status(tree[0], working = false))
+        assertNull(AgentCopy.elapsed(null))
+    }
+
+    // 在跑的不画耗时：它还没跑完，这个数此刻不成立。用词是「在跑」，不是工单卡的「在做」。
+    @Test
+    fun aRunningAgentSaysItIsRunningAndShowsNoTime() {
+        val running = AgentNode(id = "sub-b", label = "子代理", state = "working", elapsedSeconds = 42.0, children = emptyList())
+        assertEquals("在跑", AgentCopy.status(running, working = true))
+        assertEquals("在跑", AgentCopy.word("working"))
+        // 工单卡上说的是「在做」（CrewUi 的 stateWord），子代理行说的是「在跑」：
+        // 同一件事在两个语境里不是一个词，混用会有一边不像画板。
+        assertNotEquals("在做", AgentCopy.word("working"))
+        // 终态也要说人话，不是把后端的英文词原样贴出来。
+        assertEquals("已完成", AgentCopy.word("completed"))
+        assertEquals("已停下", AgentCopy.word("failed"))
+        assertEquals("已放弃", AgentCopy.word("dropped"))
+    }
+
+    // 耗时读坏了（负数、NaN、无穷、超过一天）就整段不画，不能画一个负数或一个孤零零的「· 」。
+    @Test
+    fun aBrokenElapsedDrawsNothing() {
+        for (value in listOf(-1.0, -0.5, Double.NaN, Double.POSITIVE_INFINITY, 24.0 * 60 * 60 + 1)) {
+            val node = AgentNode(id = "a", label = "子代理", state = "completed", elapsedSeconds = value, children = emptyList())
+            assertEquals("耗时 $value 读坏了，却画成了别的", "已完成", AgentCopy.status(node, working = false))
+            assertNull(AgentCopy.elapsed(value))
+        }
+        // 秒数的说法：一分钟以内说秒，超过就说「N 分 M 秒」。
+        assertEquals("0 秒", AgentCopy.elapsed(0.0))
+        assertEquals("59 秒", AgentCopy.elapsed(59.4))
+        assertEquals("1 分 0 秒", AgentCopy.elapsed(60.0))
+        assertEquals("7 分 7 秒", AgentCopy.elapsed(427.0))
+    }
+
+    // 分词着色，与桌面端 syntax_test.go 是同一组断言。
+    // 这一层唯一不能错的地方：拼回去必须与原文逐字相同 ——
+    // 高亮是装饰，吃掉一个字符就是把代码改错了给人看。
+    @Test
+    fun tokenizingNeverDropsCharacters() {
+        for (line in listOf(
+            "gap: 12px;",
+            """color: "#FFF";""",
+            "// 注释",
+            """const a = "a\"b";""",
+            "x := 0x1f + 1.85",
+            "没有数字也没有引号",
+            "",
+            "/* 块注释 */",
+            "SELECT * FROM t -- SQL 注释",
+            """不配对的引号 " 后面还有字""",
+        )) {
+            val joined = CodeSyntax.segments(CodeLine(line, "")).joinToString("") { it.text }
+            assertEquals("  $line", joined)
+        }
+        // 行首空白会被剥掉：segments 里 trimStart，与旧渲染同一行为（那一格缩进由行首
+        // 那两格前缀代表，正文不再重复带自己的缩进）。除了这两格前缀，一个字都不能少。
+        assertEquals(
+            "  # 井号开头",
+            CodeSyntax.segments(CodeLine("  # 井号开头", "")).joinToString("") { it.text },
+        )
+    }
+
+    // 画板 Desktop.dc.html:133 那一行：上下文整行暖灰，只有值 `12px` 是赭色。
+    @Test
+    fun theBoardLineMarksItsValueAsANumber() {
+        val tokens = CodeSyntax.tokenize("gap: 12px;")
+        // 三段：`gap: `、`12px`、`;`。值那一段是数字，另外两段是普通文字。
+        assertEquals(listOf("gap: ", "12px", ";"), tokens.map { it.text })
+        assertEquals(CodeSyntax.Kind.Number, tokens[1].kind)
+        assertEquals(1, tokens.count { it.kind == CodeSyntax.Kind.Number })
+    }
+
+    // 字符串里的数字不该被单独染色：整段是字符串。
+    @Test
+    fun aNumberInsideAStringStaysAString() {
+        val tokens = CodeSyntax.tokenize("""margin: "12px";""")
+        assertEquals(0, tokens.count { it.kind == CodeSyntax.Kind.Number })
+        assertEquals("\"12px\"", tokens.first { it.kind == CodeSyntax.Kind.Quoted }.text)
+    }
+
+    // 颜色值里的 # 不是注释：判成注释会让整整一行变成注释色，值就看不见了。
+    // 而贴着行首（或前面只有空白）的 # 才算注释。
+    @Test
+    fun aHashInsideAColorIsNotAComment() {
+        assertEquals(0, CodeSyntax.tokenize("color: #FFF;").count { it.kind == CodeSyntax.Kind.Comment })
+        assertEquals(CodeSyntax.Kind.Comment, CodeSyntax.tokenize("# 真注释")[0].kind)
+        val indented = CodeSyntax.tokenize("   # 缩进后的注释")
+        // 前面那几格空白先成一段普通文字，注释是第二段。
+        assertTrue(indented.size >= 2)
+        assertEquals(CodeSyntax.Kind.Comment, indented[1].kind)
+    }
+
+    // 自减不是注释：`i--` 里的 `--` 贴着内容。
+    @Test
+    fun aDecrementIsNotAComment() {
+        assertEquals(0, CodeSyntax.tokenize("i--;").count { it.kind == CodeSyntax.Kind.Comment })
+    }
+
+    // 改动行整行一段、不拆词：画板里改动的就是整行，行内再分色看不出哪一行变了。
+    @Test
+    fun aChangedLineStaysOnePieces() {
+        val added = CodeSyntax.segments(CodeLine("  gap: 16px;", "added"))
+        assertEquals(1, added.size)
+        assertEquals("+ gap: 16px;", added[0].text)
+        val removed = CodeSyntax.segments(CodeLine("- gap: 16px;", "removed"))
+        assertEquals(1, removed.size)
+        assertEquals("- gap: 16px;", removed[0].text)
+    }
+
     // 配对走的是和消息面不同的一条路：还没有凭据时也得能到达，所以它单独一组方法。
     @Test
     fun readsTheReachAddressesAlreadyShapedAsUrls() {

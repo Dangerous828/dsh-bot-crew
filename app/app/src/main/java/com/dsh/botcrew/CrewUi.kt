@@ -2073,11 +2073,28 @@ private fun SubagentCard(
 }
 
 /**
- * 消息里带的代码片段：文件名 + 增删统计，逐行标出新增/删除。
+ * 代码卡里一段文字该用什么颜色。与桌面端 `codeSegments` 三套配色的关系一一对应：
  *
- * 画板里整行浅绿底表示新增、整行浅橙底表示删除，`+` / `-` 跟在行首。
- * 只给号着色是不够的 —— 一屏代码里看不出改了哪几行。
+ * - 上下文行：普通文字暖灰（faint），值是赭色（warn）—— 画板 `gap: <span>12px</span>;`
+ *   那一段。数字与字符串都算「值」，所以都染赭色。
+ * - 注释：跟普通文字同一个颜色。认注释不是为了把它染成另一种颜色，而是为了
+ *   **别把注释里的数字当成值**：`// 等 2 秒` 里的 2 不是这段改动要改的东西。
+ *   桌面端 `codeSegments` 就是这么做的（注释落在 base 上）—— 两端不这么做，
+ *   同一行代码在两边看起来会不一样。
+ * - 新增行 / 删除行：整行一个颜色（accent / warn）。这两种行的 kind 在
+ *   [CodeSyntax.segments] 里已经合成一整段，所以这里只会被问到 Plain，
+ *   落到行类别那一支上就是整行同色。
  */
+private fun codeColor(kind: CodeSyntax.Kind, lineKind: String, palette: CrewPalette): Color = when (lineKind) {
+    "added" -> palette.accent
+    "removed" -> palette.warn
+    else -> when (kind) {
+        CodeSyntax.Kind.Number, CodeSyntax.Kind.Quoted -> palette.warn
+        // 注释与普通文字同色：见上，认注释只是为了不让里面的数字冒充「值」。
+        CodeSyntax.Kind.Comment, CodeSyntax.Kind.Plain -> palette.faint
+    }
+}
+
 /**
  * 消息里带的代码片段：文件名 + 增删统计，逐行标出新增/删除，下面挂两个按钮。
  *
@@ -2118,6 +2135,16 @@ private fun CodeCard(
     val scope = rememberCoroutineScope()
     val buttons = CodeCardRules.showsButtons(block)
 
+    // 整块代码只分词一次：键是这块的内容（逐行正文与类别）而不是「重组了几次」。
+    // 时间线每几秒读一遍，CodeBlock 每次都是新对象但内容一样 —— data class 的 equals
+    // 让 remember 认出「还是这块代码」，于是滑动、刷新都不会再切一遍。
+    // palette 一起进键：亮暗两套的赭色不同，换主题要重算颜色。颜色只是个 when，不贵；
+    // 贵的是分词，而它只跟代码内容有关。
+    val painted = remember(block.lines, palette) {
+        block.lines.map { line ->
+            CodeSyntax.segments(line).map { token -> token.text to codeColor(token.kind, line.kind, palette) }
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2139,7 +2166,7 @@ private fun CodeCard(
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(palette.line))
         Column(modifier = Modifier.padding(vertical = 4.dp)) {
-            block.lines.forEach { line ->
+            block.lines.forEachIndexed { index, line ->
                 val added = line.kind == "added"
                 val removed = line.kind == "removed"
                 val soft = when {
@@ -2147,30 +2174,25 @@ private fun CodeCard(
                     removed -> palette.warnSoft
                     else -> Color.Transparent
                 }
-                val tint = when {
-                    added -> palette.accent
-                    removed -> palette.warn
-                    else -> palette.faint
-                }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(soft)
                         .padding(horizontal = 11.dp, vertical = 1.dp),
                 ) {
-                    // 正文可能自带 + / - 前缀（后端两种写法都给过），先剥掉再按类别加，
-                    // 否则画出来是 `+ + gap: 16px;`。
-                    Text(
-                        when {
-                            added -> "+ "
-                            removed -> "- "
-                            else -> "  "
-                        } + line.text.trimStart().trimStart('+', '-').trimStart(),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        lineHeight = 19.8.sp,
-                        color = tint,
-                    )
+                    // 这一段只取上面算好的结果，不在这里分词 —— 列表每几秒重组一遍，
+                    // 每次都切一遍整块代码正是滑动卡顿的来源。拼回去与原文逐字相同，
+                    // 这一点由 CodeSyntaxTest 钉住：高亮可以少，不能吃掉字符。
+                    painted.getOrNull(index).orEmpty().forEach { (text, color) ->
+                        if (text.isEmpty()) return@forEach
+                        Text(
+                            text,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 19.8.sp,
+                            color = color,
+                        )
+                    }
                 }
             }
         }
@@ -2300,13 +2322,29 @@ private fun countRunning(nodes: List<AgentNode>): Int =
 
 @Composable
 private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
+    val done = agentDone(node.state)
     // 缩进就是层级：不压平，也不额外画线。
-    Row(modifier = Modifier.padding(start = (depth * 12).dp, top = 2.dp)) {
+    Row(
+        modifier = Modifier.padding(start = (depth * 12).dp, top = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(
-            // 有标签就显示标签：`a1-1` 这种内部编号对人没有意义。
-            "${if (agentDone(node.state)) "✓" else "·"} ${node.label.ifBlank { node.id }}",
-            color = if (agentDone(node.state)) palette.faint else palette.ink,
+            // 有标签就显示标签：`a1-1` 这种内部编号对人没有意义。记号与桌面端 subagentRow 同一套：
+            // 在跑是 ○、收工是 ✓（这里沿用手机上原来那颗 ·，颜色跟着状态走）。
+            "${if (done) "✓" else "·"} ${node.label.ifBlank { node.id }}",
+            color = if (done) palette.faint else palette.ink,
             fontSize = 11.sp,
+        )
+        // 右侧那截话：状态词 +（真有耗时时的）耗时。与桌面端 agentStatus 同一句，
+        // 用词是子代理的「在跑 / 已完成」，不是工单卡的「在做」。
+        // 后端今天还不发 elapsed_seconds，所以这里实际画出来的只有状态词 ——
+        // 没数据就不画那一截，绝不补一个假数。
+        Box(Modifier.weight(1f))
+        Text(
+            AgentCopy.status(node, working = !done),
+            // 在跑的那一行是强调绿，收工的退成弱灰 —— 与桌面端同一处配色，扫一眼就知道谁还在动。
+            color = if (done) palette.faint else palette.accent,
+            fontSize = 10.5.sp,
         )
     }
     node.children.forEach { AgentBranch(it, depth + 1, palette) }

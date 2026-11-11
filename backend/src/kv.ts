@@ -3,6 +3,7 @@
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
 import type { PromptVersion } from './app/prompts.ts'
+import type { RoutineRecord } from './app/routines.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
@@ -36,6 +37,11 @@ export const KV = {
    * each other ends, whichever side each turn comes from.
    */
   crew: { hop: family<number, [ticket: string]>('crew-hop:') },
+  /**
+   * 「常规任务」的账本：一条任务一个键。值就是账本里那一行（`RoutineRecord`），
+   * 不含 `next_run` / `overdue` —— 那两个是读的时候按周期算出来的，不落盘，免得时间在库里走样。
+   */
+  routines: { task: family<RoutineRecord, [id: string]>('routines:task:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

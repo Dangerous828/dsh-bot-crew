@@ -30,6 +30,7 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered' },
@@ -145,7 +146,7 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(16)
+  expect(registered.length).toBe(17)
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -565,4 +566,26 @@ it('exports the records a person would need to rebuild the crew, and no secrets'
   // 导出走管理面（需要同源），消息面不该暴露它。
   const viaPhone = await handler(new Request('http://dsh/api/mobile/records/export'))
   expect(viaPhone.status).toBe(404)
+})
+
+// 「常规任务」路由：有账就原样下发，读不到就说读不到，还没接这项能力时也不能说成「没有」。
+it('serves the routines ledger and keeps "nothing yet" apart from "could not read"', async () => {
+  const view = { items: [{ id: 'daily-standup', title: '每天站会', cycle: 'daily', enabled: true,
+    created_at: '2026-11-11T09:00:00.000Z' }], state: 'live', counts: { enabled: 1, paused: 0 }, runner: 'none' }
+  const fetchless = vi.fn() as unknown as typeof fetch
+  const wired = { ...host(), routines: async () => view as never } as unknown as HttpHost
+  const served = await phoneHandler(wired, undefined, fetchless)(new Request('http://dsh/api/mobile/routines'))
+  expect(served.status).toBe(200)
+  expect(await served.json()).toEqual(view)
+
+  // 宿主没接这项能力：unavailable，不是空态。
+  const bare = await phoneHandler(host(), undefined, fetchless)(new Request('http://dsh/api/mobile/routines'))
+  expect(bare.status).toBe(200)
+  expect(await bare.json()).toMatchObject({ state: 'unavailable', items: [], runner: 'none' })
+
+  // 读数时炸了也一样：不把故障说成「还没有常规任务」。
+  const broken = { ...host(), routines: async () => { throw new Error('disk gone') } } as unknown as HttpHost
+  const failed = await phoneHandler(broken, undefined, fetchless)(new Request('http://dsh/api/mobile/routines'))
+  expect(failed.status).toBe(200)
+  expect(await failed.json()).toMatchObject({ state: 'unavailable', items: [], runner: 'none' })
 })

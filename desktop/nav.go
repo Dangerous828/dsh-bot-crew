@@ -15,8 +15,8 @@ const (
 	// navOutput 是「产出」：队伍交出来的文件（契约 §5.4）。点开时重读一遍 ——
 	// worker 刚写完的文件不会自己长到界面上。
 	navOutput
-	// navRoutine 是「常规任务」。后端还没有这个概念（没有定时/周期任务的账），
-	// 所以它仍然只做一件事：点开把话说清楚。
+	// navRoutine 是「常规任务」：主人写下的定时账本（契约 §5.5）。点开时重读一遍 ——
+	// 上次跑 / 下次跑是按时间算的，不重读就会一直停在上一次。这一轮只读，不改账。
 	navRoutine
 )
 
@@ -71,6 +71,8 @@ func (s *app) pressNav(item navItem) bool {
 	case navRoutine:
 		s.navTab = item
 		s.backendOpen = true
+		// 每次打开都重读：上次跑 / 下次跑是按时间算出来的，读一次才说得准。
+		s.loadRoutines()
 		return true
 	default:
 		return false
@@ -114,17 +116,16 @@ func modelNameOf(option ModelOption) string {
 	return option.ID
 }
 
-// emptyCopy 是「产出」和「常规任务」两栏里的原话。
+// emptyCopy 是「产出」和「常规任务」两栏在空态时的原话。
 //
-// 「产出」现在接上了后端（契约 §5.4）：这里的两句只在 `state: "empty"`
-// ——读得到、确实没有文件改动——时出现；「读不到」另有一句话，不借用这两句。
-// 「常规任务」后端仍然没有这个概念，所以照旧只说明为什么空着。
+// 两栏现在都接上了后端（产出 §5.4、常规任务 §5.5）：这里的两句只在 `state: "empty"`
+// ——读得到、确实没有——时出现；「读不到」另有一句话，不借用这两句。
 func emptyCopy(item navItem) (title, body string) {
 	switch item {
 	case navOutput:
 		return "还没有产出", "队伍还没在工单里写过文件。它写过的文件会出现在这里。"
 	case navRoutine:
-		return "还没有常规任务", "这里会放定时要做的事。后端还没有这份数据，所以先空着。"
+		return "还没有常规任务", "这里是定时要做的事的账本。一条都还没有；账本里的任务到点不会自己跑 —— 后端还没有调度器。"
 	default:
 		return "", ""
 	}

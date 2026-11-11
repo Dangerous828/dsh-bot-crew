@@ -26,6 +26,7 @@ import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../
 import { ticketCard } from './cards.ts'
 import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
 import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
+import { routinesView, type RoutinesView } from './routines.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -316,6 +317,20 @@ export class Runtime extends Service implements SourceHost {
       const { events } = await this.ctx.sessionController.inspect(workerSessionId(ticketId) as SessionId)
       return events as unknown as OutputEvent[]
     })
+  }
+
+  /**
+   * 「常规任务」：把账本合成一栏。
+   *
+   * 数据源是 KV 里的一串 `routines:task:<id>`，不是会话事件、也不新开一张表：
+   * 这是主人自己写下的账，跟工单不一样，工单没了账还在。
+   * 账本读不出来（数据库打不开）就是 `unavailable`，不是「没有常规任务」。
+   */
+  async routines(): Promise<RoutinesView> {
+    return routinesView(() => this.store.keys(KV.routines.task).flatMap(name => {
+      const record = this.store.get(name)
+      return record === undefined ? [] : [record]
+    }))
   }
 
   handOff(from: Pick<OutboundMessage, 'id' | 'channel'>, bot_id: string, text: string, origin?: Ticket): boolean {

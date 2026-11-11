@@ -183,6 +183,20 @@ type app struct {
 	// loadingTicket 挡住在途的重复请求：同一张票一次只发一个。
 	loadingTicket map[string]bool
 	ticketOut     chan ticketOutputsResult
+
+	// 常规任务：右栏那一栏的账本（契约 §5.5）。
+	// routines 为 nil 表示还没读回来；读不到时 routinesNote 是那句实话，
+	// 不冒充「还没有常规任务」—— 这两句话差着一整个事实。
+	routines       *RoutinesView
+	routinesNote   string
+	routinesCh     chan routinesResult
+	loadingRoutine bool
+}
+
+// routinesResult 是一次读「常规任务」的结果。view 为 nil 时 note 说的是为什么读不到。
+type routinesResult struct {
+	view *RoutinesView
+	note string
 }
 
 // outputsResult 是一次读「产出」整栏的结果。view 为 nil 时 note 说的是为什么读不到。
@@ -532,6 +546,9 @@ func (s *app) drain(c *ui.Context) {
 				if s.navTab == navOutput {
 					s.loadOutputs()
 				}
+				if s.navTab == navRoutine {
+					s.loadRoutines()
+				}
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
 				c.Invalidate()
 			}
@@ -710,6 +727,10 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.outputsCh:
 			s.loadingOutputs = false
 			s.outputs, s.outputsNote = result.view, result.note
+			c.Invalidate()
+		case result := <-s.routinesCh:
+			s.loadingRoutine = false
+			s.routines, s.routinesNote = result.view, result.note
 			c.Invalidate()
 		case result := <-s.ticketOut:
 			delete(s.loadingTicket, result.ticket)
@@ -2310,8 +2331,8 @@ func (s *app) taskCountLine() string {
 
 // backendPane 是右栏：工单是唯一的工作状态主体，这里只是它的只读投影。
 //
-// 右栏跟着左栏点开的那一项走：「后台」是工单，「模型」是选择，「产出」「常规任务」是
-// 明说的空态。每一项都画得出来，没有一项按下去是空的。
+// 右栏跟着左栏点开的那一项走：「后台」是工单，「模型」是选择，「产出」是文件，
+// 「常规任务」是那张定时账本。每一项都画得出来，没有一项按下去是空的。
 func (s *app) backendPane(c *ui.Context, p Palette) {
 	if !s.backendOpen {
 		// 收起来不是消失：留一条窄边，点它就能再展开。
@@ -2338,7 +2359,7 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 			case navOutput:
 				s.outputsPane(c, p)
 			case navRoutine:
-				s.emptyPane(c, p, s.navTab)
+				s.routinesPane(c, p)
 			default:
 				s.workPane(c, p)
 			}
@@ -2689,22 +2710,6 @@ func (s *app) modelRow(c *ui.Context, p Palette, provider string, option ModelOp
 	})
 }
 
-// emptyPane 是「产出」和「常规任务」这两栏在没有数据时说的话。
-//
-// 两栏都已经不是死按钮了：「产出」接上了后端（契约 §5.4），这一份只负责
-// 「确实没有」时的那一句话；读不到与还没接上另有两种说法，见 outputsPane。
-// 「常规任务」后端仍然没有这个概念，所以它照旧只说明为什么空着 —— 不编一个列表出来。
-func (s *app) emptyPane(c *ui.Context, p Palette, item navItem) {
-	title, body := emptyCopy(item)
-	_, name := navLabel(item)
-	ui.Text(c, name).FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
-	ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
-		BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
-		ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
-		ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
-	})
-}
-
 // outputsPane 是右栏「产出」那一栏：有产出就列出来，没有就说明为什么没有。
 //
 // 三种情况分开说（契约 §5.4 的 state）：
@@ -2797,6 +2802,173 @@ func (s *app) outputRow(c *ui.Context, p Palette, item OutputItem) {
 			ui.Text(c, detail).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
 		})
 	})
+}
+
+// routinesPane 是右栏「常规任务」那一栏（契约 §5.5）。
+//
+// 三种情况分开说（state）：
+// - live：逐条画。标题、周期、谁负责、开关、上次跑 / 下次跑的时间。
+// - empty：读得到、确实没有 —— 画空态，并说明这里放的是什么，不编一条假任务。
+// - unavailable / 读失败：说「读不到」，绝不说「没有」。这两句话差着一整个事实。
+func (s *app) routinesPane(c *ui.Context, p Palette) {
+	_, name := navLabel(navRoutine)
+	ui.Text(c, name).FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
+
+	view := s.routines
+	if view == nil {
+		// 还没读回来。断连时先说断连：那时候「正在读」是句假话。
+		line := "正在读常规任务…"
+		if s.routinesNote != "" {
+			line = s.routinesNote
+		} else if s.problem != "" {
+			line = "还没连上，读不到常规任务"
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, line).FontSize(FontSmall).TextColor(p.Faint)
+		})
+		return
+	}
+
+	if view.State != "live" || len(view.Items) == 0 {
+		// empty / unavailable 都在这里。reason 是后端给的那句实话；
+		// 它没给（老后端）时才退回空态原话，绝不在这里自己编一个理由。
+		title, body := emptyCopy(navRoutine)
+		if view.State != "empty" {
+			title = "读不到常规任务"
+			body = view.Reason
+			if body == "" {
+				body = "后端没有说原因，这一栏现在是空的"
+			}
+		} else if view.Reason != "" {
+			body = view.Reason
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
+			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
+			if view.State == "empty" {
+				// 空态也要说清这里放的是什么、会不会自己跑：让人以为放着它就会跑，比空着更糟。
+				ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
+			}
+		})
+		return
+	}
+
+	// 栏头那行小结：开着几条、关掉几条。用后端的 counts，不自己数一遍。
+	ui.Text(c, routineSummary(*view)).FontSize(FontSmall).TextColor(p.Faint)
+	ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+		ui.Column(c).Gap(6).Children(func() {
+			for _, item := range view.Items {
+				s.routineRow(c, p, item)
+			}
+		})
+	})
+	// 这一栏只列账，不装作会到点就跑：后端说 runner 是 none 时就把这句话写出来。
+	// 认不出的 runner（老后端、新值）也一样说 —— 说多了只是保守，说少了是假装有人会跑。
+	if view.Runner != "live" {
+		ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
+	}
+}
+
+// noSchedulerNote 是这一栏必须说的那句实话：账是账，没有人会按点去跑它。
+const noSchedulerNote = "这些账到点不会自己跑：后端还没有调度器，逾期只是提醒。"
+
+// routineSummary 是「常规任务」栏头那行字：开着几条、关掉几条。都为 0 时返回空串。
+func routineSummary(view RoutinesView) string {
+	parts := []string{}
+	if view.Counts.Enabled > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条开着", view.Counts.Enabled))
+	}
+	if view.Counts.Paused > 0 {
+		parts = append(parts, fmt.Sprintf("%d 条关着", view.Counts.Paused))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// cycleName 是周期的中文说法。认不出的原词原样显示：不猜成「每天」。
+func cycleName(cycle string) string {
+	switch cycle {
+	case "hourly":
+		return "每小时"
+	case "daily":
+		return "每天"
+	case "weekly":
+		return "每周"
+	default:
+		return cycle
+	}
+}
+
+// routineRow 是「常规任务」里的一条：标题一行，周期 + 负责人 + 开关一行，上次 / 下次一行。
+//
+// 「上次跑」没有就是没有 —— 只写「还没跑过」，不填日期；「下次跑」由后端按周期算，
+// 逾期时写「该跑了」而不是「下一次」，因为后端确实没有人会去跑它。
+func (s *app) routineRow(c *ui.Context, p Palette, item RoutineItem) {
+	ui.Column(c).FillWidth().Padding(10).Gap(4).Radius(RadiusItem).
+		BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+			// 标题占满剩下的宽度再省略：不定宽、不裁，长标题会把「逾期」顶出这一行。
+			ui.Column(c).Grow(1).MinWidth(0).ClipX().Children(func() {
+				ui.Text(c, item.Title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Ink).
+					MaxLines(1).Ellipsis("…")
+			})
+			if item.Overdue && item.Enabled {
+				ui.Text(c, "逾期").FontSize(FontHairline).TextColor(p.Warn)
+			}
+		})
+		head := cycleName(item.Cycle)
+		if item.BotID != "" {
+			head += " · " + item.BotID + " 负责"
+		}
+		if !item.Enabled {
+			head += " · 已关掉"
+		}
+		ui.Text(c, head).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
+		// 上次：有才写日期；没有就直说「还没跑过」。
+		ran := "还没跑过"
+		if when := routineTime(item.LastRun); when != "" {
+			ran = "上次 " + when
+		}
+		// 「下次」这一格：时间读不出来就整格不说，别把原始串甩给人看；
+		// 关掉的那条不算「下一次」，否则关着也像随时会跑。
+		nearest := ""
+		if when := routineTime(item.NextRun); when != "" {
+			nearest = "按周期算下一次 " + when
+			if item.Overdue && item.Enabled {
+				nearest = "该跑了（" + when + "）"
+			}
+		}
+		if !item.Enabled {
+			nearest = "关着，不算下一次"
+		}
+		ui.Text(c, routineWhenLine(ran, nearest)).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
+	})
+}
+
+// routineWhenLine 把「上次」「下一次」拼成一行。两截都不说时（时间都读不出来）返回空串，
+// 由调用方整行不画 —— 一行只有「 · 」比没有更难读。
+func routineWhenLine(ran, nearest string) string {
+	switch {
+	case ran == "" && nearest == "":
+		return ""
+	case nearest == "":
+		return ran
+	case ran == "":
+		return nearest
+	default:
+		return ran + " · " + nearest
+	}
+}
+
+// routineTime 把后端的时间裁成「01-02 15:04」；认不出来就返回空串，别把原始串甩给人看。
+func routineTime(at string) string {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if parsed, err := time.Parse(layout, at); err == nil {
+			return parsed.Local().Format("01-02 15:04")
+		}
+	}
+	return ""
 }
 
 // resultBar 是挂在一条消息下面那行「✓ 两张图片已放进产出」（契约 §5.4 末节）。
@@ -3024,6 +3196,33 @@ func (s *app) loadOutputs() {
 			result.note = "读不到产出：" + err.Error()
 		}
 		s.outputsCh <- result
+		s.wake()
+	}()
+}
+
+// loadRoutines 读一遍右栏「常规任务」。账本是一条条主人写下的账，不随工单变，
+// 但「上次跑 / 下次跑」是按时间算的，所以打开这一栏与整栏刷新时都重读一次。
+// 在途时不再发第二个：连点这一格不该叠出几个一样的请求。
+func (s *app) loadRoutines() {
+	if s.client == nil {
+		// 没有客户端就发不出请求：那就直说，别让这一栏永远停在「正在读」。
+		s.routinesNote = "还没连上队伍，读不到常规任务"
+		return
+	}
+	if s.loadingRoutine {
+		return
+	}
+	s.loadingRoutine = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := s.client.Routines(ctx)
+		result := routinesResult{view: view}
+		if err != nil {
+			// 读失败与「没有常规任务」是两件事：这条 note 会原样显示，别写成「还没有」。
+			result.note = "读不到常规任务：" + err.Error()
+		}
+		s.routinesCh <- result
 		s.wake()
 	}()
 }

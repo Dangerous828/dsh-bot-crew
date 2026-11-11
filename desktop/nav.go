@@ -18,10 +18,13 @@ const (
 	// navRoutine 是「常规任务」：主人写下的定时账本（契约 §5.5）。点开时重读一遍 ——
 	// 上次跑 / 下次跑是按时间算的，不重读就会一直停在上一次。这一轮只读，不改账。
 	navRoutine
+	// navMemory 是「记忆」：队伍长期记得的事（契约 §5.7）。点开时重读一遍 ——
+	// 忘掉 / 改过之后，这一栏不会自己变。这一版能改能忘，不能在这儿新加一条。
+	navMemory
 )
 
 // navOrder 是它们在左栏从上到下的顺序。
-var navOrder = []navItem{navBackend, navModel, navOutput, navRoutine}
+var navOrder = []navItem{navBackend, navModel, navOutput, navRoutine, navMemory}
 
 // navLabel 是这一项上写的字。图标字和文字分开写：图标换字号时才不会把文字也带歪。
 func navLabel(item navItem) (glyph, text string) {
@@ -32,6 +35,8 @@ func navLabel(item navItem) (glyph, text string) {
 		return "▢", "产出"
 	case navRoutine:
 		return "◷", "常规任务"
+	case navMemory:
+		return "❖", "记忆"
 	default:
 		return "▤", "后台"
 	}
@@ -73,6 +78,12 @@ func (s *app) pressNav(item navItem) bool {
 		s.backendOpen = true
 		// 每次打开都重读：上次跑 / 下次跑是按时间算出来的，读一次才说得准。
 		s.loadRoutines()
+		return true
+	case navMemory:
+		s.navTab = item
+		s.backendOpen = true
+		// 每次打开都重读：别处（手机、某个 worker 收尾）也会往账本里写。
+		s.loadMemory()
 		return true
 	default:
 		return false
@@ -126,6 +137,8 @@ func emptyCopy(item navItem) (title, body string) {
 		return "还没有产出", "队伍还没在工单里写过文件。它写过的文件会出现在这里。"
 	case navRoutine:
 		return "还没有常规任务", "这里是定时要做的事的账本。一条都还没有；账本里的任务到点不会自己跑 —— 后端还没有调度器。"
+	case navMemory:
+		return "还没有记住什么", "这里是队伍的长期记忆：你定下的规矩、工单的结论。它办完的事会一条条记在这里。"
 	default:
 		return "", ""
 	}

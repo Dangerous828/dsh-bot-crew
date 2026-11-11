@@ -52,6 +52,8 @@ import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
+import { MemoryLayer } from './memory-layer.ts'
+import { memoryView, type MemoryView } from './views/memory.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -107,6 +109,8 @@ export class Runtime extends Service implements SourceHost {
   readonly outbox: Outbox
   readonly engine: Engine
   readonly passes: Passes
+  /** 记忆层：谁写、谁读、什么时候写（见 `memory-layer.ts`）。 */
+  readonly memory: MemoryLayer
   readonly ready: Promise<void>
   /**
    * DSH 的会话表，手机端的「子代理」卡片靠它从 worker 会话往下展开。
@@ -171,12 +175,16 @@ export class Runtime extends Service implements SourceHost {
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
+      // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
+      this.memory = new MemoryLayer({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
+        ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [] })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+        repliedTo: trigger => repliedTo({ store, sources }, trigger),
+        recall: (ticket, query) => this.memory.recall(ticket, query) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -198,6 +206,17 @@ export class Runtime extends Service implements SourceHost {
               JSON.stringify(decision?.reason ?? '-'),
               String(event.data.threadKey),
               String(decision?.ticketId ?? '-'))
+          }
+          // 主人说的「定下来的规矩」当场记一条。放在同一个 emit 里：这里是所有 Trigger 的唯一入口，
+          // 记忆层将来要加别的来源（比如某个 Source 自己的结论）也只挂在这一处。
+          if (event.type === 'trigger.received') {
+            const received = store.triggers.get(event.data.triggerId)
+            if (received?.human) { try { this.memory.hear(received) } catch (error) { console.log('[memory] settle failed: %s', String(error)) } }
+          }
+          // 一票收尾：把结论记一条（只记 ready / dropped，过程不进账本）。
+          if (event.type === 'ticket.ended') {
+            const done = store.tickets.get(event.data.ticketId)
+            if (done) { try { this.memory.close(done) } catch (error) { console.log('[memory] settle failed: %s', String(error)) } }
           }
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
@@ -347,6 +366,20 @@ export class Runtime extends Service implements SourceHost {
    * 这是主人自己写下的账，跟工单不一样，工单没了账还在。
    * 账本读不出来（数据库打不开）就是 `unavailable`，不是「没有常规任务」。
    */
+  /**
+   * 「记忆」：主人的长期账本，可以看、改、忘。
+   *
+   * 与 `routines` 同一套三态：读不到说读不到，不说「没有记忆」。
+   */
+  async memories(options: { bot?: string } = {}): Promise<MemoryView> {
+    return memoryView(() => this.memory.ledger.all(), options)
+  }
+  /** 忘掉一条：翻状态，不删行。 */
+  forgetMemory(name: string): boolean { return this.memory.ledger.forget(name) }
+  /** 改一条的正文 / 描述 / 重要性。 */
+  editMemory(name: string, patch: { description?: string; body?: string; importance?: number }): boolean {
+    return this.memory.ledger.edit(name, patch)
+  }
   async routines(): Promise<RoutinesView> {
     return routinesView(() => this.store.keys(KV.routines.task).flatMap(name => {
       const record = this.store.get(name)

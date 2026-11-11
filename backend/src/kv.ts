@@ -42,6 +42,11 @@ export const KV = {
    * 不含 `next_run` / `overdue` —— 那两个是读的时候按周期算出来的，不落盘，免得时间在库里走样。
    */
   routines: { task: family<RoutineRecord, [id: string]>('routines:task:') },
+  /**
+   * 记忆账本：一条记忆一个键，键是记忆名（`bot-<botId>-<slug>`）。
+   * 与工单、会话都分开 —— 工单结束、会话归档，记忆还在。
+   */
+  memory: { entry: family<import('./memory/recall.ts').MemoryEntry, [name: string]>('memory:entry:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

@@ -348,6 +348,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/outputs.ts` | The phone's 产出 list: the files a worker wrote (the `write` / `edit` calls in its session events), one row per path with its write count; a pure function that keeps "nothing yet" apart from "could not read" |
 | `src/app/routines.ts` | The phone's 常规任务 ledger: one row per task the owner wrote down (title, cycle, bot, switch, last and next run), read from the `routines:task:` KV records; `next_run` is counted from the cycle and never rolled forward, and `runner: none` says there is no scheduler yet |
 | `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
+| `src/memory/adapter.ts` | 记忆的格式层：`MemoryRecord` 的形状、按插件 1.3.0 frontmatter 渲染（拒多行 description）、命名空间与落盘路径；不碰数据库，也不内置 Hub 地址 |
+| `src/memory/recall.ts` | recall 的纯函数：中文二元组相关度、按新鲜度加权的排序、只留 `active` 的过滤，以及按 `maxChars` 预算拼段（放不下整条丢掉，绝不截半句） |
+| `src/memory/settle.ts` | settle 的输入端：从人的原话里认得出「定下来的规矩」，从工单收尾的 `ready` / `dropped` 里取出结论；认不出来就不记，每一条都能指回原文 |
+| `src/app/memory.ts` | 记忆账本：KV 一族 `memory:entry:`，按 Bot 命名空间和 `dedupe_key` 查重，纠错走 `superseded` 而非硬删，「忘掉」只翻状态 |
+| `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
+| `src/app/views/memory.ts` | 记忆这一栏的形状：一条记忆在界面上的一行（含来源与是否上行）、三态 `live` / `empty` / `unavailable`，以及按 Bot 过滤时仍数整本账 |
 | `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes only a name, the port, and a stateDir fingerprint — never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
@@ -426,6 +432,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/outputs.spec.ts` | The 产出 list: which tool calls count as a written file, one row per path with its write count, images counted apart, and "nothing yet" kept apart from "could not read" |
+| `tests/crew-memory.spec.ts` | 记忆格式层：frontmatter 的渲染与转义、多行 description 与空正文被拒、命名空间与文件名、注入规则与上行日限额 |
+| `tests/crew-memory-recall.spec.ts` | recall 与 settle 的纯函数：二元组相关度、Bot 命名空间过滤、新鲜度压过旧条目、预算整条取舍、哪句话算「定下来的规矩」、哪种工单收尾值得记 |
+| `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |
+| `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |
 | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
 | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |

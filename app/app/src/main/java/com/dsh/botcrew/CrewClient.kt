@@ -128,6 +128,27 @@ class CrewClient(
      */
     suspend fun routines(): RoutinesView = RoutinesWire.parse(read("/api/mobile/routines", "GET"))
 
+    /**
+     * 记忆：队伍长期记得的事。
+     *
+     * 不带 `bot` 读全队；带就读那一位的。三态由后端给（live / empty / unavailable），
+     * 客户端不拿空列表冒充「没有」。
+     */
+    suspend fun memory(botId: String? = null): MemoryView {
+        val query = if (botId.isNullOrBlank()) "" else "?bot=" + URLEncoder.encode(botId, "UTF-8")
+        return parse(read("/api/mobile/memory$query", "GET"), MemoryWire::parse)
+    }
+
+    /** 忘掉一条记忆。只翻状态，不删行。 */
+    suspend fun forgetMemory(name: String) {
+        read("/api/mobile/memory", "POST", MemoryWire.forgetBody(name))
+    }
+
+    /** 改一条记忆的正文。 */
+    suspend fun editMemory(name: String, description: String, body: String) {
+        read("/api/mobile/memory", "POST", MemoryWire.editBody(name, description, body))
+    }
+
     /** 接手：把这个工单停下来。停不下来就抛错，界面照实说，不假装点过了。 */
     suspend fun takeover(ticketId: String) {
         read("/api/mobile/takeover", "POST", JSONObject().put("ticket", ticketId).toString())

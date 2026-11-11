@@ -1742,3 +1742,136 @@ internal fun readable(raw: String): String {
         raw
     }
 }
+
+/**
+ * 一条记忆：队伍长期记得的事。
+ *
+ * 与 `RoutineItem` 同形 —— 后端给什么就画什么，不认识的 `state` 一律不当活着的用。
+ */
+data class MemoryItem(
+    val name: String,
+    val botId: String,
+    val description: String,
+    val body: String,
+    val type: String,
+    val importance: Int,
+    /** `active` / `forgotten` / `superseded`。 */
+    val state: String,
+    /** 秒级时间戳；0 表示后端没给。 */
+    val created: Long,
+    val updated: Long,
+    val origin: String,
+    val toHub: Boolean,
+) {
+    val active: Boolean get() = state == "active"
+}
+
+/** 记忆这一栏：三态与「常规任务」同一套，`unavailable` 绝不被画成「没有」。 */
+data class MemoryView(
+    val items: List<MemoryItem>,
+    val state: String,
+    val counts: MemoryCounts = MemoryCounts(),
+    val reason: String = "",
+) {
+    val live: Boolean get() = state == "live"
+}
+
+data class MemoryCounts(val active: Int = 0, val forgotten: Int = 0, val superseded: Int = 0)
+
+object MemoryWire {
+    /**
+     * 读一份 `GET /api/mobile/memory` 的回答。
+     *
+     * 一条记录认不出来（没名字、没正文）就跳过那一条；缺省 `state` 当成 `active`，
+     * 因为后端只在真的忘掉 / 被替代时才写别的值，缺字段读成「已忘掉」会凭空少一条。
+     */
+    fun parse(body: String): MemoryView {
+        val root = JSONObject(body)
+        val items = mutableListOf<MemoryItem>()
+        val raw = root.optJSONArray("items")
+        if (raw != null) for (index in 0 until raw.length()) {
+            val item = raw.optJSONObject(index) ?: continue
+            val name = item.optString("name").trim()
+            val text = item.optString("body")
+            if (name.isEmpty() || text.isBlank()) continue
+            items.add(
+                MemoryItem(
+                    name = name,
+                    botId = item.optString("bot_id").trim(),
+                    description = item.optString("description").trim(),
+                    body = text,
+                    type = item.optString("type", "project"),
+                    importance = item.optInt("importance", 4),
+                    state = item.optString("state", "active").ifEmpty { "active" },
+                    created = item.optLong("created", 0L),
+                    updated = item.optLong("updated", 0L),
+                    origin = item.optString("origin").trim(),
+                    toHub = item.optBoolean("to_hub", false),
+                ),
+            )
+        }
+        val counts = root.optJSONObject("counts")
+        return MemoryView(
+            items = items,
+            // 缺省落到 unavailable：说「读不到」是实话，说「没有」是编的。
+            state = root.optString("state", "unavailable"),
+            counts = MemoryCounts(
+                active = counts?.optInt("active", 0)?.coerceAtLeast(0) ?: 0,
+                forgotten = counts?.optInt("forgotten", 0)?.coerceAtLeast(0) ?: 0,
+                superseded = counts?.optInt("superseded", 0)?.coerceAtLeast(0) ?: 0,
+            ),
+            reason = root.optString("reason", ""),
+        )
+    }
+
+    /** 忘掉一条：只翻状态，不删行。 */
+    fun forgetBody(name: String): String = JSONObject().put("action", "forget").put("name", name).toString()
+
+    /** 改一条的正文。 */
+    fun editBody(name: String, description: String, body: String): String =
+        JSONObject().put("action", "edit").put("name", name).put("description", description).put("body", body).toString()
+}
+
+/** 记忆这一屏上的文字。纯函数，测试直接钉住。 */
+object MemoryCopy {
+    const val READING = "正在读记忆…"
+    const val UNREADABLE_TITLE = "读不到记忆"
+    const val UNREADABLE_BODY = "账本打不开。这不等于没有记忆，稍后再试。"
+    const val EMPTY_TITLE = "还没有记住什么"
+    const val EMPTY_BODY = "它在这台机器上和队伍办完的事、你定下的规矩，会一条条记在这里。"
+    const val LIVE_ONLY = "只有还活着的记忆会出现在它下一次开口时；忘掉的留在账本里，不删。"
+
+    /** 栏头那句小结：几条活着、几条忘掉、几条被替代。 */
+    fun summary(view: MemoryView): String {
+        val c = view.counts
+        val parts = mutableListOf<String>()
+        parts.add("记得 ${c.active} 条")
+        if (c.forgotten > 0) parts.add("忘掉 ${c.forgotten}")
+        if (c.superseded > 0) parts.add("被替代 ${c.superseded}")
+        return parts.joinToString(" · ")
+    }
+
+    /** 一条记忆的抬头：标题，没标题就退回正文第一句。 */
+    fun title(item: MemoryItem): String =
+        item.description.ifBlank { item.body.lineSequence().firstOrNull()?.trim().orEmpty() }.ifBlank { item.name }
+
+    /** 副行：谁记得、谁写的、记于何时。 */
+    fun detail(item: MemoryItem): String {
+        val who = item.botId.ifBlank { "全队" }
+        val from = when {
+            item.origin.startsWith("person:") -> "你说的"
+            item.origin.startsWith("ticket:") -> "工单结论"
+            else -> "队伍记的"
+        }
+        val whens = item.updated.takeIf { it > 0 }?.let { "· " + MemoryCopy.date(it) } ?: ""
+        return listOf(who, from, whens).filter { it.isNotEmpty() }.joinToString(" ")
+    }
+
+    /** 秒级时间戳转「几月几号」。读不出来就不给日期，不写 Invalid。 */
+    fun date(seconds: Long): String {
+        if (seconds <= 0) return ""
+        val calendar = java.util.Calendar.getInstance()
+        calendar.timeInMillis = seconds * 1000
+        return "${calendar.get(java.util.Calendar.MONTH) + 1} 月 ${calendar.get(java.util.Calendar.DAY_OF_MONTH)} 日"
+    }
+}

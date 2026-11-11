@@ -145,7 +145,7 @@ val DarkPalette = CrewPalette(
  * 常规任务（契约 §5.5）从后台那一屏进：桌面端它也是后台左栏里的一项，
  * 手机这一屏就是从「后台」页头点进去的同一个位置。
  */
-private enum class Screen { Crew, Backend, Workspace, Models, Routine }
+private enum class Screen { Crew, Backend, Workspace, Models, Routine, Memory }
 
 /**
  * 该 Bot 手上最近那张还没结束的票：接手与暂停都只对这张有意义。
@@ -278,8 +278,9 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
 
             when (screen) {
                 Screen.Backend -> BackendScreen(client, conversation, palette, { screen = Screen.Crew },
-                    { refresh() }, onRoutines = { screen = Screen.Routine })
+                    { refresh() }, onRoutines = { screen = Screen.Routine }, onMemory = { screen = Screen.Memory })
                 Screen.Routine -> RoutineScreen(client, conversation, palette, onBack = { screen = Screen.Backend })
+                Screen.Memory -> MemoryScreen(client, palette, onBack = { screen = Screen.Backend })
                 Screen.Workspace -> WorkspaceScreen(
                     client = client,
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
@@ -1433,6 +1434,8 @@ private fun BackendScreen(
     onRefresh: () -> Unit,
     /** 「常规任务」：后台这一屏的常驻入口，与桌面端左栏那一项同一个位置。 */
     onRoutines: () -> Unit,
+    /** 「记忆」：队伍的长期账本，与「常规任务」并排。 */
+    onMemory: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     // 三档：进行中 / 待你 / 已完成。手机屏窄，标签放不下一排就换成可点的文字行。
@@ -1445,6 +1448,7 @@ private fun BackendScreen(
             // 它是一个独立的一屏，不是页签 —— 进去读一次，退回来还是后台这一档。
             // 桌面端它也是后台栏里的一项（nav.go 的 navRoutine），两边进的是同一件事。
             TextButton(onClick = onRoutines) { Text("常规任务", color = palette.accent) }
+            TextButton(onClick = onMemory) { Text("记忆", color = palette.accent) }
             TextButton(onClick = onCrew) { Text("队伍", color = palette.accent) }
         }
         val allTickets = conversation?.tickets.orEmpty()
@@ -1739,6 +1743,195 @@ private fun RoutineRow(item: RoutineItem, conversation: Conversation?, palette: 
         )
         if (whens.isNotEmpty()) {
             Text(whens, fontSize = 11.sp, color = palette.faint, maxLines = 1)
+        }
+    }
+}
+
+/**
+ * 「记忆」：队伍长期记得什么 —— 主人能看、能改、能忘。
+ *
+ * 三态和「常规任务」同一套：读不到说读不到，读得到但没有说还没有，
+ * 只有 `live` 才逐条画。忘掉不删行，所以忘过的条目仍留在账本里，
+ * 只是不再进它下一次开口时的上下文。
+ *
+ * 与桌面端记忆栏同一份契约（`GET/POST /api/mobile/memory`），同一句小结。
+ */
+@Composable
+private fun MemoryScreen(
+    client: CrewClient,
+    palette: CrewPalette,
+    onBack: () -> Unit,
+) {
+    // null 表示还没读回来。读失败时 view 也是 null，另有 problem 说明为什么。
+    var view by remember { mutableStateOf<MemoryView?>(null) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(reload) {
+        view = null
+        problem = null
+        try {
+            view = client.memory()
+        } catch (error: Exception) {
+            if (error !is CancellationException) problem = error.message
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(palette.card)
+                .padding(start = 6.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = onBack) { Text("返回", color = palette.accent) }
+            Text("记忆", fontSize = 20.sp, fontWeight = FontWeight(660), color = palette.ink)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { reload += 1 }) { Text("重读", color = palette.accent) }
+        }
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+
+        val loaded = view
+        if (loaded == null) {
+            // 读失败先说读失败：那时说「正在读」是句假话，说「还没有」是编的。
+            val unreadable = problem != null
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(16.dp)
+                    .background(palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    if (unreadable) MemoryCopy.UNREADABLE_TITLE else MemoryCopy.READING,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight(600),
+                    color = palette.muted,
+                )
+                if (unreadable) {
+                    // 队伍那句话原样写出来：可能是 401、也可能是 503，不粉饰成「读不到」。
+                    Text(problem ?: MemoryCopy.UNREADABLE_BODY, fontSize = 12.sp, lineHeight = 19.sp, color = palette.danger)
+                }
+            }
+            return@Column
+        }
+
+        if (!loaded.live || loaded.items.isEmpty()) {
+            val unreadable = !loaded.live
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(16.dp)
+                    .background(palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    if (unreadable) MemoryCopy.UNREADABLE_TITLE else MemoryCopy.EMPTY_TITLE,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight(600),
+                    color = palette.muted,
+                )
+                Text(
+                    when {
+                        unreadable -> loaded.reason.ifBlank { MemoryCopy.UNREADABLE_BODY }
+                        else -> MemoryCopy.EMPTY_BODY
+                    },
+                    fontSize = 12.sp, lineHeight = 19.sp, color = palette.faint,
+                )
+            }
+            return@Column
+        }
+
+        Text(
+            MemoryCopy.summary(loaded),
+            fontSize = 11.sp,
+            color = palette.faint,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(loaded.items, key = { it.name }) { item ->
+                MemoryRow(
+                    item = item,
+                    palette = palette,
+                    onForget = {
+                        scope.launch {
+                            try {
+                                client.forgetMemory(item.name)
+                                reload += 1
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                problem = error.message
+                            }
+                        }
+                    },
+                )
+            }
+        }
+        // 脚注钉在列表下面：它说的不是某一条，是整本账的性质。
+        Text(
+            MemoryCopy.LIVE_ONLY,
+            fontSize = 11.sp,
+            lineHeight = 17.sp,
+            color = palette.faint,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        )
+    }
+}
+
+/**
+ * 账本里的一条：标题、正文首段、谁记得 · 来源 · 何时，以及「忘掉」。
+ *
+ * 忘掉的条目整行压暗并标一个「已忘掉」：它们仍在账本里（不删行），
+ * 但不再进它下次开口时的上下文 —— 这一点必须看得见，否则「忘了没忘」没人说得清。
+ */
+@Composable
+private fun MemoryRow(item: MemoryItem, palette: CrewPalette, onForget: () -> Unit) {
+    var confirm by remember(item.name) { mutableStateOf(false) }
+    val faded = !item.active
+    Column(
+        modifier = Modifier.fillMaxWidth()
+            .background(palette.card, RoundedCornerShape(10.dp))
+            .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                MemoryCopy.title(item),
+                fontSize = 13.sp,
+                fontWeight = FontWeight(620),
+                color = if (faded) palette.faint else palette.ink,
+                modifier = Modifier.weight(1f),
+            )
+            if (!item.active) {
+                Text("已忘掉", fontSize = 10.sp, color = palette.faint)
+            }
+        }
+        // 正文只取第一段：这一条是给主人确认用的，不是让人读文档。
+        val body = item.body.split(Regex("\\n\\s*\\n")).firstOrNull()?.trim().orEmpty()
+        if (body.isNotEmpty()) {
+            Text(
+                body,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+                color = if (faded) palette.faint else palette.muted,
+                maxLines = 4,
+            )
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(MemoryCopy.detail(item), fontSize = 11.sp, color = palette.faint, maxLines = 1, modifier = Modifier.weight(1f))
+            if (item.active) {
+                // 两步：忘掉是不可撤销的（不删行、但不再用），点一下就该生效。
+                TextButton(onClick = { if (confirm) onForget() else confirm = true }) {
+                    Text(if (confirm) "确认忘掉？" else "忘掉", fontSize = 11.sp,
+                        color = if (confirm) palette.danger else palette.accent)
+                }
+            }
         }
     }
 }

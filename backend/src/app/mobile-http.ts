@@ -13,6 +13,8 @@ import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
 import type { RoutinesView } from './routines.ts'
+import type { MemoryView } from './views/memory.ts'
+import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
 
@@ -33,6 +35,10 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   outputs?: (tickets: readonly OutputsTicket[]) => Promise<OutputsView>
   /** 「常规任务」：把 KV 里的那张定时账本合成一栏；宿主没接时路由如实说读不到。 */
   routines?: () => Promise<RoutinesView>
+  /** 记忆：读一栏；`forget` / `edit` 是主人亲手改账本。宿主没接时路由如实说读不到。 */
+  memories?: (options: { bot?: string }) => Promise<MemoryView>
+  forgetMemory?: (name: string) => boolean
+  editMemory?: (name: string, patch: { description?: string; body?: string; importance?: number }) => boolean
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
   steer?: (ticketId: string, requestId: string, text: string) => Promise<boolean>
   /** 一条模型路由支持哪些推理档位；不支持的宿主可以不给。 */
@@ -305,6 +311,8 @@ const OPERATIONS = {
   outputs: { methods: ['GET'] },
   // 「常规任务」：定时要做的事的账本。这一轮只读，不改账。
   routines: { methods: ['GET'] },
+  // 记忆：主人能看、能改、能忘。忘掉只翻状态，不删行。
+  memory: { methods: ['GET', 'POST'] },
   // 桌面左栏要能「切模型」，切之前得先知道有哪些可选：一次读回 provider、模型和此刻在用的是哪个。
   models: { methods: ['GET'] },
   // 选了模型之后才知道它支持哪些推理档位：按 provider/model 现查。
@@ -405,7 +413,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
-      || operation === 'steer' || operation === 'outputs' || operation === 'routines') {
+      || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory') {
       await runtime.ready
       if (operation === 'routines') {
         // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
@@ -421,6 +429,41 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
             runner: 'none', reason: '常规任务暂时读不出来' })
         }
+      }
+      if (operation === 'memory') {
+        // 记忆账本：GET 读一栏，POST 改一条（`action`: forget / edit）。
+        const name = url.searchParams.get('bot')?.trim()
+        if (incoming.method === 'GET') {
+          const readMemory = runtime.memories?.bind(runtime)
+          if (!readMemory) return response(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 },
+            reason: '后端还没有接入记忆' })
+          try { return response(200, await readMemory(name ? { bot: name } : {})) }
+          catch { return response(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 }, reason: '记忆账本暂时读不出来' }) }
+        }
+        const raw = await incoming.text()
+        if (Buffer.byteLength(raw) > 32 * 1024) return response(413, { error: 'Request too large' })
+        let value: { action?: unknown; name?: unknown; description?: unknown; body?: unknown; importance?: unknown }
+        try { value = JSON.parse(raw) } catch { return response(400, { error: 'Invalid JSON' }) }
+        const target = typeof value?.name === 'string' ? value.name.trim() : ''
+        if (!target) return response(400, { error: 'name is required' })
+        // 只认记忆账本那个前缀下的名字：这是主人改账本，不是任意改 KV。
+        if (!target.startsWith('bot-')) return response(400, { error: 'No such memory' })
+        if (value.action === 'forget') {
+          const forget = runtime.forgetMemory?.bind(runtime)
+          if (!forget) return response(200, { ok: false, reason: '后端还没有接入记忆' })
+          return response(200, { ok: forget(target), name: target })
+        }
+        if (value.action === 'edit') {
+          const edit = runtime.editMemory?.bind(runtime)
+          if (!edit) return response(200, { ok: false, reason: '后端还没有接入记忆' })
+          const patch: { description?: string; body?: string; importance?: number } = {}
+          if (typeof value.description === 'string') patch.description = value.description
+          if (typeof value.body === 'string') patch.body = value.body
+          if (typeof value.importance === 'number') patch.importance = value.importance
+          try { return response(200, { ok: edit(target, patch), name: target }) }
+          catch (error) { return response(400, { error: error instanceof Error ? error.message : 'Invalid memory' }) }
+        }
+        return response(400, { error: 'action must be forget or edit' })
       }
       if (operation === 'outputs') {
         // 「产出」：worker 真正写过的文件。宿主没接这项能力时如实说「读不到」，
@@ -841,6 +884,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       // 常规任务：主人写下的定时账本（契约 §5.5）。这一轮只读，不能在这里改账。
       connection.fetch.register({ path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      // 记忆：主人的长期账本。GET 读一栏，POST 改一条（forget / edit）。
+      connection.fetch.register({ path: '/api/mobile/memory', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/takeover', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),

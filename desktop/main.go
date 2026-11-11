@@ -52,6 +52,8 @@ func newApp(client *Client) *app {
 		ticketOut: make(chan ticketOutputsResult, 4),
 		// 常规任务同理：不 make 的话这一栏会永远停在「正在读常规任务」。
 		routinesCh: make(chan routinesResult, 4),
+		// 记忆同理：不 make 的话这一栏会永远停在「正在读记忆」。
+		memoryCh: make(chan memoryResult, 4),
 		// perTicket 与 loadingTicket 按票建：结果条各记各的，同一张票一次只发一个请求。
 		perTicket:     map[string]*OutputsView{},
 		loadingTicket: map[string]bool{},

@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -197,11 +198,24 @@ type app struct {
 	routinesNote   string
 	routinesCh     chan routinesResult
 	loadingRoutine bool
+
+	// 记忆：右栏那一栏的长期账本（契约 §5.7）。memory 为 nil 表示还没读回来；
+	// 读不到时 memoryNote 是那句实话，不冒充「还没有记住什么」。
+	memory        *MemoryView
+	memoryNote    string
+	memoryCh      chan memoryResult
+	loadingMemory bool
 }
 
 // routinesResult 是一次读「常规任务」的结果。view 为 nil 时 note 说的是为什么读不到。
 type routinesResult struct {
 	view *RoutinesView
+	note string
+}
+
+// memoryResult 是一次读「记忆」整栏的结果。view 为 nil 时 note 说的是为什么读不到。
+type memoryResult struct {
+	view *MemoryView
 	note string
 }
 
@@ -560,6 +574,9 @@ func (s *app) drain(c *ui.Context) {
 				if s.navTab == navRoutine {
 					s.loadRoutines()
 				}
+				if s.navTab == navMemory {
+					s.loadMemory()
+				}
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
 				c.Invalidate()
 			}
@@ -746,6 +763,10 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.routinesCh:
 			s.loadingRoutine = false
 			s.routines, s.routinesNote = result.view, result.note
+			c.Invalidate()
+		case result := <-s.memoryCh:
+			s.loadingMemory = false
+			s.memory, s.memoryNote = result.view, result.note
 			c.Invalidate()
 		case result := <-s.ticketOut:
 			delete(s.loadingTicket, result.ticket)
@@ -2521,6 +2542,8 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 				s.outputsPane(c, p)
 			case navRoutine:
 				s.routinesPane(c, p)
+			case navMemory:
+				s.memoryPane(c, p)
 			default:
 				s.workPane(c, p)
 			}
@@ -3049,6 +3072,195 @@ func (s *app) routinesPane(c *ui.Context, p Palette) {
 	if view.Runner != "live" {
 		ui.Text(c, noSchedulerNote).FontSize(FontTiny).TextColor(p.Faint)
 	}
+}
+
+// loadMemory 读一遍右栏「记忆」。记忆会被别人写：手机上的「忘掉」、某个 worker 收尾时的结论。
+// 打开这一栏和整栏刷新时都重读一次；在途时不叠第二个请求。
+func (s *app) loadMemory() {
+	if s.client == nil {
+		s.memoryNote = "还没连上队伍，读不到记忆"
+		return
+	}
+	if s.loadingMemory {
+		return
+	}
+	s.loadingMemory = true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := s.client.Memory(ctx, "")
+		result := memoryResult{view: view}
+		if err != nil {
+			// 读失败与「没有记忆」是两件事：这条 note 会原样显示，别写成「还没有」。
+			result.note = "读不到记忆：" + err.Error()
+		}
+		s.memoryCh <- result
+		s.wake()
+	}()
+}
+
+// forgetMemory 让队伍忘掉一条，然后重读。忘掉只翻状态，不删行 —— 所以这里没有「撤销」，
+// 但账本里那条还在，说得出「它曾经这么以为了」。
+func (s *app) forgetMemory(name string) {
+	if s.client == nil || name == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := s.client.ForgetMemory(ctx, name); err != nil {
+			s.memoryCh <- memoryResult{note: "忘掉没成功：" + err.Error()}
+			s.wake()
+			return
+		}
+		s.loadMemory()
+	}()
+}
+
+// memoryPane 是右栏「记忆」那一栏（契约 §5.7）。
+//
+// 三种情况分开说，与产出、常规任务同一套：
+// - live：逐条画。标题、正文首段、谁记得 · 来源 · 何时，以及「忘掉」。
+// - empty：读得到、确实没有 —— 画空态，不编一条假记忆。
+// - unavailable / 读失败：说「读不到」，绝不说「没有」。
+func (s *app) memoryPane(c *ui.Context, p Palette) {
+	_, name := navLabel(navMemory)
+	ui.Text(c, name).FontSize(FontTitle).FontWeight(WeightTitle).TextColor(p.Ink)
+
+	view := s.memory
+	if view == nil {
+		line := "正在读记忆…"
+		if s.memoryNote != "" {
+			line = s.memoryNote
+		} else if s.problem != "" {
+			line = "还没连上，读不到记忆"
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, line).FontSize(FontSmall).TextColor(p.Faint)
+		})
+		return
+	}
+
+	if view.State != "live" || len(view.Items) == 0 {
+		title, body := emptyCopy(navMemory)
+		if view.State != "empty" {
+			title = "读不到记忆"
+			body = view.Reason
+			if body == "" {
+				body = "后端没有说原因，这一栏现在是空的"
+			}
+		} else if view.Reason != "" {
+			body = view.Reason
+		}
+		ui.Column(c).FillWidth().Gap(6).Padding(14).Radius(RadiusCard).
+			BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+			ui.Text(c, title).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(p.Muted)
+			ui.Text(c, body).FontSize(FontSmall).TextColor(p.Faint)
+		})
+		return
+	}
+
+	ui.Text(c, memorySummary(*view)).FontSize(FontSmall).TextColor(p.Faint)
+	ui.Scroll(c).Grow(1).FillWidth().Children(func() {
+		ui.Column(c).Gap(6).Children(func() {
+			for _, item := range view.Items {
+				s.memoryRow(c, p, item)
+			}
+		})
+	})
+	// 脚注钉在列表下面：它说的不是某一条，是整本账的性质。
+	ui.Text(c, memoryNote).FontSize(FontTiny).TextColor(p.Faint)
+}
+
+// memoryNote 是这一栏必须说的那句实话：忘掉不删行，只是不再进它下一次开口的上下文。
+const memoryNote = "忘掉的条目不删，只是不再进它下一次开口时的上下文。"
+
+// memorySummary 是栏头那行字：记得几条、忘掉几条、被替代几条。都在用的时候只写第一条。
+func memorySummary(view MemoryView) string {
+	parts := []string{}
+	if view.Counts.Active > 0 {
+		parts = append(parts, "记得 "+strconv.Itoa(view.Counts.Active)+" 条")
+	}
+	if view.Counts.Forgotten > 0 {
+		parts = append(parts, "忘掉 "+strconv.Itoa(view.Counts.Forgotten))
+	}
+	if view.Counts.Superseded > 0 {
+		parts = append(parts, "被替代 "+strconv.Itoa(view.Counts.Superseded))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// memoryRow 画一条记忆。忘掉的整行压暗并标「已忘掉」：它们仍在账本里，只是不再被用。
+func (s *app) memoryRow(c *ui.Context, p Palette, item MemoryItem) {
+	faded := !item.Active()
+	ink, body := p.Ink, p.Muted
+	if faded {
+		ink, body = p.Faint, p.Faint
+	}
+	ui.Column(c).FillWidth().Gap(4).Padding(12).Radius(RadiusCard).
+		BorderWidth(1).BorderColor(p.Line).Background(p.Card).Children(func() {
+		ui.Row(c).FillWidth().Children(func() {
+			ui.Text(c, memoryTitle(item)).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(ink).Grow(1)
+			if faded {
+				ui.Text(c, "已忘掉").FontSize(FontTiny).TextColor(p.Faint)
+			}
+		})
+		if brief := memoryBrief(item.Body); brief != "" {
+			ui.Text(c, brief).FontSize(FontSmall).TextColor(body)
+		}
+		ui.Row(c).FillWidth().Children(func() {
+			ui.Text(c, memoryDetail(item)).FontSize(FontTiny).TextColor(p.Faint).Grow(1)
+			if item.Active() {
+				// 忘掉不可撤销（不删行、但不再用），所以它是一次就生效的按钮，不做二次确认的假把式。
+				ui.Button(c, "忘掉").OnClick(func() { s.forgetMemory(item.Name) })
+			}
+		})
+	})
+}
+
+// memoryTitle 是这一条的抬头：描述，没有描述就用正文第一句，再没有就用名字。
+func memoryTitle(item MemoryItem) string {
+	if strings.TrimSpace(item.Description) != "" {
+		return item.Description
+	}
+	if brief := memoryBrief(item.Body); brief != "" {
+		return brief
+	}
+	return item.Name
+}
+
+// memoryBrief 取正文第一段：卡片上给的是「它记住了什么」，不是让人读文档。
+func memoryBrief(body string) string {
+	for _, part := range strings.Split(body, "\n\n") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			if r := []rune(trimmed); len(r) > 120 {
+				return string(r[:120]) + "…"
+			}
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// memoryDetail 是副行：谁记得、谁写的、记于何时。缺失的项不占位。
+func memoryDetail(item MemoryItem) string {
+	who := item.BotID
+	if who == "" {
+		who = "全队"
+	}
+	from := "队伍记的"
+	switch {
+	case strings.HasPrefix(item.Origin, "person:"):
+		from = "你说的"
+	case strings.HasPrefix(item.Origin, "ticket:"):
+		from = "工单结论"
+	}
+	parts := []string{who, from}
+	if item.Updated > 0 {
+		parts = append(parts, time.Unix(item.Updated, 0).Format("1 月 2 日"))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // noSchedulerNote 是这一栏必须说的那句实话：账是账，没有人会按点去跑它。

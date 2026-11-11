@@ -80,6 +80,13 @@ export interface ExecutorHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
+  /**
+   * 开口前取一小片相关记忆，拼成注入给 worker 的那段话。
+   *
+   * 只在上工第一次交底时注入：后来的投喂是一个补丁、一句追问，塞一段「队伍记得」反而把它冲散。
+   * 没有相关记忆时返回 `''`，调用方不塞空话。
+   */
+  recall?(ticket: Ticket, query: string): string
 }
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
@@ -486,10 +493,17 @@ export class DshExecutor implements Executor {
         ...(read ? { assignment_chars: chars, assignment_read: read } : {}), ...(card ? { trigger: card } : {}),
         ...(batch.length ? { batch } : {}), ...retried })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
-    await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
+    // 记忆召回：只在真正开工的第一句话里带上，且只在有相关记忆时。召回失败不挡开工 —— 没记起来是缺上下文，不是不能干活。
+    const remembered = told ? '' : this.memory(ticket, `${ticket.title} ${source?.text ?? ''}`)
+    const delivered = remembered ? `${text}\n\n${remembered}` : text
+    await this.host.sessions.prompt(sessionId, requestId, delivered, 'queue',
       () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },
       () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
+  }
+  /** 召回一小片记忆，出错就当没记起来（不抛、不挡 launch）。 */
+  private memory(ticket: Ticket, query: string): string {
+    try { return this.host.recall?.(ticket, query) ?? '' } catch { return '' }
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */
   private ticketOf(agent: Agent): Ticket | undefined {

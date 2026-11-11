@@ -610,6 +610,62 @@
 `queued` 按「有没有回复 + 90 秒窗口」判，未读按「有没有被读走」判。两个数会不一样，
 两个都要各自的定义，谁也不冒充谁。
 
+## 5.7 记忆：`GET/POST /api/mobile/memory`
+
+记忆是队伍的**长期账本**：它记得主人定下的规矩、办完的事的结论。与工单、Session 都分开 ——
+工单结束、会话归档，记忆还在。它回答的是「这支队伍记得什么」，不是「它现在在干什么」。
+
+写侧有三条硬规矩：
+
+1. **只记认得出来的**。主人的话命中「定下来的规矩」的句式（以后都…／记住…／我习惯…／别…再造句）才记；
+   工单只在 `ready` / `dropped` 收尾时记结论。`progress` / `waiting` 是过程，不进账本 ——
+   账本一脏，下次召回的全是废话，比没有记忆更糟。
+2. **读的时候只取一小片**。上工时按中文二元组相关度 + 新鲜度取 top-k，拼成不超过 1200 字的一段，
+   跟在开工那句话后面。**不重放整段历史** —— 这正是拆掉上下文天花板的那一刀。
+3. **不上 Hub**。本地提炼的一条都 `to_hub: false`；上行走用户已有的 `local_dream` 直通源，不在这一层二次蒸馏。
+
+```jsonc
+{
+  "items": [
+    {
+      "name": "bot-lead-person-以后都用-pnpm",  // 记忆名，也是 KV 键的后半段
+      "bot_id": "lead",                        // 归哪位 Bot；调用与召回都按它分命名空间
+      "description": "以后都用 pnpm，不要用 npm", // 单行标题
+      "body": "主人原话：「以后都用 pnpm」\n\n记于 …",  // 正文，可多段
+      "type": "feedback",                      // user | feedback | project | reference
+      "importance": 5,                         // 1..5，只影响同分时的次序
+      "state": "active",                       // active | forgotten | superseded
+      "created": 1794000000,                   // 秒
+      "updated": 1794000000,                   // 秒
+      "origin": "person:owner",                // person:<id> | ticket:<id> | host
+      "source": { "ticket_id": "t1", "at": "2026-11-11T09:00:00.000Z" },
+      "to_hub": false                          // 这一条会不会上行到中枢
+    }
+  ],
+  "state": "live",                             // live | empty | unavailable
+  "counts": { "active": 1, "forgotten": 0, "superseded": 0 },
+  "reason": "…"                                // 只在 state 不是 live 时出现
+}
+```
+
+`state` 与产出（§5.4）、常规任务（§5.5）同一套规矩，**不许合并**：`empty` 是「读得到、确实没有」，
+`unavailable` 是「读不到」，后者只能说「读不出来」，不得说「还没有记住什么」。
+
+判定规则：
+
+- **忘掉不删行**。`POST {"action":"forget","name":…}` 把 `state` 翻成 `forgotten`：
+  这条不再进它下一次开口时的上下文，但仍留在账本里 —— 删掉就再也答不出「它曾经这么以为了」。
+- **纠错写新条**。同一条事实换个说法写进来，旧条翻成 `superseded`，不做硬删；
+  同一 `dedupe_key` 且正文没变的重复写入是**幂等的**，重试一轮不会让账本变长。
+- **种命名空间**。去重只在同一位 Bot 内生效：两位 Bot 都记「主人要求先说结论」时各留一条，
+  不许互相顶掉 —— 记忆是按人分的。
+- `created` / `updated` 是**秒**（插件 frontmatter 的惯例）。客户端自己按本地时区显示，不自己编日期。
+- `importance` 只影响同分时次序，不是「重要就一定排第一」；相关度才是主项。
+
+改账：`POST /api/mobile/memory`，body 是 `{"action":"forget"|"edit","name":…, "description"?, "body"?, "importance"?}`。
+只认 `bot-` 开头的记忆名 —— 这是让主人改账本，不是任意改 KV。描述不能多行、正文不能为空，
+违反时返回 400 并给一句人话。
+
 ## 6. 错误码
 
 | code | HTTP | 含义 |

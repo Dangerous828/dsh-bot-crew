@@ -395,6 +395,69 @@ func (c *Client) Routines(ctx context.Context) (*RoutinesView, error) {
 	return &view, nil
 }
 
+// MemoryItem 是队伍长期记得的一条事。
+//
+// State 与「常规任务」同形：active 参与它下一次开口时的上下文，forgotten / superseded 不参与，
+// 但仍留在账本里 —— 忘掉只翻状态，不删行。
+type MemoryItem struct {
+	Name        string `json:"name"`
+	BotID       string `json:"bot_id"`
+	Description string `json:"description"`
+	Body        string `json:"body"`
+	Type        string `json:"type"`
+	Importance  int    `json:"importance"`
+	State       string `json:"state"`
+	Created     int64  `json:"created"`
+	Updated     int64  `json:"updated"`
+	Origin      string `json:"origin,omitempty"`
+	ToHub       bool   `json:"to_hub"`
+}
+
+// Active 表示这条还参与召回。
+func (m MemoryItem) Active() bool { return m.State == "active" }
+
+// MemoryCounts 是整本账的分档计数。
+type MemoryCounts struct {
+	Active     int `json:"active"`
+	Forgotten  int `json:"forgotten"`
+	Superseded int `json:"superseded"`
+}
+
+// MemoryView 是「记忆」那一栏的一份快照。
+//
+// State 与产出、常规任务同一套三态：live 有账；empty 读得到、确实没有；unavailable 读不到。
+type MemoryView struct {
+	Items  []MemoryItem `json:"items"`
+	State  string       `json:"state"`
+	Counts MemoryCounts `json:"counts"`
+	Reason string       `json:"reason,omitempty"`
+}
+
+// Memory 读「记忆」这一栏；bot 非空时只看这一位。
+func (c *Client) Memory(ctx context.Context, bot string) (*MemoryView, error) {
+	path := "/api/mobile/memory"
+	if bot != "" {
+		path += "?bot=" + url.QueryEscape(bot)
+	}
+	var view MemoryView
+	if err := c.do(ctx, http.MethodGet, path, nil, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
+// ForgetMemory 让队伍忘掉一条。只翻状态，不删行。
+func (c *Client) ForgetMemory(ctx context.Context, name string) error {
+	body := map[string]string{"action": "forget", "name": name}
+	return c.do(ctx, http.MethodPost, "/api/mobile/memory", body, nil)
+}
+
+// EditMemory 改一条的标题与正文。
+func (c *Client) EditMemory(ctx context.Context, name, description, text string) error {
+	body := map[string]string{"action": "edit", "name": name, "description": description, "body": text}
+	return c.do(ctx, http.MethodPost, "/api/mobile/memory", body, nil)
+}
+
 // BackendStatus is the crew's own health, as the surface reports it.
 type BackendStatus struct {
 	Runtime string `json:"runtime"`

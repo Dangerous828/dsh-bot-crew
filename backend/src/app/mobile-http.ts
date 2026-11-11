@@ -588,6 +588,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           let retryable = false
           try { retryable = canRetry(ticket) } catch { retryable = false }
           const botId = ticketBot(ticket)
+          // 只在下发「等你答一个问题」时带上那句问题与它的备选答案：delivery / review / blocked / failed
+          // 也是等人，但等的不是一个能二选一的问题，编一组选项出来就是假按钮。
+          const asking = stage.stage === 'person' && stage.action === 'answer' && ticket.attention
           return { id: ticket.id, title: ticket.title,
             // `state` 是给人看的词（终态用 outcome，进行中用 stage）；放哪个页签、能不能重试
             // 由下面两个布尔决定，客户端不再自己解释词表。
@@ -597,7 +600,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             retryable,
             // Lets the phone place a task in the conversation by time and say whether it waits for the owner.
             created_at: ticket.createdAt, updated_at: ticket.updatedAt,
-            ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}) }
+            ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}),
+            // 问题和选项成对下发，见 docs/00-contract §5：没有 options 就是只有一个自写框。
+            ...(asking ? { question: ticket.attention!.question,
+              ...ticket.attention!.options?.length ? { options: ticket.attention!.options } : {} } : {}) }
         }),
         // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
         // Withdrawing it means the crew has not read it, which is what the phone needs to offer.

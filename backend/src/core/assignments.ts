@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
-import type { ReportState, Ticket } from './model.ts'
+import type { AttentionOption, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -13,6 +13,8 @@ export interface WorkerReport {
   summary: string
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
+  /** Answers the question offers, in reading order; omit for a written answer only, and they replace the pending ones. */
+  options?: AttentionOption[]
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
   askedBy?: string
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
@@ -101,6 +103,11 @@ export class Assignments extends EnginePart {
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     if (report.question && (report.state === 'ready' || report.answers)) throw new UserError('questionWithResult')
     if (report.askedBy && !report.question) throw new UserError('askerWithoutQuestion')
+    // Answers a person can tap belong to the question they answer: ids stay unique within it, labels stay one line.
+    if (report.options?.length && !report.question) throw new UserError('optionsWithoutQuestion')
+    if (report.options?.length && (report.options.length < 2 || report.options.length > 4
+      || !report.options.every(option => /^[a-z0-9_-]{1,40}$/.test(option.id) && option.label.trim() && option.label.length <= 80)
+      || new Set(report.options.map(option => option.id)).size !== report.options.length)) throw new UserError('tooManyOptions')
     const person = (id: string, channel: boolean) => {
       const trigger = this.repo.triggers.get(id)
       return !!trigger?.human && (!channel || !!trigger.channel) && this.reaches(ticket, trigger, false)
@@ -112,8 +119,16 @@ export class Assignments extends EnginePart {
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()
     const previous = ticket.attention
-    const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
-    const asked = report.question && report.question !== previous?.question ? ask(report.question) : previous
+    const ask = (question: string) => ({
+      // The options are part of the id as well, so two reports in the same millisecond that offer different answers
+      // still withdraw the older queued question instead of silently sharing its id.
+      id: key('attention', ticketId, question, JSON.stringify(report.options ?? []), at), question,
+      ...(report.askedBy ? { triggerId: report.askedBy } : {}), ...(report.options?.length ? { options: report.options } : {}) })
+    // Options are part of the question's identity: a report that keeps the question may still offer different answers,
+    // and a person's reply goes back as those answers' words, so replacing them must replace the queued question too.
+    const changed = !!report.question && (report.question !== previous?.question
+      || JSON.stringify(report.options ?? []) !== JSON.stringify(previous?.options ?? []))
+    const asked = changed ? ask(report.question!) : previous
     const attention = report.question === null || report.state === 'ready' ? undefined : asked
     if (attention) ticket.attention = attention
     else delete ticket.attention

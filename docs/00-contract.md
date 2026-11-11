@@ -144,6 +144,36 @@
 - **未实现的审批能力不得虚构按钮或审批状态**。
 - 被撤回的消息不出现在 `items`，也不出现在 `queued`。
 
+### 等你决定：`tasks[].needs_person` · `question` · `options`
+
+后台卡在等某个人拍板时，`tasks` 里那一项除了 `needs_person`（`stage.action`，取值
+`delivery` / `answer` / `review` / `blocked` / `failed`）还会带上它当前在等的那句问题，
+以及这句话的备选答案 —— 画板上那条「等你决定」卡里的 A/B 就是从这儿来的：
+
+```jsonc
+{
+  "id": "tk-1",
+  "state": "person",              // 阶段（person / working / idle）或终态 outcome
+  "needs_person": "answer",       // 等你做的是哪一类：delivery | answer | review | blocked | failed
+  "question": "付款条款对不上。合同第 4 条写 30/70，客户 11 点的邮件说 50/50。两条路：按合同回，或者我改合同。",
+  "options": [                    // 可选；只在有 question 时出现
+    { "id": "contract-30-70", "label": "按合同 30/70 回客户" },
+    { "id": "accept-50-50", "label": "接受 50/50，我改合同" }
+  ]
+}
+```
+
+- `question` / `options` 是**同一条**工单待人工决定的问题；没有这个问题（`delivery` / `review` /
+  `blocked` / `failed` 这几种「等你」）时两个字段都不出现，前端只能说「为什么在等」，不得补一个空问题。
+- `options` 有且只有 2–4 条：`id` 在同一问题内唯一且稳定（[a-z0-9_-]{1,40}），`label` 是一句给人看的话（≤80 字）。
+  **缺省表示只有一个自写框** —— 前端不得自己编 A/B，也不得把 `question` 拆成选项。
+- 选项只是呈现，不是审批：回答仍走 §3 的 `POST /send`，`text` 里带上选中的 `label`
+  （前端可以前加 `@bot_id` 让它路由到那位 Bot）。网关不解析选项，也没有单独的「选选项」路由或字段；
+  撤回、排队、幂等全部按这条普通消息的规则算。
+- 问题被换掉（文本或选项不同）时后台重新下发整组 `options`，旧的一组随即作废；工单结束、
+  `human_action: null` 或 `ready` 报告清空问题，`question` 与 `options` 一起消失。
+  前端以最新一次时间线为准，不缓存旧选项。
+
 ### 撤回排队消息：`POST /api/mobile/withdraw`
 
 ```jsonc

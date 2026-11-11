@@ -116,6 +116,14 @@ type app struct {
 	withdrawError string
 	withdrawn     chan withdrawResult
 
+	// 点选「等你决定」卡上的选项。answers 是正在发的「票号|选项 id」，防止连点；
+	// answerNote 只说成没成，不冒充断连横幅。answerTicket 记着这句话是哪张票的：
+	// 消息流里可能同时挂着两张待决的卡，答了 A 不该在 B 上也说一句「已答」。
+	answers      map[string]bool
+	answerNote   string
+	answerTicket string
+	answered     chan answerResult
+
 	// 插队：把排队中的一句直接交给正在跑的 worker。
 	steering  map[string]bool
 	steerNote string
@@ -187,6 +195,14 @@ type pauseResult struct {
 type withdrawResult struct {
 	requestID string
 	err       error
+}
+
+// answerResult 是一次点选选项的结果。key 是「票号|选项 id」，带回来才知道该松开哪个按钮；
+// ticket 带回来，那句话只写在它自己那张卡上。
+type answerResult struct {
+	key    string
+	ticket string
+	err    error
 }
 
 // workResult 是哪张票的过程。没有票号就没法判断这份结果还该不该显示。
@@ -559,6 +575,17 @@ func (s *app) drain(c *ui.Context) {
 			// 只清掉「刚发出去的那一句」；用户在这期间又打了字就留着。
 			if s.input == text {
 				s.input = ""
+			}
+			c.Invalidate()
+		case result := <-s.answered:
+			// 发出去就重读一次：问题被答掉之后，这张卡要么换成新的一组选项，要么整张消失。
+			delete(s.answers, result.key)
+			s.answerTicket = result.ticket
+			if result.err != nil {
+				s.answerNote = "没答上：" + result.err.Error()
+			} else {
+				s.answerNote = "已按这个答了，队伍下一步会接上"
+				go s.refresh()
 			}
 			c.Invalidate()
 		case result := <-s.withdrawn:
@@ -1373,11 +1400,46 @@ func (s *app) pendingDecisions() []Task {
 	return out
 }
 
+// answer 是一条点选选项的回答。在这里就把它发出去，不经过输入框：
+// 画板上那两个 A/B 按钮是「直接答」，多一步「再按发送」就不像在回答了。
+//
+// answers 是正在发的那几条（键是「票号|选项 id」），挡住连点；
+// answerNote 只写这件事的结果，不冒充连接故障。
+func (s *app) answer(task Task, option AttentionOption) {
+	slot := answerSlot(task, option)
+	label := strings.TrimSpace(option.Label)
+	// 点名那一位，回答才落在这段对话里；没有署名对象时就不硬加一个「@队伍」。
+	text := label
+	if task.BotID != "" {
+		text = "@" + s.nameOf(task.BotID) + " " + label
+	}
+	if s.client == nil || label == "" || s.answers[slot] {
+		return
+	}
+	if s.answers == nil {
+		s.answers = make(map[string]bool)
+	}
+	// 通道在 newApp 里 make；这里兜一下手工构造的 app，免得发送永久阻塞。
+	if s.answered == nil {
+		s.answered = make(chan answerResult, 4)
+	}
+	s.answers[slot] = true
+	s.answerNote, s.answerTicket = "", task.ID
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation))
+		s.answered <- answerResult{key: slot, ticket: task.ID, err: err}
+		s.wake()
+	}()
+}
+
 // pendingCard 是「等你决定」：赭色边、浅暖底、两个选项 + 一句自写。
 //
 // 画板的意图是「后台已经在等，不是在聊天里问」—— 所以它是一个能直接答的块，
-// 不是一段叙述。后端目前只给「在等什么」（needs_person），不给选项列表，
-// 所以这里只摆出现在真有的东西：等的原因 + 能不能现在回。不编 A/B 选项。
+// 不是一段叙述。选项由后端随问题一起下发（契约 §5 的 question/options）：
+// 有就画成 A/B 这类按钮，点一下就把那句话当回答发出去；没有就只留
+// 「自己写一句」。这里不编选项 —— 后端没给，就没有第二条路。
 func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 	ui.Row(c).FillWidth().Gap(11).AlignItems(ui.Start).PaddingY(6).Children(func() {
 		// 与 Bot 消息同一列头像：这张卡是那位 Bot 在等你。
@@ -1404,9 +1466,35 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 					ui.Text(c, "等你决定").FontSize(FontSmall).FontWeight(WeightFigure).
 						LetterSpacing(0.35).TextColor(p.Warn)
 				})
-				ui.Text(c, task.NeedsPerson).FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
+				// 后端给了问题就读问题；没给（delivery/review/blocked/failed 那几种「等你」）
+				// 才退回 needs_person。needs_person 存的是类别，直接画出来是英文单词。
+				if task.Question != "" {
+					ui.Text(c, task.Question).FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
+				} else {
+					ui.Text(c, "这张票卡在等你，原因：" + waitingWord(task.NeedsPerson)).
+						FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
+				}
 				if waited := s.waitedFor(task); waited != "" {
 					ui.Text(c, "已经等了 "+waited).FontSize(FontHairline).TextColor(p.Faint)
+				}
+				// A/B：画板里每个选项一行，左边一个序号，点一下直接答。
+				for index, option := range task.Options {
+					sent := s.answers[answerSlot(task, option)]
+					ui.Row(c).FillWidth().PaddingX(11).PaddingY(9).Radius(RadiusItem).
+						Background(p.Card).BorderWidth(1).BorderColor(p.WarnEdge).
+						Gap(8).AlignItems(ui.Baseline).Cursor(ui.CursorPointer).
+						Children(func() {
+							mark := optionMark(index)
+							if sent {
+								mark = "✓"
+							}
+							ui.Text(c, mark).FontSize(FontBody).FontWeight(WeightFigure).TextColor(p.Accent)
+							ui.Text(c, option.Label).FontSize(FontBody).LineHeight(1.45).TextColor(p.Ink)
+						}).OnClick(func() { s.answer(task, option) })
+				}
+				// 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
+				if s.answerTicket == task.ID && s.answerNote != "" {
+					ui.Text(c, s.answerNote).FontSize(FontHairline).TextColor(p.Faint)
 				}
 				// 回一句就落在同一段对话里：直接聚焦输入框，不再多造一个输入层。
 				ui.Row(c).Gap(7).Children(func() {
@@ -1433,6 +1521,36 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 			})
 		})
 	})
+}
+
+// answerSlot 是「这张票上的这个选项」的标识：正在发的按钮和结果回来时按它对应上。
+func answerSlot(task Task, option AttentionOption) string { return task.ID + "|" + option.ID }
+
+// optionMark 是选项左边那个字母：A、B、C…。超过 26 个就退回数字，
+// 但后端最多给四个，这条只是兜底。
+func optionMark(index int) string {
+	if index >= 0 && index < 26 {
+		return string(rune('A' + index))
+	}
+	return fmt.Sprintf("%d", index+1)
+}
+
+// waitingWord 把 needs_person 的类别说成人话。这些类别是后台的阶段动作，
+// 不是给人读的句子 —— 没有问题时，卡上至少要说清在等哪一类事。
+func waitingWord(action string) string {
+	switch action {
+	case "delivery":
+		return "上一轮回话没送到，需要你处理"
+	case "review":
+		return "活干完了，等你过目"
+	case "blocked":
+		return "做不下去，要你松开"
+	case "failed":
+		return "跑失败了，要你处理"
+	case "answer":
+		return "在等你回一句话"
+	}
+	return "在等你回一句话"
 }
 
 func (s *app) message(c *ui.Context, p Palette, message Message) {

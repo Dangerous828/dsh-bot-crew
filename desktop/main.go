@@ -45,6 +45,7 @@ func newApp(client *Client) *app {
 		screenNoteCh:  make(chan string, 4),
 		screenCh:      make(chan *ScreenView, 4),
 		withdrawn:     make(chan withdrawResult, 4),
+		answered:      make(chan answerResult, 4),
 		steerDone:     make(chan steerResult, 4),
 		pauseDone:     make(chan pauseResult, 2),
 		botSaved:      make(chan botSaveResult, 2),

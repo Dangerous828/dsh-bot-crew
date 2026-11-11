@@ -90,6 +90,9 @@ data class CrewPalette(
     val field: Color,
     // 删除行的浅橙底（画板亮色 #F6EEE6）。和 warmBase 不同：那个是「等你决定」的卡底。
     val warnSoft: Color,
+    // 工单卡进度条的轨道底（画板亮色 #EFEBE5 / 暗色 #2A2830，与桌面端 theme.go 的 Track 同值）。
+    // 填充直接复用 accent。没有计划时整条都不画，这块底色也就用不上。
+    val track: Color,
 )
 
 val LightPalette = CrewPalette(
@@ -100,6 +103,7 @@ val LightPalette = CrewPalette(
     accentSoft = Color(0xFFEAF1EC), line = Color(0xFFEDE8E1), hint = Color(0xFFA9A294),
     emptyEdge = Color(0xFFD9D3C9), emptyGlyph = Color(0xFFB8B1A5), segment = Color(0xFFEFEBE5),
     warmBase = Color(0xFFFDF9F4), warnEdge = Color(0xFFE9D9C9), warnSoft = Color(0xFFF6EEE6), field = Color(0xFFF3F0EA),
+    track = Color(0xFFEFEBE5),
 )
 
 val DarkPalette = CrewPalette(
@@ -112,6 +116,7 @@ val DarkPalette = CrewPalette(
     emptyEdge = Color(0xFF33313A), emptyGlyph = Color(0xFF928C82), segment = Color(0xFF1D1C21),
     warmBase = Color(0xFF241F1A), warnEdge = Color(0xFF4A3A28), warnSoft = Color(0xFF3A2A1C),
     field = Color(0xFF2A2830),
+    track = Color(0xFF2A2830),
 )
 
 /**
@@ -1474,7 +1479,31 @@ private fun TaskRow(ticket: WorkTicket, conversation: Conversation?, palette: Cr
     ) {
         Text(ticket.title, color = tint, fontSize = 13.sp)
         val owner = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name ?: ticket.botId
-        Text("${stateWord(ticket.state)} · $owner", color = palette.muted, fontSize = 11.sp)
+        // 第几步接在状态行的末尾；空段（没 plan / 没 bot_id）不拼，规则见 CrewWire.ticketDetail。
+        val detail = ticketDetail(stateWord(ticket.state), owner, stepOf(ticket))
+        Text(detail, color = palette.muted, fontSize = 11.sp)
+        // 进度条：只在后端给了计划（total_steps > 0）时画，与桌面端 ui.go 的 progressOf 同一口径 ——
+        // 分母来自计划，不拿读到的条数顶替。没有计划就空着，不画一根永远停在 100% 的假条。
+        // 零步走完时只画轨道：宽度 0 的填充在某些引擎上仍会留下一个点。
+        val (done, total) = progressOf(ticket)
+        if (total > 0) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp)
+                    .height(3.dp)
+                    .background(palette.track, RoundedCornerShape(2.dp)),
+            ) {
+                if (done > 0) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(done.toFloat() / total.toFloat())
+                            .height(3.dp)
+                            .background(palette.accent, RoundedCornerShape(2.dp)),
+                    )
+                }
+            }
+        }
         if (ticket.needsPerson.isNotEmpty()) {
             // needs_person 存的是类别（answer / review / …），直接画出来是个英文单词。
             Text(

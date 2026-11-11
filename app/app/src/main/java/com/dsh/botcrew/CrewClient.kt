@@ -30,8 +30,24 @@ class CrewClient(
             }
         }
 
+    /**
+     * 把读回来的正文解析成对象，放在后台线程做。
+     *
+     * read() 的网络已经在 IO 线程上，但解析（上面每个 wire 的 parse）原来落在调用方
+     * 所在的那条线程 —— 也就是主线程。时间线越长，一次 parseTimeline 就要在主线程上
+     * 建几十上百个 JSONObject 和同样多的 data class，正卡在人滑动的那一帧上。
+     * 解析是纯函数（只读字符串、不碰任何界面状态），挪到 Default 上去做的事一模一样，
+     * 只是不再占主线程的时间片。
+     *
+     * 用 Default 而不是 IO：IO 那一池是给「等着」的活（网络、磁盘）留的，
+     * 解析是实打实吃 CPU 的，占着 IO 线程会让下一次请求排队。
+     */
+    private suspend fun <T> parse(body: String, decode: (String) -> T): T =
+        withContext(Dispatchers.Default) { decode(body) }
+
     /** 拉整段对话。失败时抛出带人话的异常，界面直接显示。 */
-    suspend fun timeline(): Conversation = CrewWire.parseTimeline(read("/api/mobile/timeline", "GET"))
+    suspend fun timeline(): Conversation =
+        parse(read("/api/mobile/timeline", "GET"), CrewWire::parseTimeline)
 
     /** 发一条消息。requestId 由调用方生成并保留，重试时沿用。 */
     suspend fun send(text: String, mentions: List<String>, requestId: String) {
@@ -56,12 +72,13 @@ class CrewClient(
     }
 
     /** 可选模型目录：能连的 provider、每种的模型，以及每位成员当前的路由。 */
-    suspend fun models(): ModelCatalog = ModelWire.parseCatalog(read("/api/mobile/models", "GET"))
+    suspend fun models(): ModelCatalog =
+        parse(read("/api/mobile/models", "GET"), ModelWire::parseCatalog)
 
     /** 某个模型的推理档位。拉不到就抛错，界面照实说，不自己编档位。 */
     suspend fun efforts(provider: String, model: String): Efforts {
         val query = "?provider=" + URLEncoder.encode(provider, "UTF-8") + "&model=" + URLEncoder.encode(model, "UTF-8")
-        return ModelWire.parseEfforts(read("/api/mobile/efforts$query", "GET"))
+        return parse(read("/api/mobile/efforts$query", "GET"), ModelWire::parseEfforts)
     }
 
     /**
@@ -82,16 +99,16 @@ class CrewClient(
 
     /** 一张工单下的代理树。客户端只读，不据此维护状态。 */
     suspend fun agents(ticketId: String): List<AgentNode> =
-        AgentWire.parse(read("/api/mobile/agents?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"))
+        parse(read("/api/mobile/agents?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"), AgentWire::parse)
 
     /** 一张工单是怎么做出来的。读不到不算错：后台栏空着比报错好。 */
     suspend fun work(ticketId: String): List<WorkStep> =
-        WorkWire.parse(read("/api/mobile/work?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"))
+        parse(read("/api/mobile/work?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"), WorkWire::parse)
 
     /** 它此刻的屏幕：有活动快照就显示快照，没有时后端会给理由，界面照着写，不自己编。 */
     suspend fun screen(ticketId: String?): ScreenView {
         val query = if (ticketId.isNullOrBlank()) "" else "?ticket=" + URLEncoder.encode(ticketId, "UTF-8")
-        return ScreenWire.parse(read("/api/mobile/screen$query", "GET"))
+        return parse(read("/api/mobile/screen$query", "GET"), ScreenWire::parse)
     }
 
     /**
@@ -100,7 +117,7 @@ class CrewClient(
      */
     suspend fun outputs(ticketId: String): OutputsView {
         val query = "?ticket=" + URLEncoder.encode(ticketId, "UTF-8")
-        return OutputsWire.parse(read("/api/mobile/outputs$query", "GET"))
+        return parse(read("/api/mobile/outputs$query", "GET"), OutputsWire::parse)
     }
 
     /**

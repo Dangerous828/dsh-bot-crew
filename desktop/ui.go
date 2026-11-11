@@ -1454,8 +1454,11 @@ func (s *app) stream(c *ui.Context, p Palette) {
 			// 间距 20 是画板的节奏（每条消息之间一段呼吸），单条消息自己的
 			// 上下 PaddingY 只留一点点，两处都放大就会稀成一片。
 			ui.Column(c).PaddingX(MessageInset).PaddingY(10).Gap(20).Children(func() {
-				for _, message := range s.conversation.Messages {
-					s.message(c, p, message)
+				for index, message := range s.conversation.Messages {
+					// 同一张票的票号会挂在「收到」和「报结果」两条回复上。两条各画一遍，
+					// 屏幕上就是连着两条「1 个文件已放进产出」—— 看着像交了两回活。
+					// 只让这张票在时间线上的最后一条回复挂结果条，见 lastOfTicket。
+					s.message(c, p, message, lastOfTicket(s.conversation.Messages, index))
 				}
 				// 卡片的缩进已经在 message/subagentCard/pendingCard 里算好，
 				// 这里不再 PaddingX —— 外面加一次、里面再加一次就是双重缩进。
@@ -1824,7 +1827,43 @@ func waitingWord(action string) string {
 	return "在等你回一句话"
 }
 
-func (s *app) message(c *ui.Context, p Palette, message Message) {
+// lastOfTicket 说这条消息是不是「这张票的最后一条回复」，只有它才轮到挂结果条。
+//
+// 同一张票的票号会挂在好几条回复上（先一句「收到」、干完再一句「报结果」），
+// 每条各画一遍结果条，屏幕上就是连着两条「1 个文件已放进产出」—— 看着像交了两回活。
+// 规则：同一张票号，只让时间线上最后一条带它的回复挂结果条，之前的同票号消息不画。
+//
+// 判法只有「从这一条往后找」一件事：后面没有第二条带同票号的回复，这一条就是最后一条。
+// 不倒着排序、不按 at 比时间、更不看 id —— 顺序就是列表给的顺序，两端都照它办。
+//
+// 三条边界，与手机端 OutputsCopy.lastOfTicket 逐条对齐：
+//   - 自己发的话不挂结果条（两端都只在 Bot 的回复下面画），所以也不算「压住上面那条」；
+//   - 没有票号的这一条永远 false —— 绝不因为「前后都没票号」就替它认一张票；
+//   - 越界的下标返回 false，别让调用方一处写错就炸掉整屏。
+func lastOfTicket(messages []Message, index int) bool {
+	if index < 0 || index >= len(messages) {
+		return false
+	}
+	message := messages[index]
+	if message.Role != "agent" {
+		return false
+	}
+	ticket := message.ticketRef()
+	if ticket == "" {
+		return false
+	}
+	for _, later := range messages[index+1:] {
+		if later.Role != "agent" {
+			continue
+		}
+		if later.ticketRef() == ticket {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *app) message(c *ui.Context, p Palette, message Message, showResult bool) {
 	fromBot := message.Role == "agent"
 	// 画板的中栏是「头像 + 正文」的排版，不是「一排气泡」：
 	//
@@ -1873,7 +1912,8 @@ func (s *app) message(c *ui.Context, p Palette, message Message) {
 			}
 			// 结果条：这条话带票号、且那张票确实交了东西时才有（契约 §5.4）。
 			// 没有票号就什么都画 —— 按时间猜一张票会把别人的成果挂到这句话下面。
-			if fromBot {
+			// showResult 由 lastOfTicket 判：同一张票只挂在最后一条回复上，不重复画。
+			if fromBot && showResult {
 				s.resultBar(c, p, message)
 			}
 		})

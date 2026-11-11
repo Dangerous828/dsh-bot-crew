@@ -594,7 +594,10 @@ object CodeCopy {
             }
         }
         val summary = changeSummary(block).let { if (it.isEmpty()) "" else "，$it" }
-        return "${where}采用 $file 这段改动$summary，按这个改。"
+        // 没有文件名时 file 已经就是「这段改动」，模板里再跟一句会拼成
+        // 「采用 这段改动 这段改动，删 1 行」—— 同一个词说了两遍。
+        val target = if (file == THIS_CHANGE) file else "$file 这段改动"
+        return "${where}采用 $target$summary，按这个改。"
     }
 
     /** 增删行数说成人话；没有统计就什么也不说 —— 不编一个「加 0 行」。 */

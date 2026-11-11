@@ -50,7 +50,8 @@ func TestRoutinesDecodeWhatTheSurfaceSends(t *testing.T) {
 	view, err := routineView(t, server)
 	if err != nil {
 		t.Fatalf("Routines returned an error: %v", err)
-	}	if view.State != "live" || len(view.Items) != 2 {
+	}
+	if view.State != "live" || len(view.Items) != 2 {
 		t.Fatalf("state=%q items=%d", view.State, len(view.Items))
 	}
 	if view.Items[0].Title != "每天站会" || view.Items[0].BotID != "lead" || view.Items[0].Cycle != "daily" {

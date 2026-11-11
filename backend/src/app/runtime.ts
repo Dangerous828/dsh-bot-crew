@@ -108,6 +108,14 @@ export class Runtime extends Service implements SourceHost {
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
+  /**
+   * DSH 的会话表，手机端的「子代理」卡片靠它从 worker 会话往下展开。
+   *
+   * 这是 `ctx.agents` 的引用而不是我们自己的一份：会话的创建与销毁都由 DSH 掌管，
+   * 抄一份就会在会话重启后指向已经作废的对象。手机那条路按 `runtime.agents` 读它，
+   * 少了这个字段只会得到一句「读不到会话树」，看不出是插件根本没有把它摆出来。
+   */
+  readonly agents: Context['agents']
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   readonly masterId: string
@@ -126,6 +134,8 @@ export class Runtime extends Service implements SourceHost {
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
     super(ctx, 'orchestrator')
     const runtime = this
+    // `ctx` 不是参数属性，字段初始化时还看不到它，所以在构造器里接一次。
+    this.agents = ctx.agents
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
     const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
@@ -178,6 +188,17 @@ export class Runtime extends Service implements SourceHost {
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+          // 评估结果一律记一行。它平时是静默的：决策只在内存里广播一次，没人在听的时候就消失了。
+          // 于是「队伍为什么不接这活」在运行时看不见 —— 事后只能翻数据库，而那时上下文已经没了。
+          // 用 console 而不是 ctx.logger：宿主的 logger 收进了它自己的频道，不在这个进程的日志文件里。
+          if (event.type === 'decision.recorded') {
+            const decision = store.decisions.get(event.data.decisionId)
+            console.log('[eval] kind=%s reason=%s thread=%s ticket=%s',
+              String(decision?.kind ?? event.data.kind),
+              JSON.stringify(decision?.reason ?? '-'),
+              String(event.data.threadKey),
+              String(decision?.ticketId ?? '-'))
+          }
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
@@ -322,7 +343,7 @@ export class Runtime extends Service implements SourceHost {
   /**
    * 「常规任务」：把账本合成一栏。
    *
-   * 数据源是 KV 里的一串 `routines:task:<id>`，不是会话事件、也不新开一张表：
+   * 数据源是 KV 里 `routines` 那一族（前缀见 `kv.ts`），不是会话事件、也不新开一张表：
    * 这是主人自己写下的账，跟工单不一样，工单没了账还在。
    * 账本读不出来（数据库打不开）就是 `unavailable`，不是「没有常规任务」。
    */

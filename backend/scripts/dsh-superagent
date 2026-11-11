@@ -96,6 +96,38 @@ def sync_bind_address(address: str, profile: str) -> None:
         patch.write_text(updated)
         print(f'bind address -> {address}', flush=True)
 
+def configured_bind_address(profile: str):
+    """Return the host this profile's webserver is currently told to bind, if any.
+
+    `sync_bind_address` 只在启动时改它。机器换了网络而进程还活着时，配置里留着的还是上一张网卡的地址 ——
+    这时后端绑在一个本机已经没有的地址上，手机连过来是「拒绝连接」，而所有健康检查都是绿的。
+    """
+    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    if not patch.exists():
+        return None
+    in_webserver = False
+    for line in patch.read_text().splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith('- id:'):
+            in_webserver = stripped[len('- id:'):].strip().strip('"\'') == 'webserver'
+            continue
+        match = re.match(r'^\s{4}host:\s*(\S+)\s*$', line)
+        if in_webserver and match:
+            return match.group(1)
+    return None
+
+
+def bind_drift(profile: str):
+    """Return the address the machine should be reachable at when the configured one no longer holds, else None."""
+    lan = lan_address()
+    if not lan:
+        return None
+    configured = configured_bind_address(profile)
+    if configured is None or configured == lan:
+        return None
+    return lan
+
+
 ARTIFACTS = ROOT / '.artifacts'
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
@@ -199,7 +231,10 @@ def status(args):
     print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
                       'manually_stopped': stopped(args.profile), 'health': current and current['health'],
                       'errors': current and current['errors'], 'setup': current and current['setup'],
-                      'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
+                      'feishu': current and current['feishu'],
+                      # 进程活着但绑在旧网卡上时，手机连不上而所有健康项都是绿的。这里主动说出来。
+                      **({'bind_stale': bind_drift(args.profile)} if bind_drift(args.profile) else {})},
+                     ensure_ascii=False, indent=2))
     return outcome(pids, current)
 
 
@@ -341,6 +376,13 @@ def start(args):
     pids = processes(args.profile)
     if len(pids) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
+    if pids:
+        # 已经在跑：这时改不了它绑的地址（那要重启）。但地址漂了就得说出来 ——
+        # 不说的话，人只会看到手机连不上，而 status 全绿，没有任何线索。
+        drift = bind_drift(args.profile)
+        if drift:
+            print(f'note: this machine is now reachable at {drift}, but the running backend is bound elsewhere '
+                  f'({configured_bind_address(args.profile)}). `restart` re-points it.', file=sys.stderr)
     if not pids:
         dsh = shutil.which('dsh')
         if not dsh or not shutil.which('tmux'):

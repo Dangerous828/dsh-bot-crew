@@ -25,7 +25,7 @@ const CYCLE_MS: Record<RoutineCycle, number> = {
   weekly: 7 * 24 * 60 * 60 * 1000,
 }
 
-/** 账本里存的那一条（KV `routines:task:<id>`）。字段都是主人自己写的，不包含任何推断值。 */
+/** 账本里存的那一条（KV 的 `routines` 族，前缀在 `kv.ts` 里）。字段都是主人自己写的，不包含任何推断值。 */
 export interface RoutineRecord {
   id: string
   title: string

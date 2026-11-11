@@ -620,9 +620,12 @@ class CodeCardButtonsTest {
         // 没有统计就只说采用了哪段，不编一个「加 0 行」。
         assertEquals("采用 a.ts 这段改动，按这个改。",
             CodeCopy.adoptText(CodeBlock("a.ts", 0, 0, emptyList()), null, null))
-        // 没有文件名时说的是「这段改动」，不会变成「采用  这段改动」。
-        assertEquals("采用 这段改动，按这个改。",
+        // 没有文件名时说的是「这段改动」，不会变成「采用  这段改动」，也不会说成
+        // 「采用 这段改动 这段改动」。增删统计仍然要说 —— 那是这条消息里唯一有用的信息。
+        assertEquals("采用 这段改动，删 1 行，按这个改。",
             CodeCopy.adoptText(CodeBlock("", 0, 1, emptyList()), null, null))
+        assertEquals("采用 这段改动，按这个改。",
+            CodeCopy.adoptText(CodeBlock("", 0, 0, emptyList()), null, null))
     }
 
     @Test

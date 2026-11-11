@@ -151,7 +151,7 @@ type app struct {
 	// crewLoad 是执行器的槽位情况：排队几条、上限几张并发。
 	// 它挂在管理面上，读不到就是 nil —— 界面据此不画「上限 N 并发」那一行，
 	// 而不是写死一个 3。
-	crewLoad  *CrewLoad
+	crewLoad   *CrewLoad
 	crewLoadCh chan *CrewLoad
 
 	// 已配对的设备：配对一次之后谁还能进来的清单。读不到就空着，不挡住别的。
@@ -1716,7 +1716,7 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 				if task.Question != "" {
 					ui.Text(c, task.Question).FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
 				} else {
-					ui.Text(c, "这张票卡在等你，原因：" + waitingWord(task.NeedsPerson)).
+					ui.Text(c, "这张票卡在等你，原因："+waitingWord(task.NeedsPerson)).
 						FontSize(FontBodyWide).LineHeight(1.55).TextColor(p.Ink)
 				}
 				if waited := s.waitedFor(task); waited != "" {
@@ -2093,7 +2093,12 @@ func adoptText(block CodeBlock, botID, botName string) string {
 	if summary != "" {
 		summary = "，" + summary
 	}
-	return where + "采用 " + file + " 这段改动" + summary + "，按这个改。"
+	// 没有文件名时 file 已经是「这段改动」，再跟一句就成了同一个词说两遍。
+	target := file
+	if file != "这段改动" {
+		target = file + " 这段改动"
+	}
+	return where + "采用 " + target + summary + "，按这个改。"
 }
 
 // changeSummary 把增删行数说成人话；没有统计就什么也不说 —— 不编一个「加 0 行」。
@@ -2298,9 +2303,9 @@ func (s *app) composer(c *ui.Context, p Palette) {
 			// 输入框也得自己定字色与底：mygo 的默认色跟着系统外观走，
 			// 而这扇窗的主题可以由 CREW_THEME 覆盖 —— 系统是暗、窗口是亮时，
 			// 默认色会把输入框画成一整块黑底（实测过，亮色主题下很扎眼）。
-				ui.TextInput(c, &s.input).Placeholder(placeholder).Grow(1).
-					PlaceholderColor(p.Faint).TextColor(p.Ink).CaretColor(p.Accent).
-					SelectionColor(p.AccentSoft).Background(p.Card).OnSubmit(func() { s.send() })
+			ui.TextInput(c, &s.input).Placeholder(placeholder).Grow(1).
+				PlaceholderColor(p.Faint).TextColor(p.Ink).CaretColor(p.Accent).
+				SelectionColor(p.AccentSoft).Background(p.Card).OnSubmit(func() { s.send() })
 			if s.sending {
 				ui.Text(c, "发送中…").FontSize(FontTiny).TextColor(p.Faint)
 			} else {
@@ -3778,7 +3783,6 @@ func clockOf(at string) string {
 	}
 	return at
 }
-
 
 // botEditor 是改人设的那一层：名字、人设、保存/取消。
 //

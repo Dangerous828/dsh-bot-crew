@@ -519,9 +519,14 @@ export class DshExecutor implements Executor {
       const ticketId = ticketOfSession(session.id)
       // 计划（待办清单）一变就记到票上：进度条的分母只有 worker 自己写的那份待办给得出。
       // 这里只存计数，不存文字；读不懂的事件当作「没有计划」，不覆盖已有的那一份。
-      if (event.type === 'todo/write') {
+      //
+      // 收窄成宽松形状再判：DSH 的 SessionEvent 联合里还没有 `todo/write` 这一支，
+      // 直接拿它比会被判成「不可能相等」，data 也退化成 never。运行时它确实会来 ——
+      // 那是 worker 自己写的待办，进度条的分母只有它给得出。work.ts 里读同一批事件用的是同一招。
+      const planEvent = event as { type: string; data?: unknown }
+      if (planEvent.type === 'todo/write') {
         if (ticketId === undefined || this.host.closing()) return
-        const plan = planOf(event.data)
+        const plan = planOf(planEvent.data)
         if (!plan) return
         const ticket = this.host.store.tickets.get(ticketId)
         if (!ticket || ticket.ended) return

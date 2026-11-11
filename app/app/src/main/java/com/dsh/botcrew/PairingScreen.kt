@@ -33,6 +33,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
@@ -42,13 +44,24 @@ import kotlinx.coroutines.launch
  * 中间填地址那种事不该让用户在手机上做。
  */
 @Composable
-fun PairingScreen(palette: CrewPalette, deviceId: String, onPaired: (PairedCrew) -> Unit) {
+fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.content.Context, onPaired: (PairedCrew) -> Unit) {
     // 预填一台默认的：换电脑才需要改，第一次打开不该先让人去找 IP。
     var address by remember { mutableStateOf(BuildConfig.GW_BASE) }
+    // 自动找到的那台。只在地址还没被人改过时才覆盖：否则会把人手填的值抢走。
+    var found by remember { mutableStateOf<String?>(null) }
     var code by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var trouble by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    // 同一个 Wi-Fi 上的队伍会自己报出来。找得到就直接填好地址，人只剩念那六位数。
+    // 找不到什么都不做 —— 手输地址那条路一直留着。
+    LaunchedEffect(Unit) {
+        CrewDiscovery.find(context).collectLatest { beacon ->
+            found = beacon.name
+            address = beacon.base
+        }
+    }
 
     // 键盘弹起时可用高度会变小。居中排列会让整列上移，点到的位置和看到的位置对不上 ——
     // 表现是「点配对码框，字进了地址框」。改成顶部对齐 + 可滚动 + 让出键盘高度。
@@ -70,6 +83,15 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, onPaired: (PairedCrew)
             color = palette.muted,
             modifier = Modifier.padding(top = 8.dp, bottom = 22.dp),
         )
+
+        found?.let {
+            Text(
+                "已自动找到 $it，地址已填好。",
+                fontSize = 12.sp,
+                color = palette.muted,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+            )
+        }
 
         OutlinedTextField(
             value = address,

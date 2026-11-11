@@ -5,6 +5,7 @@ import { Runtime } from './app/runtime.ts'
 import { phoneHandler, registerMobileHttp } from './app/mobile-http.ts'
 import { deviceStoreOf } from './app/remote.ts'
 import { bindCandidates, createLanServer, lanPort } from './app/lan-server.ts'
+import { createDiscovery } from './app/discovery.ts'
 import { createTunnel } from './app/tunnel.ts'
 import { phoneGate } from './app/phone-gate.ts'
 import { createPairingThrottle } from './app/pairing-throttle.ts'
@@ -56,13 +57,20 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
       ...(body ? { body } : {}),
       ...(signal ? { signal } : {}),
     }))
+  // 手机换一次网就要重输一次地址，是这套东西最容易卡住人的地方。这里把队伍广播出去，
+  // 手机用系统 NSD 就能自己找到它。广播失败只是少一条捷径，手输地址照旧可用。
+  const discovery = createDiscovery({
+    stateDir: machine.stateDir,
+    name: process.env.CREW_DISCOVERY_NAME?.trim() || undefined,
+    onError: error => ctx.logger.warn('mDNS announce failed: %s', String(error)),
+  })
   const lan = createLanServer({
     devices,
     pairingAllowed: pairingThrottle,
     // 凭据已经验过了，直接交给消息面处理器：它不依赖 Connection，所以这条路上 Connection 那一关不参与。
     forward: request => ask(request, request.body),
   })
-  ctx.effect(() => async () => { await lan.close() })
+  ctx.effect(() => async () => { await lan.close(); await discovery.stop() })
   // 起不来不该挡住整个插件：局域网连不上只是少一条路，本机功能照常。
   // 网卡名要带上：虚拟网卡（utun / docker 之类）不能优先，否则局域网里的手机连不到。
   // 所有可达地址都绑上，因为只绑一块会漏掉别的网络（本机与模拟器走的是回环）。
@@ -71,7 +79,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   lan.listenAll(lanPort(machine.stateDir), candidates)
     .then(bound => {
       if (bound.length === 0) { ctx.logger.warn('phone listener found no address to bind'); return }
-      ctx.logger.info('phone reachable at %s', bound.map(host => `http://${host}:${lanPort(machine.stateDir)}`).join(' , '))
+      const port = lanPort(machine.stateDir)
+      // 真的绑上了才广播：没绑上就广播，手机找到的会是一个拒绝连接的地址。
+      discovery.publish(port)
+      ctx.logger.info('phone reachable at %s', bound.map(host => `http://${host}:${port}`).join(' , '))
     })
     .catch((error: unknown) => { ctx.logger.warn('phone listener did not start: %s', String(error)) })
 

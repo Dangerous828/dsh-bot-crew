@@ -29,7 +29,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val current = paired
                     if (current == null) {
-                        PairingScreen(palette, thisDevice) { credential ->
+                        PairingScreen(palette, thisDevice, this) { credential ->
                             // 配好就落盘，下一帧直接进队伍。
                             pairing.save(credential)
                             paired = credential

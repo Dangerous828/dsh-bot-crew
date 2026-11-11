@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -45,6 +46,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -176,9 +178,21 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     fun refresh() {
         scope.launch {
             try {
-                conversation = client.timeline()
+                val next = client.timeline()
+                // 轮次只在「真的换了一份内容」时才加一。时间线每 6 秒读一次，如果每次都加，
+                // 所有消息的结果条就跟着每 6 秒重读一遍；读完再 outputsTick+1，又重组一遍 ——
+                // 列表在这个环里反复重新布局，人什么都不做也看着它在动。
+                val changed = conversation != next
+                conversation = next
                 problem = null
-                timelineEpoch += 1
+                if (changed) {
+                    timelineEpoch += 1
+                    // 只有内容真的变了才记一行。每 6 秒都记的话，日志会被噪声淹掉，
+                    // 也就看不出「哪一次是真的变了」。看：adb logcat -s CrewTimeline
+                    android.util.Log.i("CrewTimeline",
+                        "changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
+                        "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
+                }
             } catch (error: Exception) {
                 problem = error.message
             }
@@ -634,6 +648,9 @@ private fun CrewScreen(
                         // 设计稿这里用的是 flex-end。
                         // 间距不设在这里：画板是组间 16、组内 9，得逐条算，见下面那一行。
                         verticalArrangement = Arrangement.Bottom,
+                        // 首尾各留一口气。不留的话，滚到中途时最上面那条会被页头的下边线
+                        // 硬生生切掉半行，最下面那条又贴着输入框消失。
+                        contentPadding = PaddingValues(top = 10.dp, bottom = 10.dp),
                     ) {
                         // 网关的 item 不保证带 id：缺 id 时 optString 给空串，几条缺 id 的消息
                         // 就会共用同一个 key，Compose 直接抛 "Key was already used"。
@@ -662,7 +679,10 @@ private fun CrewScreen(
                         if (shown.tickets.isNotEmpty()) {
                             // 「等你决定」：后端随问题下发了 options 就画成能点的 A/B，
                             // 点一下直接把那句话发回去（走同一条 POST /send）。
-                            item {
+                            // 显式给 key：消息用的是消息 id，这两块若用默认自增 key，
+                            // 一旦消息 id 是数字串就会撞上，Compose 会复用错误的 item，
+                            // 那一格的高度按上一条算 —— 表现为最后那张卡被裁掉半截、列表也滚不到位。
+                            item(key = "tickets") {
                                 TicketStrip(
                                     shown, palette, client,
                                     // 草稿空着才补一句 `@名字 `；已经写了一半的不动它 ——
@@ -674,11 +694,37 @@ private fun CrewScreen(
                                 )
                             }
                             // 第一张工单的子代理能在这里展开，就是「他派了谁」。
-                            item { SubagentCard(client, shown.tickets.first().id, palette) }
+                            item(key = "subagents") { SubagentCard(client, shown.tickets.first().id, palette) }
                         }
                     }
-                    LaunchedEffect(shown.messages.size) {
-                        if (shown.messages.isNotEmpty()) listState.animateScrollToItem(shown.messages.size - 1)
+                    // 列表要不要自己滚，只由两件事决定：是不是真的多了一句，以及人是不是本来就贴着底。
+                    //
+                    // 从前这里用「消息条数」当 key，而时间线每 6 秒读一次、把整份换成新对象，
+                    // 条数在排队、回复、撤回之间来回变，每变一次就滚一次 —— 没人碰它，屏幕自己在跳。
+                    val lastMessageId = shown.messages.lastOrNull()?.id ?: ""
+                    // 第一次拿到消息时要落到底（打开就该看到最新一句）；之后只跟着新消息走。
+                    var settled by remember { mutableStateOf(false) }
+                    LaunchedEffect(lastMessageId) {
+                        if (lastMessageId.isEmpty()) return@LaunchedEffect
+                        val info = listState.layoutInfo
+                        val last = info.visibleItemsInfo.lastOrNull()
+                        // 离底不足 48px 才算贴着底。用像素而不是索引：一条撑满整屏的长消息也算在底部；
+                        // 停在离底十来个像素时不算 —— 那种位置通常是人正看着最后一句话，不该被拽走。
+                        val gap = if (last == null) 0 else (info.viewportEndOffset - (last.offset + last.size))
+                        val atBottom = last == null || (last.index >= info.totalItemsCount - 1 && gap <= 48)
+                        // scrollToItem(末项) 只能把它顶到视口顶部；末项比视口矮时列表会停在半途。
+                        // 给一个很大的 offset，才是滚到真正的尽头。
+                        suspend fun bottom() { listState.scrollToItem(shown.messages.lastIndex, Int.MAX_VALUE) }
+                        if (!settled) {
+                            settled = true
+                            // 这一帧排完再滚：消息还没量出高度时滚，落点按估算算，会差一截。
+                            withFrameNanos { }
+                            bottom()
+                        } else if (atBottom) {
+                            // 结果条、子代理卡是异步读回来的，滚完这句它们才把高度撑开。补一帧再落一次。
+                            withFrameNanos { }
+                            bottom()
+                        }
                     }
                     // 排队中的消息要能撤回：按 request_id 把正文找回来，读不到就显示占位，不编内容。
                     val queued = shown.queued.map { requestId ->

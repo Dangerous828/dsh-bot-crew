@@ -227,11 +227,17 @@ type AttentionOption struct {
 }
 
 // AgentNode is one agent under a ticket. A subagent of a subagent is a child again, so this nests.
+//
+// ElapsedSeconds 是「它跑了多久」。**后端今天还不发这个字段**：backend/src/app/work.ts 的
+// agentTree() 只填 id / label / state，会话 header 里也没有可用的起止时间。所以这里用指针：
+// 没有就是 nil，界面上不画那一截 —— 宁可少一句「· 42 秒」，也不凭空算一个数出来。
+// 后端哪天把它加上，这里不用再改。
 type AgentNode struct {
-	ID       string      `json:"id"`
-	Label    string      `json:"label"`
-	State    string      `json:"state"`
-	Children []AgentNode `json:"children"`
+	ID             string      `json:"id"`
+	Label          string      `json:"label"`
+	State          string      `json:"state"`
+	ElapsedSeconds *float64    `json:"elapsed_seconds,omitempty"`
+	Children       []AgentNode `json:"children"`
 }
 
 // Agents reads the tree under one ticket. The phone shows who was dispatched and how deep it went.
@@ -398,6 +404,33 @@ type BackendStatus struct {
 
 // Ready is true when the crew can take work: running and not paused.
 func (s BackendStatus) Ready() bool { return s.Runtime == "ready" && !s.Paused }
+
+// CrewLoad 是执行器的槽位利用情况，来自管理面 `GET /orchestrator/api/state` 的 `load`。
+//
+// MaxWorkers 就是画板上「上限 3 并发」那三个字的真实出处：它是
+// backend/src/policy.ts 里 `executor.maxWorkers` 的默认值（3），可以在管理面板里改。
+// 所以界面上那个数不是写死的常量，是读回来的设置 —— 读不到就不画这一行。
+type CrewLoad struct {
+	Running int `json:"running"`
+	Queued  int `json:"queued"`
+	// MaxWorkers 是并发上限：同时在跑的工单最多几张，多出来的排队等槽位。
+	MaxWorkers int `json:"maxWorkers"`
+}
+
+// CrewLoad 读执行器的槽位情况。它挂在管理面上（网页端口），不是消息面。
+func (c *Client) CrewLoad(ctx context.Context) (*CrewLoad, error) {
+	var answer struct {
+		Load CrewLoad `json:"load"`
+	}
+	if err := c.management(ctx, http.MethodGet, "/state", nil, &answer); err != nil {
+		return nil, err
+	}
+	// 上限没给（0）就不是「上限 0 并发」，而是这个后端没报。整份丢掉，界面上不画。
+	if answer.Load.MaxWorkers <= 0 {
+		return nil, fmt.Errorf("crewload: 管理面没报告并发上限")
+	}
+	return &answer.Load, nil
+}
 
 // Conversation 是一次读到的队伍。
 type Conversation struct {

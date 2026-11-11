@@ -148,6 +148,12 @@ type app struct {
 	pauseNote string
 	pauseDone chan pauseResult
 
+	// crewLoad 是执行器的槽位情况：排队几条、上限几张并发。
+	// 它挂在管理面上，读不到就是 nil —— 界面据此不画「上限 N 并发」那一行，
+	// 而不是写死一个 3。
+	crewLoad  *CrewLoad
+	crewLoadCh chan *CrewLoad
+
 	// 已配对的设备：配对一次之后谁还能进来的清单。读不到就空着，不挡住别的。
 	devices      []PairedDevice
 	devicesNote  string
@@ -331,6 +337,11 @@ func (s *app) refresh() {
 			if tree, treeErr := s.client.Agents(ctx, conversation.Tasks[0].ID); treeErr == nil {
 				s.tree <- tree
 			}
+		}
+		// 槽位情况也顺手读一次：它在管理面上，读不到就留 nil，底部那一行就不画。
+		// 不影响对话 —— 一个数读不到，不该让整段对话报错。
+		if load, loadErr := s.client.CrewLoad(ctx); loadErr == nil {
+			s.crewLoadCh <- load
 		}
 		s.arrived <- conversation
 		s.wake()
@@ -588,6 +599,10 @@ func (s *app) drain(c *ui.Context) {
 		case catalog := <-s.modelList:
 			s.models, s.modelsError, s.modelNote = catalog, "", ""
 			s.loadEfforts()
+			c.Invalidate()
+		case load := <-s.crewLoadCh:
+			// 槽位情况回来了：底部「队列 · 上限 N 并发」那一行据此画。
+			s.crewLoad = load
 			c.Invalidate()
 		case view := <-s.effortsCh:
 			s.efforts = view
@@ -1467,9 +1482,11 @@ func (s *app) subagentCard(c *ui.Context, p Palette, tree []AgentNode) {
 // subagentRow 是卡里的一行：状态点 + 名字 + 右侧的状态与耗时。
 func (s *app) subagentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 	working := !agentDone(node.State)
-	mark, tint := "○", p.Muted
+	// 配色照画板：在跑的那一行是强调绿、名字用主文字色；
+	// 跑完了的退成弱灰，名字也退到次要文字色 —— 一眼扫过去，还在动的那个最显眼。
+	mark, tint, nameTint, stateTint := "○", p.Muted, p.Ink, p.Accent
 	if !working {
-		mark, tint = "✓", p.Faint
+		mark, tint, nameTint, stateTint = "✓", p.Faint, p.Muted, p.Faint
 	}
 	ui.Row(c).FillWidth().PaddingX(12).PaddingY(9).Gap(9).AlignItems(ui.Center).Children(func() {
 		if depth > 0 {
@@ -1480,13 +1497,68 @@ func (s *app) subagentRow(c *ui.Context, p Palette, node AgentNode, depth int) {
 		if name == "" {
 			name = node.ID
 		}
-		ui.Text(c, name).FontSize(FontBody).TextColor(p.Muted)
+		ui.Text(c, name).FontSize(FontBody).TextColor(nameTint)
 		ui.Row(c).Grow(1)
-		ui.Text(c, stateWord(node.State)).FontSize(FontSmall).TextColor(p.Faint)
+		// 画板这一格是「已完成 · 42 秒」：状态与耗时连成一句，状态在前。
+		// 在跑的那一行只有「在跑」，没有耗时 —— 它还没跑完，这个数此刻不成立。
+		ui.Text(c, agentStatus(node, working)).FontSize(FontSmall).TextColor(stateTint)
 	})
 	for _, child := range node.Children {
 		s.subagentRow(c, p, child, depth+1)
 	}
+}
+
+// agentStatus 是一行右侧那截话：状态，跑完了的再补上耗时。
+//
+// 耗时只在后端真的给了才画。今天 agentTree() 不发这个字段，所以实际画出来的
+// 就是「已完成」三个字 —— 这是有意的：编一个「· 42 秒」出来，屏幕上那个数
+// 会被当成真的读过。后端补上 elapsed_seconds 之后，这里不用改就能画出来。
+func agentStatus(node AgentNode, working bool) string {
+	line := agentWord(node.State)
+	// 在跑的那个没有「跑了多久」：它还没跑完，这个数此刻不成立。
+	if working || node.ElapsedSeconds == nil {
+		return line
+	}
+	// 值读坏了（负数、NaN）就整段不画：留着「已完成 · 」比不画更糟。
+	if spent := elapsedSeconds(*node.ElapsedSeconds); spent != "" {
+		line += " · " + spent
+	}
+	return line
+}
+
+// agentWord 是子代理那一行右侧的状态词。
+//
+// 和 stateWord 分开：工单卡上说的是「在做 · 林 · 第 2 步」（画板右栏），
+// 子代理行说的是「在跑」/「已完成」（画板 Desktop.dc.html:182/185）。
+// 同一件事在两个语境里不是一个词，混用会有一边不像画板。
+func agentWord(state string) string {
+	switch state {
+	case "work", "working":
+		return "在跑"
+	case "completed", "done", "merged", "closed":
+		return "已完成"
+	case "failed", "stopped":
+		return "已停下"
+	case "dropped":
+		return "已放弃"
+	}
+	return "在跑"
+}
+
+// elapsedSeconds 把秒数说成人话，量级跟画板一致（画板是「42 秒」）。
+//
+// 超过一分钟进到「1 分 5 秒」：一屏里出现「427 秒」没人算得过来。
+// 负数、NaN、无穷这类读坏了的值一律返回空串 —— 调用方据此不画，而不是画一个假数。
+// 上界也要挡住：把超大浮点转成 int 在 Go 里是未定义结果，可能转出一个负数。
+func elapsedSeconds(seconds float64) string {
+	if seconds != seconds || seconds < 0 || seconds > 24*60*60 { // NaN、负数、超过一天：数据坏了
+		return ""
+	}
+	total := int(seconds + 0.5)
+	if total < 60 {
+		return fmt.Sprintf("%d 秒", total)
+	}
+	return fmt.Sprintf("%d 分 %d 秒", total/60, total%60)
 }
 
 // countAgents 数整棵树有多少个分身。
@@ -1862,15 +1934,28 @@ func (s *app) codeCard(c *ui.Context, p Palette, block CodeBlock, botID string) 
 		})
 		ui.Column(c).FillWidth().Height(1).Background(p.Line)
 		for _, line := range block.Lines {
-			text, soft := "  "+line.Text, p.Card
+			// 行首那两格跟着整行走（"  " 上下文 / "+ " 新增 / "- " 删除），
+			// 画板里 `+` / `-` 号就在这一列。
+			prefix, soft, base := "  ", p.Card, p.Faint
+			// 上下文行与改动行是两种画法：改动行整行一个颜色，不拆词；
+			// 上下文行才分词着色（画板 Desktop.dc.html:133 —— 整行暖灰，
+			// 只有值 `12px` 是赭色）。行内再给改动行分色，反而看不出哪一行变了。
+			highlight := true
 			switch line.Kind {
 			case "added":
-				text, soft = "+ "+line.Text, p.AccentSoft
+				prefix, soft, base, highlight = "+ ", p.AccentSoft, p.Accent, false
 			case "removed":
-				text, soft = "- "+line.Text, p.WarnSoft
+				prefix, soft, base, highlight = "- ", p.WarnSoft, p.Warn, false
 			}
 			ui.Row(c).FillWidth().PaddingX(14).PaddingY(3).Background(soft).Children(func() {
-				ui.Text(c, text).FontSize(FontBody).TextColor(p.Muted)
+				// 分段铺：一段一个 Text，颜色各自带。拼回去与原文逐字相同，
+				// 这一点由 syntax_test.go 钉住 —— 高亮可以少，不能吃掉字符。
+				for _, segment := range codeSegments(prefix, line.Text, base, p.Warn, highlight) {
+					if segment.Text == "" {
+						continue
+					}
+					ui.Text(c, segment.Text).FontSize(FontBody).TextColor(segment.Color)
+				}
 			})
 		}
 		// 按钮行与卡片同宽，紧贴在代码下面：采用是主强调的实心按钮，
@@ -2368,6 +2453,14 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 			ui.Row(c).Grow(1)
 			ui.Column(c).FillWidth().Gap(8).Children(func() {
 				ui.Text(c, s.crewStateLine()).FontSize(FontSmall).TextColor(p.Muted)
+				// 画板底部是一组「名目 —— 值」：
+				//   运行状态   ● 就绪
+				//   队列       0 等待 · 上限 3 并发
+				// 上限那三个字的出处是管理面的 maxWorkers（policy.ts 的默认 3），
+				// 不是写死在界面里的常数；读不到就整行不画，见 loadRow。
+				if load := s.crewLoad; load != nil {
+					s.loadRow(c, p, "队列", fmt.Sprintf("%d 等待 · 上限 %d 并发", load.Queued, load.MaxWorkers))
+				}
 				if s.pauseNote != "" {
 					ui.Text(c, s.pauseNote).FontSize(FontTiny).TextColor(p.Faint)
 				}
@@ -2383,6 +2476,17 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 				}).OnClick(s.pauseAll)
 			})
 		})
+	})
+}
+
+// loadRow 是右栏底部「名目 —— 值」的一行（画板：队列 / 0 等待 · 上限 3 并发）。
+//
+// 名目在左、值在右，中间一个 Grow 撑开：右栏拖宽拖窄时值始终贴着右边。
+func (s *app) loadRow(c *ui.Context, p Palette, name, value string) {
+	ui.Row(c).FillWidth().MinWidth(0).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, name).FontSize(FontSmall).TextColor(p.Muted)
+		ui.Row(c).Grow(1)
+		ui.Text(c, value).FontSize(FontSmall).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
 	})
 }
 

@@ -39,4 +39,7 @@ func TestTheChannelsAreWired(t *testing.T) {
 	if s.routinesCh == nil {
 		t.Fatal("routinesCh 是 nil：「常规任务」那一栏会永远停在正在读")
 	}
+	if s.crewLoadCh == nil {
+		t.Fatal("crewLoadCh 是 nil：右栏底部的「上限 N 并发」永远画不出来")
+	}
 }

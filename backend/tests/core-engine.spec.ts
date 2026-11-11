@@ -792,6 +792,43 @@ describe('worker reports', () => {
     expect(cleared).not.toHaveProperty('attention')
     expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
   })
+  it('carries a question\'s options, keeps them only while they are repeated, and clears them when the question is repeated without them', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const options = [{ id: 'contract-30-70', label: '按合同 30/70 回客户' }, { id: 'accept-50-50', label: '接受 50/50，我改合同' }]
+    const asked = h.engine.report(ticketId, { state: 'progress', summary: 'need a call', question: 'Which terms?', options })
+    expect(asked.attention).toMatchObject({ question: 'Which terms?', options })
+    // The same question with the same options reuses the request; nothing is withdrawn.
+    expect(h.engine.report(ticketId, { state: 'blocked', summary: 'still waiting', question: 'Which terms?', options }).attention).toEqual(asked.attention)
+    expect(h.withdrawn).toEqual([])
+    // Different options replace the question, withdrawing the old one.
+    const other = [{ id: 'a', label: 'Wait' }, { id: 'b', label: 'Go' }]
+    const replaced = h.engine.report(ticketId, { state: 'progress', summary: 'other answers', question: 'Which terms?', options: other })
+    expect(replaced.attention).toMatchObject({ question: 'Which terms?', options: other })
+    expect(replaced.attention!.id).not.toBe(asked.attention!.id)
+    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id)])
+    // Repeating the question without options means a written answer only: the options are cleared.
+    const cleared = h.engine.report(ticketId, { state: 'progress', summary: 'just write it', question: 'Which terms?' })
+    expect(cleared.attention).toMatchObject({ question: 'Which terms?' })
+    expect(cleared.attention).not.toHaveProperty('options')
+    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
+  })
+  it('refuses options that are too few, too many, badly named, duplicated, or offered without a question, and measures a label after trimming it', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const report = (extra: object) => () => h.engine.report(ticketId, { state: 'progress', summary: 'x', ...extra })
+    const two = [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }]
+    expect(report({ options: two })).toThrow(new UserError('optionsWithoutQuestion'))
+    expect(report({ question: 'Q?', options: [two[0]!] })).toThrow(new UserError('tooManyOptions'))
+    expect(report({ question: 'Q?', options: [...two, { id: 'c', label: 'C' }, { id: 'd', label: 'D' }, { id: 'e', label: 'E' }] })).toThrow(new UserError('tooManyOptions'))
+    expect(report({ question: 'Q?', options: [{ id: 'Bad Id', label: 'A' }, two[1]!] })).toThrow(new UserError('tooManyOptions'))
+    expect(report({ question: 'Q?', options: [two[0]!, { id: 'a', label: 'Again' }] })).toThrow(new UserError('tooManyOptions'))
+    expect(report({ question: 'Q?', options: [{ id: 'a', label: '   ' }, two[1]!] })).toThrow(new UserError('tooManyOptions'))
+    expect(report({ question: 'Q?', options: [{ id: 'a', label: 'x'.repeat(81) }, two[1]!] })).toThrow(new UserError('tooManyOptions'))
+    // A label that only fits once its surrounding spaces are trimmed is accepted, like the tool's zod check measures it.
+    expect(report({ question: 'Q?', options: [{ id: 'a', label: `${'x'.repeat(80)}  ` }, two[1]!] })().attention)
+      .toMatchObject({ question: 'Q?', options: [{ id: 'a', label: `${'x'.repeat(80)}  ` }, two[1]!] })
+  })
   it('ends the ticket on a final report: dropped drops it, ready completes it unless it follows a Source\'s Thread that is open', () => {
     const outcome = (state: 'ready' | 'dropped' | 'failed', follows: boolean, closed = false) => {
       const h = harness()

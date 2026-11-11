@@ -92,6 +92,31 @@ it('shows actual runtime state and reports transport failures without secrets', 
   expect(await failed.text()).not.toContain('private')
 })
 
+it('sends a question with its options only while the ticket waits on an answer', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  const tickets = [
+    { id: 't1', title: 'Pick one', channels: [{ source: 'team' }], createdAt: '2026-11-11T00:00:00Z', updatedAt: '2026-11-11T00:00:01Z',
+      attention: { id: 'q1', question: 'Which way?', options: [{ id: 'a', label: '按合同回' }, { id: 'b', label: '接受新条款' }] },
+      assignments: [], inputs: [] },
+    // Delivery outranks attention: this ticket still waits on a person, but not on a question it can answer, so no question leaves the server.
+    { id: 't2', title: 'Undelivered', channels: [{ source: 'team' }], createdAt: '2026-11-11T00:00:00Z', updatedAt: '2026-11-11T00:00:01Z',
+      delivery: { error: 'gone', at: '' },
+      attention: { id: 'q2', question: 'Stale?', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
+      assignments: [], inputs: [] },
+  ]
+  const withTickets = { ...host(), store: { settings: () => ({ paused: false }), tickets: { list: () => tickets } } } as unknown as HttpHost
+  const result = await phoneHandler(withTickets, undefined, upstream as typeof fetch)(new Request('http://dsh/api/mobile/timeline'))
+  expect(result.status).toBe(200)
+  const body = await result.json() as { tasks: Record<string, unknown>[] }
+  expect(body.tasks).toEqual([
+    expect.objectContaining({ id: 't1', needs_person: 'answer', question: 'Which way?',
+      options: [{ id: 'a', label: '按合同回' }, { id: 'b', label: '接受新条款' }] }),
+    expect.objectContaining({ id: 't2', needs_person: 'delivery' }),
+  ])
+  expect(body.tasks[1]).not.toHaveProperty('question')
+  expect(body.tasks[1]).not.toHaveProperty('options')
+})
+
 it('takes the phone channel state from the Source that actually carries it', async () => {
   // 队伍里手机消息走 team 源；mobile 源是独立部署才装的。别再对不存在的源兜底报「启动中」。
   const upstream = vi.fn(async () => Response.json({ items: [] }))

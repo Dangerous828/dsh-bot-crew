@@ -170,6 +170,9 @@ it('shows a ticket card\'s state from a closed set: the open ticket\'s stage, th
   expect(ticketCard(ticket)).toMatchObject({ ticket_id: 'ticket-1', pr_number: 42, strength: 'explicit' })
   expect(ticketCard(ticket)).not.toHaveProperty('attention')
   expect(ticketCard({ ...ticket, attention: { id: 'q', question: 'Desktop too?' } })).toMatchObject({ attention: { question: 'Desktop too?' } })
+  expect(ticketCard({ ...ticket, attention: { id: 'q', question: 'Desktop too?', options: [{ id: 'a', label: '按合同回' }, { id: 'b', label: '接受新条款' }] } }))
+    .toMatchObject({ attention: { question: 'Desktop too?', options: [{ id: 'a', label: '按合同回' }, { id: 'b', label: '接受新条款' }] } })
+  expect(ticketCard({ ...ticket, attention: { id: 'q', question: 'Desktop too?' } }).attention).not.toHaveProperty('options')
 })
 it('shows a decision with snake_case keys and a reference to its details', () => {
   const decision: Decision = { id: 'd1', evalId: 'e1', threadKey: 'github:42', triggerIds: ['request-1'], policyVersion: 'v1', at: 'a', kind: 'accept', reason: [said('r')],

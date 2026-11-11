@@ -106,7 +106,7 @@ export class Assignments extends EnginePart {
     // Answers a person can tap belong to the question they answer: ids stay unique within it, labels stay one line.
     if (report.options?.length && !report.question) throw new UserError('optionsWithoutQuestion')
     if (report.options?.length && (report.options.length < 2 || report.options.length > 4
-      || !report.options.every(option => /^[a-z0-9_-]{1,40}$/.test(option.id) && option.label.trim() && option.label.length <= 80)
+      || !report.options.every(option => /^[a-z0-9_-]{1,40}$/.test(option.id) && option.label.trim() && option.label.trim().length <= 80)
       || new Set(report.options.map(option => option.id)).size !== report.options.length)) throw new UserError('tooManyOptions')
     const person = (id: string, channel: boolean) => {
       const trigger = this.repo.triggers.get(id)

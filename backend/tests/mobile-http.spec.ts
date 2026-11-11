@@ -222,6 +222,36 @@ it('names the messages the crew read and left, so the phone can tell it apart fr
   expect(declined).toEqual([{ request_id: 'r1', reason: '只是寒暄，不必开票' }])
 })
 
+// 代码卡上的「看看改完的样子」要知道去看哪张票。网关只记「回哪条消息」（reply_to），
+// 工单在这一侧从最近的决定里对齐：threadKey 的尾号是队列行号，ticketId 是那张票。
+// 对不上就不补 —— 客户端据此如实说「这段改动没带工单号」，不拿别的票顶替。
+it('points a code reply at its own ticket, and leaves it blank when it cannot tell', async () => {
+  const { ticketRefs, withTicketRefs } = await import('../src/app/mobile-http.ts')
+  const items = [
+    { id: 'm6', role: 'user', request_id: 'r6', text: '改一下', at: '2026-11-11T00:00:00.000Z' },
+    { id: 'r7', role: 'agent', reply_to: 'm6', bot_id: 'coder', text: '改好了',
+      code: { path: 'login.tsx', added: 8, removed: 4, lines: [] }, at: '2026-11-11T00:00:10.000Z' },
+    // 没有票号可对的那条：决定是被忽略的，没有 ticketId。
+    { id: 'r9', role: 'agent', reply_to: 'm8', text: '看了看',
+      code: { path: 'a.ts', lines: [] }, at: '2026-11-11T00:00:20.000Z' },
+    // 不带代码的回话不该被补这个字段：它不是代码卡。
+    { id: 'r11', role: 'agent', reply_to: 'm10', text: '收到', at: '2026-11-11T00:00:30.000Z' },
+  ]
+  const decisions = [
+    { kind: 'accept', threadKey: 'team:main:6', ticketId: 'tk-1', at: '2026-11-11T00:00:05.000Z' },
+    { kind: 'ignore', threadKey: 'team:main:8', at: '2026-11-11T00:00:15.000Z' },
+    { kind: 'accept', threadKey: 'team:main:10', ticketId: 'tk-3', at: '2026-11-11T00:00:25.000Z' },
+  ]
+  const refs = ticketRefs(items as never, decisions as never)
+  expect(Object.fromEntries(refs)).toEqual({ r7: 'tk-1' })
+  const out = withTicketRefs(items as never, refs) as Record<string, unknown>[]
+  expect(out[1]).toMatchObject({ id: 'r7', ticket_ref: 'tk-1' })
+  expect(out[2]).not.toHaveProperty('ticket_ref')
+  expect(out[3]).not.toHaveProperty('ticket_ref')
+  // 消息面的其余字段一格不改：只是把缺的那个补上。
+  expect(out[0]).toEqual(items[0])
+})
+
 // 工作区三个控件与花名册。假宿主只给这一条会用到的那部分能力：真 Runtime 上它们都在，
 // 但测试不必为了一个 stopTicket 把整个引擎搭起来。
 function controlHost(options: { tickets?: Record<string, unknown>; engine?: unknown; settingsControl?: unknown

@@ -129,6 +129,17 @@ type app struct {
 	steerNote string
 	steerDone chan steerResult
 
+	// 代码卡上的两个按钮。adopting 是正在「采用」的那几张卡（键是 CodeBlock.ID），挡连点；
+	// adoptNotes 只写这张卡自己的结果，不冒充断连横幅 —— 采用了什么、没采用成什么，
+	// 都只关系到这一段改动。adoptedOK 记着哪几张已经采用过，按钮据此换成「已采用」。
+	// previewNote 是「看看改完的样子」在标题栏说的那句实话。
+	adopting    map[string]bool
+	adoptNotes  map[string]string
+	adoptedOK   map[string]bool
+	previewNote string
+	adopted     chan adoptResult
+	previewed   chan previewResult
+
 	// 全部暂停：pausing 挡住连点，pauseNote 只说暂停这件事的结果，不冒充断连。
 	pausing   bool
 	pauseNote string
@@ -184,6 +195,22 @@ type modelSwitchResult struct {
 type steerResult struct {
 	requestID string
 	err       error
+}
+
+// adoptResult 是一次「采用」的结果。key 是代码卡的 ID，带回来才知道该松开哪张卡上的按钮、
+// 把回执写在哪张卡下面：同一段对话里可能并排挂着两张代码卡。
+type adoptResult struct {
+	key string
+	err error
+}
+
+// previewResult 是一次「看看改完的样子」的结果。view 为 nil 时 reason 说的是为什么看不了 ——
+// 那是这件功能的实话，不是连接故障，不能写进 s.problem。
+type previewResult struct {
+	key    string
+	ticket string
+	view   *ScreenView
+	reason string
 }
 
 // pauseResult 是一次「全部暂停」的结果。
@@ -605,6 +632,32 @@ func (s *app) drain(c *ui.Context) {
 			// 撤掉了就重读一次，让那条从队列里消失；重读本身失败会走 failed，
 			// 那时才轮到全局横幅说话。
 			s.refresh()
+		case result := <-s.adopted:
+			// 一张卡只有它自己那行回执：并排两张代码卡时，A 的结果不该写到 B 上。
+			delete(s.adopting, result.key)
+			if s.adoptNotes == nil {
+				s.adoptNotes = map[string]string{}
+			}
+			if s.adoptedOK == nil {
+				s.adoptedOK = map[string]bool{}
+			}
+			if result.err != nil {
+				s.adoptNotes[result.key] = "没采用成：" + result.err.Error()
+			} else {
+				s.adoptedOK[result.key] = true
+				s.adoptNotes[result.key] = "已请它采用这段改动，下一步会按这个改"
+				go s.refresh()
+			}
+			c.Invalidate()
+		case result := <-s.previewed:
+			if result.view != nil {
+				// 有具体的活动快照就换中间栏：它和「看它的屏幕」是同一块画面。
+				s.screen, s.screenNote, s.previewNote = result.view, "", ""
+			} else {
+				// 没有就说清楚为什么没有。这句话写在标题栏，不挂断连横幅。
+				s.previewNote = result.reason
+			}
+			c.Invalidate()
 		case message := <-s.failed:
 			s.problem = message
 			s.sending = false
@@ -995,6 +1048,11 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 				})
 				if s.screenNote != "" {
 					ui.Text(c, s.screenNote).FontSize(FontMini).TextColor(p.Faint)
+				}
+				// 代码卡上「看看改完的样子」没看成时，那句实话也写在这里：
+				// 和「看它的屏幕」同一类说明，不是断连，不进红色横幅。
+				if s.previewNote != "" {
+					ui.Text(c, s.previewNote).FontSize(FontMini).TextColor(p.Faint)
 				}
 			})
 			ui.Row(c).Grow(1)
@@ -1596,8 +1654,9 @@ func (s *app) message(c *ui.Context, p Palette, message Message) {
 				})
 			}
 			// 消息带代码就画代码卡：设计稿里它挂在正文下面、与正文同宽。
+			// 署名带下去：卡上的「采用」要点名写这段的那位，不能猜成默认 Bot。
 			if block := message.Code(); block != nil {
-				s.codeCard(c, p, *block)
+				s.codeCard(c, p, *block, message.BotID)
 			}
 		})
 	})
@@ -1655,11 +1714,24 @@ func isWarnBot(botID string) bool {
 	return false
 }
 
-// codeCard 是消息里的代码片段：文件名 + 增删统计 + 逐行高亮。
+// codeCard 是消息里的代码片段：文件名 + 增删统计 + 逐行高亮，下面挂两个按钮。
 //
-// 设计稿里新增行是整行浅绿底、删除行整行浅橙底，`+` / `-` 号跟在行首。
+// 设计稿里新增行是整行浅绿底、删除行整行橙底，`+` / `-` 号跟在行首。
 // 只给号着色是不够的 —— 一屏代码里看不出改了哪几行。
-func (s *app) codeCard(c *ui.Context, p Palette, block CodeBlock) {
+//
+// 画板在这张卡下面还有「采用」「看看改完的样子」两个按钮，之前没接，
+// 桌面端就只剩一段只读的代码。两个按钮都不新开后端接口：
+//   - 采用：走已有的消息通道（POST /api/mobile/send），把「采用这段改动」这句
+//     当普通回答发出去，点名写这段的那位 Bot。它本来就是一次对话里的表态，
+//     和「等你决定」卡上点选选项是同一条路。
+//   - 看看改完的样子：走已有的 POST /api/mobile/screen，读这段改动所属工单的
+//     活动快照。快照里就是它改完跑了什么、输出什么。
+//
+// 两件事都得先说清「对谁做」：没有票号或没有署名对象时，按钮照样在，
+// 但按下去只会得到一句实话，而不是静默不动或改到别的工单上。
+func (s *app) codeCard(c *ui.Context, p Palette, block CodeBlock, botID string) {
+	key := block.ID
+	busy, done := s.adopting[key], s.adoptedOK[key]
 	ui.Column(c).FillWidth().Radius(RadiusPane).Background(p.Card).
 		BorderWidth(1).BorderColor(p.Line).Children(func() {
 		// 表头：左边文件名，右边 +N −M。
@@ -1686,7 +1758,163 @@ func (s *app) codeCard(c *ui.Context, p Palette, block CodeBlock) {
 				ui.Text(c, text).FontSize(FontBody).TextColor(p.Muted)
 			})
 		}
+		// 按钮行与卡片同宽，紧贴在代码下面：采用是主强调的实心按钮，
+		// 「看看改完的样子」是白底细边的次按钮 —— 画板里就是这一主一次。
+		ui.Row(c).FillWidth().PaddingX(10).PaddingY(9).Gap(7).AlignItems(ui.Center).Children(func() {
+			s.adoptButton(c, p, block, botID, busy, done)
+			s.previewButton(c, p, block)
+		})
+		// 回执只写在它自己这张卡下面：同一段对话里并排两张卡时，不串台。
+		if note := s.adoptNotes[key]; note != "" {
+			ui.Row(c).FillWidth().PaddingX(10).PaddingY(9).Children(func() {
+				ui.Text(c, note).FontSize(FontHairline).TextColor(p.Faint)
+			})
+		}
 	})
+}
+
+// adoptButton 是代码卡上的「采用」。
+func (s *app) adoptButton(c *ui.Context, p Palette, block CodeBlock, botID string, busy, done bool) {
+	label, fill, tint := "采用", p.Accent, p.AccentInk
+	switch {
+	case done:
+		label, fill = "✓ 已采用", p.AccentSoft
+		tint = p.Accent
+	case busy:
+		label = "采用中…"
+	}
+	button := ui.Row(c).PaddingX(14).PaddingY(7).Radius(RadiusButton).Background(fill).Center().Children(func() {
+		ui.Text(c, label).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(tint)
+	})
+	// 已经采用过、或者这条正在发：按钮还在（布局不跳），但不再接第二下，
+	// 指针也不变手 —— 一个按下去没反应的手型指针，比一个普通指针更让人以为坏了。
+	if busy || done {
+		return
+	}
+	button.Cursor(ui.CursorPointer).OnClick(func() { s.adopt(block, botID) })
+}
+
+// previewButton 是代码卡上的「看看改完的样子」。
+func (s *app) previewButton(c *ui.Context, p Palette, block CodeBlock) {
+	ui.Row(c).PaddingX(14).PaddingY(7).Radius(RadiusButton).Background(p.Card).
+		BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).Children(func() {
+		ui.Text(c, "看看改完的样子").FontSize(FontBodyWide).TextColor(p.Ink)
+	}).OnClick(func() { s.preview(block) })
+}
+
+// adopt 采用这段改动。它不新开接口：把这句话当一条普通消息发给队伍，点名写它的那位 Bot。
+//
+// 为什么不是「直接改文件」：这段代码是 worker 在自己的会话里写出来的，宿主机上没有
+// 一条能把某一行的增删重新应用回工作区的通道；凭空造一条，就等于让前台绕过
+// worker 去动它的工作目录。走消息通道，采用变成一次明确的表态，由队伍自己接下一步。
+func (s *app) adopt(block CodeBlock, botID string) {
+	key := block.ID
+	if s.client == nil || s.adopting[key] || s.adoptedOK[key] {
+		return
+	}
+	if s.conversation == nil {
+		s.noteAdopt(key, "还没读到对话，先刷新一下再采用")
+		return
+	}
+	text := adoptText(block, botID, s.nameOf(botID))
+	if s.adopting == nil {
+		s.adopting = map[string]bool{}
+	}
+	if s.adopted == nil {
+		s.adopted = make(chan adoptResult, 4)
+	}
+	s.adopting[key] = true
+	delete(s.adoptNotes, key)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation))
+		s.adopted <- adoptResult{key: key, err: err}
+		s.wake()
+	}()
+}
+
+// noteAdopt 把一句实话写在某张卡下面。
+func (s *app) noteAdopt(key, note string) {
+	if s.adoptNotes == nil {
+		s.adoptNotes = map[string]string{}
+	}
+	s.adoptNotes[key] = note
+}
+
+// adoptText 是「采用」发出去的那句话：点名写这段的 Bot，带上文件名，
+// 再说清采用的是哪一段改动。
+func adoptText(block CodeBlock, botID, botName string) string {
+	file := strings.TrimSpace(block.Path)
+	if file == "" {
+		file = "这段改动"
+	}
+	where := ""
+	if botID != "" {
+		// 点名用 bot_id：名字可以被改，id 不会。nameOf 给的是人看的名字，两处都要有。
+		where = "@" + botID
+		if botName != "" && botName != botID {
+			where += "（" + botName + "）"
+		}
+		where += " "
+	}
+	summary := changeSummary(block)
+	if summary != "" {
+		summary = "，" + summary
+	}
+	return where + "采用 " + file + " 这段改动" + summary + "，按这个改。"
+}
+
+// changeSummary 把增删行数说成人话；没有统计就什么也不说 —— 不编一个「加 0 行」。
+func changeSummary(block CodeBlock) string {
+	switch {
+	case block.Added > 0 && block.Removed > 0:
+		return fmt.Sprintf("加 %d 行、删 %d 行", block.Added, block.Removed)
+	case block.Added > 0:
+		return fmt.Sprintf("加 %d 行", block.Added)
+	case block.Removed > 0:
+		return fmt.Sprintf("删 %d 行", block.Removed)
+	}
+	return ""
+}
+
+// preview 看看改完的样子：读这段改动所属这张票的活动快照。
+//
+// 票号只认代码块自己带的那个。没有就如实说 —— 拿第一张在跑的票顶替，
+// 就是把 A 的活显示成 B 的结果，比不给看更糟。
+func (s *app) preview(block CodeBlock) {
+	ticket := strings.TrimSpace(block.TicketRef)
+	key := block.ID
+	if s.client == nil {
+		return
+	}
+	if ticket == "" {
+		s.previewNote = "这段改动没带工单号，看不到它改完的样子；让它再报一次就能看了"
+		return
+	}
+	if s.previewed == nil {
+		s.previewed = make(chan previewResult, 4)
+	}
+	// 上一张卡留下的那句实话先擦掉：新的一次请求还没回来，标题栏不该挂着旧的结论。
+	s.previewNote = ""
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		view, err := s.client.Screen(ctx, ticket)
+		result := previewResult{key: key, ticket: ticket}
+		switch {
+		case err != nil:
+			result.reason = "读不到「改完的样子」：" + err.Error()
+		case view != nil && view.State == "live" && len(view.Lines) > 0:
+			result.view = view
+		case view != nil && view.Reason != "":
+			result.reason = view.Reason
+		default:
+			result.reason = "这张工单暂时没有可显示的活动"
+		}
+		s.previewed <- result
+		s.wake()
+	}()
 }
 
 func (s *app) nameOf(botID string) string {

@@ -149,6 +149,54 @@ export function declinedRequests(items: TimelineItem[], decisions: readonly { ki
   })
 }
 
+/**
+ * 给带了代码块的回话补上 `ticket_ref`：代码卡上的「看看改完的样子」要知道去看哪张票。
+ *
+ * 网关写出的回话只记「挂在哪条消息下」（`reply_to: m6`），不记工单 —— 它本来就不该持有任务账。
+ * 工单号在这一侧是现成的：最近的决定里，threadKey 的尾号就是队列行号，`ticketId` 就是那张票。
+ * 所以这里只做一次对齐，不做推断：行号对不上、决定是被忽略的、票号为空，一律不补。
+ * 补不上就让它缺着 —— 客户端据此如实说「这段改动没带工单号」，而不是拿别的票顶替。
+ */
+export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: string; at?: string; threadKey?: string;
+  ticketId?: string }[]): Map<string, string> {
+  const byRow = new Map<string, { ticket: string; at: number }>()
+  for (const decision of decisions) {
+    const row = typeof decision.threadKey === 'string' ? /:(\d+)$/.exec(decision.threadKey)?.[1] : undefined
+    if (!row || typeof decision.ticketId !== 'string' || !decision.ticketId) continue
+    // 被忽略的决定没有票；同一行上后来接受过，就以接受的那次为准（取最新一次带票的）。
+    if (decision.kind === 'ignore') continue
+    const at = Date.parse(decision.at ?? '')
+    const seen = byRow.get(row)
+    if (seen && (!Number.isFinite(at) || at <= seen.at)) continue
+    byRow.set(row, { ticket: decision.ticketId, at: Number.isFinite(at) ? at : 0 })
+  }
+  const refs = new Map<string, string>()
+  for (const item of items) {
+    if (item.role !== 'agent') continue
+    // 只有带改动的回话才是代码卡：别的回话不需要票号，补上去只会多一个用不上的字段。
+    if (!item.code && !item.diff) continue
+    const row = typeof item.reply_to === 'string' ? /^m(\d+)$/.exec(item.reply_to)?.[1] : undefined
+    const found = row ? byRow.get(row) : undefined
+    // 网关自己已经给了 ticket_ref 就以它为准：这里只补缺，不改写已有的值。
+    if (!found || typeof item.ticket_ref === 'string') continue
+    if (typeof item.id === 'string' && item.id) refs.set(item.id, found.ticket)
+  }
+  return refs
+}
+
+/**
+ * 把 `ticketRefs` 算出来的票号放回条目上。没有代码块的条目不动：
+ * 这个字段只服务于代码卡，别的话不需要它。
+ */
+export function withTicketRefs(items: TimelineItem[], refs: Map<string, string>): TimelineItem[] {
+  if (refs.size === 0) return items
+  return items.map(item => {
+    const ticket = typeof item.id === 'string' ? refs.get(item.id) : undefined
+    if (!ticket || !(item.code || item.diff)) return item
+    return { ...item, ticket_ref: ticket }
+  })
+}
+
 /** 花名册接口的读法：只交出手机上要显示的三样，配置里坏掉的行跳过而不是让整份花名册报错。 */
 function teamBotRows(bots: readonly Record<string, unknown>[]): { bot_id: string; name: string; role: string }[] {
   return bots.flatMap(bot => {
@@ -574,11 +622,18 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       const data = await upstream.json() as Record<string, unknown>
       if (operation === 'timeline') {
         const settings = runtime.store.settings()
+        const decisions = runtime.store.read?.recentDecisions?.(0, 200) ?? []
+        const gatewayItems = Array.isArray(data.items) ? data.items as TimelineItem[] : []
+        // 代码卡上「看看改完的样子」要知道看哪张票：网关只记「回哪条消息」，
+        // 工单号在这一侧对齐一次再下发。对不上就让它缺着，客户端会如实说。
+        const items = withTicketRefs(gatewayItems, ticketRefs(gatewayItems, decisions))
         // The crew Source answers on the same queue as mobile, so its tickets belong on the phone too.
         const tickets = runtime.store.tickets.list().filter(ticket => ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team')).slice(0, 30)
         // The phone names a Bot on send; the roster tells it who exists and who answers by default.
         const roster = crewRoster(runtime.store.settings(), bot => earliestTicketAt(data, bot))
         return response(200, { ...data, ...roster,
+          // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
+          items,
           tasks: tickets.map(ticket => {
           // One early ticket whose shape the stage machine cannot read must not take the whole conversation down
           // with it: it still belongs on the phone, it just cannot say which stage it is in.
@@ -612,7 +667,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // one that will never be answered.
         // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
         declined: declinedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : [],
-          runtime.store.read?.recentDecisions?.(0, 200) ?? []),
+          decisions),
         // 手机消息由已安装的那个 Source 承载：独立部署是 `mobile`，Bot 队伍里是 `team`。
         // 两个都不在时如实说 missing；兜底写 starting 会让人以为服务一直没起来。
         status: { runtime: runtime.health.runtime?.state ?? 'starting',
@@ -631,7 +686,11 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
 export const QUEUE_WINDOW_MS = 90_000
 
 /** The parts of a gateway timeline entry this module reads. */
-export interface TimelineItem { id?: string; role?: string; request_id?: string; reply_to?: string; text?: string; at?: string; bot_id?: string }
+export interface TimelineItem { id?: string; role?: string; request_id?: string; reply_to?: string; text?: string; at?: string; bot_id?: string
+  /** 这条回话带的改动代码（契约 §5「代码卡」）；字段名 `code` 与 `diff` 同形，两个都认。 */
+  code?: unknown; diff?: unknown
+  /** 这段改动属于哪张工单；只读引用，前台不得据此维护任务账。 */
+  ticket_ref?: string }
 
 /**
  * The request ids the crew has not answered yet. A reply hangs under the message it answers, so a sent message with

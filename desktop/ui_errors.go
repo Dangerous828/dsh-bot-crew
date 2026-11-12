@@ -20,6 +20,17 @@ func actionNote(prefix string, err error) string {
 	return prefix + "：" + actionErrorHuman(raw)
 }
 
+// actionErrorText 给只存一句文案的字段/channel 用：中文 reason 原样、英文错误翻人话，
+// 原文进日志。错误通道（failed / modelError / pairFailed …）也走这里，避免英文漏上屏。
+func actionErrorText(err error) string {
+	if err == nil {
+		return "这次没成功，稍后再试"
+	}
+	raw := err.Error()
+	log.Printf("动作失败（原始错误）：%s", raw)
+	return actionErrorHuman(raw)
+}
+
 // actionErrorHuman 是错误映射表：中文 reason 原样回，英文内部错误按形状翻，
 // 命中不了就统一兜底。不把后端内部字符串甩给用户。
 func actionErrorHuman(raw string) string {

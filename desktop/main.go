@@ -86,7 +86,7 @@ func newApp(client *Client) *app {
 		// 凭据已经在手上时直接说「已配对」：那块地方让给模型列表，不再占一整块。
 		pairingNote: func() string {
 			if client != nil && client.deviceID != "" && client.token != "" {
-				return "已配对 · 这台已能直连"
+				return "已配对"
 			}
 			return ""
 		}(),

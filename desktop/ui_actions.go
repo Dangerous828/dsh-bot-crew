@@ -157,7 +157,7 @@ func (s *app) saveMemory() {
 		err := s.client.EditMemory(ctx, name, description, body)
 		result := actionResult{kind: "memory", name: name, ok: err == nil}
 		if err != nil {
-			result.note = err.Error()
+			result.note = actionErrorText(err)
 		}
 		s.deliver(result)
 	}()

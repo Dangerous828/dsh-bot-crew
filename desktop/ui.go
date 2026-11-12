@@ -369,7 +369,7 @@ func (s *app) refresh() {
 		defer cancel()
 		conversation, err := s.client.Timeline(ctx)
 		if err != nil {
-			s.failed <- err.Error()
+			s.failed <- actionErrorText(err)
 			s.wake()
 			return
 		}
@@ -401,7 +401,7 @@ func (s *app) send() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation)); err != nil {
-			s.failed <- err.Error()
+			s.failed <- actionErrorText(err)
 			s.wake()
 			return
 		}
@@ -621,9 +621,9 @@ func (s *app) drain(c *ui.Context) {
 			// 配对成功：先把凭据落到本机，再换上新的 client。存不下来也要说清楚 ——
 			// 这一次能连、下次启动又要重配，是两件不同的事。
 			if err := saveCredential(credentialPath(), credential); err != nil {
-				s.pairingNote = "配上了，但凭据存不下来：" + err.Error()
+				s.pairingNote = actionNote("配上了，但凭据存不下来", err)
 			} else {
-				s.pairingNote = "已配对，下次启动免配置直连"
+				s.pairingNote = "已配对，下次启动免配置"
 			}
 			s.client = New(credential.Base, credential.Token, credential.DeviceID)
 			// 横幅要跟着换：连的是新地址了，再失败时不能还报旧的那个。
@@ -637,7 +637,7 @@ func (s *app) drain(c *ui.Context) {
 				continue
 			}
 			if result.err != nil {
-				s.workError = result.err.Error()
+				s.workError = actionErrorText(result.err)
 				c.Invalidate()
 				continue
 			}
@@ -666,7 +666,7 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.exportCh:
 			s.exporting = false
 			if result.err != nil {
-				s.exportNote = "没导出成功：" + result.err.Error()
+				s.exportNote = actionNote("没导出成功", result.err)
 			} else {
 				s.exportNote = "已备份到 " + result.path
 			}
@@ -675,7 +675,7 @@ func (s *app) drain(c *ui.Context) {
 			s.devicesTried = true
 			s.revoking = map[string]bool{}
 			if result.err != nil {
-				s.devicesNote = "读不到已配对的设备：" + result.err.Error()
+				s.devicesNote = actionNote("读不到已配对的设备", result.err)
 			} else {
 				s.devices = result.list
 				s.devicesNote = ""
@@ -684,7 +684,7 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.botSaved:
 			s.botSaving = false
 			if result.err != nil {
-				s.botError = result.err.Error()
+				s.botError = actionErrorText(result.err)
 			} else {
 				// 存住了才关层：否则人会以为改了却没生效。
 				s.editingBot = ""
@@ -695,7 +695,7 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.pauseDone:
 			s.pausing = false
 			if result.err != nil {
-				s.pauseNote = "没停下来：" + result.err.Error()
+				s.pauseNote = actionNote("没停下来", result.err)
 			} else {
 				s.pauseNote = "已让它停一下（全局执行器，恢复要去面板）"
 				go s.refresh()
@@ -704,7 +704,7 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.steerDone:
 			delete(s.steering, result.requestID)
 			if result.err != nil {
-				s.steerNote = "插队没成功：" + result.err.Error()
+				s.steerNote = actionNote("插队没成功", result.err)
 				if errors.Is(result.err, ErrSteerTooLate) {
 					go s.refresh()
 				}
@@ -732,7 +732,7 @@ func (s *app) drain(c *ui.Context) {
 			delete(s.answers, result.key)
 			s.answerTicket, s.answerAsked = result.ticket, result.asked
 			if result.err != nil {
-				s.answerNote = "没答上：" + result.err.Error()
+				s.answerNote = actionNote("没答上", result.err)
 			} else {
 				// 只在这道题还在等、还是同一组时才说「已答」：结果回来时若已经
 				// 刷新成了新问题（或者这张票走了），那句话说的就是上一道题，收起来。
@@ -748,7 +748,7 @@ func (s *app) drain(c *ui.Context) {
 			if result.err != nil {
 				// 撤回失败只写在排队那一块：其他消息照样能发，不该挂断连横幅。
 				// 409 多半是队伍已经答过/读走了：重读一次时间线，排队那条才不会一直挂着。
-				s.withdrawError = result.err.Error()
+				s.withdrawError = actionErrorHuman(result.err.Error())
 				if errors.Is(result.err, ErrWithdrawalTooLate) {
 					go s.refresh()
 				}
@@ -770,7 +770,7 @@ func (s *app) drain(c *ui.Context) {
 				s.adoptedOK = map[string]bool{}
 			}
 			if result.err != nil {
-				s.adoptNotes[result.key] = "没采用成：" + result.err.Error()
+				s.adoptNotes[result.key] = actionNote("没采用成", result.err)
 			} else {
 				s.adoptedOK[result.key] = true
 				s.adoptNotes[result.key] = "已请它采用这段改动，下一步会按这个改"
@@ -1413,7 +1413,7 @@ func (s *app) sendSteer(ticketID string) {
 	s.sending = true
 	requestID, idErr := newRequestID()
 	if idErr != nil {
-		s.modelError <- "插队没成功：" + idErr.Error()
+		s.modelError <- actionNote("插队没成功", idErr)
 		return
 	}
 	go func() {
@@ -1421,7 +1421,7 @@ func (s *app) sendSteer(ticketID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := s.client.SteerText(ctx, ticketID, requestID, text); err != nil {
-			s.modelError <- "插队没成功：" + err.Error()
+			s.modelError <- actionNote("插队没成功", err)
 			s.wake()
 			return
 		}
@@ -1470,7 +1470,7 @@ func (s *app) lookAtScreen() {
 		view, err := s.client.Screen(ctx, ticketID)
 		switch {
 		case err != nil:
-			s.screenNoteCh <- "读不到屏幕：" + err.Error()
+			s.screenNoteCh <- actionNote("读不到屏幕", err)
 		case view.State == "live" && len(view.Lines) > 0:
 			s.screenCh <- view
 		case view.Reason != "":
@@ -2346,7 +2346,7 @@ func (s *app) preview(block CodeBlock) {
 		result := previewResult{key: key, ticket: ticket}
 		switch {
 		case err != nil:
-			result.reason = "读不到「改完的样子」：" + err.Error()
+			result.reason = actionNote("读不到「改完的样子」", err)
 		case view != nil && view.State == "live" && len(view.Lines) > 0:
 			result.view = view
 		case view != nil && view.Reason != "":
@@ -3299,7 +3299,7 @@ func (s *app) loadMemory() {
 		result := memoryResult{view: view}
 		if err != nil {
 			// 读失败与「没有记忆」是两件事：这条 note 会原样显示，别写成「还没有」。
-			result.note = "读不到记忆：" + err.Error()
+			result.note = actionNote("读不到记忆", err)
 		}
 		s.memoryCh <- result
 		s.wake()
@@ -3716,7 +3716,7 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 						defer cancel()
 						if err := s.client.Retry(ctx, ticketID); err != nil {
 							// 重试失败只影响这张票，不能写成全局断连把发送也锁住。
-							s.retryErrorCh <- err.Error()
+							s.retryErrorCh <- actionErrorText(err)
 							s.wake()
 							return
 						}
@@ -3945,7 +3945,7 @@ func (s *app) loadOutputs() {
 		result := outputsResult{view: view}
 		if err != nil {
 			// 读失败与「没有产出」是两件事：这条 note 会原样显示，别写成「还没有产出」。
-			result.note = "读不到产出：" + err.Error()
+			result.note = actionNote("读不到产出", err)
 		}
 		s.outputsCh <- result
 		s.wake()
@@ -3972,7 +3972,7 @@ func (s *app) loadRoutines() {
 		result := routinesResult{view: view}
 		if err != nil {
 			// 读失败与「没有常规任务」是两件事：这条 note 会原样显示，别写成「还没有」。
-			result.note = "读不到常规任务：" + err.Error()
+			result.note = actionNote("读不到常规任务", err)
 		}
 		s.routinesCh <- result
 		s.wake()
@@ -4025,7 +4025,7 @@ func (s *app) loadModels() {
 		catalog, err := s.client.Models(ctx)
 		if err != nil {
 			// 模型目录读不到不是连接故障：不能写进 s.problem，那会把发送也一起锁死。
-			s.modelError <- "读不到模型目录：" + err.Error()
+			s.modelError <- actionNote("读不到模型目录", err)
 			s.wake()
 			return
 		}
@@ -4046,7 +4046,7 @@ func (s *app) switchTo(choice ModelChoice) {
 		defer cancel()
 		if err := s.client.SwitchModel(ctx, choice, scope); err != nil {
 			// 换模型失败只影响模型栏，不该冒充断连、更不该锁住输入框。
-			s.modelError <- err.Error()
+			s.modelError <- actionErrorText(err)
 			s.wake()
 			return
 		}
@@ -4068,7 +4068,7 @@ func (s *app) loadEfforts() {
 		defer cancel()
 		view, err := s.client.Efforts(ctx, route.Provider, route.Model)
 		if err != nil {
-			s.modelError <- "读不到推理档位：" + err.Error()
+			s.modelError <- actionNote("读不到推理档位", err)
 			s.wake()
 			return
 		}
@@ -4326,7 +4326,7 @@ func (s *app) pairNow() {
 			credential, err := pairDevice(ctx, target, defaultDeviceID, "crew-desktop", "macos", nil)
 			if err != nil {
 				// 配对失败的原因（码过期、策略拒绝、队伍没起来）原样交回去，不吞成一个「失败」。
-				s.pairFailed <- err.Error()
+				s.pairFailed <- actionErrorText(err)
 				s.wake()
 				return
 			}

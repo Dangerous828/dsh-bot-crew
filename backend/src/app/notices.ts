@@ -105,12 +105,11 @@ export function followupRelay(message: { trigger_id: string },
   return { id: `followup:${message.trigger_id}`, text: JSON.stringify({ kind: 'follow_up', ...message, delivered_to: tickets,
     note: FOLLOWUP_NOTE }) }
 }
-/** Formats a worker report relay for the main Session (truncating summaries over 600 characters behind `ticket/<id>/result`); `replyTo` names the human question trigger it answers. */
+/** Formats a worker report relay for the main Session with the full summary (the main Session has its own compaction); `replyTo` names the human question trigger it answers. */
 export function resultRelay(ticket: Ticket, state: string, text: string, replyTo?: string): Relay {
   const id = key('worker-result', ticket.id, ticket.updatedAt, text)
-  const summary = text.length > 600 ? { summary: text.slice(0, 600), chars: text.length } : { summary: text }
   const report = { kind: 'worker_report', ticket: brief(ticket), trigger_id: ticket.origin.triggerId, state, ...replyTo ? { answer_to: replyTo } : {},
-    ...summary, read: `ticket/${ticket.id}/result` }
+    summary: text, read: `ticket/${ticket.id}/result` }
   return { id: `report:${id}`, text: JSON.stringify(report) }
 }
 /**

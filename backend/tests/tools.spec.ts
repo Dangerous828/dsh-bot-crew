@@ -422,9 +422,10 @@ it('relays a worker\'s report with its ticket card and the start of its summary,
   await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary, human_action: null })
   await h.runtime.idle()
   const report = relaysOf('worker_report').at(-1)!
-  expect(report).toMatchObject({ ticket: { ticket_id: ticket.id, title: ticket.title }, trigger_id: trigger.id, state: 'ready', chars: summary.length,
+  // 报告全文进主 Session 上下文（主 Session 也有 compaction），不再截到 600。
+  expect(report).toMatchObject({ ticket: { ticket_id: ticket.id, title: ticket.title }, trigger_id: trigger.id, state: 'ready',
     read: `ticket/${ticket.id}/result` })
-  expect(String(report.summary)).toBe(summary.slice(0, 600))
+  expect(String(report.summary)).toBe(summary)
   expect(report.ticket).not.toHaveProperty('preview')
   // The end of the ticket, which the ready report brought, comes with its card.
   expect(notices().at(-1)).toMatchObject({ ticket_ended: { ticket_id: ticket.id, state: 'completed' } })

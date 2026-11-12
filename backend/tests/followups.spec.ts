@@ -258,9 +258,11 @@ it('shows a candidate\'s message as its workers would read it, with the message 
   await h.runTool(sessionId, 'orchestrator_trigger_handback', { trigger_id: reply.id, reason: 'Another change.' })
   await h.runtime.pump(); await h.runtime.idle()
   const card = h.relays(h.runtime.masterId).find(item => item.kind === 'candidate' && item.trigger_id === reply.id)!
-  expect(card).toMatchObject({ from: 'ou_alice', text: long.slice(0, 600) + '…', chars: long.length, read: `trigger/${reply.id}`,
+  // 全文进上下文，不在入口按字符截断（收敛长上下文交给 DSH compaction）。
+  expect(card).toMatchObject({ from: 'ou_alice', text: long,
     replies_to: { trigger_id: ticket.origin.triggerId, preview: '@bot 修一下回归' } })
   expect(card).not.toHaveProperty('triggers')
+  expect(card).not.toHaveProperty('read')
 })
 
 it('keeps a listed member\'s request on a ticket\'s thread to that ticket, so it is not done twice', async () => {

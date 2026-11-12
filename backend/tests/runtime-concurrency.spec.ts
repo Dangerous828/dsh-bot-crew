@@ -910,9 +910,10 @@ describe('the Executor\'s parts', () => {
       at: '2026-09-01T00:00:00Z', text: 'Which page?', meta: {} } as Trigger
     const reply = { ...asked, id: 'tr2', text: 'The login page. '.repeat(50) }
     const card = triggerMessage(reply, { source_url: 'https://x' }, 'see the log', asked)
-    expect(card).toEqual({ trigger_id: 'tr2', from: 'ou_a', thread: 'feishu:oc:om_1', at: '2026-09-01T00:00:00Z', text: expect.stringMatching(/^The login page\./),
-      chars: reply.text.length, read: 'trigger/tr2', source_url: 'https://x', routing_note: 'see the log', replies_to: { trigger_id: 'tr1', preview: 'Which page?' } })
-    expect(card.text).toHaveLength(601)
+    expect(card).toEqual({ trigger_id: 'tr2', from: 'ou_a', thread: 'feishu:oc:om_1', at: '2026-09-01T00:00:00Z', text: reply.text,
+      source_url: 'https://x', routing_note: 'see the log', replies_to: { trigger_id: 'tr1', preview: 'Which page?' } })
+    // 全文进上下文，不再按 600 截断。
+    expect(card.text).toBe(reply.text)
     expect(triggerMessage(asked, {})).toEqual({ trigger_id: 'tr1', from: 'ou_a', thread: 'feishu:oc:om_1', at: asked.at, text: 'Which page?' })
     expect(JSON.parse(inputMessage({ id: 'i1', kind: 'trigger', triggerId: 'tr2', at: '' }, card)!)).toEqual(card)
     expect(JSON.parse(inputMessage({ id: 'i1', kind: 'trigger', triggerId: 'gone', at: '' })!)).toEqual({ trigger_id: 'gone', read: 'trigger/gone' })

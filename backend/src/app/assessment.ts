@@ -34,7 +34,7 @@ export const AssessmentSchema = z.object({
   || !!value.worktree_name, { message: 'Accepted work requires a short English worktree_name', path: ['worktree_name'] })
 
 /** Character limits in the initial thread window: for the trigger itself, its two nearest neighbours, other window messages, and stub previews. */
-const TRIGGER_CHARS = 4000, NEAR_CHARS = 1200, WINDOW_CHARS = 400, STUB_CHARS = 50
+const NEAR_CHARS = 1200, WINDOW_CHARS = 400, STUB_CHARS = 50
 const FINISHED = 'This assessment has finished: it was decided, timed out or restarted'
 const EXPLICIT = 'This is an explicit request, which is routed instead of assessed: use orchestrator_route with its trigger_id and kind accept, attach, stop or ignore'
 type AssessmentContext = Awaited<ReturnType<typeof admissionContext>>
@@ -173,7 +173,7 @@ export class MasterAssessor implements Assessor {
     if (!this.live(evalId, trigger)) throw new Error(FINISHED)
   }
   /**
-   * Returns the `orchestrator_eval` payload: the trigger's text once (up to `TRIGGER_CHARS`), batch peers, related tickets
+   * Returns the `orchestrator_eval` payload: the trigger's full text, batch peers, related tickets
    * on the thread, the Policy version its Eval was built from, and the initial thread window (first five messages and five
    * on either side of the trigger, truncated to `WINDOW_CHARS` or `NEAR_CHARS` for its two nearest neighbours with total
    * length and image IDs, plus other loaded messages as `STUB_CHARS` previews; `orchestrator_eval_read` reads any message
@@ -207,9 +207,11 @@ export class MasterAssessor implements Assessor {
     const settings = this.host.settings()
     const others = candidate.triggers.filter(item => item.id !== trigger.id)
     return { trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
+      // 待评估的这条消息全文进评估上下文；收敛长上下文交给 compaction，不在入口砍掉主人写的话。
+      text: trigger.text,
       source: { kind: trigger.source, actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), ...(trigger.url
         ? { url: trigger.url } : {}) },
-      ...cut(trigger.text, TRIGGER_CHARS), ...imageIds(source?.messageId ?? '', trigger.text),
+      ...imageIds(source?.messageId ?? '', trigger.text),
       ...others.length ? { batch: others.map(item => {
         const text = cut(item.text, WINDOW_CHARS)
         return { trigger_id: item.id, actor: item.actor.id, at: item.at, ...text, ...'chars' in text ? { read: `trigger/${item.id}` } : {} }

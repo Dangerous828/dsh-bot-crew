@@ -124,18 +124,24 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const where = `Work in this ticket's own directory \`${directory}\`; create it if it does not exist.`
   return { name, directory, assignment: assignment ? `${assignment}\n${where}` : '' }
 }
-/** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
-const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600
-/** Returns `text` up to `limit` characters, or a truncated preview with total character count and the resource path to read the full text. */
-const capped = (text: string, limit: number, read: string) =>
-  text.length <= limit ? { text } : { text: `${text.slice(0, limit)}…`, chars: text.length, read }
 /**
- * Formats a Trigger for worker delivery: author, thread, timestamp, text up to `TRIGGER_CHARS`, source message link,
+ * 用户消息与派工说明**全文进 worker 上下文**，不在入口截断。收敛长上下文是 DSH compaction 的职责
+ * （会话变长自动压缩、被遮蔽的历史留在日志、溢出后压缩重试），不是在交付层把主人写的话砍掉。
+ *
+ * `capped` 只在一种极端情形退回「指针 + 资源路径」：单条正文超过 `INLINE_HARD_CAP`（防一次把几 MB
+ * 贴文塞进一条消息把网关/编码打爆）。这个上限远大于任何正常需求，正常对话与派工永远走全文。
+ */
+const INLINE_HARD_CAP = 200_000
+/** Returns `text` whole; only a body past the extreme hard cap falls back to a pointer with total length and read path. */
+const capped = (text: string, read: string) =>
+  text.length <= INLINE_HARD_CAP ? { text } : { text: `${text.slice(0, INLINE_HARD_CAP)}…`, chars: text.length, read }
+/**
+ * Formats a Trigger for worker delivery: author, thread, timestamp, the full text, source message link,
  * optional routing note, and a preview of the replied-to message when the worker has not yet seen it.
  */
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
-    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
+    ...capped(trigger.text, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
 /** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */
@@ -285,6 +291,7 @@ export class DshExecutor implements Executor {
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
+    if (ticket.pendingApproval && ticket.pendingApproval.status !== 'approved') return
     this.host.effects.enqueue('launch', assignment.id, { ticketId: ticket.id, assignmentId: assignment.id })
   }
   /** Enqueues a `delivery` effect to steer pending inputs into `ticket`'s running worker session. */
@@ -294,6 +301,7 @@ export class DshExecutor implements Executor {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
+    if (ticket.pendingApproval && ticket.pendingApproval.status !== 'approved') return
     this.slots.reserve(ticketId, 'launch')
     try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
@@ -361,7 +369,7 @@ export class DshExecutor implements Executor {
     const trigger = input.kind === 'trigger' ? await this.triggerCard(ticket, input.triggerId, input.note) : undefined
     const message = inputMessage(input, trigger)
     if (message === undefined) return
-    const text = message.length > ASSIGNMENT_CHARS ? JSON.stringify(capped(message, ASSIGNMENT_CHARS, inputResource(ticket.id, input.id))) : message
+    const text = message.length > INLINE_HARD_CAP ? JSON.stringify(capped(message, inputResource(ticket.id, input.id))) : message
     await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, 'steer', live)
   }
   /** Formats a trigger on `ticket` for the worker, including a preview of the replied-to message when the worker has not yet seen it. */
@@ -484,7 +492,7 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const retried = ticket.assignments.at(-2)?.endedReason === 'retried' ? { note: RETRIED } : {}
     const assignmentText = ticket.execution?.assignment ?? ''
-    const { text: brief, chars, read } = capped(assignmentText, ASSIGNMENT_CHARS, `ticket/${ticket.id}/assignment`)
+    const { text: brief, chars, read } = capped(assignmentText, `ticket/${ticket.id}/assignment`)
     const card = told || !source ? undefined : await this.triggerCard(ticket, source.id)
     if (!current()) return
     const batch = told ? [] : batchOf(this.host, ticket).map(batchLine)

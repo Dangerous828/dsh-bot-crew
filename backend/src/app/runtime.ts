@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, liveTicket, reasonText, runningAssignment, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
+import { Engine, key, liveTicket, reasonText, runningAssignment, threadKey, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
   type Ticket, type Trigger, type AssessmentOutcome } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
@@ -29,15 +29,15 @@ import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } f
 import { routinesView, routineItemOf, type RoutinesView } from './routines.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText } from './followup.ts'
-import { spendOf, stepOf, type Spend, type SpendEvent } from './spend.ts'
+import { spendOf, spendSteps, type Spend, type SpendEvent } from './spend.ts'
 import { auditOf, type AuditRow } from './audit.ts'
 import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from './voice.ts'
 import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './compact-memory.ts'
 import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
 import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
-import { approvalOf, approvalPrompt, type ApprovalDecision } from './approval.ts'
+import { approvalOf, approvalPrompt, readAnswer, type ApprovalDecision } from './approval.ts'
 import { quotaOf, quotaWarning, replySpendOf, type Quota, type ReplySpend } from './quota.ts'
-import { connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
+import { allowedTools, connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
 import { speak as speakText, systemSpeakHost, DEFAULT_VOICE, type SpeakOutcome, type SpeakHost } from './speech.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -203,11 +203,19 @@ export class Runtime extends Service implements SourceHost {
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
+        guardConnection: (ticketId, name, args) => this.guardConnection(ticketId, name, args),
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
       this.memory = new MemoryLayer({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
         ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [] })
-      const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
+      const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => {
+        for (const ticket of store.tickets.open()) {
+          if (ticket.pendingApproval?.kind !== 'connection' || ticket.pendingApproval.status !== 'approved') continue
+          delete ticket.pendingApproval
+          store.tickets.save(ticket)
+        }
+        this.engine.policyChanged(from, to, effects)
+      }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
@@ -278,7 +286,7 @@ export class Runtime extends Service implements SourceHost {
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
-      const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
+      const passes = this.passes = new Passes({ engine: { receive: trigger => this.approvalReply(trigger) ?? engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
@@ -502,8 +510,7 @@ export class Runtime extends Service implements SourceHost {
     this.pushNotice({ title: '等你点头', body: prompt.question, kind: 'approval' })
     return {
       ...ticket,
-      // 强度降成 `inferred`：worker 据此知道「这不是已经批准的活」。
-      mandate: { ...ticket.mandate, strength: 'inferred' },
+      pendingApproval: { kind: 'task', status: 'waiting' },
       attention: {
         id: `attention-approval-${ticket.id}`,
         question: prompt.question,
@@ -558,6 +565,43 @@ export class Runtime extends Service implements SourceHost {
       // 读不出配置时保守：一律要点头。宁可多问一句，也不要静默发出去。
       return { action: 'ask', reason: `读不出对外连接设置（${String(error)}），先问你一声` }
     }
+  }
+
+  /** The grant is one exact MCP call, invalidated by any connection configuration change. */
+  private guardConnection(ticketId: string, name: string, args: unknown): string | undefined {
+    return this.store.atomic(() => {
+      const ticket = this.store.tickets.get(ticketId)
+      if (!ticket || !liveTicket(ticket)) return '工单已经结束'
+      const config = connectionsOf(this.store.settings().connections)
+      const connection = config.connections.find(item => name.startsWith(`mcp__${item.server}__`))
+      if (!connection || !allowedTools(config).includes(name)) {
+        if (ticket.pendingApproval?.kind === 'connection' && ticket.pendingApproval.status === 'approved') {
+          delete ticket.pendingApproval
+          this.store.tickets.save(ticket)
+        }
+        return '这个外部工具已不在当前连接配置中'
+      }
+      const tool = name.slice(`mcp__${connection.server}__`.length)
+      const verdict = judgeCall(config, connection.server, tool)
+      if (verdict.action === 'deny') return verdict.reason
+      if (verdict.action === 'allow') return undefined
+      const signature = key(name, JSON.stringify(args ?? null), JSON.stringify(config))
+      if (ticket.pendingApproval?.kind === 'connection' && ticket.pendingApproval.status === 'approved'
+        && ticket.pendingApproval.signature === signature) {
+        delete ticket.pendingApproval
+        this.store.tickets.save(ticket)
+        return undefined
+      }
+      ticket.pendingApproval = { kind: 'connection', status: 'waiting', signature }
+      const summary = JSON.stringify(args ?? null, (field, value) =>
+        /token|password|credential|authorization|secret|api_?key/i.test(field) ? '[redacted]' : value).slice(0, 500)
+      const prompt = approvalPrompt(`${name}（${summary}）`,
+        { ask: true, because: 'rule', reason: verdict.reason })
+      ticket.attention = { id: `attention-connection-${ticketId}-${signature}`, ...prompt, triggerId: ticket.origin.triggerId }
+      ticket.updatedAt = new Date().toISOString()
+      this.store.tickets.save(ticket)
+      return `${prompt.question} 请结束本轮等待，批准后只重试同一参数的一次调用。`
+    })
   }
 
   /** 写操作被拦下时的那一句话，直接给人看。 */
@@ -681,11 +725,12 @@ export class Runtime extends Service implements SourceHost {
     catch { return undefined }
     // 这张票 worker 的默认路由：事件里没带 provider/model 时用它兜底。
     const fallback = this.routeOf(id)
-    const window = await this.contextWindowOf(fallback.provider, fallback.model)
+    const windows = new Map<string, number | undefined>()
     const replies: ReplySpend[] = []
-    for (const event of events) {
-      const step = stepOf(event, fallback)
-      if (!step) continue
+    for (const step of spendSteps(events, fallback)) {
+      const route = `${step.provider}/${step.model}`
+      if (!windows.has(route)) windows.set(route, await this.contextWindowOf(step.provider, step.model))
+      const window = windows.get(route)
       replies.push(replySpendOf({
         provider: step.provider, model: step.model, usage: step.usage,
         ...(window === undefined ? {} : { contextWindow: window }),
@@ -730,7 +775,9 @@ export class Runtime extends Service implements SourceHost {
 
   /** 这张票的 worker 用哪条路由：审计账在事件没带 provider/model 时的兜底。 */
   private routeOf(ticketId: string): { provider?: string; model?: string } {
-    const route = this.store.settings().executor?.model
+    const executor = this.store.settings().executor
+    const bot = this.store.tickets.get(ticketId)?.channels[0]?.address.bot_id
+    const route = (typeof bot === 'string' ? executor?.botModels?.[bot] : undefined) ?? executor?.model
     if (route?.provider && route?.model) return { provider: route.provider, model: route.model }
     return {}
   }
@@ -879,6 +926,62 @@ export class Runtime extends Service implements SourceHost {
     }))
     return { efforts, ...(info.reasoning?.defaultEffort ? { default: String(info.reasoning.defaultEffort) } : {}) }
   }
+  /** A unique pending question can only be answered by its requester in the same conversation and Bot. */
+  private approvalReply(trigger: Trigger): ReceiveResult | undefined {
+    if (!trigger.human || this.store.triggers.get(trigger.id) || !this.sources.scope(trigger).listened) return undefined
+    const conversation = (channel: Trigger['channel']) => channel
+      ? `${channel.source}:${channel.address.conversation ?? channel.address.chatId ?? channel.thread}` : undefined
+    const text = trigger.text.replace(/^@\S+\s+/, '').trim()
+    const candidates = this.store.tickets.open().filter(ticket => ticket.pendingApproval
+      && ticket.pendingApproval.status !== 'approved'
+      && ticket.mandate.actor.source === trigger.actor.source && ticket.mandate.actor.id === trigger.actor.id
+      && ticket.channels.some(channel => conversation(channel) === conversation(trigger.channel)
+        && channel.address.bot_id === trigger.channel?.address.bot_id))
+    const sameThread = candidates.filter(ticket => trigger.threads.some(ref =>
+      this.store.threads.get(threadKey(ref))?.subscriptions.includes(ticket.id)))
+    const matches = sameThread.length ? sameThread : candidates
+    // A bare label must never approve two tickets or guess which one the person meant.
+    if (matches.length !== 1) return undefined
+    const ticket = matches[0]!
+    const pending = ticket.pendingApproval!
+    const option = ticket.attention?.options?.find(item => item.label === text || item.id === text)
+    if (!option && pending.status !== 'revise') return undefined
+    return this.store.atomic(() => {
+      const at = new Date().toISOString()
+      this.store.triggers.save(trigger)
+      this.store.triggers.saveDisposition(trigger.id, { fanout: [ticket.id], acked: [ticket.id], at })
+      ticket.inputs.push({ id: key('approval-input', trigger.id), kind: 'trigger', triggerId: trigger.id, human: true, at })
+      ticket.updatedAt = at
+      const answer = option ? readAnswer(option.label) : 'revise'
+      if (option && answer === 'stop') {
+        this.store.tickets.save(ticket)
+        this.engine.stopTicket(ticket.id, '主人选择先别做')
+      } else if (option && answer === 'revise') {
+        pending.status = 'revise'
+        ticket.attention = { id: `attention-approval-${ticket.id}`, question: '请写下新的做法；确认后才会继续。', triggerId: trigger.id }
+        this.store.tickets.save(ticket)
+      } else if (pending.status === 'revise') {
+        if (ticket.execution) ticket.execution.assignment += `\n\n主人修订：${trigger.text}`
+        ticket.pendingApproval = { kind: 'task', status: 'waiting' }
+        const prompt = approvalPrompt(ticket.title, { ask: true, because: 'mode', reason: `已记录新要求：${text}` })
+        ticket.attention = { id: `attention-approval-${ticket.id}`, ...prompt, triggerId: trigger.id }
+        this.store.tickets.save(ticket)
+      } else {
+        if (pending.kind === 'connection') pending.status = 'approved'
+        else delete ticket.pendingApproval
+        delete ticket.attention
+        const input = { id: key('approval-go', trigger.id), kind: 'text' as const, at,
+          text: '主人已批准这次请求。外部写操作仅批准之前展示的同一工具和同一参数的一次调用；不要扩大范围。' }
+        ticket.inputs.push(input); ticket.undelivered.push(input.id)
+        this.store.tickets.save(ticket)
+        const latest = ticket.assignments.at(-1)
+        if (latest?.state === 'pending') this.executor.start(ticket, latest)
+        else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
+      }
+      return 'stored' as const
+    })
+  }
+
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }

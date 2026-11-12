@@ -167,7 +167,7 @@ beforeEach(async () => {
       const inherited = ['memory_write', 'memory_read', 'memory_list', 'memory_search',
          'mcp__magpie__hub_memory__hub_memory_search', 'mcp__magpie__hub_memory__hub_memory_write',
          'bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
-        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
+        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit', 'mcp__mail__list', 'mcp__mail__send']
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
       agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name,
@@ -1882,6 +1882,119 @@ it('retries a pending setup on its own instead of staying paused until a manual 
   await next.stop()
 }, 30_000)
 
+describe('live MCP connection gate', () => {
+  function connectMail() {
+    const current = runtime.store.settings()
+    runtime.store.saveSettings({ ...current, connections: { readOnly: true,
+      connections: [{ kind: 'mail', server: 'mail', readTools: ['list'], writeTools: ['send'] }] } })
+  }
+  const sendMail = (body = 'hello') => ({ name: 'mcp__mail__send', arguments: { to: 'yg@example.test', body, token: 'hidden-secret' } })
+
+  it('allows reads, holds writes, and consumes an exact human-approved call once', async () => {
+    connectMail()
+    const { ticket, sessionId } = await acceptedTicket()
+    const guard = guards.get(sessionId)!
+    expect(guard({ name: 'mcp__mail__list', arguments: {} })).toBeUndefined()
+    expect(guard(sendMail())).toContain('先问')
+    expect(runtime.store.tickets.get(ticket.id)?.attention?.question).not.toContain('hidden-secret')
+    expect(guard({ name: 'bash', arguments: { command: 'echo bypass' } })).toContain('等主人审批')
+    await receive(feishu('2', '做吧'))
+    expect(guard(sendMail())).toBeUndefined()
+    expect(guard(sendMail())).toContain('先问')
+  })
+
+  it('asks again if the arguments change after approval', async () => {
+    connectMail()
+    const { sessionId } = await acceptedTicket()
+    const guard = guards.get(sessionId)!
+    guard(sendMail())
+    await receive(feishu('2', '做吧'))
+    expect(guard(sendMail('different content'))).toContain('先问')
+  })
+
+  it('revokes access for an already-created worker when configuration changes', async () => {
+    connectMail()
+    const { sessionId } = await acceptedTicket()
+    const guard = guards.get(sessionId)!
+    guard(sendMail())
+    await receive(feishu('2', '做吧'))
+    runtime.store.saveSettings({ ...runtime.store.settings(), connections: { readOnly: true, connections: [] } })
+    expect(guard(sendMail())).toContain('不在当前连接配置')
+    connectMail()
+    expect(guard(sendMail())).toContain('先问')
+  })
+
+  it('applies the same live gate to a worker subagent', async () => {
+    connectMail()
+    const { ticket, sessionId } = await acceptedTicket()
+    await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'mail-child' })
+    const child = agents.get('mail-child')! as unknown as { session: { header: { parentSession?: string } } }
+    child.session.header = { parentSession: sessionId }
+    await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+    expect(guards.get('mail-child')!(sendMail())).toContain('先问')
+    expect(runtime.store.tickets.get(ticket.id)?.pendingApproval?.status).toBe('waiting')
+  })
+})
+
+describe('approval execution gate', () => {
+  const requireApproval = () => {
+    const current = runtime.store.settings()
+    runtime.store.saveSettings({ ...current, approval: { ...current.approval, mode: 'off' } })
+  }
+
+  it('keeps the immutable mandate and does not launch until its requester approves', async () => {
+    requireApproval()
+    const { ticket, sessionId } = await acceptedTicket()
+    expect(runtime.store.tickets.get(ticket.id)?.mandate.strength).toBe('explicit')
+    expect(agents.has(sessionId)).toBe(false)
+    await receive(feishu('2', '做吧'))
+    expect(agents.has(sessionId)).toBe(true)
+    expect(runtime.store.tickets.get(ticket.id)?.attention).toBeUndefined()
+  })
+
+  it('stops without starting a worker when the requester declines', async () => {
+    requireApproval()
+    const { ticket, sessionId } = await acceptedTicket()
+    await receive(feishu('2', '先别做'))
+    expect(runtime.store.tickets.get(ticket.id)?.ended?.by).toBe('human')
+    expect(agents.has(sessionId)).toBe(false)
+  })
+
+  it('waits for revised instructions and a fresh approval before launching', async () => {
+    requireApproval()
+    const { ticket, sessionId } = await acceptedTicket()
+    await receive(feishu('2', '换个做法'))
+    expect(agents.has(sessionId)).toBe(false)
+    await receive(feishu('3', '只检查问题，先别修改文件'))
+    expect(agents.has(sessionId)).toBe(false)
+    await receive(feishu('4', '做吧'))
+    expect(agents.has(sessionId)).toBe(true)
+    expect(runtime.store.tickets.get(ticket.id)?.execution?.assignment).toContain('只检查问题，先别修改文件')
+  })
+
+  it('keeps approval pending across a runtime restart', async () => {
+    requireApproval()
+    const { ticket, sessionId } = await acceptedTicket()
+    const next = await restart()
+    next.sources.register(feishuKind); next.sources.register(githubKind)
+    await next.ready
+    await next.idle()
+    expect(next.store.tickets.get(ticket.id)?.pendingApproval?.status).toBe('waiting')
+    expect(agents.has(sessionId)).toBe(false)
+    await receive(feishu('2', '做吧'), next)
+    expect(next.store.tickets.get(ticket.id)?.pendingApproval).toBeUndefined()
+    expect(next.store.tickets.get(ticket.id)?.assignments.at(-1)?.report).toBeUndefined()
+    expect(agents.has(sessionId)).toBe(true)
+  })
+
+  it('ignores another sender as an approver', async () => {
+    requireApproval()
+    const { sessionId } = await acceptedTicket()
+    await receive({ ...feishu('2', '做吧'), actor: { source: 'feishu', id: 'ou_other' } })
+    expect(agents.has(sessionId)).toBe(false)
+  })
+})
+
 describe('runRoutines: 到点真的派出去，还是只记一句', () => {
   // 这一段之前一条测试都没有：`routines.spec.ts` 只测 due 怎么算、账怎么记，
   // 而「到点之后真的变成一张票」和「暂停时只记一句 held」是两条完全不同的行为，
@@ -1905,8 +2018,9 @@ describe('runRoutines: 到点真的派出去，还是只记一句', () => {
     expect(result.dispatched).toEqual([])
     expect(result.held).toEqual(['task-1'])
     // 没派出去就不能记成跑过。
-    const after = instance.store.get(KV.routines.task('task-1')) as Record<string, unknown>
-    expect(after.last_run).toBeUndefined()
+    const after = instance.store.get(KV.routines.task('task-1'))
+    expect(after).toBeDefined()
+    expect(after?.last_run).toBeUndefined()
   })
 
   it('holds a due task while the crew is paused, and does not record it as run', async () => {
@@ -1918,8 +2032,9 @@ describe('runRoutines: 到点真的派出去，还是只记一句', () => {
     expect(result.dispatched).toEqual([])
     expect(result.held).toEqual(['task-1'])
     // 没跑成就不能记成跑过 —— 否则暂停期间的那几拍会被吞掉，恢复后也不再补。
-    const after = instance.store.get(KV.routines.task('task-1')) as Record<string, unknown>
-    expect(after.last_run).toBeUndefined()
+    const after = instance.store.get(KV.routines.task('task-1'))
+    expect(after).toBeDefined()
+    expect(after?.last_run).toBeUndefined()
   })
 
   it('leaves a task that is not due alone', async () => {

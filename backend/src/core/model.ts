@@ -293,6 +293,8 @@ export interface Ticket {
   ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
+  /** Approval belongs to this ticket; a connection grant covers one exact call under the same settings. */
+  pendingApproval?: { kind: 'task' | 'connection'; status: 'waiting' | 'revise' | 'approved'; signature?: string }
   assignments: Assignment[]
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */

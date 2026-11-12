@@ -114,7 +114,10 @@ export function judgeCall(config: ConnectionConfig, server: string, tool: string
 export function allowedTools(config: ConnectionConfig): string[] {
   const names: string[] = []
   for (const connection of config.connections) {
-    const tools = [...connection.readTools, ...(connection.writeTools ?? [])]
+    // 没列工具的连接吃内置读白名单，与 natureOf 的分类一致；显式配过就以配置为准。
+    const explicit = connection.readTools.length > 0 || (connection.writeTools?.length ?? 0) > 0
+    const reads = explicit ? connection.readTools : DEFAULT_READ[connection.kind] ?? []
+    const tools = [...reads, ...(connection.writeTools ?? [])]
     for (const tool of tools) names.push(`mcp__${connection.server}__${tool}`)
   }
   return names

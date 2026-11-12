@@ -38,6 +38,20 @@ describe('approvalOf', () => {
     const decision = approvalOf(facts({ mode: 'off', rules: ['r1'], sensitive: ['r1'], budgetUsed: 1 }))
     expect(decision.because).toBe('mode')
   })
+
+  it('follows a rule change: flipping a sensitive mark changes the verdict', () => {
+    // 规则集合没变，只是把 r1 标成「要审批」：判定必须跟着变，不能沿用旧结论。
+    expect(approvalOf(facts({ rules: ['r1'], sensitive: [] })).ask).toBe(false)
+    expect(approvalOf(facts({ rules: ['r1'], sensitive: ['r1'] }))).toMatchObject({ ask: true, because: 'rule' })
+    expect(approvalOf(facts({ rules: [], sensitive: ['r1'] })).ask).toBe(false)
+  })
+
+  it('never reuses a past approval: every call is judged from its own facts', () => {
+    // 先按 auto 放行，再切到一律先问：判定不记住上一次的「不用问」。
+    expect(approvalOf(facts({ mode: 'auto' })).ask).toBe(false)
+    expect(approvalOf(facts({ mode: 'off' })).ask).toBe(true)
+    expect(approvalOf(facts({ mode: 'auto' })).ask).toBe(false)
+  })
 })
 
 describe('approvalPrompt', () => {
@@ -55,5 +69,11 @@ describe('readAnswer', () => {
     for (const revise of ['换个做法', '改一下', 'revise']) expect(readAnswer(revise)).toBe('revise')
     // 认不出的回答一律不动：宁可停着，也不要猜他要什么。
     for (const no of ['', '随便', '嗯……', '再说']) expect(readAnswer(no)).toBe('stop')
+  })
+
+  it('reads the exact labels the prompt offers (a tap sends the label)', () => {
+    expect(readAnswer('做吧')).toBe('go')
+    expect(readAnswer('先别做')).toBe('stop')
+    expect(readAnswer('换个做法')).toBe('revise')
   })
 })

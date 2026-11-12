@@ -58,6 +58,22 @@ describe('judgeCall', () => {
     expect(KIND_NAME.calendar).toBe('日历')
     expect(KIND_NAME.files).toBe('文件')
   })
+
+  it('treats an unknown tool on a connected server as a write', () => {
+    // 认不出来的工具按最谨慎的一侧处理：只读模式下停下来问，而不是悄悄放行。
+    const verdict = judgeCall(config, 'mail', 'brand_new_tool')
+    expect(verdict.action).toBe('ask')
+    expect(verdict.reason).toContain('brand_new_tool')
+  })
+
+  it('re-judges from the current config each call, never reusing a past approval', () => {
+    // 先把只读关掉放行写，再用原配置判：不能因为上一次放行过就记住那个决定。
+    expect(judgeCall({ ...config, readOnly: false }, 'mail', 'send_message').action).toBe('allow')
+    expect(judgeCall(config, 'mail', 'send_message').action).toBe('ask')
+    // 服务器从配置里移除（断连 / 撤销接入）后，同一工具立刻变 deny。
+    const removed: ConnectionConfig = { connections: [calendar], readOnly: true }
+    expect(judgeCall(removed, 'mail', 'send_message')).toMatchObject({ action: 'deny' })
+  })
 })
 
 describe('allowedTools', () => {
@@ -68,6 +84,20 @@ describe('allowedTools', () => {
   it('keeps write tools reachable so the approval can happen at call time', () => {
     const withWrite = { connections: [{ ...mail, readTools: ['list_messages'], writeTools: ['send_message'] }], readOnly: true }
     expect(allowedTools(withWrite)).toContain('mcp__mail__send_message')
+  })
+
+  it('makes the built-in read names reachable on a bare connection', () => {
+    // 只写 { kind, server } 的连接：natureOf 认这些工具为读、judgeCall 放行，放行层也得给得出工具名。
+    const bare: ConnectionConfig = { connections: [{ kind: 'mail', server: 'mail', readTools: [] }], readOnly: true }
+    expect(natureOf(bare.connections[0]!, 'list_messages')).toBe('read')
+    expect(judgeCall(bare, 'mail', 'list_messages').action).toBe('allow')
+    expect(allowedTools(bare)).toContain('mcp__mail__list_messages')
+  })
+
+  it('does not leak built-in reads into a connection that listed only writes', () => {
+    // 显式配过工具就以配置为准：与 natureOf 一致，别把没声明的读工具塞给 worker。
+    const writesOnly: ConnectionConfig = { connections: [{ kind: 'mail', server: 'mail', readTools: [], writeTools: ['send_message'] }], readOnly: true }
+    expect(allowedTools(writesOnly)).toEqual(['mcp__mail__send_message'])
   })
 })
 
@@ -98,5 +128,11 @@ describe('connectionsOf', () => {
   it('reads an empty configuration as no connections at all', () => {
     expect(connectionsOf(undefined).connections).toEqual([])
     expect(connectionsOf({}).connections).toEqual([])
+  })
+
+  it('keeps a minimal { kind, server } declaration', () => {
+    // schema 的 readTools 默认 []：这种条目合法，靠内置白名单分类与放行。
+    expect(connectionsOf({ connections: [{ kind: 'calendar', server: 'cal' }] }).connections)
+      .toEqual([{ kind: 'calendar', server: 'cal', readTools: [] }])
   })
 })

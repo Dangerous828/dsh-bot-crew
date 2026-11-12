@@ -37,6 +37,7 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  guardConnection?(ticketId: string, name: string, args: unknown): string | undefined
 }
 
 /**
@@ -317,9 +318,14 @@ export class Sessions {
     // 只放行宿主真的注册了的（`tools.get` 为假说明那个 MCP 服务器没连上）。
     const configured = allowedTools(connectionsOf((store.settings() as { connections?: unknown }).connections))
     const allow = [...WORK_TOOLS, ...configured].filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(execution => {
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
+      if (current.pendingApproval && current.pendingApproval.status !== 'approved') return '这张票在等主人审批，请结束本轮等待，不要改用其他工具。'
+      if (execution?.name.startsWith('mcp__') && !WORK_TOOLS.includes(execution.name)) {
+        return this.host.guardConnection?.(ticketId, execution.name, execution.arguments) ?? undefined
+      }
+      return undefined
     })]
   }
   /**

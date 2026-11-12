@@ -35,6 +35,12 @@
 - 将来要上公网多租户，这条 ADR 需重新审视——那时 B（容器）成为主方案。
 - 跨平台：Linux 同理（独立用户 + 目录权限）；Windows 另议（本机是 macOS）。
 
+## 已知边界（本轮实现范围）
+
+- 本仓用 `runIsolated` 包住的是**我们自己的** `runAsWorker` 调用（ticket 的 `prepare` 命令、git 探活等）。
+- worker 在 agent 会话里**实际跑的每一条命令**由 DSH 的 subprocess provider 起，不在本仓 `runAsWorker` 这条缝上——要连那些也关进沙箱，需要在 DSH provider 层支持 uid/gid 或 per-session 沙箱包装，超出本仓能控范围。这是 A 方案「完整落地」的下一步：向 DSH 提 provider 能力，或在 provider 外包一层。
+- 因此当前隔离强度：**ticket 准备阶段与 git/文件基线命令已隔开凭据**；agent 自由命令的隔离依赖 DSH。如实记录，不把「部分隔离」说成「全隔离」。
+
 ## 落地顺序（对应 #9 五项）
 
 1. 本 ADR（定方案）。

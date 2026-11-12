@@ -506,6 +506,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/mobile-http.spec.ts` | Connection Fetch registration, validated sends and withdrawals, server-only credentials, transport errors, and the gateway's 409 refusal kept intact |
 | `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation; a withdrawn request leaving `queued` |
+| `tests/mobile-read.spec.ts` | 已读回话：报上水位才数得出未读回话、没报过/水位不在时间线里都算 unknown、只数水位之后的 Bot 回话、按时间线顺序判、缺字段与超长被拒 |
 | `tests/screen.spec.ts` | The screen snapshot: why there is nothing to show, the kinds of event lines, the tail limit and secret masking |
 | `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
 | `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, the pairing rate limit, port reporting, forwarding after the gate |

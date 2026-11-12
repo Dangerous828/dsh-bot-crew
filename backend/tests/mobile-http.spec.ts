@@ -23,6 +23,7 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/timeline', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/send', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/withdraw', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/read', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/work', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/agents', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered' },
@@ -154,7 +155,7 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(24)
+  expect(registered.length).toBe(25)
   expect(registered).toContain('/api/mobile/resume')
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)

@@ -127,3 +127,68 @@ func TestEveryPaletteColorIsOpaque(t *testing.T) {
 		}
 	}
 }
+
+// Tertiary 是设计系统把 hint / faint 收成一档后的名字，theme.go 里这个字段叫 Hint。
+// 亮色 :96 从 #A9A294（on Surface 2.41:1）压到 #6F6A60，为的是让它压在任何一层底上
+// 都还读得清。这里按「前景 × 实际背景」逐对列全：占位、状态行、空态说明并不只落在
+// 卡片上，页签轨道 / 抬起层 / 淡色标签都比卡片更深，只测 Card 会漏掉最先糊掉的那一层。
+func TestTertiaryInkOnEveryBackgroundItSitsOn(t *testing.T) {
+	cases := []struct {
+		name string
+		ink  ui.Color
+		on   ui.Color
+		min  float64
+	}{
+		// 亮色 tertiary：本轮落地的 #6F6A60。这些是 11–14px 的说明文字，按 WCAG AA 正文 4.5 要求。
+		{"亮/Hint·页面底", LightPalette.Hint, LightPalette.Surface, 4.5},
+		{"亮/Hint·卡片", LightPalette.Hint, LightPalette.Card, 4.5},
+		{"亮/Hint·页签轨道", LightPalette.Hint, LightPalette.Track, 4.5},
+		{"亮/Hint·抬起层", LightPalette.Hint, LightPalette.Raised, 4.5},
+		{"亮/Hint·脚注", LightPalette.Hint, LightPalette.Footer, 4.5},
+		{"亮/Hint·浅脚注", LightPalette.Hint, LightPalette.Faintest, 4.5},
+		{"亮/Hint·代码底", LightPalette.Hint, LightPalette.Code, 4.5},
+		{"亮/Hint·选中项", LightPalette.Hint, LightPalette.Selected, 4.5},
+		{"亮/Hint·等你决定卡", LightPalette.Hint, LightPalette.WarmBase, 4.5},
+		{"亮/Hint·强调淡底", LightPalette.Hint, LightPalette.AccentSoft, 4.5},
+		{"亮/Hint·警告淡底", LightPalette.Hint, LightPalette.WarnSoft, 4.5},
+		{"亮/Hint·失败淡底", LightPalette.Hint, LightPalette.DangerSoft, 4.5},
+		// 暗色 tertiary 还没压到亮色那一档（优化对照 §一给的目标值是 #9A938A）。
+		// 这一组按与 Faint 相同的「弱化文字 2.5」守住现状，只列它真正压着的底，
+		// 不让某一层继续往下掉；目标值落地时把整组一起提到 4.5。彩色淡底上不摆 Hint 文字，故不列。
+		{"暗/Hint·页面底", DarkPalette.Hint, DarkPalette.Surface, 2.5},
+		{"暗/Hint·卡片", DarkPalette.Hint, DarkPalette.Card, 2.5},
+		{"暗/Hint·页签轨道", DarkPalette.Hint, DarkPalette.Track, 2.5},
+		{"暗/Hint·抬起层", DarkPalette.Hint, DarkPalette.Raised, 2.5},
+		{"暗/Hint·脚注", DarkPalette.Hint, DarkPalette.Footer, 2.5},
+		{"暗/Hint·浅脚注", DarkPalette.Hint, DarkPalette.Faintest, 2.5},
+		{"暗/Hint·代码底", DarkPalette.Hint, DarkPalette.Code, 2.5},
+		{"暗/Hint·选中项", DarkPalette.Hint, DarkPalette.Selected, 2.5},
+		{"暗/Hint·等你决定卡", DarkPalette.Hint, DarkPalette.WarmBase, 2.5},
+	}
+	for _, c := range cases {
+		if got := contrast(c.ink, c.on); got < c.min {
+			t.Errorf("%s: 对比度 %.2f，低于 %.1f（这层底上会读不清）", c.name, got, c.min)
+		}
+	}
+}
+
+// 负对照：把亮 Hint 换回设计系统废弃的 #A9A294，上面那组 4.5 的判定必须报错。
+// 这条钉的是「测试本身真能抓到回归」——落地映射 §六要求改回旧色值时测试要红；
+// 万一有人把亮色那一档的门槛放松到 2.5，或把旧值填回去，先由这里说话。
+func TestOldTertiaryValueFailsTheReadableFloor(t *testing.T) {
+	regressed := LightPalette
+	regressed.Hint = ui.Hex("#A9A294")
+	for _, on := range []struct {
+		name  string
+		color ui.Color
+	}{
+		{"页面底", LightPalette.Surface}, {"卡片", LightPalette.Card}, {"页签轨道", LightPalette.Track},
+		{"抬起层", LightPalette.Raised}, {"脚注", LightPalette.Footer}, {"浅脚注", LightPalette.Faintest},
+		{"代码底", LightPalette.Code}, {"选中项", LightPalette.Selected}, {"等你决定卡", LightPalette.WarmBase},
+		{"强调淡底", LightPalette.AccentSoft}, {"警告淡底", LightPalette.WarnSoft}, {"失败淡底", LightPalette.DangerSoft},
+	} {
+		if got := contrast(regressed.Hint, on.color); got >= 4.5 {
+			t.Errorf("旧 Hint #A9A294 压在%s上是 %.2f，竟达到 4.5；4.5 门槛已拦不住回归", on.name, got)
+		}
+	}
+}

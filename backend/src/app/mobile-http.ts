@@ -8,7 +8,7 @@ import { canRetry, ticketStage } from '../core/index.ts'
 import { SettingsConflict } from './settings.ts'
 import type { Settings } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
-import { KV } from '../kv.ts'
+import { KV, record } from '../kv.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
@@ -101,6 +101,8 @@ const PHONE_ERRORS: Readonly<Record<string, string>> = {
   'Mobile request was rejected': '消息通道拒绝了这次请求',
   'no such message': '这句话已经不在队列里了',
   'request_id is required': '缺 request_id',
+  'last_read_id is required': '缺 last_read_id：没说读到哪一条回话',
+  'Read cursor is unavailable': '这个后端记不下已读位置',
 }
 /** 把一条错误换成人话；没有对应条目就原样交回，不吞掉后端的原因。 */
 const say = (error: string): string => PHONE_ERRORS[error] ?? error
@@ -318,11 +320,26 @@ function gatewayOrigin(stateDir?: string): string {
   return `${process.env.MOBILEGW_SECURE === '1' ? 'https' : 'http'}://${host}:${port}`
 }
 
+/**
+ * 「回话已读到哪」的会话级水位。存在 Store 的 KV 里：不开新表、不给网关的 `replies` 表加
+ * 阅读回执（契约 §5.6 明确说那上面不该有）。值和 `GET /timeline` 的回话 id 同源，都是网关给的 `r<n>`。
+ */
+const READ_CURSOR = record<string>('mobile-read-cursor')
+
+/** 读水位；宿主没接 KV（老版本或假宿主）时是「没报过」，不是 0 条。 */
+function replyReadCursor(store: PhoneHost['store']): string | undefined {
+  const value = typeof store.get === 'function' ? store.get(READ_CURSOR) : undefined
+  return typeof value === 'string' && value ? value : undefined
+}
+
 /** Which operations exist, how they are called, and whether they need a query the surface checks itself. */
 const OPERATIONS = {
   timeline: { methods: ['GET'] }, send: { methods: ['POST'] },
   // 排队中的消息撤回：只按 request_id 指认，网关自己判定是否还来得及。
   withdraw: { methods: ['POST'] },
+  // 回话已读到哪：客户端上报它在时间线上读到的最后一条回话，后端记一条会话级水位。
+  // 这是契约 §5.6 原来缺的那个输入；有了它，`GET /timeline` 才多得出「未读回话」这一格。
+  read: { methods: ['POST'] },
   work: { methods: ['GET'], needsTicket: true }, agents: { methods: ['GET'], needsTicket: true },
   // 「产出」：队伍交出来的文件。不带 `?ticket=` 时列最近几张票的产出，带就只看那一张。
   outputs: { methods: ['GET'] },
@@ -399,7 +416,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Pairing request too large' })
     }
     if (operation === 'steer') body = await incoming.text()
-    if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || (operation === 'bots' && incoming.method === 'POST')) {
+    if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'read' || (operation === 'bots' && incoming.method === 'POST')) {
       // 控制请求与花名册只带几个短字段，和配对请求同量级。
       body = await incoming.text()
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
@@ -440,7 +457,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
       || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'bots' || operation === 'efforts'
-      || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory'
+      || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory' || operation === 'read'
       || operation === 'spend' || operation === 'audit' || operation === 'voice' || operation === 'reply-spend' || operation === 'speak') {
       await runtime.ready
       if (operation === 'routines') {
@@ -670,6 +687,19 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         catch { return response(500, { error: 'Resume control failed' }) }
         return response(200, { ok: true, resumed: true, scope: 'executor' })
       }
+      if (operation === 'read') {
+        // 「未读回话」原来没有，是因为后端从来收不到「主人看过哪条回话」这个输入
+        // （契约 §5.6：网关只有人 → 队伍的 messages.read_at，反方向没有回执）。
+        // 这条路由只补那一个输入：客户端报上它读到的最后一条回话 id，后端记一条会话级水位。
+        // 不逐条改 replies 表、不发明阅读回执；数由 GET /timeline 按这份水位算（unreadRepliesOf）。
+        const asked = askedBody(body)
+        if (!asked) return response(400, { error: 'Invalid JSON' })
+        const lastReadId = typeof asked.last_read_id === 'string' ? asked.last_read_id.trim() : ''
+        if (!lastReadId || lastReadId.length > 128) return response(400, { error: 'last_read_id is required' })
+        if (typeof runtime.store.set !== 'function') return response(503, { error: 'Read cursor is unavailable' })
+        runtime.store.set(READ_CURSOR, lastReadId)
+        return response(200, { ok: true, last_read_id: lastReadId })
+      }
       if (operation === 'bots') {
         const settings = runtime.store.settings()
         const config = (settings.sources?.team?.config ?? {}) as Record<string, unknown>
@@ -874,6 +904,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 但判据不同：`queued` 是「还没回复、还能撤回」，未读是「还没被读走」。一条消息可以先被读走
         // 再慢慢回，那时它已经不算未读了。
         unread: unreadOf(items),
+        // 「未读回话」：队伍回了、主人还没看的有几条（契约 §5.6 新增的一格）。
+        // 和 `unread` 方向相反、判据不同，两个数谁也不冒充谁；没报过水位就是 unknown，不是 0。
+        unread_replies: unreadRepliesOf(items, replyReadCursor(runtime.store)),
         // The messages read and left on purpose. Without these the phone cannot tell a thought in progress from
         // one that will never be answered.
         // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
@@ -938,6 +971,29 @@ export function unreadOf(items: readonly TimelineItem[]): UnreadView {
 }
 
 /**
+ * 队伍回了、主人还没看的有几条（契约 §5.6 的第二个数）。
+ *
+ * 和 `unreadOf` 是方向相反的两件事：那边数「人发出去、队伍还没读走」，靠网关 `messages.read_at`；
+ * 这边数「队伍回话、主人还没看到」，唯一的输入是客户端通过 `POST /api/mobile/read` 报上来的
+ * 已读水位 `last_read_id`。沿用 `UnreadView` 的三态口径，三条规矩都与 `unreadOf` 对齐：
+ * - 没报过水位、或水位那条在这份时间线里找不到 → `unknown`，`count` 是 null。
+ *   算不出来就别画徽标，绝不把「不知道」写成 0 条。
+ * - 只数 `role === 'agent'` 的回话；人的消息和撤回都不算。
+ * - 按时间线给的顺序判，不按 `at` 比时间：两端照同一份顺序，才不会因时钟差一秒画出不同的数。
+ *   水位本身是读到的那条回话，所以它之后新来的回话才是「还没看」的。
+ */
+export function unreadRepliesOf(items: readonly TimelineItem[], lastReadId: string | undefined): UnreadView {
+  if (!lastReadId) {
+    return { count: null, state: 'unknown', reason: '还没有报过读到哪一条回话，算不出未读回话' }
+  }
+  const anchor = items.findIndex(item => item.id === lastReadId)
+  if (anchor < 0) {
+    return { count: null, state: 'unknown', reason: '报上来的那条回话不在这份时间线里，算不出未读回话' }
+  }
+  return { count: items.slice(anchor + 1).filter(item => item.role === 'agent').length, state: 'live' }
+}
+
+/**
  * The request ids the crew has not answered yet. A reply hangs under the message it answers, so a sent message with
  * no reply on it is the one still queued. Unreadable entries are skipped rather than failing the whole timeline.
  */
@@ -967,6 +1023,8 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/send', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 撤回还没被读走/回复的消息；能不能撤由网关判定，冲突原样回 409。
       connection.fetch.register({ path: '/api/mobile/withdraw', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // 回话已读水位：客户端读到哪一条，后端记下来，timeline 才能给出「未读回话」这一格。
+      connection.fetch.register({ path: '/api/mobile/read', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/work', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/agents', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/models', methods: ['GET'], requestBody: 'buffered', fetch: handler }),

@@ -1,6 +1,6 @@
 # Crew
 
-Bot 队伍的设计系统。**目标态**：`tokens.json` 是修订后的值，`desktop/theme.go`、`ui.go` 的字号常量、`app/.../CrewUi.kt` 目前仍是旧值，尚未同步。落地位置见 [落地映射.md](落地映射.md)。
+Bot 队伍的设计系统。**目标态**：`tokens.json` 是修订后的值，`desktop/theme.go`（含 `Font*` / `Radius*` 常量）、`desktop/ui.go`、`app/.../CrewUi.kt` 目前仍是旧值，尚未同步。落地位置见 [落地映射.md](落地映射.md)。
 
 ## 气质
 

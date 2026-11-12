@@ -98,6 +98,17 @@ vi.mock('../src/app/tunnel.ts', () => ({
   },
 }))
 // relay-chain 有真实实现，这里不 mock：配置解析本身就是接线的一部分。
+// 但 orderRelays 会对每条地址做一次 WebSocket 握手来排序；测试里不能真连，换成一个
+// 全部「打不开」的假 WebSocket：排序退回原顺序，而「顺序保持」的结论仍然成立。
+vi.stubGlobal('WebSocket', class {
+  // 「打不开」：既不 open 也不 close，只让没有超时保护的用例可以同步返回；
+  // orderRelays 自己的 2s 超时会把它判成不通并退回原顺序。
+  constructor() { queueMicrotask(() => this.onerror?.()) }
+  onerror?: () => void
+  addEventListener(type: string, handler: () => void): void { if (type === 'error') this.onerror = handler }
+  close(): void {}
+})
+
 
 // P2P 那条路同理换成替身：真跑 `tools/tailcat serve` 会开一条真 WireGuard 隧道、在 HOME 下建密钥，
 // 而这里要钉的只是「起来了没有、停得掉没有」。解析地址的纯函数仍用真实现。
@@ -221,4 +232,38 @@ it('keeps the tunnel on the message surface after the path is normalised', async
       expect(answer.status, url).toBe(404)
     }
   })
+})
+
+it('puts the reachable relay first and keeps the rest in their original order', async () => {
+  const { orderRelays } = await import('../src/index.ts')
+  const relays = [
+    { name: 'relay.self', url: 'wss://a.example/tunnel' },
+    { name: 'relay.fallback', url: 'wss://b.example/tunnel' },
+    { name: 'relay.fallback', url: 'wss://c.example/tunnel' },
+  ]
+  // 只有第二条通：它被提到最前；其余按原顺序跟在后面。
+  const probe = { reachable: async (url: string) => url === 'wss://b.example/tunnel' }
+  const ordered = await orderRelays(relays, probe)
+  expect(ordered.map(relay => relay.url)).toEqual(['wss://b.example/tunnel', 'wss://a.example/tunnel', 'wss://c.example/tunnel'])
+})
+
+it('leaves the configured order alone when nothing answers', async () => {
+  // 一条都没探通不代表都不存在：可能是探得太早。退回原顺序，让隧道自己按退避去连。
+  const { orderRelays } = await import('../src/index.ts')
+  const relays = [
+    { name: 'relay.self', url: 'wss://a.example/tunnel' },
+    { name: 'relay.fallback', url: 'wss://b.example/tunnel' },
+  ]
+  const ordered = await orderRelays(relays, { reachable: async () => false })
+  expect(ordered.map(relay => relay.url)).toEqual(['wss://a.example/tunnel', 'wss://b.example/tunnel'])
+})
+
+it('prefers the cheaper relay when more than one answers', async () => {
+  const { orderRelays } = await import('../src/index.ts')
+  const relays = [
+    { name: 'relay.self', url: 'wss://a.example/tunnel' },
+    { name: 'relay.fallback', url: 'wss://b.example/tunnel' },
+  ]
+  const ordered = await orderRelays(relays, { reachable: async () => true })
+  expect(ordered[0]!.url).toBe('wss://a.example/tunnel')
 })

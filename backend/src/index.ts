@@ -11,7 +11,7 @@ import { createP2p } from './app/p2p.ts'
 import { createTunnel } from './app/tunnel.ts'
 import { phoneGate } from './app/phone-gate.ts'
 import { createPairingThrottle } from './app/pairing-throttle.ts'
-import { parseRelayCandidates } from './app/relay-chain.ts'
+import { createChain, parseRelayCandidates, type RelayTarget } from './app/relay-chain.ts'
 import { createHash } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -133,10 +133,15 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   if (relays.length === 0) {
     ctx.logger.info('no relay configured; the phone can only reach this machine on the LAN')
   } else {
+    // 降级链：把备选中转按 relay-chain 的 choose() 排一次序，先连此刻探得通、代价最低的那条，
+    // 再把它放进隧道地址数组的第一位 —— 隧道内部仍按数组顺序轮转，丢了就换下一条。
+    // 这样「先试哪条」有唯一答案（lan 不在这一步，出站隧道只用 relay/fallback 两档），
+    // 而不是把配置里的顺序当顺序。
+    const orderedRelays = await orderRelays(relays)
     const tunnel = createTunnel({
-      // 全部地址一起交给隧道：第一条不通时它自己换下一条（见 tunnel.ts 的 cursor）。
+      // 排好序的地址一起交给隧道：第一条不通时它自己换下一条（见 tunnel.ts 的 cursor）。
       // 只交出第一条的话，兜底就只是配置里的两行字。
-      relayUrl: relays.map(relay => relay.url),
+      relayUrl: orderedRelays.map(relay => relay.url),
       instanceId: process.env.CREW_RELAY_INSTANCE?.trim() || instanceIdFor(machine.stateDir),
       name: process.env.CREW_RELAY_NAME?.trim() || undefined,
       // 注册密钥走帧，不走 URL：URL 会进反代的 access log。
@@ -174,6 +179,44 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   }
   ctx.logger.info(runtime.configured() ? 'dsh-superagent ready; the Superagent sidebar entry opens the management panel' : `dsh-superagent is waiting for setup: ${runtime.setupProblem?.detail ?? ''}`)
 }
+/**
+ * 把中转地址交给 relay-chain 排序，返回「此刻探得通、代价最低的那条」排在最前的列表。
+ *
+ * 探测用一次 WebSocket 握手，超时就当不通 —— 与隧道的判死是同一套语义，不另发明。
+ * 全部不通时退回原顺序：一条都没探通不代表它们都不存在（可能只是探得太早），
+ * 让隧道自己按退避去连，比在这里判死更合理。
+ */
+export async function orderRelays(relays: readonly RelayTarget[], probe: { reachable: (url: string) => Promise<boolean> } = { reachable: url => providerReachable(url) }): Promise<RelayTarget[]> {
+  // 一条（或零条）：没什么可排的，原样返回 —— 也避免为单条地址白做一次握手。
+  if (relays.length <= 1) return [...relays]
+  const routes = relays.map(relay => ({
+    name: relay.name, kind: (relay.name === 'relay.self' ? 'relay' : 'fallback') as 'relay' | 'fallback',
+    reachable: () => probe.reachable(relay.url),
+  }))
+  const chosen = await createChain({ routes, probeTimeoutMs: 2_000 }).choose()
+  if (!chosen) return [...relays]
+  // 按下标定位选中的那条：fallback 可能有多条同名，按名字过滤会把它们全提到最前。
+  // 名字唯一时 name 就够用；万一重名，chain 也只会选到其中一条，取第一个匹配即可。
+  const index = relays.findIndex(relay => relay.name === chosen.name)
+  if (index <= 0) return [...relays]
+  return [relays[index]!, ...relays.filter((_, i) => i !== index)]
+}
+
+/** 一次 WebSocket 握手判断中转此刻通不通；握手成功即关闭，不留连接。 */
+function providerReachable(url: string, timeoutMs = 2_000): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    let settled = false
+    const done = (value: boolean): void => { if (settled) return; settled = true; try { socket.close() } catch { /* 关不掉就算了 */ } resolve(value) }
+    let socket: WebSocket
+    try { socket = new WebSocket(url) } catch { resolve(false); return }
+    const timer = setTimeout(() => done(false), timeoutMs)
+    timer.unref?.()
+    socket.addEventListener('open', () => { clearTimeout(timer); done(true) })
+    socket.addEventListener('error', () => { clearTimeout(timer); done(false) })
+    socket.addEventListener('close', () => { clearTimeout(timer); done(false) })
+  })
+}
+
 /**
  * 没显式给 instanceId 时的默认值：由状态目录算出来。
  *

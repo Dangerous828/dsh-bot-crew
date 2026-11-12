@@ -21,10 +21,14 @@ const (
 	// navMemory 是「记忆」：队伍长期记得的事（契约 §5.7）。点开时重读一遍 ——
 	// 忘掉 / 改过之后，这一栏不会自己变。这一版能改能忘，不能在这儿新加一条。
 	navMemory
+	// navBoard 是「事务板」：聊天模式右栏那块紧凑列表，数据就是同一份时间线里的
+	// tasks[] 与 Queued，点开不重读、不发请求。放在枚举末尾，既有几项的取值不动。
+	navBoard
 )
 
 // navOrder 是它们在左栏从上到下的顺序。
-var navOrder = []navItem{navBackend, navModel, navOutput, navRoutine, navMemory}
+// 事务板排在第一行：它是默认落在右栏的那一页。枚举值仍按常量块算，顺序不动取值。
+var navOrder = []navItem{navBoard, navBackend, navModel, navOutput, navRoutine, navMemory}
 
 // navLabel 是这一项上写的字。图标字和文字分开写：图标换字号时才不会把文字也带歪。
 // navIcon 是这一项用的图标名（`icons` 里那几条路径之一）；认不出就退回空串，由调用方画字形。
@@ -40,6 +44,8 @@ func navIcon(item navItem) string {
 		return "clock"
 	case navMemory:
 		return "bookmark"
+	case navBoard:
+		return "board"
 	default:
 		return ""
 	}
@@ -55,6 +61,8 @@ func navLabel(item navItem) (glyph, text string) {
 		return "◷", "常规任务"
 	case navMemory:
 		return "❖", "记忆"
+	case navBoard:
+		return "▦", "事务板"
 	default:
 		return "▤", "后台"
 	}
@@ -102,6 +110,11 @@ func (s *app) pressNav(item navItem) bool {
 		s.backendOpen = true
 		// 每次打开都重读：别处（手机、某个 worker 收尾）也会往账本里写。
 		s.loadMemory()
+		return true
+	case navBoard:
+		// 事务板就是同一份时间线的另一种分组：点开不重读、不发请求。
+		s.navTab = item
+		s.backendOpen = true
 		return true
 	default:
 		return false

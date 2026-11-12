@@ -82,8 +82,8 @@ func newApp(client *Client) *app {
 		// 宽度先落在设计稿的两个值上；拖过之后只记在内存里。
 		sidebarWidth: SidebarWidth,
 		backendWidth: BackendWidth,
-		// 打开窗口先看到「后台」那一栏，它是对外最早能看懂的一块。
-		navTab:      navBackend,
+		// 打开窗口右栏先看到「事务板」：聊天的旁边就是同一本账的紧凑列表。
+		navTab:      navBoard,
 		backendOpen: true,
 		// 凭据已经在手上时直接说「已配对」：那块地方让给模型列表，不再占一整块。
 		pairingNote: func() string {

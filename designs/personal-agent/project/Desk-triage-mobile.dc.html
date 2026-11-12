@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Personal Agent · 提案：大哥的分拣台（手机）</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#20242E}a:hover{color:#B23A2B}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 844px; box-sizing: border-box; position: relative; overflow: hidden; background-color: #DDD3C2; background-image: radial-gradient(rgba(32,36,46,.055) .6px, transparent .6px); background-size: 5px 5px; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; color: #20242E">
+
+  <header style="height: 50px; box-sizing: border-box; padding: 0 16px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid #20242E; background: rgba(246,241,231,.5)">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#B23A2B" stroke-width="1.8" role="img" aria-label="队伍印记">
+      <circle cx="12" cy="12" r="9.2"/><circle cx="12" cy="12" r="5.2"/>
+      <path d="M12 2.8v18.4M2.8 12h18.4"/>
+    </svg>
+    <span style="font-size: 15px; font-weight: 700; letter-spacing: .18em">CREW</span>
+    <span style="font-size: 10px; letter-spacing: .16em; color: #5A5650; margin-left: 4px">分拣台</span>
+    <span style="margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #5A5650">收进 7</span>
+  </header>
+
+  <div style="position: relative; height: 794px; padding: 14px 14px 0; box-sizing: border-box">
+
+    <!-- 大哥在分：一句话说清现状 -->
+    <div style="display: flex; gap: 11px; align-items: flex-start; background: #F6F1E7; border: 1px solid #C9BFA9; box-shadow: 0 2px 4px rgba(32,36,46,.10); padding: 12px 13px">
+      <div style="width: 36px; height: 36px; flex: none; background: {{seal}}; color: #FBF7EE; display: flex; align-items: center; justify-content: center; font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 19px">大</div>
+      <div>
+        <div style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 15px; line-height: 1.5">收到 7 件，我按人分一下。合同那件等你拍板。</div>
+        <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #5A5650; margin-top: 7px">大哥 · 18:12</div>
+      </div>
+    </div>
+
+    <!-- 最显眼的入口：什么都往这儿丢 -->
+    <button type="button" style="width: 100%; height: 58px; margin-top: 12px; border: 1px dashed #8B8577; background: rgba(246,241,231,.62); color: #20242E; font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 17px; cursor: pointer; letter-spacing: .04em">＋ 丢一件进来（话 / 链接 / 图 / 语音）</button>
+
+    <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px">
+
+      <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; letter-spacing: .16em; color: {{seal}}">还没分 / 1</div>
+      <div style="background: #FFFFFF; border: 1px solid {{seal}}; box-shadow: 0 3px 6px rgba(32,36,46,.14); padding: 11px 13px; transform: rotate(-1.2deg)">
+        <div style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 16px">现在几点了</div>
+        <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: {{seal}}; margin-top: 8px">刚刚 · 等大哥接</div>
+      </div>
+
+      <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; letter-spacing: .16em; color: #96603A; margin-top: 8px">等你拍板 / 1</div>
+      <div style="background: #F6E7CD; border: 1px solid #E0C9A6; padding: 11px 13px; transform: rotate(1deg)">
+        <div style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 15px; line-height: 1.45">合同付款条款对不上</div>
+        <div style="font-size: 11px; color: #96603A; margin-top: 7px">按合同 30/70 回，还是接受 50/50？</div>
+        <div style="display: flex; gap: 8px; margin-top: 10px">
+          <button type="button" style="flex: 1; border: 1px solid #96603A; background: transparent; color: #96603A; font-size: 11px; padding: 8px 4px; cursor: pointer">按合同回</button>
+          <button type="button" style="flex: 1; border: 1px solid #96603A; background: transparent; color: #96603A; font-size: 11px; padding: 8px 4px; cursor: pointer">接受 50/50</button>
+        </div>
+      </div>
+
+      <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; letter-spacing: .16em; color: #5A5650; margin-top: 8px">各人在跑 / 2</div>
+      <div style="background: #FFFFFF; border: 1px solid {{seal}}; box-shadow: 0 3px 7px rgba(32,36,46,.14); padding: 11px 13px">
+        <div style="display: flex; align-items: baseline; gap: 8px">
+          <span style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 15px">跑测试套件</span>
+          <span style="margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: {{seal}}">→ 码农</span>
+        </div>
+        <div style="height: 4px; background: #DDD3C2; margin-top: 10px"><div style="height: 4px; width: 66%; background: {{seal}}"></div></div>
+        <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #5A5650; margin-top: 7px">第 2 步 / 共 3 步 · 00:03:12</div>
+      </div>
+      <div style="background: #F6F1E7; border: 1px solid #C9BFA9; padding: 11px 13px">
+        <div style="display: flex; align-items: baseline; gap: 8px">
+          <span style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 15px">整理本周会议纪要</span>
+          <span style="margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #2C3E56">→ 写手</span>
+        </div>
+        <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #5A5650; margin-top: 8px">排着 · 第 2 件</div>
+      </div>
+
+      <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; letter-spacing: .16em; color: #5A5650; margin-top: 8px">办完了 / 3</div>
+      <div style="display: flex; align-items: center; gap: 10px; background: #F0E9DA; border: 1px solid #C9BFA9; padding: 10px 13px">
+        <div style="flex: 1">
+          <div style="font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 14px">weather.md · ok.txt</div>
+          <div style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; color: #5A5650; margin-top: 6px">2 个文件 · 18:04</div>
+        </div>
+        <div aria-hidden="true" style="width: 38px; height: 38px; border: 2px solid {{seal}}; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: {{seal}}; font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 16px; transform: rotate(-14deg); opacity: .8">办</div>
+      </div>
+    </div>
+
+    <!-- 底部固定：什么都能丢 -->
+    <div style="position: absolute; left: 0; right: 0; bottom: 0; height: 60px; box-sizing: border-box; display: flex; align-items: center; gap: 9px; border-top: 1px solid #20242E; padding: 0 14px; background: #DDD3C2">
+      <label for="drop-input" style="font-family: ui-monospace, Menlo, monospace; font-size: 9px; letter-spacing: .1em; color: #5A5650; white-space: nowrap">丢 →</label>
+      <input id="drop-input" type="text" placeholder="一句话、链接、图、语音…" style="flex: 1; min-width: 0; border: 0; border-bottom: 1px solid #20242E; outline: 0; background: transparent; font-family: 'Iowan Old Style', Palatino, 'Songti SC', Georgia, serif; font-size: 14px; color: #20242E; padding: 6px 0">
+      <button type="button" aria-label="丢进来" style="width: 36px; height: 36px; border-radius: 50%; border: 0; background: #20242E; color: #F6F1E7; font-size: 17px; cursor: pointer; flex: none">↑</button>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"seal":{"editor":"color","default":"#B23A2B"},"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+renderVals() {
+return { seal: this.props.seal ?? '#B23A2B' };
+}
+}
+</script>
+</body>
+</html>

@@ -43,6 +43,8 @@ func TestEveryNavItemDoesSomething(t *testing.T) {
 // 「后台」再点一次是把右栏收起来，让对话占满；第三次点回来还是「进行中」。
 func TestBackendNavTogglesAndComesBackHome(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))
+	// 默认落在事务板；这一条测的是「后台」自己的开关，先按一次切过去。
+	s.pressNav(navBackend)
 	if !s.backendOpen || s.navTab != navBackend {
 		t.Fatal("打开窗口时就该停在后台那一栏")
 	}

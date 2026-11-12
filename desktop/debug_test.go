@@ -31,12 +31,18 @@ func TestDebugBusNavigatesAndDumpsState(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))
 	bus := newDebugBus(s)
 
-	// newApp 默认就停在后台且右栏展开；再按一次后台是「收起」——那也算有反应。
-	if s.navTab != navBackend || !s.backendOpen {
-		t.Fatalf("newApp 默认应停在后台且展开，实际 navTab=%v backendOpen=%v", s.navTab, s.backendOpen)
+	// newApp 默认停在事务板且右栏展开；按一次「后台」切过去，再按一次才是「收起」。
+	if s.navTab != navBoard || !s.backendOpen {
+		t.Fatalf("newApp 默认应停在事务板且展开，实际 navTab=%v backendOpen=%v", s.navTab, s.backendOpen)
 	}
 	if _, err := bus.invoke("nav.backend", map[string]json.RawMessage{}); err != nil {
 		t.Fatalf("nav.backend: %v", err)
+	}
+	if s.navTab != navBackend || !s.backendOpen {
+		t.Fatalf("按一次后台应切到后台且展开，实际 navTab=%v backendOpen=%v", s.navTab, s.backendOpen)
+	}
+	if _, err := bus.invoke("nav.backend", map[string]json.RawMessage{}); err != nil {
+		t.Fatalf("nav.backend 第二次: %v", err)
 	}
 	if s.backendOpen {
 		t.Fatalf("已在后台再按一次应收起右栏，实际 backendOpen=%v", s.backendOpen)

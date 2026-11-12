@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Personal Agent · 聊天模式（群聊 + 事务板）</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+a{color:#F2EFEA}a:hover{color:#5FBFA8}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; display: flex; flex-direction: column; background: #17161A; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; color: #F2EFEA">
+
+  <!-- 顶栏：常规，不用翻牌 -->
+  <header style="height: 56px; flex: none; box-sizing: border-box; padding: 0 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #33313A; background: #1D1C21">
+    <div style="width: 30px; height: 30px; border-radius: 8px; background: #1E3A34; display: flex; align-items: center; justify-content: center; color: #5FBFA8; font-size: 15px; font-weight: 700">群</div>
+    <div>
+      <div style="font-size: 14px; font-weight: 600">我的队伍</div>
+      <div style="font-size: 11px; color: #928C82; margin-top: 2px">3 位在线 · 大哥默认接话</div>
+    </div>
+    <div style="margin-left: auto; display: flex; gap: 2px; background: #2A2830; padding: 3px; border-radius: 9px">
+      <button type="button" style="border: 0; background: #3B3942; color: #F2EFEA; font-size: 12px; padding: 7px 16px; border-radius: 7px; cursor: pointer; font-weight: 600">聊天</button>
+      <button type="button" style="border: 0; background: transparent; color: #928C82; font-size: 12px; padding: 7px 16px; border-radius: 7px; cursor: pointer">分拣台</button>
+    </div>
+    <button type="button" aria-label="更多" style="border: 1px solid #33313A; background: transparent; color: #928C82; width: 32px; height: 32px; border-radius: 8px; cursor: pointer; margin-left: 8px">···</button>
+  </header>
+
+  <!-- 成员条：QQ 群那种一排人 -->
+  <div style="height: 46px; flex: none; box-sizing: border-box; padding: 0 20px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #2A2830; background: #1A191E">
+    <span style="font-size: 10px; letter-spacing: .1em; color: #6E6860; margin-right: 4px">成员</span>
+    <div style="display: flex; align-items: center; gap: 6px; padding: 5px 10px 5px 5px; background: #232228; border: 1px solid #3E6B62; border-radius: 999px">
+      <span style="width: 22px; height: 22px; border-radius: 6px; background: #3E6B62; color: #F2EFEA; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">大</span>
+      <span style="font-size: 12px">大哥</span>
+      <span style="width: 6px; height: 6px; border-radius: 50%; background: #5FBFA8"></span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 6px; padding: 5px 10px 5px 5px; background: #232228; border: 1px solid #33313A; border-radius: 999px">
+      <span style="width: 22px; height: 22px; border-radius: 6px; background: #2C3E56; color: #C4BFB6; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">写</span>
+      <span style="font-size: 12px; color: #C4BFB6">写手</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 6px; padding: 5px 10px 5px 5px; background: #232228; border: 1px solid #33313A; border-radius: 999px">
+      <span style="width: 22px; height: 22px; border-radius: 6px; background: #494650; color: #C4BFB6; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">码</span>
+      <span style="font-size: 12px; color: #C4BFB6">码农</span>
+    </div>
+    <span style="margin-left: auto; font-size: 11px; color: #6E6860">@ 点名谁，没人点大哥接</span>
+  </div>
+
+  <div style="flex: 1; display: flex; min-height: 0">
+
+    <!-- 左：正常群聊 -->
+    <section aria-label="群聊" style="width: 940px; flex: none; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid #33313A">
+      <div style="flex: 1; min-height: 0; overflow: hidden; padding: 22px 28px 12px; display: flex; flex-direction: column; gap: 16px">
+
+        <div style="align-self: center; font-size: 11px; color: #6E6860; background: #1F1E24; padding: 5px 12px; border-radius: 999px">今天 18:03</div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 9px; align-items: flex-start">
+          <div style="text-align: right">
+            <div style="font-size: 11px; color: #928C82; margin-bottom: 5px">我 · 18:03</div>
+            <div style="display: inline-block; background: #2E4A44; color: #F2EFEA; padding: 9px 14px; border-radius: 12px 12px 4px 12px; font-size: 14px; line-height: 1.55">今天天气怎么样</div>
+          </div>
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #3B3942; color: #C4BFB6; font-size: 12px; display: flex; align-items: center; justify-content: center">我</div>
+        </div>
+
+        <div style="display: flex; gap: 10px; align-items: flex-start">
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #3E6B62; color: #F2EFEA; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center">大</div>
+          <div style="min-width: 0">
+            <div style="font-size: 12px; margin-bottom: 5px"><span style="color: #5FBFA8; font-weight: 600">大哥</span><span style="color: #6E6860; margin-left: 8px; font-size: 11px">18:03</span></div>
+            <div style="font-size: 14px; line-height: 1.6; color: #F2EFEA">收到：查一下今天的天气，马上回你。</div>
+            <div style="font-size: 11px; color: #5FBFA8; margin-top: 5px; cursor: pointer">听播报</div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 10px; align-items: flex-start">
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #3E6B62; color: #F2EFEA; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center">大</div>
+          <div style="min-width: 0">
+            <div style="font-size: 14px; line-height: 1.6; color: #F2EFEA">按上海位置查：今天 9–18°C，现在 14°C，体感 12°C，全天基本无雨（日出 06:17，日落 16:58）。要换别的城市再查，告诉我城市名即可。</div>
+            <div style="font-size: 11px; color: #5FBFA8; margin-top: 5px; cursor: pointer">听播报</div>
+          </div>
+        </div>
+
+        <div style="align-self: center; font-size: 11px; color: #6E6860; background: #1F1E24; padding: 5px 12px; border-radius: 999px">大哥把「在桌面写个 ok.txt」派给了码农</div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 9px; align-items: flex-start">
+          <div style="text-align: right">
+            <div style="font-size: 11px; color: #928C82; margin-bottom: 5px">我 · 18:04</div>
+            <div style="display: inline-block; background: #2E4A44; color: #F2EFEA; padding: 9px 14px; border-radius: 12px 12px 4px 12px; font-size: 14px; line-height: 1.55">在桌面写个 ok.txt，内容是 done</div>
+          </div>
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #3B3942; color: #C4BFB6; font-size: 12px; display: flex; align-items: center; justify-content: center">我</div>
+        </div>
+
+        <div style="display: flex; gap: 10px; align-items: flex-start">
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #494650; color: #F2EFEA; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center">码</div>
+          <div style="min-width: 0">
+            <div style="font-size: 12px; margin-bottom: 5px"><span style="color: #B4AEC8; font-weight: 600">码农</span><span style="color: #6E6860; margin-left: 8px; font-size: 11px">18:04</span></div>
+            <div style="font-size: 14px; line-height: 1.6; color: #F2EFEA">已在桌面新建 ok.txt，内容为 done，并复核过内容正确。</div>
+            <div style="font-size: 11px; color: #5FBFA8; margin-top: 6px">✓ 2 个文件已放进产出</div>
+          </div>
+        </div>
+
+        <div style="align-self: center; font-size: 11px; color: #6E6860; background: #1F1E24; padding: 5px 12px; border-radius: 999px">大哥记住了「以后都先说结论」</div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 9px; align-items: flex-start">
+          <div style="text-align: right">
+            <div style="font-size: 11px; color: #928C82; margin-bottom: 5px">我 · 18:06</div>
+            <div style="display: inline-block; background: #2E4A44; color: #F2EFEA; padding: 9px 14px; border-radius: 12px 12px 4px 12px; font-size: 14px; line-height: 1.55">现在几点了</div>
+          </div>
+          <div style="width: 30px; height: 30px; flex: none; border-radius: 8px; background: #3B3942; color: #C4BFB6; font-size: 12px; display: flex; align-items: center; justify-content: center">我</div>
+        </div>
+
+        <!-- 等你决定：插在消息流里，群聊里就该看得见 -->
+        <div style="margin-left: 40px; max-width: 560px; background: #2A2119; border: 1px solid #6B4A2C; border-radius: 10px; padding: 14px 16px">
+          <div style="font-size: 11px; color: #E0A574; letter-spacing: .06em; margin-bottom: 8px">等你决定 · 合同付款条款</div>
+          <div style="font-size: 13px; color: #F2EFEA; line-height: 1.6">第 4 条写 30/70，客户 11 点邮件说 50/50。按合同回，还是我改合同？</div>
+          <div style="display: flex; gap: 8px; margin-top: 12px">
+            <button type="button" style="border: 1px solid #6B4A2C; background: transparent; color: #E0A574; font-size: 12px; padding: 7px 12px; border-radius: 7px; cursor: pointer">按合同 30/70 回</button>
+            <button type="button" style="border: 1px solid #6B4A2C; background: transparent; color: #E0A574; font-size: 12px; padding: 7px 12px; border-radius: 7px; cursor: pointer">接受 50/50</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部输入 -->
+      <div style="flex: none; border-top: 1px solid #33313A; padding: 14px 20px; display: flex; align-items: center; gap: 10px; background: #1A191E">
+        <button type="button" aria-label="点名成员" style="width: 34px; height: 34px; flex: none; border: 1px solid #33313A; background: #232228; color: #928C82; border-radius: 8px; cursor: pointer; font-size: 15px">@</button>
+        <input type="text" aria-label="输入消息" placeholder="跟队伍说点什么，或者 @ 某一位……" style="flex: 1; min-width: 0; border: 1px solid #33313A; background: #232228; color: #F2EFEA; border-radius: 10px; padding: 10px 14px; font-size: 13px; outline: 0">
+        <button type="button" aria-label="发送" style="width: 36px; height: 36px; flex: none; border: 0; background: #3E6B62; color: #F2EFEA; border-radius: 9px; cursor: pointer; font-size: 16px">↑</button>
+      </div>
+    </section>
+
+    <!-- 右：事务板（紧凑列表，不是纸条） -->
+    <aside aria-label="事务板" style="width: 500px; flex: 1; box-sizing: border-box; display: flex; flex-direction: column; min-height: 0; background: #1D1C21">
+      <div style="height: 58px; flex: none; box-sizing: border-box; padding: 0 18px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #33313A">
+        <span style="font-size: 14px; font-weight: 600">事务板</span>
+        <span style="font-size: 11px; color: #928C82">7 件 · 1 在跑</span>
+        <button type="button" style="margin-left: auto; border: 1px solid #3E6B62; background: transparent; color: #5FBFA8; font-size: 11px; padding: 6px 10px; border-radius: 7px; cursor: pointer">＋ 丢一件</button>
+      </div>
+
+      <div style="flex: 1; min-height: 0; overflow: hidden; padding: 8px 12px">
+
+        <div style="font-size: 10px; letter-spacing: .12em; color: #6E6860; padding: 12px 6px 8px">待分 · 1</div>
+        <div style="background: #232228; border: 1px solid #5FBFA8; border-radius: 9px; padding: 11px 12px; display: flex; align-items: center; gap: 10px">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: #5FBFA8; flex: none"></span>
+          <div style="flex: 1; min-width: 0">
+            <div style="font-size: 13px; color: #F2EFEA">现在几点了</div>
+            <div style="font-size: 11px; color: #928C82; margin-top: 4px">刚刚 · 等大哥接</div>
+          </div>
+          <button type="button" style="border: 1px solid #3E6B62; background: transparent; color: #5FBFA8; font-size: 10px; padding: 5px 8px; border-radius: 6px; cursor: pointer">去分</button>
+        </div>
+
+        <div style="font-size: 10px; letter-spacing: .12em; color: #6E6860; padding: 16px 6px 8px">在跑 · 1</div>
+        <div style="background: #232228; border: 1px solid #33313A; border-radius: 9px; padding: 11px 12px">
+          <div style="display: flex; align-items: center; gap: 9px">
+            <span style="width: 6px; height: 6px; border-radius: 50%; background: #5FBFA8; flex: none"></span>
+            <span style="font-size: 13px; color: #F2EFEA; flex: 1">跑测试套件</span>
+            <span style="font-size: 10px; color: #928C82">码农</span>
+          </div>
+          <div style="height: 4px; background: #33313A; border-radius: 999px; margin-top: 10px"><div style="height: 4px; width: 66%; background: #5FBFA8; border-radius: 999px"></div></div>
+          <div style="font-size: 10px; color: #928C82; margin-top: 7px">第 2 步 / 共 3 步 · 00:03:12</div>
+        </div>
+
+        <div style="font-size: 10px; letter-spacing: .12em; color: #E0A574; padding: 16px 6px 8px">等你拍板 · 1</div>
+        <div style="background: #2A2119; border: 1px solid #6B4A2C; border-radius: 9px; padding: 11px 12px">
+          <div style="font-size: 13px; color: #F2EFEA">合同付款条款对不上</div>
+          <div style="font-size: 11px; color: #E0A574; margin-top: 5px">按合同 30/70 回，还是接受 50/50？</div>
+        </div>
+
+        <div style="font-size: 10px; letter-spacing: .12em; color: #6E6860; padding: 16px 6px 8px">办完 · 3</div>
+        <div style="background: #232228; border: 1px solid #33313A; border-radius: 9px; padding: 10px 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 9px; opacity: .8">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: #494650; flex: none"></span>
+          <span style="font-size: 12px; color: #C4BFB6; flex: 1">查今天的天气</span>
+          <span style="font-size: 10px; color: #6E6860">大哥 · 18:03</span>
+        </div>
+        <div style="background: #232228; border: 1px solid #33313A; border-radius: 9px; padding: 10px 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 9px; opacity: .8">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: #494650; flex: none"></span>
+          <span style="font-size: 12px; color: #C4BFB6; flex: 1">新建 ok.txt</span>
+          <span style="font-size: 10px; color: #6E6860">码农 · 18:04</span>
+        </div>
+        <div style="background: #232228; border: 1px solid #33313A; border-radius: 9px; padding: 10px 12px; display: flex; align-items: center; gap: 9px; opacity: .8">
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: #494650; flex: none"></span>
+          <span style="font-size: 12px; color: #C4BFB6; flex: 1">整理本周会议纪要</span>
+          <span style="font-size: 10px; color: #6E6860">写手 · 16:40</span>
+        </div>
+      </div>
+
+      <div style="flex: none; border-top: 1px solid #33313A; padding: 12px 18px; font-size: 11px; color: #6E6860; display: flex; align-items: center; gap: 8px">
+        <span style="width: 6px; height: 6px; border-radius: 50%; background: #5FBFA8"></span>点任一条，能跳回群里那句话
+      </div>
+    </aside>
+
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

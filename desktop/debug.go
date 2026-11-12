@@ -51,7 +51,7 @@ func newDebugBus(s *app) *DebugBus {
 	// ── 导航：等价于点左栏任一项 ──────────────────────────────
 	nav := map[string]navItem{
 		"backend": navBackend, "models": navModel, "outputs": navOutput,
-		"routines": navRoutine, "memory": navMemory,
+		"routines": navRoutine, "memory": navMemory, "board": navBoard,
 	}
 	for name, item := range nav {
 		it := item
@@ -246,6 +246,24 @@ func newDebugBus(s *app) *DebugBus {
 		return map[string]any{"loading": true}, nil
 	})
 
+	// ── 模式：等价于点标题栏那条 segmented ────────────────────
+	bus.register("mode.set", func(args map[string]json.RawMessage) (any, error) {
+		name, err := argString(args, "mode")
+		if err != nil {
+			return nil, err
+		}
+		switch name {
+		case "chat":
+			s.mode = modeChat
+		case "triage":
+			s.mode = modeTriage
+		default:
+			return nil, fmt.Errorf("unknown mode: %s", name)
+		}
+		s.wake()
+		return map[string]any{"mode": modeName(s.mode)}, nil
+	})
+
 	// ── 刷新 / 状态 ──────────────────────────────────────────
 	bus.register("refresh", func(args map[string]json.RawMessage) (any, error) {
 		s.refresh()
@@ -291,6 +309,8 @@ func (bus *DebugBus) navName(item navItem) string {
 		return "routines"
 	case navMemory:
 		return "memory"
+	case navBoard:
+		return "board"
 	}
 	return "unknown"
 }
@@ -310,6 +330,7 @@ func (bus *DebugBus) pendingTask(ticketID string) (Task, bool) {
 func (s *app) stateSnapshot() map[string]any {
 	snap := map[string]any{
 		"nav":          tabName(s.navTab),
+		"mode":         modeName(s.mode),
 		"backendOpen":  s.backendOpen,
 		"backendTab":   s.backendTab,
 		"selectedBot":  s.selectedBot,
@@ -360,6 +381,8 @@ func tabName(item navItem) string {
 		return "routines"
 	case navMemory:
 		return "memory"
+	case navBoard:
+		return "board"
 	}
 	return "unknown"
 }

@@ -100,6 +100,36 @@
       "w": 1440,
       "h": 900,
       "title": "桌面 · 模型"
+    },
+    "Desk-triage.dc.html": {
+      "x": 0,
+      "y": 5044,
+      "w": 1440,
+      "h": 900,
+      "title": "定案 · 大哥的分拣台（桌面）",
+      "expand": "fill"
+    },
+    "Desk-triage-mobile.dc.html": {
+      "x": 1520,
+      "y": 5044,
+      "w": 390,
+      "h": 844,
+      "title": "定案 · 大哥的分拣台（手机）"
+    },
+    "Desk-chatmode.dc.html": {
+      "x": 0,
+      "y": 6064,
+      "w": 1440,
+      "h": 900,
+      "title": "定案 · 聊天模式（桌面）",
+      "expand": "fill"
+    },
+    "Desk-chatmode-mobile.dc.html": {
+      "x": 1520,
+      "y": 6064,
+      "w": 390,
+      "h": 844,
+      "title": "定案 · 聊天模式（手机）"
     }
   },
   "order": [
@@ -115,7 +145,11 @@
     "Desktop-memory.dc.html",
     "Desktop-outputs.dc.html",
     "Desktop-routines.dc.html",
-    "Desktop-models.dc.html"
+    "Desktop-models.dc.html",
+    "Desk-triage.dc.html",
+    "Desk-triage-mobile.dc.html",
+    "Desk-chatmode.dc.html",
+    "Desk-chatmode-mobile.dc.html"
   ],
   "notes": {},
   "designSystems": []

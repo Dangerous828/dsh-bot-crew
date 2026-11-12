@@ -89,7 +89,10 @@ type app struct {
 	services ui.Services
 	// backendTab 是右栏「后台」那一档里当前在看哪一页：进行中 / 待你 / 已完成。
 	backendTab int
-	// navTab 是左栏点开的是哪一项。默认停在「后台」，所以打开窗口看到的就是那一栏。
+	// mode 是中栏的两个镜头：聊天（常规暗色群聊）与分拣台（纸感案头）。
+	// 零值是 modeChat —— 默认日常聊天，事务板在右栏。定义见 modes.go。
+	mode appMode
+	// navTab 是左栏点开的是哪一项。默认停在「事务板」，打开窗口右栏就是那块板。
 	navTab navItem
 	// backendOpen 是右栏在不在。「后台」再点一次收起来，中间的对话就占满整扇窗。
 	backendOpen bool
@@ -1320,6 +1323,8 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 				}
 			})
 			ui.Row(c).Grow(1)
+			// 模式切换：普通 segmented，只切 s.mode，不新建状态、不发请求。
+			s.modeSwitch(c, p)
 			// 「看它的屏幕」：画板 109×31、圆角 9、白底细边。
 			//
 			// 画板里它是一扇窗：按下就换成这张票此刻的会话快照（命令、输出、回话）。
@@ -1338,12 +1343,18 @@ func (s *app) conversationPane(c *ui.Context, p Palette) {
 		// 画板的 header 带一条 border-bottom。mygo 没有单边边框，用 1px 的线代替 ——
 		// 少了这条，标题栏和消息区会糊成一片，暗色下尤其像「整块空的」。
 		ui.Column(c).FillWidth().Height(1).Background(p.Line)
-		if s.screen != nil {
+		switch {
+		case s.mode == modeTriage:
+			// 分拣台：中栏换成三段流水线。输入语义不同（丢一件 vs 说一句），
+			// 所以不再叠聊天那条输入框；三段骨架自带底部计数带。
+			s.triagePane(c, p)
+		case s.screen != nil:
 			s.screenPanel(c, p)
-		} else {
+			s.composer(c, p)
+		default:
 			s.stream(c, p)
+			s.composer(c, p)
 		}
-		s.composer(c, p)
 	})
 }
 
@@ -2797,6 +2808,8 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 			// 这条链一定写在管理面 /state 上，不依赖 App 系统推送；读不到（watchdog=nil）就不画。
 			s.watchdogBanner(c, p)
 			switch s.navTab {
+			case navBoard:
+				s.boardPane(c, p)
 			case navModel:
 				s.modelPane(c, p)
 			case navOutput:

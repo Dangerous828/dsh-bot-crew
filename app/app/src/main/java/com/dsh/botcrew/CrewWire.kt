@@ -2028,7 +2028,7 @@ object SpeechWire {
 
 /** 播报那几行字。纯函数，测试直接钉住。 */
 object SpeechCopy {
-    const val LISTEN = "听"
+    const val LISTEN = "听播报"
     const val PLAYING = "念着…"
     const val FAILED = "念不出来"
 

@@ -185,6 +185,8 @@ fun CrewRoot(
     // 同一条草稿重发要沿用同一个 request_id：超时后其实已经进了队，换一个键会重复入队。
     var pendingSend by remember { mutableStateOf<Pair<String, String>?>(null) }
     var screen by remember { mutableStateOf(Screen.Crew) }
+    // 两个模式共一本时间线：这里只存镜头，不另拉一次账（契约 §1）。默认日常群聊。
+    var mode by remember { mutableStateOf(Mode.Chat) }
     var profile by remember { mutableStateOf<BotCard?>(null) }
     // 工作区要看谁的屏幕。null 表示从后台进的，那时还没有具体的人。
     var onScreen by remember { mutableStateOf<BotCard?>(null) }
@@ -351,6 +353,9 @@ fun CrewRoot(
                         onScreen = bot
                         screen = Screen.Workspace
                     },
+                    // 队伍这一屏内部再分聊天 / 分拣台：切镜头不换 Screen、不重建时间线。
+                    mode = mode,
+                    onModeChange = { mode = it },
                 )
             }
 
@@ -613,6 +618,9 @@ private fun CrewScreen(
     onBackend: () -> Unit,
     onModels: () -> Unit,
     onWorkspace: (BotCard?) -> Unit,
+    /** 聊天 / 分拣台：只切渲染，群聊的滚动位置与草稿都留在这一页里。 */
+    mode: Mode = Mode.Chat,
+    onModeChange: (Mode) -> Unit = {},
 ) {
     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
     var profile by remember { mutableStateOf<BotCard?>(null) }
@@ -622,7 +630,73 @@ private fun CrewScreen(
     var withdrawNote by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    // 事务板抽屉与模式切换都归这一页：切镜头时群聊的滚动位置还在（listState 留在组合里）。
+    var boardOpen by remember { mutableStateOf(false) }
+    var pendingJump by remember { mutableStateOf<String?>(null) }
+
+    // 分拣台的「丢」与事务板上的回答都走和群聊同一条 POST /send，不另造一套发送。
+    fun sendBoardText(text: String, done: (Boolean) -> Unit) {
+        onSending(true)
+        scope.launch {
+            val ok = try {
+                client.send(text, CrewWire.mentionsIn(text, conversation?.bots.orEmpty()), requestIdFor(text))
+                onDraft("")
+                onSent()
+                true
+            } catch (error: Exception) {
+                onFailed(error.message ?: "发送失败")
+                false
+            } finally {
+                onSending(false)
+            }
+            done(ok)
+        }
+    }
+    fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (Boolean) -> Unit) {
+        val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
+        val address = name.ifEmpty { ticket.botId.trim() }
+        val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
+        sendBoardText(text, done)
+    }
+    fun jump(messageId: String) {
+        boardOpen = false
+        onModeChange(Mode.Chat)
+        pendingJump = messageId
+    }
+    fun switchMode(next: Mode) {
+        boardOpen = false
+        onModeChange(next)
+    }
+
+    if (mode == Mode.Triage) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // 分拣台整屏用纸感（含顶栏），聊天模式仍是暗色：两个镜头各自的视觉语言不混着用。
+            ModeHeader(mode, TriagePalette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = {})
+            TriageScreen(
+                conversation = conversation,
+                palette = TriagePalette,
+                draft = draft,
+                onDraft = onDraft,
+                sending = sending,
+                enabled = problem == null,
+                problem = problem,
+                onDrop = { text -> sendBoardText(text) {} },
+                onAnswer = { ticket, option, done -> answerTicket(ticket, option, done) },
+                onJumpToMessage = { messageId -> jump(messageId) },
+                modifier = Modifier.weight(1f),
+            )
+        }
+        return
+    }
     Column(modifier = Modifier.fillMaxSize()) {
+        ModeHeader(mode, palette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = { boardOpen = true })
+        // 事务板/分拣台点一条：切回群聊并滚到那句话（ticket_ref 对不上的行不会走到这里）。
+        LaunchedEffect(pendingJump) {
+            val messageId = pendingJump ?: return@LaunchedEffect
+            val index = conversation?.messages?.indexOfFirst { it.id == messageId } ?: -1
+            if (index >= 0) listState.animateScrollToItem(index)
+            pendingJump = null
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -906,6 +980,17 @@ private fun CrewScreen(
                 horizontalArrangement = Arrangement.Center,
             ) { CircularProgressIndicator() }
         }
+    }
+    // 事务板是聊天模式旁边的抽屉，压在群聊上；分拣台模式本身就是那块板，不再叠一层。
+    if (boardOpen) {
+        BoardDrawer(
+            conversation = conversation,
+            palette = palette,
+            onDismiss = { boardOpen = false },
+            onJumpToMessage = { messageId -> jump(messageId) },
+            problem = problem,
+            onAnswer = { ticket, option, done -> answerTicket(ticket, option, done) },
+        )
     }
 }
 

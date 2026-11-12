@@ -49,6 +49,8 @@ export interface HttpHost {
   readonly setupProblem?: SetupProblem | undefined
   readonly feishuProblem?: SetupProblem | undefined
   configured(): boolean
+  /** 看门狗最近告警快照（超时未决定等）。可选：老宿主没有就不出现在 /state 里。 */
+  watchdogStatus?(): { alerts: { at: string; kind: string; title: string; body: string; decisionId: string }[]; lastSelfHealAt?: string }
   links(): LinkTarget
   ticketEnvironment(ticket: Ticket): Variable[]
   checkSetup(): void
@@ -107,7 +109,9 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    // 看门狗快照：桌面右栏与管理面都从这里读「最近有没有卡住的事」，不依赖 App 系统推送（#8-2）。
+    watchdog: runtime.watchdogStatus?.() ?? null }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,

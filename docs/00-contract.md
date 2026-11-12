@@ -753,6 +753,39 @@
 只认 `bot-` 开头的记忆名 —— 这是让主人改账本，不是任意改 KV。描述不能多行、正文不能为空，
 违反时返回 400 并给一句人话。
 
+## 5.8 看门狗时限：多久算「卡住」
+
+静默卡死（#4）的根子是「没人知道它卡了多久」，所以这里把两个时限钉成明确的数，写进配置、
+由看门狗按它报警。两个数都从 `settings.eval.timeoutSeconds` / `LIMITS` 派生，不再散落在各处拍脑袋。
+
+| 时限 | 含义 | 取值为默认 | 出处 |
+| --- | --- | --- | --- |
+| **Eval 无 judgement** | 评估投递给判官 Session 后，多久没拿到裁决算超时 | `eval.timeoutSeconds`，**默认 120s**，可调 30–600s | `settings.eval.timeoutSeconds` → `policy.evalTimeoutMs` |
+| **turn 无第一步** | worker 的 turn 被接收后，多久没有进入任何一步（Session 没吃掉输入）算超时 | 同一 `evalTimeoutMs`（与上一条同一套口径，不另立第二个数） | 同上 |
+
+规则：
+
+- **超时必报警**。Eval 超时（`delivered` 后过 `evalTimeoutMs` 仍未裁决）先按 `REQUEUES=2` 重排，
+  仍超时则记 `unavailable` + `reason.code=timeout`，看门狗据此推一条「有一件事没判下来」并交给
+  自愈重跑一次（见 #8 已验收项）。**不允许出现「卡了几分钟没人知道」**——超时那条一定发出。
+- **不作静默重试的死循环**：`healed` 标记保证自愈只做一次，判官正常说「现在别接」的 `unavailable`
+  不动（那是裁决，不是故障）。
+- 面板改 `timeoutSeconds` 即改这两个数（同一个 `evalTimeoutMs`），改完下一次扫描生效，无需重启。
+
+### 看门狗告警走哪条链（#8-2）
+
+超时未决定（「有一件事没判下来」）这类告警，**落在三条明确的链上，不依赖 App 的独立系统推送**
+（那条用户已停，不再作为唯一通道）：
+
+| 链 | 落在哪 | 谁读 | 可靠度 |
+| --- | --- | --- | --- |
+| **看门狗账本** | `Runtime.watchdogStatus().alerts`（内存最近 10 条，含 `decisionId`） | 桌面右栏横幅、管理面 `GET /orchestrator/api/state` 的 `watchdog` 字段 | **一定写**，与推送无关 |
+| **主 Session timeline** | `sessions.relay(key('eval-timeout', id), {kind:'eval_timeout'})` | 手机/桌面读 `GET /timeline` | 一定递（进程内 effect） |
+| **手机通知（加分项）** | `pushNotice` → relay 隧道 `pushSend`（手机在线直收）/ `pushOutbox` 留件 | 手机 | 手机在线/重连时才有；**不作唯一依赖** |
+
+结论：即使手机没连、或 App 系统推送停着，超时这件事也一定出现在**看门狗账本 + timeline** 上，
+桌面右栏与管理面能看到。这就不留「说不清的链」——每一条都能指到具体落点与读它的地方。
+
 ## 6. 错误码
 
 | code | HTTP | 含义 |

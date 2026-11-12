@@ -548,3 +548,41 @@ func TestCrewLoadWithoutALimitIsDiscarded(t *testing.T) {
 		t.Error("报错时不该同时给出一份数据")
 	}
 }
+
+// #8-2：看门狗告警从管理面 /state 的 watchdog 读回来，解析要对；没有该字段时返回 nil（不画横幅）。
+func TestCrewWatchdogParsesAlertsFromState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"watchdog":{"alerts":[{"at":"2026-11-13T00:00:00Z","kind":"eval_timeout","title":"有一件事没判下来","body":"「修一下」评估超时，队伍没有接。","decisionId":"d-1"}],"lastSelfHealAt":"2026-11-13T00:01:00Z"}}`))
+	}))
+	defer server.Close()
+	c := New("http://127.0.0.1:1", "t", "d").WithManagement(server.URL)
+	wd, err := c.CrewWatchdog(context.Background())
+	if err != nil {
+		t.Fatalf("读看门狗失败: %v", err)
+	}
+	if wd == nil || len(wd.Alerts) != 1 {
+		t.Fatalf("应解析出 1 条告警，实际 %+v", wd)
+	}
+	if wd.Alerts[0].DecisionID != "d-1" || wd.Alerts[0].Kind != "eval_timeout" {
+		t.Errorf("告警字段解析错: %+v", wd.Alerts[0])
+	}
+	if wd.LastSelfHealAt != "2026-11-13T00:01:00Z" {
+		t.Errorf("上次自愈时刻解析错: %q", wd.LastSelfHealAt)
+	}
+}
+
+// 老后端没有 watchdog 字段：返回 nil，界面据此不画横幅（「读不到」不当成「没告警」去画空条）。
+func TestCrewWatchdogMissingFieldIsNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"load":{"running":0,"queued":0,"maxWorkers":3}}`))
+	}))
+	defer server.Close()
+	c := New("http://127.0.0.1:1", "t", "d").WithManagement(server.URL)
+	wd, err := c.CrewWatchdog(context.Background())
+	if err != nil {
+		t.Fatalf("读看门狗失败: %v", err)
+	}
+	if wd != nil {
+		t.Errorf("没有 watchdog 字段时应返回 nil，实际 %+v", wd)
+	}
+}

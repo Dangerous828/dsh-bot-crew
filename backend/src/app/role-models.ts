@@ -72,3 +72,40 @@ export async function initializeRoleModel(ctx: Context, agent: Agent, model: Rou
   })
   await ctx.sessionPersistence.flush()
 }
+
+/**
+ * 一条路由在启动时「能不能解析通」的预检结果。
+ *
+ * `ok` 表示主路由或备选路由里至少有一条能解析（provider 在、model 名字认得出）；
+ * `detail` 在失败时给一句人话，用来记到 health 与启动日志里，别让操作者对着
+ * 「Eval 一直卡在 evaluating」猜。
+ */
+export interface RouteCheck {
+  ok: boolean
+  detail: string
+}
+
+/**
+ * 启动一致性检查：把 settings 里所有会被拿来用的路由（eval、executor、每个 bot 的路由）
+ * 各解析一次，确认主/备至少有一条通。
+ *
+ * 为什么要它：#4 那类静默卡死的一种成因，是 settings 里写了一个解析不通的模型，而 Eval 建起来
+ * 之后不会失败、只会等 judgement 等到超时。在这里先把错配拦在启动阶段 —— 报错清清楚楚，
+ * 而不是进入 evaluating 之后死等。复用 resolveRoutedModel，主路由不通时它自己会试 backup，
+ * 所以「主挂了但备在」不会误报。
+ *
+ * 返回所有失败项（空数组 = 全部通）。调用方据此决定是否拦下启动。
+ */
+export async function checkRoleRoutes(ctx: Context, models: readonly (RoutedModel | null | undefined)[]): Promise<RouteCheck[]> {
+  const failures: RouteCheck[] = []
+  for (const model of models) {
+    if (!model) continue // 没配 = 走宿主默认，不是错配，跳过
+    try {
+      await resolveRoutedModel(ctx, model)
+    } catch (error) {
+      const label = [model.provider, model.model].filter(Boolean).join('/')
+      failures.push({ ok: false, detail: `${label || '(未命名路由)'}：${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+  return failures
+}

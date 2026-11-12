@@ -637,6 +637,23 @@ type CrewLoad struct {
 	MaxWorkers int `json:"maxWorkers"`
 }
 
+// WatchdogAlert 是一条看门狗告警（超时未决定等「卡住」事件），来自管理面 /state 的 watchdog。
+// 它是一条「说不清就说明白」的链：这条告警一定写在 /state 上，桌面右栏据此显示横幅，
+// 不依赖 App 的系统推送（那条已停）。
+type WatchdogAlert struct {
+	At    string `json:"at"`
+	Kind  string `json:"kind"`
+	Title string `json:"title"`
+	Body  string `json:"body"`
+	DecisionID string `json:"decisionId"`
+}
+
+// Watchdog 是看门狗快照：最近几条告警 + 上次真重排过的自愈时刻。为空表示没有告警。
+type Watchdog struct {
+	Alerts         []WatchdogAlert `json:"alerts"`
+	LastSelfHealAt string          `json:"lastSelfHealAt,omitempty"`
+}
+
 // CrewLoad 读执行器的槽位情况。它挂在管理面上（网页端口），不是消息面。
 func (c *Client) CrewLoad(ctx context.Context) (*CrewLoad, error) {
 	var answer struct {
@@ -650,6 +667,18 @@ func (c *Client) CrewLoad(ctx context.Context) (*CrewLoad, error) {
 		return nil, fmt.Errorf("crewload: 管理面没报告并发上限")
 	}
 	return &answer.Load, nil
+}
+
+// CrewWatchdog 读看门狗的最近告警，来自管理面 `GET /orchestrator/api/state` 的 `watchdog`。
+// 读不到就返回空（nil），界面不画横幅——「读不到」不等于「没有告警」，所以调用方据此保守即可。
+func (c *Client) CrewWatchdog(ctx context.Context) (*Watchdog, error) {
+	var answer struct {
+		Watchdog *Watchdog `json:"watchdog"`
+	}
+	if err := c.management(ctx, http.MethodGet, "/state", nil, &answer); err != nil {
+		return nil, err
+	}
+	return answer.Watchdog, nil
 }
 
 // Conversation 是一次读到的队伍。

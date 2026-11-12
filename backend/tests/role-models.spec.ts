@@ -92,3 +92,42 @@ it('throws the last error only when both the primary and the backup fail', async
     .rejects.toThrow('everything is down')
   expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
 })
+
+// #8-1 启动一致性检查：settings 里任一路由主备都解析不通时，checkRoleRoutes 要把它报出来，
+// 好让运行时在启动阶段拦下（进 Eval 前就报错，而不是 evaluating 里死等）。
+it('checkRoleRoutes reports a route whose provider cannot resolve', async () => {
+  const { ctx, resolve } = await fixture()
+  // 让 worker-provider 解析成功，unknown-provider 抛错（模拟 provider 下线 / 名字配错）。
+  resolve.mockImplementation(async (value: { provider: string }) => {
+    if (value.provider === 'unknown-provider') throw new Error('unknown provider')
+    return value
+  })
+  const { checkRoleRoutes } = await import('../src/app/role-models.ts')
+  const ok = await checkRoleRoutes(ctx, [{ provider: 'worker-provider', model: 'm' }])
+  expect(ok).toEqual([])
+  const bad = await checkRoleRoutes(ctx, [{ provider: 'unknown-provider', model: 'x' }])
+  expect(bad).toHaveLength(1)
+  const first = bad[0]!
+  expect(first.ok).toBe(false)
+  expect(first.detail).toContain('unknown-provider')
+  expect(first.detail).toContain('unknown provider')
+})
+
+// 主路由挂了但 backup 通 —— 不算错配（resolveRoutedModel 会自己退到 backup）。
+it('checkRoleRoutes passes when the primary fails but the backup resolves', async () => {
+  const { ctx, resolve } = await fixture()
+  resolve.mockImplementation(async (value: { provider: string }) => {
+    if (value.provider === 'down') throw new Error('connection refused')
+    return value
+  })
+  const { checkRoleRoutes } = await import('../src/app/role-models.ts')
+  const result = await checkRoleRoutes(ctx, [{ provider: 'down', model: 'x', backup: { provider: 'up', model: 'y' } }])
+  expect(result).toEqual([])
+})
+
+// 没配（null/undefined）不算错配：走宿主默认，跳过检查。
+it('checkRoleRoutes skips unset routes', async () => {
+  const { ctx } = await fixture()
+  const { checkRoleRoutes } = await import('../src/app/role-models.ts')
+  expect(await checkRoleRoutes(ctx, [null, undefined])).toEqual([])
+})

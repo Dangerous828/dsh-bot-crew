@@ -162,6 +162,8 @@ const stateView = (): StateView => ({
   masterId: 'master', paused: server.settings.paused,
   // The panel does not read health; the service script does.
   health: {},
+  // 看门狗快照：这份 fixture 不驱动它，给 null（没有告警）。
+  watchdog: null,
 })
 const settingsView = (): ApiResponse<'GET settings'> => ({
   policyVersion: 'abcdef1234567890',

@@ -159,6 +159,10 @@ type app struct {
 	// 而不是写死一个 3。
 	crewLoad   *CrewLoad
 	crewLoadCh chan *CrewLoad
+	// watchdog 是看门狗的最近告警（超时未决定等）。读不到就是 nil，界面不画横幅。
+	// 它一定写在管理面 /state 上，不依赖 App 系统推送（#8-2）。
+	watchdog   *Watchdog
+	watchdogCh chan *Watchdog
 
 	// 已配对的设备：配对一次之后谁还能进来的清单。读不到就空着，不挡住别的。
 	devices      []PairedDevice
@@ -383,6 +387,10 @@ func (s *app) refresh() {
 		// 不影响对话 —— 一个数读不到，不该让整段对话报错。
 		if load, loadErr := s.client.CrewLoad(ctx); loadErr == nil {
 			s.crewLoadCh <- load
+		}
+		// 看门狗告警：与槽位同一次 /state 读不回（各发一份请求也行，读不到就不画横幅）。
+		if wd, wdErr := s.client.CrewWatchdog(ctx); wdErr == nil {
+			s.watchdogCh <- wd
 		}
 		// 已读位置：把主人读到的最后一条回话 id 报上去（契约 §5.6）。只报队伍回的最后一条：
 		// 还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。尽力而为，失败不打断刷新。
@@ -655,6 +663,10 @@ func (s *app) drain(c *ui.Context) {
 		case load := <-s.crewLoadCh:
 			// 槽位情况回来了：底部「队列 · 上限 N 并发」那一行据此画。
 			s.crewLoad = load
+			c.Invalidate()
+		case wd := <-s.watchdogCh:
+			// 看门狗告警回来了：右栏顶部据此画横幅。
+			s.watchdog = wd
 			c.Invalidate()
 		case view := <-s.effortsCh:
 			s.efforts = view
@@ -2740,6 +2752,27 @@ func (s *app) taskCountLine() string {
 //
 // 右栏跟着左栏点开的那一项走：「后台」是工单，「模型」是选择，「产出」是文件，
 // 「常规任务」是那张定时账本。每一项都画得出来，没有一项按下去是空的。
+// watchdogBanner 把看门狗最近的告警画成右栏顶部一条横幅。
+//
+// 只画「最新一条」：告警是一次「这活没人判」，不是一个可滚动的日志——多了反而埋掉最新那条。
+// 一条都没有就不画（watchdog=nil 或 alerts 为空），不占位置。这是「说不清链」的收口：
+// 超时这件事一定在 /state 的 watchdog 上，桌面据此可见，与手机系统推送无关。
+func (s *app) watchdogBanner(c *ui.Context, p Palette) {
+	wd := s.watchdog
+	if wd == nil || len(wd.Alerts) == 0 {
+		return
+	}
+	latest := wd.Alerts[0]
+	ui.Column(c).FillWidth().Gap(4).Padding(10).Radius(RadiusItem).
+		Background(p.WarnSoft).BorderWidth(1).BorderColor(p.WarnEdge).Children(func() {
+		ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(6).Children(func() {
+			ui.Text(c, "看门狗").FontSize(FontTiny).TextColor(p.Warn)
+			ui.Text(c, latest.Title).FontSize(FontSmall).TextColor(p.Ink).Grow(1)
+		})
+		ui.Text(c, latest.Body).FontSize(FontTiny).TextColor(p.Faint)
+	})
+}
+
 func (s *app) backendPane(c *ui.Context, p Palette) {
 	if !s.backendOpen {
 		// 收起来不是消失：留一条窄边，点它就能再展开。
@@ -2760,6 +2793,9 @@ func (s *app) backendPane(c *ui.Context, p Palette) {
 	ui.Row(c).FillWidth().FillHeight().Direction(ui.LeftToRight).Gap(0).Children(func() {
 		ui.Column(c).Width(1).FillHeight().Background(p.Line)
 		ui.Column(c).Grow(1).FillHeight().PaddingX(16).PaddingY(22).Gap(14).Background(p.Raised).Children(func() {
+			// 看门狗横幅（#8-2）：有超时未决定的告警就画在最上面，不论停在哪个标签页都能看见。
+			// 这条链一定写在管理面 /state 上，不依赖 App 系统推送；读不到（watchdog=nil）就不画。
+			s.watchdogBanner(c, p)
 			switch s.navTab {
 			case navModel:
 				s.modelPane(c, p)

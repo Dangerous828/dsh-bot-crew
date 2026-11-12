@@ -59,6 +59,7 @@ import { Setup } from './setup.ts'
 import { feishuSettings } from '../sources/feishu.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { Sessions } from './sessions.ts'
+import { checkRoleRoutes, type RoutedModel } from './role-models.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
@@ -103,6 +104,11 @@ const crewHop = (store: Pick<Store, 'get'>, ticketId: string): number => store.g
  */
 const GATEWAY = { host: process.env.MOBILEGW_HOST ?? '127.0.0.1', port: process.env.MOBILEGW_PORT ?? '8788',
   secure: process.env.MOBILEGW_SECURE === '1' }
+
+/** 一条看门狗告警：何时、什么事、给谁看的一句话，以及对应的 decision id（去重/追查用）。 */
+export interface WatchdogAlert { at: string; kind: string; title: string; body: string; decisionId: string }
+/** 看门狗对外快照：最近几条告警 + 上次真重排过的自愈时刻（证明它是活的）。 */
+export interface WatchdogStatus { alerts: WatchdogAlert[]; lastSelfHealAt?: string }
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -164,7 +170,15 @@ export class Runtime extends Service implements SourceHost {
   /** 会话压缩的监听只挂一次；挂不上（老宿主）时也不会每轮重试。 */
   private compactionWatch = false
   /** 常规任务的调度器；`start` 之后才有，`stop` 时清掉（`routines()` 据此说 runner 是 live 还是 none）。 */
+  // 看门狗告警账本：超时未决定这类「卡住」事件各记一条，桌面/管理面读它显示横幅。
+  // 与 pushNotice 无关——即使 App 的独立系统推送停了，这条账本也一定写在 /state 上（#8-2）。
+  private readonly watchdogAlerts: { at: string; kind: string; title: string; body: string; decisionId: string }[] = []
   private routineTimer?: ReturnType<typeof setInterval>
+  // 上次 tick 的时刻。Mac 睡眠时 setInterval 也停摆，醒来后第一次 tick 会明显晚于 TICK_MS；
+  // 用它判断「是不是睡过头了」，睡过就先补扫一次自愈，别让停机窗口里的卡死没人管（#8-4）。
+  private lastTickAt?: number
+  // 上次真正重排过一条决策的自愈时刻，供 watchdogStatus 展示「看门狗是活的」。
+  private lastSelfHealAt?: string
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
@@ -279,6 +293,11 @@ export class Runtime extends Service implements SourceHost {
               const title = thread ? threadTitle(store, thread) : event.data.threadKey
               const text = `评估超时未决定：「${title}」这条请求连续超时仍未得到判断，队伍没有接下它。可以重发，或到面板看这一条。`
               sessions.relay(key('eval-timeout', decision.id), JSON.stringify({ kind: 'eval_timeout', thread: event.data.threadKey, text }))
+              // 账本先写：这是「一定送达」的那条链——桌面右栏与管理面 /state 都读它，
+              // 不依赖 App 的独立系统推送（那条用户已停）。pushNotice 只作手机在线时的加送。
+              this.watchdogAlerts.unshift({ at: now(), kind: 'eval_timeout', title: '有一件事没判下来',
+                body: `「${title}」评估超时，队伍没有接。`, decisionId: decision.id })
+              if (this.watchdogAlerts.length > 50) this.watchdogAlerts.length = 50
               this.pushNotice({ title: '有一件事没判下来', body: `「${title}」评估超时，队伍没有接。`, kind: 'followup' })
             }
           }
@@ -518,9 +537,11 @@ export class Runtime extends Service implements SourceHost {
    *
    * @returns 真正被捡回来重跑的决策 id。
    */
-  async runSelfHeal(now = Date.now()): Promise<string[]> {
+  async runSelfHeal(now = Date.now(), options: { catchUpMs?: number } = {}): Promise<string[]> {
     if (this.paused()) return []
-    const since = new Date(now - 3_600_000).toISOString()
+    // 默认扫最近一小时；醒来补扫时按实际停机时长扩大窗口，把睡过头那段时间里超时的也捞回来。
+    const windowMs = Math.max(3_600_000, options.catchUpMs ?? 0)
+    const since = new Date(now - windowMs).toISOString()
     const healed: string[] = []
     for (const decision of this.store.read.decisionsOfKinds(['unavailable'], 200)) {
       if (decision.at < since) continue
@@ -528,6 +549,7 @@ export class Runtime extends Service implements SourceHost {
       try {
         if (this.engine.recoverExpiredDecision(decision.id)) {
           healed.push(decision.id)
+          this.lastSelfHealAt = new Date(now).toISOString()
           console.log('[selfheal] requeued decision=%s thread=%s', decision.id, decision.threadKey)
         }
       } catch (error) { console.log('[selfheal] failed decision=%s error=%s', decision.id, String(error)) }
@@ -1001,6 +1023,10 @@ export class Runtime extends Service implements SourceHost {
   /** Resolved deployment; throws while waiting for setup (`!configured()`). */
   get deployment(): Deployment { return this.setup.deployment }
   configured(): boolean { return this.setup.configured() }
+  /** 看门狗最近告警（超时未决定等「卡住」事件），桌面右栏与管理面 /state 读它。最新的在前。 */
+  watchdogStatus(): WatchdogStatus {
+    return { alerts: this.watchdogAlerts.slice(0, 10), lastSelfHealAt: this.lastSelfHealAt }
+  }
   get setupProblem(): SetupProblem | undefined { return this.setup.problem }
   /** Why the Feishu bot is unavailable even though the Feishu Source configures a CLI. */
   get feishuProblem(): SetupProblem | undefined { return this.setup.feishuProblem }
@@ -1104,9 +1130,30 @@ export class Runtime extends Service implements SourceHost {
    * so a short outage looked like a stopped product. The retry only recovers a pending crew — it never takes a working
    * one down — and stops on its own once setup holds or the runtime closes.
    */
+  /**
+   * 收集 settings 里所有会被当角色模型用的路由：eval 主、executor 主、每位 bot 的 route。
+   * 只收「配了值」的；null/空 = 走宿主默认，不算错配。启动一致性检查用它。
+   */
+  private configuredRoutes(): (RoutedModel | null | undefined)[] {
+    const settings = this.store.settings()
+    const routes: (RoutedModel | null | undefined)[] = [settings.eval.model, settings.executor.model]
+    for (const route of Object.values(settings.executor.botModels ?? {})) routes.push(route)
+    return routes
+  }
+
   private async finishSetup(): Promise<void> {
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
+      this.retrySetup()
+      return
+    }
+    // 启动一致性检查（#8-1）：settings 里任何一条会被拿来用的路由（eval / executor / 每个 bot）
+    // 若主备都解析不通，就在启动阶段拦下 —— 报错写进 health 与日志，而不是让 Eval 进了 evaluating 之后
+    // 死等 judgement 到超时。轮询/重试 setup 时也会再走这里，所以改好配置后能自愈。
+    const routeFailures = await checkRoleRoutes(this.ctx, this.configuredRoutes())
+    if (routeFailures.length > 0) {
+      const detail = `模型路由解析不通：${routeFailures.map(f => f.detail).join('；')}`
+      this.runtimeHealth.set({ state: 'error', detail, at: now() })
       this.retrySetup()
       return
     }
@@ -1213,11 +1260,23 @@ export class Runtime extends Service implements SourceHost {
     if (this.routineTimer || this.closing()) return
     this.routineTimer = setInterval(() => {
       if (this.closing()) return
+      const now = Date.now()
+      // 睡过头的判定：距上次 tick 超过 3 个周期（>= 3 分钟），基本只可能是机器睡眠/断网挂起，
+      // 不是正常节拍。醒来第一拍先补一次自愈扫描（把停机期间超时的 Eval 捡回来），扫描窗口按
+      // 实际停机时长扩大，别漏掉窗口外的；然后照常跑这一拍。
+      const gap = this.lastTickAt === undefined ? 0 : now - this.lastTickAt
+      this.lastTickAt = now
+      if (gap >= TICK_MS * 3) {
+        console.log('[selfheal] 检测到长时间停机（%dms），醒来补扫一次', gap)
+        void this.runSelfHeal(now, { catchUpMs: gap })
+          .catch(error => { console.log('[selfheal] catch-up failed: %s', String(error)) })
+      }
       void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
-      void this.runSelfHeal().catch(error => { console.log('[selfheal] tick failed: %s', String(error)) })
+      void this.runSelfHeal(now).catch(error => { console.log('[selfheal] tick failed: %s', String(error)) })
       void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })
       void this.runDaily().catch(error => { console.log('[daily] tick failed: %s', String(error)) })
     }, TICK_MS)
+    this.lastTickAt = Date.now()
     // 定时器不该一个人把进程钉住（测试、以及脚本里的一次性启动）。
     this.routineTimer.unref?.()
   }

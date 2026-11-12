@@ -216,7 +216,10 @@ beforeEach(async () => {
   runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 })
-afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks();
+  // 停服之后偶尔还有 SQLite/隧道 close 的尾巴在写目录，立刻 rm 会撞 ENOTEMPTY。
+  // maxRetries+retryDelay 让它在文件落定后再删，消掉这类并发 flaky（不是逻辑问题）。
+  rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) })
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -757,6 +760,11 @@ it('relays and pushes once when an Eval times out, and stays quiet when a judgem
   // 主 Session 也收到一条（relay 走 effects，需要 pump 一次才落到 deliveries）。
   await runtime.pump()
   expect(relays(runtime.masterId).filter(item => item.kind === 'eval_timeout')).toHaveLength(1)
+  // #8-2：告警还必须落在看门狗账本上（桌面右栏与管理面 /state 读它），
+  // 不依赖 App 的独立系统推送；判官说「别接」的那条不该进账本。
+  const watchdog = runtime.watchdogStatus()
+  expect(watchdog.alerts.some(a => a.decisionId === 'unavailable-timeout' && a.kind === 'eval_timeout')).toBe(true)
+  expect(watchdog.alerts.some(a => a.decisionId === 'unavailable-quiet')).toBe(false)
 })
 
 it('counts every step of the day\'s flow over the same arriving messages and lists the same accepted Decisions', async () => {
@@ -2103,5 +2111,26 @@ describe('runSelfHeal: 超时的评估被捡回来重跑一次', () => {
     expect(recovered).not.toContain('sh-said')
     // 第二次跑：超时那条已标 healed，不再重排（有界）。
     expect(await instance.runSelfHeal()).not.toContain('sh-timeout')
+  })
+
+  // #8-4 睡眠/断网后恢复：catchUpMs 把扫描窗口扩大，捡回「睡过头那段时间」之前、默认一小时窗口外的超时决策。
+  it('widens the scan window with catchUpMs to catch decisions older than the default hour', async () => {
+    const instance = await restart()
+    vi.spyOn(instance as unknown as { paused: () => boolean }, 'paused').mockReturnValue(false)
+    const now = Date.now()
+    const mkTrigger = (id: string): Trigger => ({ id, source: 'feishu', threads: [{ source: 'feishu', id: 'oc_sleep' }],
+      actor: { source: 'feishu', id: 'ou_alice' }, human: true, at: new Date(now).toISOString(), text: 'x',
+      channel: { source: 'feishu', thread: 'oc_sleep', address: { message: id, chat_id: 'oc_sleep' } }, meta: {} })
+    instance.store.triggers.save(mkTrigger('t-slept'))
+    // 这条决策落在「两小时前」—— 默认一小时窗口看不到，但机器睡了两小时醒来补扫就该看到。
+    const twoHoursAgo = new Date(now - 2 * 3_600_000).toISOString()
+    instance.store.decisions.save({ id: 'sh-slept', evalId: 'e9', threadKey: 'feishu:oc_sleep', triggerIds: ['t-slept'], policyVersion: 'v1',
+      at: twoHoursAgo, kind: 'unavailable', reason: [{ code: 'timeout' }], strength: 'inferred' })
+    // 默认窗口（一小时）看不到它。
+    expect(await instance.runSelfHeal(now)).not.toContain('sh-slept')
+    instance.store.decisions.save({ id: 'sh-slept2', evalId: 'e10', threadKey: 'feishu:oc_sleep', triggerIds: ['t-slept'], policyVersion: 'v1',
+      at: twoHoursAgo, kind: 'unavailable', reason: [{ code: 'timeout' }], strength: 'inferred' })
+    // 补扫：catchUpMs 三小时，窗口覆盖到两小时前，就应该捡回来。
+    expect(await instance.runSelfHeal(now, { catchUpMs: 3 * 3_600_000 })).toContain('sh-slept2')
   })
 })

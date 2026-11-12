@@ -74,6 +74,7 @@ func newApp(client *Client) *app {
 		pauseDone:     make(chan pauseResult, 2),
 		// 槽位情况（排队几条、上限几张并发）：不 make 的话，右栏底部会永远缺那一行。
 		crewLoadCh: make(chan *CrewLoad, 4),
+		watchdogCh: make(chan *Watchdog, 4),
 		botSaved:      make(chan botSaveResult, 2),
 		devicesCh:     make(chan devicesResult, 4),
 		revoking:      map[string]bool{},

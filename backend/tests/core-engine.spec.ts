@@ -1682,6 +1682,32 @@ describe('expired Eval self-heal', () => {
     h.pump()
     expect(h.requests.length).toBe(before + 1)
   })
+  // #8-5：复现 #4 完整场景——turn 被 blocked → 超时三次记 unavailable → 决定有痕迹 →
+  // 自愈把 Trigger 捡回 pending → 起一轮新 Eval 接手。全程 Ticket/Trigger 不丢、可追。
+  it('walks the whole #4 path: blocked turn -> timeout -> unavailable -> self-heal -> fresh Eval', () => {
+    const h = harness(undefined, { emit: undefined })
+    // receive + pump 起第一轮 Eval
+    h.engine.receive(trigger('1', { threads: [{ source: 'chat', id: 't1' }] })); h.pump()
+    // 连续三次「投递了但不裁决」= 超时，第三次后记 unavailable(timeout)
+    const deliver = () => h.engine.candidateDelivered(h.requests.at(-1)!.evalId)
+    deliver(); h.tick(61); h.pump()
+    deliver(); h.tick(61); h.pump()
+    deliver(); h.tick(61); h.pump()
+    const decision = h.repo.decisions.byThread('chat:t1').at(-1)!
+    // ① 卡住这件事在账本上留了痕：kind=unavailable、reason=timeout（有痕迹才谈得上告警/追查）
+    expect(decision).toMatchObject({ kind: 'unavailable', reason: [{ code: 'timeout' }] })
+    // ② Trigger 没丢，仍在 thread 里（能自愈的前提）
+    expect(h.repo.threads.get('chat:t1')).toBeTruthy()
+    const beforeRequests = h.requests.length
+    // ③ 自愈：把 Trigger 捡回 pending、标 healed
+    expect(h.engine.recoverExpiredDecision(decision.id)).toBe(true)
+    expect(h.repo.triggers.disposition('1')).toMatchObject({ healed: true })
+    // ④ 新 Session/新一轮评估接手：pump 之后又冒出一次 assessor.request，证明真的回到了评估流程
+    h.pump()
+    expect(h.requests.length).toBe(beforeRequests + 1)
+    // ⑤ 有界：同一件事不再无限自愈
+    expect(h.engine.recoverExpiredDecision(decision.id)).toBe(false)
+  })
   it('never self-heals an unavailable a judge decided on purpose', () => {
     const h = harness()
     h.engine.receive(trigger('1')); h.pump()

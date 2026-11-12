@@ -130,6 +130,15 @@ export const ExecutorConfigSchema = z.object({
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  /**
+   * worker 执行面的隔离档（Step 2 强制隔离 / gap 3）：
+   * - `none`：不隔离，沿用操作者 OS 用户（当前默认，保持向后兼容）；
+   * - `sandbox`：用平台沙箱（macOS `sandbox-exec`）把 worker 子进程包起来，只允许写本 ticket
+   *   执行根目录，读系统基础路径但拒绝读操作者凭据（`~/.ssh`、`~/.config`）与别的 ticket 目录。
+   *   详情见 `docs/adr/0004-worker-isolation-os-user.md`。
+   * 平台不支持该沙箱时启动一致性检查会报错，不会静默退回不隔离。
+   */
+  isolation: z.enum(['none', 'sandbox']).default('none'),
 }).strict()
 /** 远程连接：配对策略与局域网直连开关。 */
 export const RemoteConfigSchema = z.object({

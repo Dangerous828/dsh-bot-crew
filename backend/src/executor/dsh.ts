@@ -8,11 +8,12 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
-import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
+import { runAsWorker, runIsolated, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
+import { homedir } from 'node:os'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { planOf } from '../app/work.ts'
@@ -276,11 +277,19 @@ export class DshExecutor implements Executor {
   private async prepareDirectory(ticket: Ticket): Promise<void> {
     const directory = ticket.execution?.directory ?? ''
     await mkdir(dirname(directory), { recursive: true })
-    const command = this.host.store.settings().executor.prepare.trim()
+    const settings = this.host.store.settings().executor
+    const command = settings.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
+    // 隔离档（Step 2）：sandbox 时 prepare 只能写本 ticket 执行目录 + 其父，读不到操作者凭据与别的 ticket。
+    // none 时退回原来的 runAsWorker，行为不变。
+    if (command) await runIsolated(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, {
+      mode: settings.isolation,
+      writableRoots: [directory, dirname(directory)],
+      readableDeny: workerSensitivePaths(this.host.machine.stateDir),
+      env,
+    })
       .catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
         await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
@@ -732,4 +741,22 @@ export class DshExecutor implements Executor {
       }
     })
   }
+}
+
+/**
+ * 隔离时要挡住读的宿主凭据目录（Step 2 / ADR 0004）。worker 不需要、也不该能读这些——
+ * 这是 gap 3 实测症状（worker 读操作者 `~/.ssh`、`~/.config`）的正面拦截。
+ *
+ * 只 deny 凭据目录、不 deny stateDir 整体：worker 的执行目录就在 stateDir 下，deny 整片会把它也挡了。
+ * ticket 之间互读的进一步收紧留待后续（可配合每 ticket 独立 stateDir），本轮先挡住凭据这条硬边界。
+ */
+function workerSensitivePaths(_stateDir: string): string[] {
+  const home = homedir()
+  return [
+    join(home, '.ssh'),
+    join(home, '.config'),
+    join(home, '.aws'),
+    join(home, '.gnupg'),
+    join(home, '.docker'),
+  ]
 }

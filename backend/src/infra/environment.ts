@@ -134,6 +134,71 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
+/** 隔离档：`none` 不隔离；`sandbox` 用平台沙箱约束 worker 的可写面（见 ADR 0004）。 */
+export type IsolationMode = 'none' | 'sandbox'
+
+/** 平台沙箱是否可用：macOS 用 `sandbox-exec`。别的平台暂不提供，`sandbox` 档会在校验时报错。 */
+export function sandboxAvailable(): boolean {
+  return process.platform === 'darwin'
+}
+
+/**
+ * 造一个「只允许写这些目录」的 macOS sandbox 执行前缀。
+ *
+ * 约束口径（刻意收窄）：
+ * - **允许**：进程/信号（worker 要 fork、git 要起子进程）、读系统基础路径（`/usr`、`/bin`、`/System`、
+ *   `/private/var`、`/tmp`、`/dev` 等）、写 `writableRoots` 里列出的目录与其子路径。
+ * - **拒绝**：写 `writableRoots` 之外的任何位置；读操作者凭据目录（`~/.ssh`、`~/.config`）与别的
+ *   ticket 目录 —— 做法是 `deny file-read* (subpath "<sesitive>")` 显式压过默认的「读放行」。
+ *
+ * 这不是「读全放、写白名单」的半个隔离：敏感读被显式 deny，别处写被默认 deny 兜住。
+ * 返回可直接拼在 `sh -c` 前面的 `["/usr/bin/sandbox-exec", "-p", profile, ...]`。
+ */
+export function sandboxArgv(writableRoots: readonly string[], readableDeny: readonly string[] = []): string[] {
+  // 每个可写目录用 subpath 放行写。写是默认 deny、只放白名单目录——这是隔离的主约束。
+  const writes = writableRoots.map(root => `(allow file-write* (subpath ${sbQuote(realSubpath(root))}))`).join('')
+  // 敏感目录显式 deny 读：sandbox 里 deny 压过 allow（同规则族 deny 优先），所以即使下面读全放行也挡得住。
+  const denies = readableDeny.map(dir => `(deny file-read* (subpath ${sbQuote(realSubpath(dir))}))`).join('')
+  // 读走「全放行 + 敏感目录 deny」：系统基础路径（/usr /bin /System …）在各版本 macOS 上位置不一，
+  // 逐个列举容易因某个不存在的 subpath 让 profile 校验失败；全放行 + 定向 deny 更稳，且隔离强度不降——
+  // 真正要挡的是「读操作者凭据 / 别的 ticket」，那是 deny 的活；写面始终只放白名单。
+  const profile = [
+    '(version 1)',
+    '(deny default)',
+    '(allow process*)',
+    '(allow signal)',
+    '(allow file-read*)',
+    writes,
+    denies,
+  ].join(' ')
+  return ['/usr/bin/sandbox-exec', '-p', profile]
+}
+
+/** 把路径解析成真实路径（macOS 上 `/tmp`→`/private/tmp`），失败就原样返回。 */
+function realSubpath(path: string): string {
+  try { return realpathSync(path) } catch { return resolve(path) }
+}
+
+/** sandbox profile 里的字符串要转义双引号与反斜杠。 */
+function sbQuote(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+/**
+ * 隔离地跑一条 worker 命令：`sandbox` 档在 `sandbox-exec` 里跑，`none` 档退回普通 `runAsWorker`。
+ *
+ * `writableRoots` 是这次命令允许写的目录（通常是本 ticket 的执行目录 + 必要时 `~/.gitconfig` 那个文件所在）；
+ * `readableDeny` 是要挡住读的敏感目录（凭据、别的 ticket）。沙箱不可用（非 macOS）时抛错 —— 不静默退回不隔离，
+ * 否则「以为隔离了其实没有」比不隔离更危险。
+ */
+export async function runIsolated(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal,
+  options: { mode: IsolationMode; writableRoots: readonly string[]; readableDeny?: readonly string[]; env?: Record<string, string> }): Promise<string> {
+  if (options.mode === 'none') return runAsWorker(subprocess, argv, cwd, signal, options.env)
+  if (!sandboxAvailable()) throw new Error('isolation=sandbox 只在 macOS 上可用；这台机器没有 sandbox-exec，拒绝以「未隔离」冒充「已隔离」')
+  const wrapped = [...sandboxArgv(options.writableRoots, options.readableDeny ?? []), ...argv]
+  return runAsWorker(subprocess, wrapped, cwd, signal, options.env)
+}
+
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
 export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
   const { github, stateDir } = deployment

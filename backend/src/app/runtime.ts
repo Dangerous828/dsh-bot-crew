@@ -60,6 +60,7 @@ import { feishuSettings } from '../sources/feishu.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { Sessions } from './sessions.ts'
 import { checkRoleRoutes, type RoutedModel } from './role-models.ts'
+import { sandboxAvailable } from '../infra/environment.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
@@ -1153,6 +1154,14 @@ export class Runtime extends Service implements SourceHost {
     const routeFailures = await checkRoleRoutes(this.ctx, this.configuredRoutes())
     if (routeFailures.length > 0) {
       const detail = `模型路由解析不通：${routeFailures.map(f => f.detail).join('；')}`
+      this.runtimeHealth.set({ state: 'error', detail, at: now() })
+      this.retrySetup()
+      return
+    }
+    // 隔离平台校验（Step 2）：配了 isolation=sandbox 但平台没有相应的沙箱，就在启动阶段拦下，
+    // 绝不静默退回「未隔离」——「以为隔离了其实没有」比不隔离更危险。
+    if (this.store.settings().executor.isolation === 'sandbox' && !sandboxAvailable()) {
+      const detail = '配置了 worker 隔离 isolation=sandbox，但这台机器没有可用的沙箱（仅 macOS 提供）；拒绝以「未隔离」冒充「已隔离」'
       this.runtimeHealth.set({ state: 'error', detail, at: now() })
       this.retrySetup()
       return

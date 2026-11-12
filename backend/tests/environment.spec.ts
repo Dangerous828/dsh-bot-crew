@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment, sandboxAvailable }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -182,5 +182,74 @@ describe('the repository the host\'s environment names', () => {
       for (const name of GIT_LOCATION) expect(env, name).not.toHaveProperty(name)
       expect(env.GIT_CEILING_DIRECTORIES).toBe(dir)
     } finally { vi.unstubAllEnvs() }
+  })
+})
+
+// Step 2 强制隔离（#9-2）：真跑 sandbox-exec，证明 worker 只能写执行目录、读到敏感目录被拦。
+// 只在这台 macOS 上真跑；别的平台 sandboxAvailable() 返回 false 时跳过（并断言 runIsolated 会拒绝冒充）。
+describe('worker isolation (sandbox)', () => {
+  const signal = new AbortController().signal
+  const realSubprocess = (): SubprocessRuntime => ({
+    spawn: ({ argv, cwd }: { argv: readonly string[]; cwd: string }) => {
+      const child = spawn(argv[0]!, argv.slice(1), { cwd })
+      const output = { stdout: '', stderr: '' }
+      child.stdout.on('data', chunk => { output.stdout += String(chunk) })
+      child.stderr.on('data', chunk => { output.stderr += String(chunk) })
+      const reader = (name: 'stdout' | 'stderr') => ({ readFrom: () => ({ text: output[name], nextOffset: 0, lossy: false }) })
+      const done = new Promise(resolve => child.on('close', code => resolve({ exitCode: code, signal: null })))
+      return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
+    },
+  }) as unknown as SubprocessRuntime
+
+  it('lets a worker write inside its own exec dir but not outside, and not read the operator credential dir', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated } = await import('../src/infra/environment.ts')
+    const execDir = mkdtempSync(join(tmpdir(), 'iso-exec-'))
+    const outside = mkdtempSync(join(tmpdir(), 'iso-outside-'))
+    const fakeSshDir = mkdtempSync(join(tmpdir(), 'iso-ssh-'))
+    const secret = join(fakeSshDir, 'id_ed25519')
+    writeFileSync(secret, 'PRIVATE-KEY')
+    const sb = realSubprocess()
+    try {
+      // ① 写自己的执行目录：成功，文件真落地。
+      await runIsolated(sb, ['sh', '-c', 'echo hi > own.txt'], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir], readableDeny: [fakeSshDir] })
+      expect(readdirSync(execDir)).toContain('own.txt')
+      // ② 写执行目录之外：被拦（命令失败）。
+      await expect(runIsolated(sb, ['sh', '-c', `echo x > ${join(outside, 'no.txt')}`], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir], readableDeny: [fakeSshDir] })).rejects.toBeInstanceOf(CliError)
+      expect(readdirSync(outside)).not.toContain('no.txt')
+      // ③ 读操作者凭据目录（这里用 fakeSshDir 顶替 ~/.ssh）：被拦。
+      await expect(runIsolated(sb, ['sh', '-c', `cat ${secret}`], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir], readableDeny: [fakeSshDir] })).rejects.toBeInstanceOf(CliError)
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+      rmSync(fakeSshDir, { recursive: true, force: true })
+    }
+  })
+
+  it('mode=none runs plainly (backwards compatible): write outside the exec dir is allowed', async () => {
+    const { runIsolated } = await import('../src/infra/environment.ts')
+    const execDir = mkdtempSync(join(tmpdir(), 'iso-none-'))
+    const outside = mkdtempSync(join(tmpdir(), 'iso-none-out-'))
+    try {
+      await runIsolated(realSubprocess(), ['sh', '-c', `echo x > ${join(outside, 'ok.txt')}`], execDir, signal,
+        { mode: 'none', writableRoots: [execDir] })
+      expect(readdirSync(outside)).toContain('ok.txt')
+    } finally {
+      rmSync(execDir, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to pretend isolation when the platform has no sandbox', async () => {
+    const { runIsolated, sandboxAvailable } = await import('../src/infra/environment.ts')
+    if (sandboxAvailable()) { expect(true).toBe(true); return } // 本机有，跳过这条
+    const dir2 = mkdtempSync(join(tmpdir(), 'iso-no-'))
+    try {
+      await expect(runIsolated(realSubprocess(), ['true'], dir2, signal, { mode: 'sandbox', writableRoots: [dir2] }))
+        .rejects.toThrow(/sandbox/)
+    } finally { rmSync(dir2, { recursive: true, force: true }) }
   })
 })

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -143,5 +143,21 @@ describe('MemoryLedger rendering', () => {
     ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'host' })
     expect(ledger.all()).toHaveLength(2)
     expect(ledger.all().filter(entry => entry.state === 'active')).toHaveLength(1)
+  })
+})
+
+// Step 2 / #9-3 记忆落盘收口：记忆只存在 SQLite（kv 表），不是散在执行目录里的明文文件；
+// worker 读不到——要读得读整个 sqlite 并懂其结构，而不是 cat 一个 json。这条守卫这一点不倒退。
+describe('memory storage boundary (Step 2 / gap 3)', () => {
+  it('stores memory inside the sqlite database, not as plaintext files a worker could cat', () => {
+    ledger.settle({ bot_id: 'lead', fact: fact(), now: '2026-11-13T00:00:00.000Z', scope: 'local' } as never)
+    // 记忆条目写得进、读得回（功能仍工作）。
+    expect(ledger.all().some(entry => entry.body.includes('pnpm'))).toBe(true)
+    // 落点是数据库文件本身，不是执行目录下的明文记忆文件。
+    const files = readdirSync(directory)
+    expect(files).toContain('orchestrator.sqlite')
+    // 目录里没有任何「按记忆名命名的明文文件」——记忆名带 bot- 前缀（KV.memory.entry 的键），
+    // 若落成散文件这里就能看到；落成 sqlite 则看不到。
+    expect(files.some(name => /memory|entry|bot-/.test(name))).toBe(false)
   })
 })

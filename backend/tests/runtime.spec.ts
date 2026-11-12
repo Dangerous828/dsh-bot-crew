@@ -2134,3 +2134,16 @@ describe('runSelfHeal: 超时的评估被捡回来重跑一次', () => {
     expect(await instance.runSelfHeal(now, { catchUpMs: 3 * 3_600_000 })).toContain('sh-slept2')
   })
 })
+
+// Step 2 / #9-4 审批闸与隔离衔接：把 worker 隔离档设成 sandbox，审批判定不受影响——
+// 隔离改的是 worker 进程能碰什么，审批改的是工具层外部写要不要 ask，两者正交、不互相削弱。
+it('keeps the approval gate judging writes the same with worker isolation turned on', async () => {
+  // 配上一条连接：mail 服务、默认只读。
+  runtime.store.saveSettings({ ...runtime.store.settings(),
+    executor: { ...runtime.store.settings().executor, isolation: 'sandbox' },
+    connections: { readOnly: true, connections: [{ kind: 'mail', server: 'mail', readTools: ['list_messages'] }] } } as never)
+  // 隔离开了，审批照旧：读放行、写 ask、未知 deny。
+  expect(runtime.judgeConnection('mail', 'list_messages').action).toBe('allow')
+  expect(runtime.judgeConnection('mail', 'send_message').action).toBe('ask')
+  expect(runtime.judgeConnection('random-server', 'do_something').action).toBe('deny')
+})

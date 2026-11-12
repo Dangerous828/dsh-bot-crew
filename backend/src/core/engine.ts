@@ -3,6 +3,7 @@ import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
 import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
+import type { DomainEvent, DomainEvents } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
@@ -35,6 +36,16 @@ export class Engine {
     this.assignments = new Assignments(options, this.tickets, this.replies)
     this.evals = new Evals(options, this.tickets)
     this.intake = new Intake(options, this.tickets)
+  }
+
+  /**
+   * Re-emit a recorded domain event through the same `emit` the Engine uses.
+   *
+   * 只给测试用：让「宿主收到 decision.recorded 之后做了什么」可以被单独验证，
+   * 不必真的等一次超时。生产路径不会走这里 —— 事件本来就由各 part 自己发出。
+   */
+  emitForTest<K extends keyof DomainEvents>(type: K, data: DomainEvents[K]): void {
+    this.options.emit?.({ type, at: this.options.now?.() ?? new Date().toISOString(), data } as DomainEvent)
   }
 
   // Sources

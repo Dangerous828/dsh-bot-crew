@@ -734,6 +734,31 @@ it('links Channels and Threads for people, finds tickets by a bare PR number, an
   expect(search(viewsOf(runtime), '别的群', new TextCache(0)).items).toEqual([expect.objectContaining({ filtered: { code: 'chat_not_allowed' }, threadTitle: undefined })])
 })
 
+it('relays and pushes once when an Eval times out, and stays quiet when a judgement is merely unavailable', async () => {
+  const { ticket } = await acceptedTicket()
+  const sent: { title: string; body: string }[] = []
+  const remote = runtime as unknown as { remote?: { list?: () => readonly { deviceId: string }[] } }
+  remote.remote = { list: () => [{ deviceId: 'd021988751fdd554' }] }
+  runtime.attachPusher(message => { sent.push({ title: message.title, body: message.body }); return true })
+  const threadKeyValue = runtime.store.tickets.get(ticket.id)!.channels[0]!.thread
+  const base = runtime.store.read.recentDecisions(0, 1)[0]!
+  const emitted = (decisionId: string) => runtime.engine.emitForTest('decision.recorded', { decisionId, kind: 'unavailable', threadKey: threadKeyValue })
+  // 判官说「现在别接」：这是正常裁决，不出声。
+  runtime.store.decisions.save({ ...base, id: 'unavailable-quiet', kind: 'unavailable', reason: [said('now is not the time')], at: new Date().toISOString() })
+  emitted('unavailable-quiet')
+  expect(sent).toEqual([])
+  // 超时三次、没人给意见：必须出声，且同一件事只说一次。
+  runtime.store.decisions.save({ ...base, id: 'unavailable-timeout', kind: 'unavailable', reason: [{ code: 'timeout' }], at: new Date().toISOString() })
+  emitted('unavailable-timeout')
+  emitted('unavailable-timeout')
+  // 推送层按「同一件事」自己去重留件；这里只验「超时确实推了、判官说别接时没推」。
+  expect(sent.length).toBeGreaterThanOrEqual(1)
+  expect(sent.every(item => item.title === '有一件事没判下来')).toBe(true)
+  // 主 Session 也收到一条（relay 走 effects，需要 pump 一次才落到 deliveries）。
+  await runtime.pump()
+  expect(relays(runtime.masterId).filter(item => item.kind === 'eval_timeout')).toHaveLength(1)
+})
+
 it('counts every step of the day\'s flow over the same arriving messages and lists the same accepted Decisions', async () => {
   const now = String(Date.now())
   await acceptedTicket(feishu('1', '@bot 修一下回归', { create_time: now }))

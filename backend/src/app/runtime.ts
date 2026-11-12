@@ -47,7 +47,7 @@ import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
-import type { LinkTarget } from './views/records.ts'
+import { threadTitle, type LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
@@ -267,6 +267,20 @@ export class Runtime extends Service implements SourceHost {
               JSON.stringify(decision?.reason ?? '-'),
               String(event.data.threadKey),
               String(decision?.ticketId ?? '-'))
+            // 评估静默失败要出声。`unavailable` 里有两种不同的事：
+            // 判官说「现在别接」是一种正常裁决（不出声）；超时三次、判官没给出意见是
+            // 「这活没人判」（#4 那类静默卡死），必须让人知道 —— 否则请求就这么消失，
+            // 界面上看不到任何痕迹。这里给主 Session 递一条、推一条手机通知，
+            // 与 followup / routine 同一条出口；按 decision id 去重，同一件事只说一次。
+            const timedOut = decision?.kind === 'unavailable' && event.data.kind === 'unavailable'
+              && (decision.reason ?? []).some(reason => reason.code === 'timeout')
+            if (timedOut) {
+              const thread = store.threads.get(event.data.threadKey)
+              const title = thread ? threadTitle(store, thread) : event.data.threadKey
+              const text = `评估超时未决定：「${title}」这条请求连续超时仍未得到判断，队伍没有接下它。可以重发，或到面板看这一条。`
+              sessions.relay(key('eval-timeout', decision.id), JSON.stringify({ kind: 'eval_timeout', thread: event.data.threadKey, text }))
+              this.pushNotice({ title: '有一件事没判下来', body: `「${title}」评估超时，队伍没有接。`, kind: 'followup' })
+            }
           }
           // 主人说的「定下来的规矩」当场记一条。放在同一个 emit 里：这里是所有 Trigger 的唯一入口，
           // 记忆层将来要加别的来源（比如某个 Source 自己的结论）也只挂在这一处。

@@ -99,3 +99,24 @@ it('records nothing for a pause that changes nothing, refuses a sync while setup
   vi.mocked(Setup.prototype.configured).mockRestore()
   expect(() => settings.block('source:x')).toThrow(new UserError('unknownBlock', { block: 'source:x' }))
 })
+
+it('saves approval and connections from the panel, bumps the policy version, and refuses a non-panel change', async () => {
+  h = await startRuntime()
+  const { settings, store } = h.runtime
+  const approvalRev = store.blockRevision('approval')
+  const versionBefore = (await import('../src/policy.ts')).policyVersion(store.settings())
+  await settings.save('approval', { mode: 'auto', askWhenBudgetUsed: 0.5 }, approvalRev, 'panel')
+  expect(store.settings().approval).toEqual({ mode: 'auto', askWhenBudgetUsed: 0.5 })
+  expect(store.blockRevision('approval')).toBe(approvalRev + 1)
+  const versionAfter = (await import('../src/policy.ts')).policyVersion(store.settings())
+  expect(versionAfter).not.toBe(versionBefore)
+  // 模型工具不得自行放宽审批档位。
+  await expect(settings.save('approval', { mode: 'off', askWhenBudgetUsed: 0.5 }, store.blockRevision('approval'), 'tool'))
+    .rejects.toThrow(new UserError('panelOnlyApproval'))
+  // 连接同理：非面板来源不得加写连接。
+  const connRev = store.blockRevision('connections')
+  await settings.save('connections', { readOnly: false, connections: [{ kind: 'mail', server: 'mail', readTools: ['list'], writeTools: ['send'] }] }, connRev, 'panel')
+  expect(store.settings().connections.connections[0]?.server).toBe('mail')
+  await expect(settings.save('connections', { readOnly: true, connections: [] }, store.blockRevision('connections'), 'tool'))
+    .rejects.toThrow(new UserError('panelOnlyConnections'))
+})

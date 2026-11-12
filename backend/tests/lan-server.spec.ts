@@ -19,7 +19,8 @@ it.each([64, 300_000])('preserves %i raw voice bytes and speech headers on the a
     expect(answer.headers.get('x-speech-seconds')).toBe('2')
     expect(answer.headers.get('x-speech-truncated')).toBe('1')
   } finally { await server.close() }
-})
+  // 300KB 真实回环 + 全并发跑套件时可能超过默认 5s；这是搬运字节，不是被测逻辑，给足时间。
+}, 20_000)
 
 // 手机连的那条路是一个独立监听：它不经过 Connection，所以凭据校验必须自己做。
 // 这是 AI-HUB 的做法（lib/relay/lan-proxy.js），也是 Connection 那套 launch-token 体系之外唯一的选择。

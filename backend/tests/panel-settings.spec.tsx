@@ -128,7 +128,7 @@ it('lists the settings groups stages first, opens each stage\'s group from its s
   async () => {
   await mount()
   await click(tab(zh['tab.settings']))
-  expect(all('.dt-settings-link').map(link => link.textContent)).toEqual(['来源', '评估', '执行', '提示词', '部署'])
+  expect(all('.dt-settings-link').map(link => link.textContent)).toEqual(['来源', '评估', '执行', '审批与连接', '提示词', '部署'])
   expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['term.source'])
   for (const [tab, group] of [['来源', '来源'], ['评估', '评估'], ['执行', '执行']] as const) {
     await click(find(tab, '[role="tab"]'))
@@ -144,4 +144,24 @@ it('lists the settings groups stages first, opens each stage\'s group from its s
   await remount()
   await click(tab(zh['tab.settings']))
   expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
+})
+
+it('edits the approval mode and external connections on the approval group, each block saved on its own revision', async () => {
+  await mount()
+  await click(tab(zh['tab.settings']))
+  await click(find(zh['settingsGroup.approval'], '.dt-settings-link'))
+  // Approval: switch to 自动 (default is 询问), save the approval block. Only the mode is exposed; the budget threshold has no data source and is not in the UI.
+  const autoRadio = all('label').find(label => label.textContent?.trim() === zh['approvalMode.auto'])!.querySelector('input')!
+  await act(async () => { (autoRadio as HTMLInputElement).click() })
+  await click(find(zh.save, '.dt-savebar button'))
+  expect(server.settings.approval.mode).toBe('auto')
+  // Connections: toggle read-only off, add a mail connector, save the connections block.
+  await click(field<HTMLInputElement>(zh.connectionsReadOnly))
+  await click(find(zh.connectionAdd))
+  await type(field<HTMLInputElement>(zh.connectionServer), 'mail')
+  await type(field<HTMLInputElement>(zh.connectionReadTools), 'list_messages, read_message')
+  await type(field<HTMLInputElement>(zh.connectionWriteTools), 'send_message')
+  await click(find(zh.save, '.dt-savebar button'))
+  expect(server.settings.connections.readOnly).toBe(false)
+  expect(server.settings.connections.connections).toEqual([{ kind: 'mail', server: 'mail', readTools: ['list_messages', 'read_message'], writeTools: ['send_message'] }])
 })

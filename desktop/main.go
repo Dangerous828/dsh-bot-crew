@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net"
 	"net/url"
@@ -262,6 +263,18 @@ func main() {
 	s := newApp(client)
 	s.target = located.Target
 	s.endpoint = located.Base
+	// 全局调试态：CREW_DEBUG=1 时才建动作表、开本地 unix socket 控制口。
+	// 不设就一个口都不开——调试口能驱动整屏，生产面零暴露。
+	if debugEnabled() {
+		bus := newDebugBus(s)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := bus.serveDebug(ctx); err != nil {
+			log.Printf("调试口开不起来（不影响界面）：%v", err)
+		} else {
+			log.Printf("调试口已开：unix %s（CREW_DEBUG=1）", debugSocketPath())
+		}
+	}
 	mygo.App.WhenReady(func() {
 		mygo.NewWindow(mygo.WindowOptions{
 			Title: "Bot 队伍",

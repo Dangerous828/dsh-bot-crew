@@ -78,8 +78,9 @@ cd backend && ./scripts/dsh-superagent status|start|restart   # 默认 profile s
 
 ## 六、待办
 
-- [ ] 界面文案按实测延迟区分「P2P 直连 / 隧道中继（Xms）」（A 在做）
-- [ ] 跨网段真机复验：手机在 `cp-net-6F` 时应显示「中继」而不是「直连」
+- [x] 界面文案按实测延迟区分「P2P 直连 / 隧道中继（Xms）」（`CrewRoute.tunnelLabel`，40ms 为界，单测覆盖 1/12/39/40/137/146/null）
+- [x] 跨网段真机复验：手机在 `cp-net-6F`、Mac 在 `192.168.113.134`，App 探针稳态 **11ms** → 界面「P2P 直连」，与 LAN 基线同量级、比 DERP 的 130ms+ 低一个数量级，有实测支撑
+- [x] 代码入库并推送：`890dd2e`（20 改 + 15 新，`.so` 已忽略、`scripts/crew-watch/` 属他人未动）；后端 1667 例、App 201 例全过
 - [ ] 家里路由器上重测打洞（那台若支持 UPnP，portmapper 已编译进来，可能真能直连）
 - [ ] 推送真机验：`pushRegister` / 断网 `push queued` / 重连 `push flushed`
 - [ ] 播报、审批三档、语音、hourly 账、记忆 settle/recall 的真机验（交接旧文 §五 那批）

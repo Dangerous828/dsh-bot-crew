@@ -65,6 +65,7 @@ import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { MemoryLayer } from './memory-layer.ts'
+import { HubProbe, LocalMemory, pickMemoryPort } from '../memory/detect.ts'
 import { memoryView, type MemoryView } from './views/memory.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -123,6 +124,8 @@ export class Runtime extends Service implements SourceHost {
   readonly passes: Passes
   /** 记忆层：谁写、谁读、什么时候写（见 `memory-layer.ts`）。 */
   readonly memory: MemoryLayer
+  /** 记忆中枢可达性探测（供记忆层分叉与设置保存后刷新）。 */
+  memoryProbe?: HubProbe
   readonly ready: Promise<void>
   /**
    * DSH 的会话表，手机端的「子代理」卡片靠它从 worker 会话往下展开。
@@ -206,8 +209,19 @@ export class Runtime extends Service implements SourceHost {
         guardConnection: (ticketId, name, args) => this.guardConnection(ticketId, name, args),
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
-      this.memory = new MemoryLayer({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
+      // 记忆中枢：按设置里的 memory.hub 探测决定走中枢版还是本机版；两版共用同一个本机账本。
+      const memorySettings = store.settings().memory
+      const memoryProbe = new HubProbe({ hub: memorySettings.hub, timeoutMs: memorySettings.timeoutMs,
+        log: line => console.log(line) })
+      const localMemory = new LocalMemory({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
         ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [] })
+      this.memoryProbe = memoryProbe
+      void memoryProbe.refresh().catch(() => undefined)
+      this.memory = new MemoryLayer({
+        store,
+        bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
+          ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [],
+        port: pickMemoryPort(localMemory, memoryProbe) })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => {
         for (const ticket of store.tickets.open()) {
           if (ticket.pendingApproval?.kind !== 'connection' || ticket.pendingApproval.status !== 'approved') continue

@@ -19,11 +19,17 @@ export interface MemoryEntry extends MemoryRecord {
   /** 宿主从哪一轮提炼出来的，用于回查。 */
   source?: { ticket_id?: string; session_id?: string; at?: string }
   /**
-   * `active` 正常参与召回；`forgotten` 是主人说了「忘掉」；`superseded` 是被新条替代的旧条。
+   * `active` 正常参与召回；`forgotten` 进了遗忘区（主人说忘掉、或末位淘汰前的候选）；
+   * `superseded` 是被新条替代的旧条。
    *
-   * 三种都不删行 —— 删掉就查不出「它曾经这么以为了」。
+   * `forgotten` / `superseded` 不参与召回与注入，但行先留着（能回查「它曾经这么以为」）。
+   * 遗忘区里的条目超过 `FORGET_EVICT_MS` 且期间一次没被调起，才真正删行 —— 见 `evict()`。
    */
   state: 'active' | 'forgotten' | 'superseded'
+  /** 进遗忘区的时间（秒）。末位淘汰以它为起点算 30 天。 */
+  forgottenAt?: number
+  /** 最近一次被召回为 worker 上下文的时间（秒）。遗忘区里被调起过就重新计时不淘汰。 */
+  lastUsedAt?: number
 }
 
 /** 一条记忆能不能进 worker 的上下文。 */

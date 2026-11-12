@@ -75,6 +75,8 @@ export class MemoryLayer {
   }
 
   forget(name: string): boolean { return this.port.forget(name) }
+  /** 末位淘汰：遗忘区里超期且没被调起的真删掉。 */
+  evict(now?: number): string[] { return this.port.evict(now) }
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean { return this.port.edit(name, patch) }
   all(): MemoryEntry[] { return this.port.all() }
 }

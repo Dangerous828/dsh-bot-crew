@@ -257,6 +257,7 @@ describe('settings migration', () => {
       executor: { model: null, botModels: {}, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
       // 新加的配置块走默认值：旧存档里没有它，迁移不该为它编内容。
       remote: { pairing: 'code', lan: true },
+      memory: { hub: '', timeoutMs: 1500 },
       approval: { mode: 'ask', askWhenBudgetUsed: 0.9 },
       connections: { connections: [], readOnly: true },
     })

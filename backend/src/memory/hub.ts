@@ -68,6 +68,7 @@ export class HubMemory implements MemoryPort {
   }
 
   forget(name: string): boolean { return this.host.fallback.forget(name) }
+  evict(now?: number): string[] { return this.host.fallback.evict(now) }
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean { return this.host.fallback.edit(name, patch) }
   all(): MemoryEntry[] { return this.host.fallback.all() }
 }

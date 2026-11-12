@@ -135,6 +135,19 @@ export const RemoteConfigSchema = z.object({
   /** 局域网直连。关掉就只留隧道。 */
   lan: z.boolean().default(true),
 }).strict()
+/**
+ * 记忆中枢（Hub）：给记忆的向量检索与睡眠期巩固用。
+ *
+ * 空地址 = 没有中枢，记忆全在本机完成（本机版）。配了地址且探测可达才走中枢；
+ * 探测失败自动降级本机，不阻塞开工。原始对话不上中枢，只有筛选过的稳定事实走
+ * local_dream 直通链路上行 —— 这里只控制「记忆要不要把重活交给中枢」。
+ */
+export const MemoryConfigSchema = z.object({
+  /** 中枢记忆 API 的基址；空表示不启用中枢。 */
+  hub: z.string().trim().refine(url => url === '' || /^https?:\/\//.test(url), 'An http(s) URL, or empty for no hub').default(''),
+  /** 探测超时（毫秒）：连不上就当没有中枢。 */
+  timeoutMs: z.number().int().min(200).max(10_000).default(1500),
+}).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
   paused: z.boolean().default(false),
@@ -145,6 +158,7 @@ export const SettingsSchema = z.object({
   connections: ConnectionsConfigSchema.default(() => ConnectionsConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
   remote: RemoteConfigSchema.default(() => RemoteConfigSchema.parse({})),
+  memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
 export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'approval' | 'connections' | `source:${string}`

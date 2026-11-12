@@ -96,6 +96,29 @@ describe('MemoryLedger.forget / edit', () => {
     expect(ledger.edit('bot-lead-nope', { body: 'x' })).toBe(false)
   })
 
+  it('evicts a forgotten entry only after 30 days without a later recall', () => {
+    const [entry] = ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'host' }).written
+    const forgottenAt = Math.floor(Date.now() / 1000)
+    ledger.forget(entry!.name)
+    // 刚进遗忘区：不删。
+    expect(ledger.evict(forgottenAt + 60)).toEqual([])
+    expect(store.get(KV.memory.entry(entry!.name))).toBeDefined()
+    // 过了 30 天、期间没被调起：真删。
+    const later = forgottenAt + 31 * 24 * 60 * 60
+    expect(ledger.evict(later)).toEqual([entry!.name])
+    expect(store.get(KV.memory.entry(entry!.name))).toBeUndefined()
+  })
+
+  it('keeps a forgotten entry that was recalled again after being forgotten', () => {
+    const [entry] = ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'host' }).written
+    const forgottenAt = Math.floor(Date.now() / 1000)
+    ledger.forget(entry!.name)
+    // 遗忘后又"被调起"（lastUsedAt 晚于 forgottenAt）：即便过了 30 天也不淘汰。
+    ledger.touch([entry!.name], forgottenAt + 100)
+    expect(ledger.evict(forgottenAt + 31 * 24 * 60 * 60)).toEqual([])
+    expect(store.get(KV.memory.entry(entry!.name))).toBeDefined()
+  })
+
   it('edits description and body, and refuses what the renderer would refuse', () => {
     const [entry] = ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'host' }).written
     expect(ledger.edit(entry!.name, { description: '改用 pnpm', body: '改过的正文' })).toBe(true)

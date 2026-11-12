@@ -51,6 +51,8 @@ export class LocalMemory implements MemoryPort {
     const others = rank(this.ledger.all(), query, { topK: RECALL_TOP_K }).filter(hit => !seen.has(hit.entry.name))
     const composed = compose([...own, ...others], RECALL_MAX_CHARS)
     if (!composed.text) return ''
+    // 记一笔「这几条被调起过」：末位淘汰据此判断遗忘区里有没有被重新需要，避免误删。
+    this.ledger.touch(composed.taken.map(entry => entry.name))
     console.log('[memory] recall mode=local bot=%s chars=%d taken=%s', bot || '-', composed.chars,
       JSON.stringify(composed.taken.map(entry => entry.name)))
     return injectText(composed)
@@ -110,10 +112,13 @@ export class LocalMemory implements MemoryPort {
       }
     }
     if (result.facts) console.log('[memory] consolidate mode=local facts=%d superseded=%d', result.facts, result.superseded)
+    // 顺手做末位淘汰：遗忘区里超期且没被调起的真删掉。
+    this.ledger.evict()
     return result
   }
 
   forget(name: string): boolean { return this.ledger.forget(name) }
+  evict(now?: number): string[] { return this.ledger.evict(now) }
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean { return this.ledger.edit(name, patch) }
   all(): MemoryEntry[] { return this.ledger.all() }
 }

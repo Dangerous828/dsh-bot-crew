@@ -16,6 +16,9 @@ import type { MemoryEntry } from '../memory/recall.ts'
 /** 一条记忆落成 `MemoryEntry` 时共用的时间基准（秒）。 */
 const seconds = (): number => Math.floor(Date.now() / 1000)
 
+/** 遗忘区里待多久还没被调起就真删：30 天（秒）。 */
+export const FORGET_EVICT_SECONDS = 30 * 24 * 60 * 60
+
 export interface SettleInput {
   bot_id: string
   fact: Fact
@@ -113,12 +116,46 @@ export class MemoryLedger {
     return { written: [entry], superseded }
   }
 
-  /** 主人说「忘掉这条」：翻状态，不删行。 */
+  /** 主人说「忘掉这条」：进遗忘区（翻状态 + 记时间），不立刻删行。 */
   forget(name: string): boolean {
     const raw = this.store.get(KV.memory.entry(name) as Parameters<typeof this.store.get>[0])
     if (!raw || typeof raw !== 'object') return false
-    this.store.set(KV.memory.entry(name), { ...(raw as MemoryEntry), state: 'forgotten', updated: seconds() })
+    const now = seconds()
+    this.store.set(KV.memory.entry(name), { ...(raw as MemoryEntry), state: 'forgotten', forgottenAt: now, updated: now })
     return true
+  }
+
+  /**
+   * 末位淘汰：遗忘区里超过 `FORGET_EVICT_SECONDS` 且期间一次没被调起（`lastUsedAt` 不晚于 `forgottenAt`）
+   * 的条目，真删行。返回删掉的名字。
+   *
+   * 为什么不是「说忘掉就立刻删」：留一个遗忘窗口，既能让主人反悔，又保留近期审计；
+   * 久到没人再想起、也确实没被调起过，才按隐私诉求彻底删掉。
+   */
+  evict(now = seconds()): string[] {
+    const removed: string[] = []
+    for (const entry of this.all()) {
+      if (entry.state !== 'forgotten') continue
+      const since = entry.forgottenAt ?? entry.updated
+      if (now - since < FORGET_EVICT_SECONDS) continue
+      // 遗忘区里被重新调起过（lastUsedAt 晚于 forgottenAt）：当作又被需要，不淘汰。
+      if (entry.lastUsedAt !== undefined && entry.lastUsedAt > since) continue
+      this.store.delete(KV.memory.entry(entry.name))
+      removed.push(entry.name)
+    }
+    if (removed.length) console.log('[memory] evicted forgotten entries: %d', removed.length)
+    return removed
+  }
+
+  /** 记「被召回为上下文」的时间，供末位淘汰判断「期间有没有被调起」。 */
+  touch(names: readonly string[], now = seconds()): void {
+    if (!names.length) return
+    this.store.atomic(() => {
+      for (const name of names) {
+        const raw = this.store.get(KV.memory.entry(name) as Parameters<typeof this.store.get>[0])
+        if (raw && typeof raw === 'object') this.store.set(KV.memory.entry(name), { ...(raw as MemoryEntry), lastUsedAt: now })
+      }
+    })
   }
 
   /** 主人改了一条记忆的正文或描述。 */

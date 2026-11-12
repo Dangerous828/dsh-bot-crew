@@ -47,8 +47,10 @@ export interface MemoryPort {
   upsert(botId: string, fact: Fact, origin: string, source?: MemoryEntry['source']): UpsertResult
   /** 触发一轮睡眠期巩固（把一段原始日志提炼成事实）。没中枢时本机跑，有中枢时交给中枢。 */
   consolidate(range?: ConsolidateRange): Promise<ConsolidateResult>
-  /** 主人说忘掉一条。 */
+  /** 主人说忘掉一条（进遗忘区，不立刻删）。 */
   forget(name: string): boolean
+  /** 末位淘汰：遗忘区里超过 30 天且没被调起过的，真删行。返回删掉的名字。 */
+  evict(now?: number): string[]
   /** 主人改一条。 */
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean
   /** 全部条目（治理/展示用）。 */

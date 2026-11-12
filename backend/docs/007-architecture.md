@@ -354,6 +354,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/memory/port.ts` | 记忆端口接口 `MemoryPort`：召回/写账/睡眠期巩固/治理，两个实现（本机版、中枢版）共用一套方法；上层只认接口，按有无中枢选实现 |
 | `src/memory/local.ts` | 本机版记忆端口：正则 settle + 二元组召回 + KV 账本，睡眠期巩固调便宜模型提炼；没中枢或中枢降级时用它 |
 | `src/memory/hub.ts` | 中枢版记忆端口：向量检索与睡眠期巩固走中枢，中枢不可用时降级到本机实现；本机不算 embedding、原始对话不上中枢 |
+| `src/memory/detect.ts` | 记忆中枢探测与降级：按设置里 `memory.hub` 探测 `/health`（带 TTL 缓存），通就用中枢版、不通就本机版；只回答「现在有没有中枢」，不做记忆读写 |
 | `src/app/memory.ts` | 记忆账本：KV 一族 `memory:entry:`，按 Bot 命名空间和 `dedupe_key` 查重，纠错走 `superseded` 而非硬删，「忘掉」只翻状态 |
 | `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
 | `src/app/routine-runner.ts` | 常规任务的执行器：哪几条到点了、派出去时对队伍说的那句话、派完之后账本怎么往前推一格；不补跑、不重试，逾期只提醒 |

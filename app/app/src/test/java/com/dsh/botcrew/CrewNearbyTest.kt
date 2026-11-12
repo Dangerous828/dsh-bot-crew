@@ -137,4 +137,23 @@ class CrewNearbyTest {
         assertEquals("找到 3 台队伍，点一台填上地址。", NearbyCopy.several(3, picked = null))
         assertEquals("已选中 林的书房，地址已填好。", NearbyCopy.several(3, picked = "林的书房"))
     }
+
+    // 出门那条路：电脑在 mDNS 记录里一起报了外网入口，表要原样带着它，配对时才有得存。
+    // 丢了这一格，人回到家之外就只剩「重新手输地址」这一条路 —— 那正是这套东西要消灭的事。
+    @Test
+    fun thePublicEntrySurvivesDiscoveryTable() {
+        val beacon = CrewBeacon("dsh-crew-a", "http://10.0.0.1:43499", "https://crew.example.top")
+        val spots = CrewNearby.add(emptyList(), beacon)
+        assertEquals("https://crew.example.top", spots.single().publicBase)
+
+        // 同一台重新广播：地址以最新一次为准，外网入口也跟着最新一次走（改域名/换隧道后要能更新）。
+        val moved = CrewNearby.add(spots, CrewBeacon("dsh-crew-a", "http://10.0.0.9:43499", "https://new.example.top"))
+        assertEquals(1, moved.size)
+        assertEquals("https://new.example.top", moved.single().publicBase)
+
+        // 没配外网入口的电脑：空串，不是 null。界面据此决定不显示那一行，也不会把它当成一个地址去连。
+        val local = CrewNearby.add(emptyList(), CrewBeacon("dsh-crew-b", "http://10.0.0.2:43499"))
+        assertEquals("", local.single().publicBase)
+    }
+
 }

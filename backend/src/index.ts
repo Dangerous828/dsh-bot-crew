@@ -6,6 +6,7 @@ import { phoneHandler, registerMobileHttp } from './app/mobile-http.ts'
 import { deviceStoreOf } from './app/remote.ts'
 import { bindCandidates, createLanServer, lanPort } from './app/lan-server.ts'
 import { createDiscovery } from './app/discovery.ts'
+import { publicEntry } from './app/public-entry.ts'
 import { createTunnel } from './app/tunnel.ts'
 import { phoneGate } from './app/phone-gate.ts'
 import { createPairingThrottle } from './app/pairing-throttle.ts'
@@ -62,6 +63,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   const discovery = createDiscovery({
     stateDir: machine.stateDir,
     name: process.env.CREW_DISCOVERY_NAME?.trim() || undefined,
+    publicUrl: publicEntry(machine.stateDir),
     onError: error => ctx.logger.warn('mDNS announce failed: %s', String(error)),
   })
   const lan = createLanServer({

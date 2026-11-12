@@ -36,7 +36,19 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         CrewRoot(
-                            client = CrewClient(current.base, current.token, current.deviceId),
+                            client = CrewClient(
+                                initialBase = current.base,
+                                token = current.token,
+                                deviceId = current.deviceId,
+                                fallbackBase = current.fallbackBase,
+                                // 换过路并成功了就落盘：下次启动直接走通的那条，不必先失败一次。
+                                onBaseSwitched = { reached ->
+                                    val next = if (reached == current.fallbackBase) current.copy(base = reached, fallbackBase = current.base)
+                                    else current.copy(base = reached)
+                                    pairing.save(next)
+                                    paired = next
+                                },
+                            ),
                             palette = palette,
                             onForget = {
                                 pairing.clear()

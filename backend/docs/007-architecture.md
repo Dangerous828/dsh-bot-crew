@@ -366,7 +366,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/connections.ts` | 对外连接（邮箱 / 日历 / 文件）经宿主的 MCP 桥：哪些工具算「读」直接放行、哪些算「写」停下来等人点头、认不出来的按写处理；默认只读，凭据不在这一层 |
 | `src/app/speech.ts` | 播报：把一句话念成 WAV（系统 `say` + `afconvert`，不出本机）；先剥掉代码块与网址再念、超长截断并说明、没这个声音/转换失败分开说 |
 | `src/app/views/memory.ts` | 记忆这一栏的形状：一条记忆在界面上的一行（含来源与是否上行）、三态 `live` / `empty` / `unavailable`，以及按 Bot 过滤时仍数整本账 |
-| `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes only a name, the port, and a stateDir fingerprint — never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
+| `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes only a name, the port, a stateDir fingerprint and (when configured) the public entry as `pub` — never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
+| `src/app/public-entry.ts` | Where "out of the house" points: the public entry a phone keeps after seeing it once. Read from `CREW_PUBLIC_URL`, else `<stateDir>/mobile-public-url`; a bare host gets `https://` and trailing slashes are trimmed. Absent means LAN-only, which is not an error |
 | `src/app/lan-server.ts` | The phone's own listener: verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
 | `src/app/phone-gate.ts` | The shared gate of the phone API: only `/api/mobile/*`, the pairing POST alone is anonymous, every other request must present a paired device credential. Used by both the LAN listener and the relay tunnel, so neither entry is looser than the other |
@@ -499,6 +500,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
 | `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, port reporting, forwarding after the gate |
 | `tests/discovery.spec.ts` | The mDNS announce the phone finds this machine by: a stable stateDir fingerprint that does not leak the path, the port it publishes, stopping cleanly twice, and a failed announce that never reaches the start path |
+| `tests/public-entry.spec.ts` | Turning one line into the public entry a phone keeps: `https` added to a bare host, environment before the state-dir file, and "not configured" reported as absent rather than as an empty address |
 | `tests/phone-gate.spec.ts` | The shared phone gate on both entries, and the pairing throttle's window and address aggregation |
 | `tests/relay-protocol.spec.ts` | The wire format against the AI-HUB reference implementation, both directions: every frame code, every id width, byte-identical encoding, chunked decoding, the frame-size cap, close codes that survive Chinese reasons |
 | `tests/tunnel.spec.ts` | The outbound tunnel against a real relay: registering, serving a request, streaming, reconnect with backoff, heartbeat both ways, cancellation, upstream failures that stay off the phone |

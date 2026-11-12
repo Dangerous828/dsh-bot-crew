@@ -80,14 +80,27 @@ object CrewDiscovery {
                 if (port <= 0) return
                 // IPv6 地址要带方括号，否则拼出来的 URL 是坏的。
                 val shaped = if (host.contains(':')) "[$host]" else host
-                onFound(CrewBeacon(name = serviceInfo.serviceName, base = "http://$shaped:$port"))
+                // TXT 里的 `pub` 是电脑自己说的「出门往哪走」。同一条记录里一起给，所以人只要在
+                // 同一个 Wi-Fi 下配过一次，之后换到任何网络都照着它连 —— 这是不装任何客户端
+                // 也能跨网的全部机关。没有这一格就只是这台机器没配外网入口，局域网照旧可用。
+                val public = serviceInfo.attributes?.get("pub")?.toString(Charsets.UTF_8)?.trim()
+                onFound(CrewBeacon(
+                    name = serviceInfo.serviceName,
+                    base = "http://$shaped:$port",
+                    publicBase = public?.takeIf { it.isNotEmpty() }.orEmpty(),
+                ))
             }
         })
     }
 }
 
-/** 找到的一台队伍：名字给人看，`base` 直接填进地址框。 */
-data class CrewBeacon(val name: String, val base: String)
+/**
+ * 找到的一台队伍：名字给人看，`base` 直接填进地址框。
+ *
+ * [publicBase] 是同一台电脑的出门地址（`https://...`），空串表示它没配。它不填进地址框 ——
+ * 同一 Wi-Fi 下直连更快也更稳；只在局域网那条路连不上时才拿来兜底。
+ */
+data class CrewBeacon(val name: String, val base: String, val publicBase: String = "")
 
 /**
  * 发现流上的一件事：看见一台，或者一台不见了。

@@ -8,8 +8,8 @@ package com.dsh.botcrew
  * 都是纯函数 —— 屏幕只负责把这些结果画出来。
  */
 object CrewNearby {
-    /** 表的一行：名字是服务实例名（认人的），base 是填进地址框的那个。 */
-    data class Spot(val name: String, val base: String)
+    /** 表的一行：名字是服务实例名（认人的），base 是填进地址框的那个，publicBase 是出门那条路（可空）。 */
+    data class Spot(val name: String, val base: String, val publicBase: String = "")
 
     /**
      * 把一台并进表里：同一台（按服务名）只留一行，位置不动，地址以最新一次为准。
@@ -18,7 +18,7 @@ object CrewNearby {
      * 手指正好按在上面就会点错人。
      */
     fun add(spots: List<Spot>, beacon: CrewBeacon): List<Spot> {
-        val spot = Spot(beacon.name, beacon.base)
+        val spot = Spot(beacon.name, beacon.base, beacon.publicBase)
         val at = spots.indexOfFirst { it.name == beacon.name }
         return if (at < 0) spots + spot else spots.toMutableList().also { it[at] = spot }
     }

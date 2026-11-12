@@ -38,6 +38,14 @@ export interface DiscoveryOptions {
   stateDir: string
   /** 服务实例名；缺省用主机名 + 指纹，同机多队伍也能一眼分开。 */
   name?: string
+  /**
+   * 出了门那条路的入口（例：`https://crew.example.top`），配了才写进 TXT。
+   *
+   * mDNS 只走同一网段，所以手机在别的网络里**发现不到**这条记录；但它在同一 Wi-Fi 下看见过一次，
+   * 就可以把这一行记下来，之后换到任何网络都照着连。这是「不装任何客户端也能出门」的全部机关：
+   * 发现一次，永久可用。没配就只广播局域网，和原来一字不差。
+   */
+  publicUrl?: string
   /** 广播失败时的去处。默认吞掉：mDNS 不可用（容器、无组播、端口被占）不该拖垮后端。 */
   onError?: (error: unknown) => void
 }
@@ -52,12 +60,14 @@ export interface Discovery {
 }
 
 export function createDiscovery(options: DiscoveryOptions): Discovery {
-  const { stateDir, onError } = options
+  const { stateDir, onError, publicUrl } = options
   const crew = crewFingerprint(stateDir)
   const name = options.name ?? `dsh-crew-${crew}`
   let bonjour: Bonjour | undefined
   let service: Service | undefined
   let current: number | undefined
+  /** 上一次广播时写进去的那条公网入口。它变了也得重播，否则手机永远拿着旧的地址出门。 */
+  let currentPublic: string | undefined
 
   /**
    * 广播出错时的统一去处。底层异步报错（组播被系统收走、socket 关了）之后，这条记录已经不会再应答：
@@ -71,7 +81,7 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
 
   return {
     publish(port) {
-      if (current === port) return
+      if (current === port && currentPublic === publicUrl) return
       // 换端口就先撤掉旧的：同一个名字广播两次会让手机看到两条记录，选哪条都可能是死的。
       if (service) {
         const previous = service
@@ -79,11 +89,13 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
         try { previous.stop(() => {}) } catch { /* 停不掉也不影响新记录 */ }
       }
       current = port
+      currentPublic = publicUrl
       try {
         bonjour ??= new Bonjour()
         service = bonjour.publish({
           name, type: SERVICE_TYPE, port, protocol: 'tcp',
-          txt: { crew, port: String(port) },
+          // pub 是「出了门往哪走」。它和 port 一起给，所以手机发现一次就把两条路都记住了。
+          txt: { crew, port: String(port), ...(publicUrl ? { pub: publicUrl } : {}) },
         })
         const announced = service
         announced.on('error', error => fail(error, announced))
@@ -94,6 +106,7 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
     },
     async stop() {
       current = undefined
+      currentPublic = undefined
       const published = service
       service = undefined
       if (published) {

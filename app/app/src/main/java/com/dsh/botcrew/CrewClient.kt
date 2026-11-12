@@ -8,27 +8,66 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 
-/** 连一段对话。base 形如 http://10.0.2.2:18882（模拟器里 10.0.2.2 是宿主机）。 */
+/**
+ * 连一段对话。base 形如 http://10.0.2.2:18882（模拟器里 10.0.2.2 是宿主机）。
+ *
+ * [fallbackBase] 是同一台电脑的「出门」入口（配对时由 mDNS 的 `pub` 一并带过来）。
+ * 两条路谁先用不是配置出来的，是**试出来的**：先走当前这条，连不上就换另一条。同一 Wi-Fi
+ * 下局域网直连永远更快，出门之后局域网那条根本不存在 —— 与其让人去设置里开关，不如让它自己认。
+ */
 class CrewClient(
-    private val base: String,
+    initialBase: String,
     private val token: String,
     /** 队伍自己签发的设备凭据。独立监听那道门认它，不认网关 token。 */
     private val deviceId: String? = null,
+    /** 出门那条路的入口；空表示这台电脑没配外网入口。 */
+    private val fallbackBase: String? = null,
+    /** 换了路并真的成功之后才回调：上层据此把它记住，下次启动就不必先失败一次。 */
+    private val onBaseSwitched: ((String) -> Unit)? = null,
 ) {
+    /** 配对时记下的那条（局域网）。用来判断「现在用的是哪一条」。 */
+    private val primaryBase = initialBase
+
+    /** 当前实际在用的入口。会变：出门换到公网，回家再换回来。 */
+    @Volatile
+    private var base: String = initialBase
+
+    /** 另一条路；没配或者只有一条路时为 null。 */
+    private fun other(): String? {
+        val alt = fallbackBase?.takeIf { it.isNotBlank() } ?: return null
+        return if (base == primaryBase) alt else primaryBase
+    }
 
     /**
      * 发一次请求并把正文读回来。每个接口只差路径、方法与 body，
      * 连接的开合收在这一处：漏一次 disconnect 就是一条泄漏的 socket。
+     *
+     * 换路只发生在「连不上」的时候，且只换一次。401 不算：那是凭据问题，换一条路同样进不去，
+     * 只会让人多等一次超时，还把错误说成「连不上」。
      */
     private suspend fun read(path: String, method: String, body: String? = null): String =
         withContext(Dispatchers.IO) {
-            val connection = open(path, method, body)
             try {
-                connection.inputStream.bufferedReader().use { it.readText() }
-            } finally {
-                connection.disconnect()
+                attempt(base, path, method, body)
+            } catch (error: CrewRejected) {
+                throw error
+            } catch (error: IOException) {
+                val alt = other() ?: throw error
+                val text = attempt(alt, path, method, body)
+                base = alt
+                onBaseSwitched?.invoke(alt)
+                text
             }
         }
+
+    private fun attempt(entry: String, path: String, method: String, body: String?): String {
+        val connection = open(entry, path, method, body)
+        return try {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
 
     /**
      * 把读回来的正文解析成对象，放在后台线程做。
@@ -256,12 +295,12 @@ class CrewClient(
         read("/api/mobile/retry?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "POST")
     }
 
-    private fun open(path: String, method: String, body: String?): HttpURLConnection {
+    private fun open(entry: String, path: String, method: String, body: String?): HttpURLConnection {
         val url = try {
             // 路径都带 /api/mobile 前缀：那是消息面的位置，独立监听与插件路由都只认它。
-            URL(base + path)
+            URL(entry + path)
         } catch (error: Exception) {
-            throw IOException("队伍地址不对：$base")
+            throw IOException("队伍地址不对：$entry")
         }
         val connection = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = method
@@ -280,7 +319,8 @@ class CrewClient(
         try {
             if (body != null) connection.outputStream.use { it.write(body.toByteArray()) }
             val status = connection.responseCode
-            if (status == 401) throw IOException("队伍拒绝了这次请求：token 不对")
+            // 专用类型：凭据不对时不许换路重试，见 read()。
+            if (status == 401) throw CrewRejected("队伍拒绝了这次请求：token 不对")
             if (status >= 300) {
                 val detail = connection.errorStream?.bufferedReader()?.use { it.readText() }?.take(200).orEmpty()
                 throw IOException("队伍返回 $status：$detail")
@@ -290,8 +330,11 @@ class CrewClient(
             throw error
         } catch (error: Exception) {
             connection.disconnect()
-            throw IOException("连不上队伍（$base）：${error.message}")
+            throw IOException("连不上队伍（$entry）：${error.message}")
         }
         return connection
     }
 }
+
+/** 对端明确拒绝了凭据：地址是通的，换一条路也一样进不去。 */
+private class CrewRejected(message: String) : IOException(message)

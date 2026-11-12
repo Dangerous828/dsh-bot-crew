@@ -28,7 +28,8 @@ class PairingStore(context: Context) {
         val device = store.getString("deviceId", null) ?: return null
         val token = store.getString("token", null) ?: return null
         val base = store.getString("base", null) ?: return null
-        return PairedCrew(device, token, base)
+        // 老装机存下来的那份没有 fallbackBase：读成空串，等下次在同一 Wi-Fi 下重新发现时补上。
+        return PairedCrew(device, token, base, store.getString("fallbackBase", "").orEmpty())
     }
 
     fun save(paired: PairedCrew) {
@@ -36,6 +37,7 @@ class PairingStore(context: Context) {
             .putString("deviceId", paired.deviceId)
             .putString("token", paired.token)
             .putString("base", paired.base)
+            .putString("fallbackBase", paired.fallbackBase)
             .apply()
     }
 

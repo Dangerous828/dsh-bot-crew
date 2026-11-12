@@ -260,7 +260,10 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
                         val base = CrewPairing.normalize(address)
                         val client = PairingClient(base)
                         val credential = client.pair(code, deviceId, deviceName(), "android")
-                        onPaired(PairedCrew(credential.deviceId, credential.token, base))
+                        // 配对时顺手把「出门那条路」记下来：它和局域网地址是同一条 mDNS 记录给的，
+                        // 人不用再输第二遍。没发现到（手填地址进来的）就是空串，只在本机附近可用。
+                        val public = spots.firstOrNull { CrewNearby.holds(address, it.base) }?.publicBase.orEmpty()
+                        onPaired(PairedCrew(credential.deviceId, credential.token, base, public))
                     } catch (error: Exception) {
                         trouble = error.message ?: "配对被拒绝"
                     } finally {

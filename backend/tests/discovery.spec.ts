@@ -13,13 +13,16 @@ interface RecordedService {
  * 广播成功之后底层才出错（组播被系统收走、socket 关掉）这条路真 mDNS 不会照着剧本演，
  * 所以只在这一条用例里把 Bonjour 换成替身；其余用例照旧走真实现。
  */
-const stub = vi.hoisted(() => ({ service: undefined as RecordedService | undefined }))
+const stub = vi.hoisted(() => ({ service: undefined as RecordedService | undefined,
+  // 最近一次 publish 的参数：公网入口那一格只能从这里看（真 mDNS 不回头告诉你）。
+  options: undefined as { txt?: Record<string, string> } | undefined }))
 vi.mock('bonjour-service', async importOriginal => {
   const actual = await importOriginal<typeof import('bonjour-service')>()
   // 替身只在用例塞了 service 时出镜，其余时候原样转给真 Bonjour——同一个文件里的用例还得照旧播真记录。
   class StubbedBonjour {
     private real: Bonjour | undefined
     publish(options: Parameters<Bonjour['publish']>[0]): Service {
+      stub.options = options as unknown as { txt?: Record<string, string> }
       // 结构足够按 discovery.ts 的用法扮演一条记录，不必真起 socket。
       if (stub.service) return stub.service as unknown as Service
       this.real ??= new actual.Bonjour()
@@ -114,4 +117,27 @@ it('stops claiming to broadcast once the announce fails asynchronously', async (
 it('names the service type the phones look for', () => {
   // 这个名字是协议：改它等于让已经装好的 App 找不到任何服务。
   expect(SERVICE_TYPE).toBe('dsh-crew')
+})
+
+// 出门那条路：手机在别的网络里发现不到 mDNS，唯一的机会是「在同一个 Wi-Fi 下看见过一次」，
+// 所以公网入口必须和端口一起广播出去。少这一条，手机出了家门就只能靠人重新输地址。
+it('announces the public entry together with the port', async () => {
+  const discovery = createDiscovery({ stateDir: '/tmp/state-public', publicUrl: 'https://crew.example.top' })
+  try {
+    discovery.publish(43499)
+    expect(stub.options?.txt).toMatchObject({ pub: 'https://crew.example.top' })
+  } finally {
+    await discovery.stop()
+  }
+})
+
+it('leaves the public entry out when none is configured', async () => {
+  const discovery = createDiscovery({ stateDir: '/tmp/state-no-public' })
+  try {
+    discovery.publish(43499)
+    // 「没配」和「配了一个空值」在手机上不一样：一个不显示外网那一行，一个显示一条连不上的地址。
+    expect(stub.options?.txt ?? {}).not.toHaveProperty('pub')
+  } finally {
+    await discovery.stop()
+  }
 })

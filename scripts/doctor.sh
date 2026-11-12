@@ -100,7 +100,8 @@ for block in eval executor; do
   case "$value" in
     # Unset is not a fault: `initializeRoleModel` returns without seeding, so the session takes the host's own
     # default and work still gets done. It is worth knowing, because nothing on screen says which model that is.
-    null|"") say "$block model" "unset — the host default answers; pin one with scripts/configure.py" ;;
+    # Marked as a note (not a failure line) so a healthy-but-unpinned crew is not told to "fix the lines above".
+    null|"") say "$block model" "note: unset — the host default answers (pin one with scripts/configure.py)" ;;
     *) say "$block model" "$value" ;;
   esac
 done
@@ -111,7 +112,7 @@ done
 # browser cookie is no good here: the message surface is guarded by a paired-device credential, so a cookie
 # read answers 401 and the roster looks empty when it is not.
 if [ -z "${DSH_DEVICE_CREDENTIAL:-}" ]; then
-  say "crew roster" "skipped — set DSH_DEVICE_CREDENTIAL (and DSH_DEVICE) to check it"
+  say "crew roster" "note: not checked — set DSH_DEVICE_CREDENTIAL (and DSH_DEVICE) to include it (not a fault)"
 else
   roster=$(curl -s --max-time 5 -H "x-crew-device: ${DSH_DEVICE:-crew-desktop}" \
     -H "x-crew-credential: $DSH_DEVICE_CREDENTIAL" "http://127.0.0.1:$LAN_PORT/api/mobile/timeline" 2>/dev/null)
@@ -139,5 +140,11 @@ sys.exit(0 if ok else 1)
 fi
 
 echo
-[ $fail -eq 0 ] && echo "crew path looks healthy" || echo "fix the lines above, then re-run"
+if [ $fail -eq 0 ]; then
+  echo "crew path looks healthy"
+  # 只有提示（模型未钉、roster 未查）时，明说这些不是故障，别让人误以为要「fix」。
+  echo "notes (not faults): an unpinned model uses the host default; an unchecked roster needs DSH_DEVICE_CREDENTIAL to verify."
+else
+  echo "fix the lines marked above (hard failures), then re-run"
+fi
 exit $fail

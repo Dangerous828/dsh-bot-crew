@@ -56,10 +56,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   // 两条路（局域网直连、中转隧道）通向的是同一个处理器，所以请求的拼法只写一份：
   // 「`http://dsh` + 路径」只是为了给 Request 一个合法的绝对 URL，处理器只读 pathname。
   // 隧道那边还要把取消信号传下去（手机放弃了要能停掉宿主这边的活），所以它单独传一个 signal。
-  const ask = (request: { method: string; url: string }, body: string, signal?: AbortSignal): Promise<Response> =>
+  const ask = (request: { method: string; url: string }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<Response> =>
     answer(new Request(`http://dsh${request.url}`, {
       method: request.method,
-      ...(body ? { body } : {}),
+      ...(body.length ? { body } : {}),
       ...(signal ? { signal } : {}),
     }))
   // 手机换一次网就要重输一次地址，是这套东西最容易卡住人的地方。这里把队伍广播出去，
@@ -159,7 +159,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
         }
         const denied = phoneGate({ pathname, method: request.method, headers: request.headers, devices })
         if (denied) return denied
-        return ask(request, request.body, signal)
+        return ask(request, request.rawBody ?? request.body, signal)
       },
       onLog: line => ctx.logger.info('%s', line),
     })

@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { phoneHandler, registerMobileHttp } from '../src/app/mobile-http.ts'
 import type { HttpHost } from '../src/app/http.ts'
+import { phoneGate } from '../src/app/phone-gate.ts'
 
 const directories: string[] = []
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
@@ -41,6 +42,7 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/resume', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered' },
   ])
 })
@@ -152,7 +154,8 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(23)
+  expect(registered.length).toBe(24)
+  expect(registered).toContain('/api/mobile/resume')
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -282,6 +285,23 @@ function controlHost(options: { tickets?: Record<string, unknown>; engine?: unkn
   if (options.steer) runtime.steer = options.steer
   return runtime as unknown as HttpHost
 }
+
+it('reads the actual speak POST body and returns the generated WAV', async () => {
+  const audio = new Uint8Array([82, 73, 70, 70, 0, 0, 0, 0, 87, 65, 86, 69])
+  const speak = vi.fn(async (_text: string) => ({ status: 'ok' as const, audio, seconds: 2, truncated: false }))
+  const handler = phoneHandler({ ...controlHost(), speak }, undefined, vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/speak', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: '实际按钮点下来的文字' }) }))
+  expect(result.status).toBe(200)
+  expect(speak).toHaveBeenCalledWith('实际按钮点下来的文字')
+  expect(result.headers.get('content-type')).toBe('audio/wav')
+  expect(new Uint8Array(await result.arrayBuffer())).toEqual(audio)
+  for (const text of [null, 123, {}, '']) {
+    const bad = await handler(new Request('http://dsh/api/mobile/speak', { method: 'POST', body: JSON.stringify({ text }) }))
+    expect(bad.status).toBe(400)
+  }
+  expect(speak).toHaveBeenCalledTimes(1)
+})
 
 it('says the screen source is missing instead of pretending there is one', async () => {
   const handler = phoneHandler(controlHost(), undefined, vi.fn() as unknown as typeof fetch)
@@ -432,6 +452,58 @@ it('pauses the executor and says so, because no per-ticket pause exists', async 
   const missing = await handler(new Request('http://dsh/api/mobile/pause', { method: 'POST', body: '{"ticket":"t9"}' }))
   expect(missing.status).toBe(404)
   expect(pauseControl.pause).toHaveBeenCalledTimes(1)
+})
+
+it('resumes the whole executor with no body or an empty object, including repeated calls', async () => {
+  const pause = vi.fn(async () => ({ paused: false }))
+  const stopTicket = vi.fn()
+  const upstream = vi.fn() as unknown as typeof fetch
+  const handler = phoneHandler(controlHost({ settingsControl: { pause }, engine: { stopTicket } }), undefined, upstream)
+  for (const body of [undefined, '{}', '{}']) {
+    const result = await handler(new Request('http://dsh/api/mobile/resume', { method: 'POST', body }))
+    expect(result.status).toBe(200)
+    expect(await result.json()).toEqual({ ok: true, resumed: true, scope: 'executor' })
+  }
+  expect(pause.mock.calls).toEqual([[false, 'panel'], [false, 'panel'], [false, 'panel']])
+  expect(stopTicket).not.toHaveBeenCalled()
+  expect(upstream).not.toHaveBeenCalled()
+  expect((await handler(new Request('http://dsh/api/mobile/resume'))).status).toBe(404)
+})
+
+it('validates resume bodies before changing executor settings', async () => {
+  const pause = vi.fn(async () => ({ paused: false }))
+  const handler = phoneHandler(controlHost({ settingsControl: { pause } }), undefined, vi.fn() as unknown as typeof fetch)
+  for (const body of ['{', 'null', '[]']) {
+    expect((await handler(new Request('http://dsh/api/mobile/resume', { method: 'POST', body }))).status).toBe(400)
+  }
+  expect((await handler(new Request('http://dsh/api/mobile/resume', { method: 'POST', body: ' '.repeat(8193) }))).status).toBe(413)
+  expect(pause).not.toHaveBeenCalled()
+})
+
+it('reports missing resume control and a failed change without claiming success', async () => {
+  const unavailable = await phoneHandler(controlHost())(new Request('http://dsh/api/mobile/resume', { method: 'POST' }))
+  expect(unavailable.status).toBe(503)
+  expect(await unavailable.json()).toEqual({ error: '这个后端不支持继续执行' })
+  for (const pause of [vi.fn(() => { throw new Error('private failure') }), vi.fn(async () => { throw new Error('private failure') })]) {
+    const handler = phoneHandler(controlHost({ settingsControl: { pause } }))
+    const result = await handler(new Request('http://dsh/api/mobile/resume', { method: 'POST', body: '{}' }))
+    expect(result.status).toBe(500)
+    expect(await result.json()).toEqual({ error: '恢复执行没成功，请刷新状态后重试' })
+  }
+})
+
+it('requires the existing device credentials before dispatching resume', async () => {
+  const pause = vi.fn(async () => ({ paused: false }))
+  const handler = phoneHandler(controlHost({ settingsControl: { pause } }))
+  const devices = { allows: (id: string, token: string) => id === 'phone-1' && token === 'paired-token' }
+  const dispatch = (headers: Record<string, string | undefined>) => phoneGate({ pathname: '/api/mobile/resume', method: 'POST', headers, devices })
+    ?? handler(new Request('http://dsh/api/mobile/resume', { method: 'POST', body: '{}' }))
+  for (const headers of [{}, { 'x-crew-device': 'phone-1', 'x-crew-credential': 'wrong' }]) {
+    expect((await dispatch(headers)).status).toBe(401)
+  }
+  expect(pause).not.toHaveBeenCalled()
+  expect((await dispatch({ 'x-crew-device': 'phone-1', 'x-crew-credential': 'paired-token' })).status).toBe(200)
+  expect(pause).toHaveBeenCalledWith(false, 'panel')
 })
 
 it('reads the crew roster and adds a bot under the same rules the directory enforces', async () => {

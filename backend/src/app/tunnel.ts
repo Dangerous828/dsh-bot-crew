@@ -28,6 +28,9 @@ export interface PushPayload {
 }
 
 /** 宿主发 ping 的节奏。与参考实现一致：15s 一拍，45s 三拍没回就自己判死。 */
+/** 一帧正文的最大字节数：与中转侧一致，保证大响应的单帧不会被判成协议错误。 */
+const CHUNK_BYTES = 64 * 1024
+
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000
 /** 多久收不到 pong 判死。必须比中转的 60s 早，见下面 `reconnect` 的注释。 */
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 45_000
@@ -69,6 +72,8 @@ export interface TunnelRequest {
   url: string
   headers: Record<string, string>
   body: string
+  /** 原始载体字节；body 保留给现有 JSON 调用方。 */
+  rawBody?: Uint8Array<ArrayBuffer>
 }
 
 /** 谁能接住中转发来的请求。`signal` 在手机那边放弃时被推倒。 */
@@ -396,9 +401,11 @@ export function createTunnel(options: TunnelOptions): Tunnel {
         if (typeof value === 'string') headers[name] = value
       }
     }
-    const body = Buffer.concat(entry.chunks).toString('utf8')
+    const bytes = Buffer.concat(entry.chunks)
+    const body = bytes.toString('utf8')
+    const rawBody = new Uint8Array(bytes)
     try {
-      const answered = await options.forward({ method, url, headers, body }, entry.controller.signal)
+      const answered = await options.forward({ method, url, headers, body, rawBody }, entry.controller.signal)
       await relay(answered, id, entry.controller.signal)
     } catch (error) {
       // 上游的错误细节不能漏到手机上：里面可能有本机路径。而且隧道本身要活着。
@@ -423,7 +430,14 @@ export function createTunnel(options: TunnelOptions): Tunnel {
         const { value, done } = await reader.read()
         if (done) break
         if (signal.aborted) { try { await reader.cancel() } catch { /* ignore */ } break }
-        if (value && value.length) send(T.httpChunk, id, Buffer.from(value))
+        if (value && value.length) {
+          // 一段读取可能远大于单帧上限（大响应会被合进一次 read），按 64KiB 切开，
+          // 否则中转侧的解码器会把超过 1MiB 的帧判成协议错误并关掉整条隧道。
+          const chunk = Buffer.from(value)
+          for (let offset = 0; offset < chunk.length; offset += CHUNK_BYTES) {
+            send(T.httpChunk, id, chunk.subarray(offset, offset + CHUNK_BYTES))
+          }
+        }
       }
     } finally {
       if (signal.aborted) { try { await reader.cancel() } catch { /* ignore */ } }

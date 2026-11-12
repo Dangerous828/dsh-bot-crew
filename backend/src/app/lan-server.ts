@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createPairingThrottle } from './pairing-throttle.ts'
 import { presentedDevice } from './phone-gate.ts'
+import { MAX_WAV_BYTES } from './voice.ts'
 
 /**
  * 手机走的那条路。
@@ -21,7 +22,7 @@ export interface LanDevices {
 export interface LanServerOptions {
   devices: LanDevices
   /** 凭据验过之后把请求交给谁；返回值原样写回手机。 */
-  forward(request: { method: string; url: string; headers: IncomingMessage['headers']; body: string }): Promise<Response>
+  forward(request: { method: string; url: string; headers: IncomingMessage['headers']; body: Uint8Array<ArrayBuffer> }): Promise<Response>
   /**
    * 配对尝试的限速判定。由调用方传进来，是为了与中转隧道那条路共用同一份计数：
    * 各自 new 一个的话，同一台机器在两条路上各拿一份额度。
@@ -38,17 +39,18 @@ export interface LanServer {
 
 const MAX_BODY_BYTES = 256 * 1024
 
-async function readBody(request: IncomingMessage): Promise<string> {
+async function readBody(request: IncomingMessage): Promise<Buffer<ArrayBuffer>> {
+  const maximum = new URL(request.url ?? '/', 'http://dsh').pathname === '/api/mobile/voice' ? MAX_WAV_BYTES : MAX_BODY_BYTES
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of request) {
     const bytes = Buffer.from(chunk as Buffer)
     size += bytes.length
     // 超了就断开，不把内存吃掉。
-    if (size > MAX_BODY_BYTES) throw new Error('body too large')
+    if (size > maximum) throw new Error('body too large')
     chunks.push(bytes)
   }
-  return Buffer.concat(chunks).toString('utf8')
+  return Buffer.concat(chunks)
 }
 
 export function createLanServer(options: LanServerOptions): LanServer {
@@ -94,7 +96,7 @@ export function createLanServer(options: LanServerOptions): LanServer {
       response.end(JSON.stringify({ error: 'Not paired' }))
       return
     }
-    let body: string
+    let body: Uint8Array<ArrayBuffer>
     try {
       body = await readBody(request)
     } catch {
@@ -105,8 +107,10 @@ export function createLanServer(options: LanServerOptions): LanServer {
     try {
       const answered = await forward({ method: request.method ?? 'GET', url: request.url ?? '/', headers: request.headers, body })
       const headers: Record<string, string> = { 'cache-control': 'no-store' }
-      const type = answered.headers.get('content-type')
-      if (type) headers['content-type'] = type
+      for (const name of ['content-type', 'x-speech-seconds', 'x-speech-truncated']) {
+        const value = answered.headers.get(name)
+        if (value) headers[name] = value
+      }
       response.writeHead(answered.status, headers)
       response.end(Buffer.from(await answered.arrayBuffer()))
     } catch {

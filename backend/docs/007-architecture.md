@@ -355,7 +355,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
 | `src/app/routine-runner.ts` | 常规任务的执行器：哪几条到点了、派出去时对队伍说的那句话、派完之后账本怎么往前推一格；不补跑、不重试，逾期只提醒 |
 | `src/app/followup.ts` | 跟进：卡在等人的票（10 分钟）与跑着很久没回报的票（45 分钟）各提醒一次，等得久的先；提醒过就安静等着，不追问 |
-| `src/app/spend.ts` | 成本账：把 worker 会话里 `assistant/message.usage` 的用量算成合计、按模型分项、最近几步；没上报的步数单独数出来，不估也不填 0 |
+| `src/app/spend.ts` | 成本账：按 `model/selection` 与 `request/header` 还原每步实际路由，再把 `assistant/message.usage` 算成合计、按模型分项和最近几步；没上报的步数单独计数 |
 | `src/app/audit.ts` | 审计账：一票一行地把谁派的、谁判的、谁干的、花了多少编成表，缺的格子写「没有记录」 |
 | `src/app/voice.ts` | 语音输入的壳：认出宿主有没有识别能力、校验录音是不是 WAV 且不过大过长，再把字节交给宿主的 `speechToText`；认不出字与跑不起来分开说 |
 | `src/app/compact-memory.ts` | 压缩产物进账本：宿主折完会话那一段摘要值不值得记、怎么掐到上限、怎么按 compactionId 保持幂等；压缩本身归宿主 |
@@ -421,6 +421,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
+| `src/client/approval.tsx` | The Approval settings group: the approval mode and budget threshold, and the external connections (kind, server, read/write tools, read-only switch |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
@@ -452,7 +453,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |
 | `tests/crew-routine-runner.spec.ts` | 常规任务调度：只派开着的且到点的、逾期久的先派、停机两天后不补跑、没跑过就写「第一次」 |
 | `tests/crew-followup.spec.ts` | 跟进：等人的门槛比在跑的低、长跑不催命、已结束的不追、说不清多久就不提醒、同一件事只算一次 |
-| `tests/crew-spend.spec.ts` | 成本账：按票合计用量与分模型、没有 totalTokens 时按进+出算、没上报的步数单独数、会话没路由写 unknown |
+| `tests/crew-spend.spec.ts` | 成本账：按票合计与分模型、请求头及选模事件的历史归属、没有 totalTokens 时按进+出算、没上报的步数单独数、会话没路由写 unknown |
 | `tests/crew-audit.spec.ts` | 审计账：四个来源分别认得出（人 / 规则 / Bot / 到点）、缺裁决写「没有记录」、读不到会话时不给 0 |
 | `tests/crew-voice.spec.ts` | 语音输入的壳：WAV 头校验与时长从头部读、宿主没能力时说没有、非 WAV 不白等、太长不转、「没听出字」与「没跑起来」分开 |
 | `tests/crew-compact-memory.spec.ts` | 压缩进账本：什么摘要值得记、按 compactionId 幂等、超长掐断并说明、太短的不进账本 |
@@ -506,6 +507,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/phone-gate.spec.ts` | The shared phone gate on both entries, and the pairing throttle's window and address aggregation, including the one bucket every loopback spelling shares so the tunnel cannot split into two budgets |
 | `tests/relay-protocol.spec.ts` | The wire format against the AI-HUB reference implementation, both directions: every frame code, every id width, byte-identical encoding, chunked decoding, the frame-size cap, close codes that survive Chinese reasons |
 | `tests/tunnel.spec.ts` | The outbound tunnel against a real relay: registering, serving a request, streaming, reconnect with backoff, heartbeat both ways, cancellation, upstream failures that stay off the phone |
+| `tests/voice-carrier.spec.ts` | The voice WAV carrier end to end (real HTTP → relay → tunnel): byte-exact non-UTF-8 audio of any length, JSON/GET compatibility, the ordinary 256KiB cap, an explicit administrator cap, and the 8MiB media cap |
 | `tests/relay-chain.spec.ts` | The ladder's order and its fall-through, a hanging probe that cannot stall it, the chosen route being remembered, and the environment's relay list including what it refuses |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |

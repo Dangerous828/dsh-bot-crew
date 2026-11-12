@@ -31,7 +31,9 @@ export function optionsFromEnv(env: NodeJS.ProcessEnv = process.env): RelayOptio
     // 60s：宿主那边是 45s 判死（三拍 ping 没回），中转比它晚一步，免得两边同时抖。
     pongTimeoutMs: positive(env.RELAY_PONG_TIMEOUT_MS, 60_000),
     responseTimeoutMs: positive(env.RELAY_RESPONSE_TIMEOUT_MS, 120_000),
-    maxRequestBodyBytes: positive(env.RELAY_MAX_BODY_BYTES, 256 * 1024),
+    // 只在管理员显式设了 RELAY_MAX_BODY_BYTES 时才带上这个键；缺省不传，
+    // 让 server 自己区分「没配」与「显式配成某个值」，语音才能吃到媒体默认上限。
+    ...(env.RELAY_MAX_BODY_BYTES !== undefined ? { maxRequestBodyBytes: positive(env.RELAY_MAX_BODY_BYTES, 256 * 1024) } : {}),
     maxInflightPerInstance: positive(env.RELAY_MAX_INFLIGHT, 64),
     authFailureLimit: positive(env.RELAY_AUTH_FAILURE_LIMIT, 20),
     log: logger(),

@@ -111,6 +111,8 @@ export interface RelayOptions {
   maxFrameBytes?: number
   /** 一个手机请求体的上限。宿主那边也有自己的 256KiB 上限，这里先挡在公网侧。 */
   maxRequestBodyBytes?: number
+  /** 未显式设置 maxRequestBodyBytes 时，audio/wav 上传（如语音）可用的体上限。默认 8MiB。 */
+  maxMediaBodyBytes?: number
   /** 收完一个请求体的最长时间。公网上「发一个字节然后挂着」是免费的，没有它就等于不设防。 */
   bodyTimeoutMs?: number
   /** 同时收着请求体的连接数上限，防止大量慢请求各占一小块内存。 */
@@ -187,8 +189,14 @@ export function createRelay(options: RelayOptions = {}): Relay {
   const pongTimeoutMs = options.pongTimeoutMs ?? 60_000
   const registerTimeoutMs = options.registerTimeoutMs ?? 10_000
   const responseTimeoutMs = options.responseTimeoutMs ?? 120_000
-  const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES
+  // 宿主把大响应（如 8MiB 语音）按块发来，中转接收的单帧上限也要能容纳媒体上限，
+  // 否则默认 1MiB 会把它判成协议错误、关掉整条隧道。宿主侧同样按 64KiB 分帧，正常流不受影响。
+  const mediaFrameBytes = (options.maxMediaBodyBytes ?? 8 * 1024 * 1024) + 64 * 1024
+  const maxFrameBytes = Math.max(options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES, mediaFrameBytes)
   const maxRequestBodyBytes = options.maxRequestBodyBytes ?? 256 * 1024
+  // 语音上传走同一入口，但默认只给 256KiB 会把正常录音挡在门外。未显式配置时对 WAV 放宽到媒体上限；
+  // 管理员显式设了 maxRequestBodyBytes（含环境变量 RELAY_MAX_BODY_BYTES）就一律以它为准。
+  const voiceLimit = options.maxRequestBodyBytes ?? (options.maxMediaBodyBytes ?? 8 * 1024 * 1024)
   const bodyTimeoutMs = options.bodyTimeoutMs ?? 30_000
   const maxPendingBodies = options.maxPendingBodies ?? 64
   const maxPendingRegistrations = options.maxPendingRegistrations ?? 128
@@ -196,6 +204,8 @@ export function createRelay(options: RelayOptions = {}): Relay {
   let pendingRegistrations = 0
   const maxInflightPerInstance = options.maxInflightPerInstance ?? 64
   const maxResponseBufferBytes = options.maxResponseBufferBytes ?? 4 * 1024 * 1024
+  // 语音响应本身可到 8MiB，再叠一层流式缓冲余量，避免内核还没写出去时被当成慢流切断。
+  const responseBufferLimit = Math.max(maxResponseBufferBytes, (options.maxMediaBodyBytes ?? 8 * 1024 * 1024) + maxResponseBufferBytes)
   const authFailureLimit = options.authFailureLimit ?? 20
   const authFailureWindowMs = options.authFailureWindowMs ?? 60_000
   const authBlockMs = options.authBlockMs ?? 60_000
@@ -478,7 +488,10 @@ export function createRelay(options: RelayOptions = {}): Relay {
         // 手机读得慢时 write 会返回 false，写缓冲就一直长。不等 drain 是可以的，
         // 但必须封顶：超了就断掉这一个请求，而不是让一条慢流把中转的内存吃完。
         // writableLength 是还没交给内核的字节数，比我们自己记账更准。
-        if (pending.response.writableLength > maxResponseBufferBytes) {
+        // 但内核没把大响应写出去之前 writableLength 会整块地攒着：一次 3.8MB 的语音读数
+        // 合法地超过 4MiB 的流式缓冲上限，于是被误判成慢流而切断、手机看到 0 字节。
+        // 所以封顶按「超过 8MiB 媒体上限 + 4MiB 流缓冲」算，普通响应仍从 4MiB 起判。
+        if (pending.response.writableLength > responseBufferLimit) {
           pending.done = true
           if (pending.timer) clearTimeout(pending.timer)
           tunnel.requests.delete(frame.id)
@@ -579,6 +592,9 @@ export function createRelay(options: RelayOptions = {}): Relay {
     }
 
     // 请求体：先读，边读边判上限。超了当场回 413，一个字节都不往隧道里送。
+    // 语音（audio/wav）按媒体上限读；只有在管理员显式限定 body 上限时才收紧到那个值。
+    const isVoice = String(request.headers['content-type'] ?? '').toLowerCase().startsWith('audio/wav')
+    const bodyLimit = isVoice ? voiceLimit : maxRequestBodyBytes
     // 慢请求另外封顶：收体的连接不占 inflight，不数的话几十条就能把内存与 fd 占住。
     if (pendingBodies >= maxPendingBodies) {
       request.resume()
@@ -588,7 +604,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
     pendingBodies += 1
     let body: Buffer
     try {
-      body = await readBody(request, maxRequestBodyBytes, bodyTimeoutMs)
+      body = await readBody(request, bodyLimit, bodyTimeoutMs)
     } catch (error) {
       const timedOut = error instanceof Error && error.message === 'body timeout'
       writeJson(response, timedOut ? 408 : 413, { error: timedOut ? 'Request body timed out' : 'Request too large' })

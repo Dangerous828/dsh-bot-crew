@@ -89,6 +89,8 @@ const PHONE_ERRORS: Readonly<Record<string, string>> = {
   'Ticket is not running': '这张工单已经不在跑了',
   'Steering is unavailable': '这个后端不支持插队',
   'Pause control is unavailable': '这个后端不支持暂停',
+  'Resume control is unavailable': '这个后端不支持继续执行',
+  'Resume control failed': '恢复执行没成功，请刷新状态后重试',
   'Session tree is unavailable': '这个后端读不到会话树',
   'Pairing is unavailable': '这个后端没有接入配对',
   'Pairing refused': '配对被拒绝了：码不对，或者已经过期',
@@ -352,6 +354,7 @@ const OPERATIONS = {
   // 失败/卡住的票再跑一次。手机面只到得了这里：管理面的 retry 要求本机同源，手机不满足。
   retry: { methods: ['POST'], needsTicket: true },
   pause: { methods: ['POST'] },
+  resume: { methods: ['POST'] },
   // 花名册的读写：空态「加第一位 Bot」与手机上要显示的名字。
   bots: { methods: ['GET', 'POST'] },
 } as const
@@ -396,8 +399,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Pairing request too large' })
     }
     if (operation === 'steer') body = await incoming.text()
-    if (operation === 'takeover' || operation === 'pause' || (operation === 'bots' && incoming.method === 'POST')) {
-      // 这三条只带一个 id 或几个短字段，和配对请求同量级；不超过 8KB 就不必再细分。
+    if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || (operation === 'bots' && incoming.method === 'POST')) {
+      // 控制请求与花名册只带几个短字段，和配对请求同量级。
       body = await incoming.text()
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
     }
@@ -436,7 +439,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // The three work routes read the store and the live session tree, which the gateway does not hold. They answer
     // here, after the same Connection-owned authentication that guards every other route.
     if (operation === 'work' || operation === 'agents' || operation === 'models' || operation === 'model' || operation === 'pair'
-      || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'bots' || operation === 'efforts'
+      || operation === 'screen' || operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'bots' || operation === 'efforts'
       || operation === 'steer' || operation === 'outputs' || operation === 'routines' || operation === 'memory'
       || operation === 'spend' || operation === 'audit' || operation === 'voice' || operation === 'reply-spend' || operation === 'speak') {
       await runtime.ready
@@ -470,8 +473,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (operation === 'speak') {
         const speak = runtime.speak?.bind(runtime)
         if (!speak) return response(200, { available: false, reason: '这台后端没有接入播报' })
-        let text = ''
-        try { text = (JSON.parse(body || '{}') as { text?: unknown }).text as string ?? '' } catch { text = '' }
+        const raw = await incoming.text()
+        if (Buffer.byteLength(raw) > 64 * 1024) return response(413, { error: 'Request too large' })
+        const asked = askedBody(raw)
+        const text = typeof asked?.text === 'string' ? asked.text : ''
         if (!text.trim()) return response(400, { error: 'text is required' })
         const outcome = await speak(text)
         if (outcome.status !== 'ok') {
@@ -657,6 +662,13 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         await runtime.settings.pause(true, 'panel')
         // 目前只有执行器这一种暂停。如实写 scope，别让手机以为只停了这一张票。
         return response(200, { ok: true, scope: 'executor' })
+      }
+      if (operation === 'resume') {
+        if (!askedBody(body || '{}')) return response(400, { error: 'Invalid JSON' })
+        if (!runtime.settings?.pause) return response(503, { error: 'Resume control is unavailable' })
+        try { await runtime.settings.pause(false, 'panel') }
+        catch { return response(500, { error: 'Resume control failed' }) }
+        return response(200, { ok: true, resumed: true, scope: 'executor' })
       }
       if (operation === 'bots') {
         const settings = runtime.store.settings()
@@ -961,7 +973,7 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/efforts', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/model', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
-      // 手机工作区：看画面、接手、停一下。画面现在是「诚实的没有」，另外两条动真格。
+      // 手机工作区：会话活动快照、接手、暂停与继续执行。
       connection.fetch.register({ path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       // 产出：队伍交出来的文件（worker 写过的那些）。和 screen 一样是宿主侧纯读，不经过网关。
       connection.fetch.register({ path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
@@ -982,6 +994,7 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/retry', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/steer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/resume', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 花名册：GET 读，POST 加一位。
       connection.fetch.register({ path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
     ]

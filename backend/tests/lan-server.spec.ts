@@ -4,6 +4,23 @@ import { bindAddress, bindCandidates, createLanServer, lanPort } from '../src/ap
 
 const blank = () => ({ allows: () => true, list: () => [], cfg: undefined }) as never
 
+it.each([64, 300_000])('preserves %i raw voice bytes and speech headers on the actual LAN carrier', async size => {
+  const bytes = new Uint8Array(size).fill(0xff)
+  const server = createLanServer({ devices: blank(), forward: async request => {
+    expect(new Uint8Array(Buffer.from(request.body))).toEqual(bytes)
+    return new Response(bytes, { headers: { 'content-type': 'audio/wav', 'x-speech-seconds': '2', 'x-speech-truncated': '1' } })
+  } })
+  const port = await server.listen(0, '127.0.0.1')
+  try {
+    const answer = await fetch(`http://127.0.0.1:${port}/api/mobile/voice`, { method: 'POST',
+      headers: { 'x-crew-device': 'a', 'x-crew-credential': 'b', 'content-type': 'audio/wav' }, body: bytes })
+    expect(answer.status).toBe(200)
+    expect(new Uint8Array(await answer.arrayBuffer())).toEqual(bytes)
+    expect(answer.headers.get('x-speech-seconds')).toBe('2')
+    expect(answer.headers.get('x-speech-truncated')).toBe('1')
+  } finally { await server.close() }
+})
+
 // 手机连的那条路是一个独立监听：它不经过 Connection，所以凭据校验必须自己做。
 // 这是 AI-HUB 的做法（lib/relay/lan-proxy.js），也是 Connection 那套 launch-token 体系之外唯一的选择。
 it('answers only requests carrying a credential the crew issued', async () => {

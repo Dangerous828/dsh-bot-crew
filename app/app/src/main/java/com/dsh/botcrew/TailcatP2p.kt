@@ -10,6 +10,9 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
+internal fun acceptsProbeStatus(status: Int, latency: Boolean): Boolean =
+    status in 200..299 || (latency && status == 404)
+
 /**
  * 手机这一侧的 tailcat 代理：在回环上开一个监听，进来的每条 TCP 都转进隧道。
  *
@@ -116,6 +119,12 @@ object TailcatP2p {
         proxy = null
     }
 
+    /** 延迟完成的旧协程只释放自己那一份代理。 */
+    @Synchronized
+    fun stop(port: Int) {
+        if (proxy?.port == port) stop()
+    }
+
     /**
      * 探测结果。[ok] 是「隧道能承载真请求」，[millis] 是同一条连接上一个来回的耗时。
      *
@@ -165,8 +174,7 @@ object TailcatP2p {
     /**
      * 发一个请求并把正文读干净，返回从发出到正文读完的毫秒数；没拿到回应返回 null。
      *
-     * 任何状态码都算通（401/404 说明路是通的，只是这一句问的不是那个东西），
-     * 只有真正连不上/超时才算没通。
+     * timeline 必须成功通过认证；延迟专用的不存在路径允许 404。401、重定向与服务错误均不升级。
      *
      * 故意不调 `disconnect()`：那会把这条件连接关掉，下一次计时请求就得重新握手，
      * 正好把要量的东西盖掉。读完就关流，连接自然回连接池。
@@ -183,9 +191,16 @@ object TailcatP2p {
                 deviceId?.let { setRequestProperty("x-crew-device", it) }
                 if (deviceId != null) setRequestProperty("x-crew-credential", token)
             }
-            val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
+            connection.instanceFollowRedirects = false
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             stream?.use { it.readBytes() }
-            (System.nanoTime() - startedAt) / 1_000_000
+            if (!acceptsProbeStatus(status, path == LATENCY_PATH)) {
+                detail = "隧道请求返回 HTTP $status"
+                null
+            } else {
+                (System.nanoTime() - startedAt) / 1_000_000
+            }
         } catch (error: IOException) {
             detail = error.message ?: "经过隧道没拿到回应"
             Log.i(TAG, "探测没通（$path）：$detail")

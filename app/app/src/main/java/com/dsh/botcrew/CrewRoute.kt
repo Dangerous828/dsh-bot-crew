@@ -6,9 +6,9 @@ package com.dsh.botcrew
  * 顺序是 P2P → 局域网 → 公网，不做成开关：隧道直连最快（同网段实测 1.4ms），局域网少一跳
  * 且不用隧道注册，公网是打不通时的兜底。三条都留着 —— 任何一条断了，下一跳自动接上。
  *
- * 隧道这条要分两种说法：打洞成功是直连，打不通时 tailcat 会退到 DERP 中继（实测 130–146ms）。
- * 两种都在「隧道通」这个事实里，但快慢差两个数量级，所以措辞按实测往返时间分开说 ——
- * 把中继说成直连，人就会以为 137ms 是 1.4ms。
+ * 隧道这条只说「连上了」加实测往返：往返时间证明不了走的是打洞直连还是 DERP 中继
+ * （同网段打洞 1.4ms、经东京中继 130–146ms 是两次实测，不是一条判据），拿 RTT 反推路径
+ * 就是替网络下结论。所以不再分「直连 / 中继」两种措辞，统一报连上了，把实测数摆出来让人自己看。
  *
  * 全是纯函数：只拿字符串和毫秒数判断，不碰网络也不碰 Android，单测直接跑。
  */
@@ -45,6 +45,9 @@ object CrewRoute {
         return trimmed
     }
 
+    /** 失败探测按 1/2/4/8/16/30 秒退避，前台恢复会重新从第一档开始。 */
+    fun retryDelay(failures: Int): Long = (1_000L shl failures.coerceIn(0, 5)).coerceAtMost(30_000L)
+
     /** 手机这一侧的入口。绑在回环上，所以换 Wi-Fi、开热点都不会变。 */
     fun proxyBase(port: Int): String = "http://127.0.0.1:$port"
 
@@ -64,34 +67,38 @@ object CrewRoute {
         return all.distinct()
     }
 
-    /** 手上这条入口是哪条路。认不出来（手输了一个没见过的地址）返回 null。 */
+    /**
+     * 手上这条入口是哪条路。认不出来（手输了一个没见过的地址）返回 null。
+     *
+     * 判定按地址的内容而不是它存在哪一格：人完全可能把公网地址直接填进「电脑地址」那一栏，
+     * 按位置判就会把出门那条路说成局域网。所以先排除空串（两格都没配时不能拿空串碰空串
+     * 就认成某条路），再看它是不是电脑公布的出门地址 —— 命中就是公网，不管写在哪一格。
+     */
     fun kindOf(entry: String, paired: PairedCrew, proxyPort: Int?): Way? {
         val here = CrewPairing.normalize(entry)
+        if (here.isEmpty()) return null
+        val fallback = CrewPairing.normalize(paired.fallbackBase)
         return when {
             proxyPort != null && here == CrewPairing.normalize(proxyBase(proxyPort)) -> Way.P2P
+            fallback.isNotEmpty() && here == fallback -> Way.PUBLIC
             here == CrewPairing.normalize(paired.base) -> Way.LAN
-            here == CrewPairing.normalize(paired.fallbackBase) -> Way.PUBLIC
             else -> null
         }
     }
 
     /**
-     * 直连与中继的分界线（毫秒）。
-     *
-     * 依据是实测：同网段打洞成功 1.4ms，跨网段经东京 DERP 中继 130–146ms。40 落在两者中间，
-     * 给慢一点的直连留了余量（蜂窝、弱 Wi-Fi 下的直连也就几十毫秒），又远低于 DERP 那一档。
-     * 这条线只有一个用途：不许把 137ms 的中继写成「P2P 直连」。
-     */
-    const val DIRECT_MAX_MILLIS = 40L
-
-    /**
      * 隧道那条路的措辞。
      *
-     * 没有实测值（null）时按直连说：只有探通过才会走到这句话，而探通就说明请求确实是经这条隧道
-     * 回去的，只是没量到时间。低于阈值才说「P2P 直连」，其余一律把毫秒数摆出来。
+     * 只说「连上了」加实测往返。曾经按 40ms 分界把慢的写成「隧道中继」、快的写成「P2P 直连」，
+     * 但往返时间证明不了路径：同网段打洞 1.4ms、经东京 DERP 130–146ms 只是两次实测，
+     * 蜂窝网络下的直连也能到几十毫秒。拿 RTT 反推「直连还是中继」是在替网络下结论，
+     * 猜错一次就让人以为 137ms 是 1.4ms。所以把实测数摆出来，不补路径判断。
+     *
+     * 没有实测值（null）时只说连上了 —— 只有探通过才会走到这句话，探通本身就说明请求
+     * 确实是经这条隧道回去的，只是没量到时间。
      */
     fun tunnelLabel(millis: Long?): String =
-        if (millis != null && millis >= DIRECT_MAX_MILLIS) "隧道中继（${millis}ms）" else "P2P 直连"
+        if (millis == null) "隧道已连接" else "隧道已连接（${millis}ms）"
 
     /**
      * 界面上那句话。

@@ -103,13 +103,47 @@ class CrewRouteTest {
         assertNull(CrewRoute.kindOf("http://10.0.0.9:43499", paired, 43001))
     }
 
+    // 人可能把公网地址直接填进「电脑地址」那一栏（见去重那条测试）。按位置判就会把它说成局域网；
+    // fallback 是电脑自己公布的出门地址，命中它就该说公网 —— 不管它在哪一格里出现过。
+    @Test
+    fun aPublicAddressFilledIntoTheBaseSlotIsStillPublic() {
+        val swapped = paired.copy(base = "https://crew.example.top/")
+        assertEquals(CrewRoute.Way.PUBLIC, CrewRoute.kindOf("https://crew.example.top", swapped, null))
+    }
+
+    // 一格地址都没配时，别拿空串碰上空串就说「这是局域网 / 公网」。
+    @Test
+    fun emptyPairingSlotsDoNotClaimARoute() {
+        val empty = PairedCrew("dev-1", "tok-1", "", "", "")
+        assertNull(CrewRoute.kindOf("", empty, null))
+    }
+
     // 界面上那一行说的是「这条路是什么」，不是「连接正常」。
     @Test
     fun theLineOnScreenNamesTheWay() {
-        assertEquals("P2P 直连", CrewRoute.label(CrewRoute.Way.P2P))
+        assertEquals("隧道已连接", CrewRoute.label(CrewRoute.Way.P2P))
         assertEquals("局域网", CrewRoute.label(CrewRoute.Way.LAN))
         assertEquals("公网中转", CrewRoute.label(CrewRoute.Way.PUBLIC))
         assertEquals("自定义地址", CrewRoute.label(null))
+    }
+
+    @Test
+    fun retryWaitGrowsAndStaysBounded() {
+        assertEquals(listOf(1000L, 2000L, 4000L, 8000L, 16000L, 30000L, 30000L),
+            (0..6).map(CrewRoute::retryDelay))
+        assertEquals(1000L, CrewRoute.retryDelay(-1))
+        assertEquals(30000L, CrewRoute.retryDelay(Int.MAX_VALUE))
+    }
+
+    @Test
+    fun probeRequiresAuthenticatedTimelineAndOnlyAllows404ForLatency() {
+        assertEquals(true, acceptsProbeStatus(200, false))
+        assertEquals(false, acceptsProbeStatus(404, false))
+        assertEquals(true, acceptsProbeStatus(404, true))
+        for (status in listOf(301, 401, 403, 429, 500)) {
+            assertEquals(false, acceptsProbeStatus(status, false))
+            assertEquals(false, acceptsProbeStatus(status, true))
+        }
     }
 
     // 一条地址都没有时（配对存下来的东西坏了）不能拼出一个空入口。
@@ -119,30 +153,28 @@ class CrewRouteTest {
         assertEquals(emptyList<String>(), CrewRoute.entries(empty, proxyPort = null))
     }
 
-    // 阈值两侧的措辞：快的是直连，慢的必须把毫秒数说出来。
-    // 「隧道通」有两种真相 —— 1.4ms 的直连和 137ms 的 DERP 中继，混成一句话就是在骗人。
+    // 隧道只说「连上了」加实测往返。RTT 快慢证明不了是直连还是 DERP 中继，
+    // 所以不再拿它断言路径：1ms 和 137ms 用同一种措辞，只差那个实测数。
     @Test
-    fun theTunnelLineNeverCallsARelayADirectLink() {
-        assertEquals("P2P 直连", CrewRoute.tunnelLabel(1))
-        assertEquals("P2P 直连", CrewRoute.tunnelLabel(12))
-        assertEquals("P2P 直连", CrewRoute.tunnelLabel(CrewRoute.DIRECT_MAX_MILLIS - 1))
-        // 阈值本身算中继：宁可把临界值说慢，也不要把它说成直连。
-        assertEquals("隧道中继（40ms）", CrewRoute.tunnelLabel(CrewRoute.DIRECT_MAX_MILLIS))
-        assertEquals("隧道中继（137ms）", CrewRoute.tunnelLabel(137))
-        assertEquals("隧道中继（146ms）", CrewRoute.tunnelLabel(146))
-        // 没量到时间就不下结论说它慢：只有探通才会走到这句话。
-        assertEquals("P2P 直连", CrewRoute.tunnelLabel(null))
+    fun theTunnelLineReportsOnlyConnectionAndMeasuredLatency() {
+        assertEquals("隧道已连接（1ms）", CrewRoute.tunnelLabel(1))
+        assertEquals("隧道已连接（12ms）", CrewRoute.tunnelLabel(12))
+        assertEquals("隧道已连接（40ms）", CrewRoute.tunnelLabel(40))
+        assertEquals("隧道已连接（137ms）", CrewRoute.tunnelLabel(137))
+        assertEquals("隧道已连接（146ms）", CrewRoute.tunnelLabel(146))
+        // 没量到时间也只说连上了，不补一句没根据的「直连」。
+        assertEquals("隧道已连接", CrewRoute.tunnelLabel(null))
     }
 
     // 那一行字只给隧道带实测值：换到局域网/公网之后，隧道那个数字跟这句话无关，不能顺手带出来。
     @Test
     fun theRouteLineCarriesTheMeasurementOnlyOnTheTunnel() {
-        assertEquals("P2P 直连", CrewRoute.label(CrewRoute.Way.P2P, 3))
-        assertEquals("隧道中继（137ms）", CrewRoute.label(CrewRoute.Way.P2P, 137))
+        assertEquals("隧道已连接（3ms）", CrewRoute.label(CrewRoute.Way.P2P, 3))
+        assertEquals("隧道已连接（137ms）", CrewRoute.label(CrewRoute.Way.P2P, 137))
         assertEquals("局域网", CrewRoute.label(CrewRoute.Way.LAN, 137))
         assertEquals("公网中转", CrewRoute.label(CrewRoute.Way.PUBLIC, 137))
         // 补的那句话仍然接在括号里，和实测值不打架。
         assertEquals("局域网（P2P 没通）", CrewRoute.label(CrewRoute.Way.LAN, null, "P2P 没通"))
-        assertEquals("隧道中继（137ms）", CrewRoute.label(CrewRoute.Way.P2P, 137, ""))
+        assertEquals("隧道已连接（137ms）", CrewRoute.label(CrewRoute.Way.P2P, 137, ""))
     }
 }

@@ -305,10 +305,25 @@ class CrewClient(
         read("/api/mobile/takeover", "POST", JSONObject().put("ticket", ticketId).toString())
     }
 
-    /** 停一下。返回后端如实给出的 scope（现在只有 executor），界面据此解释恢复在哪。 */
+    /** 停一下。只有后端确认成功且给出执行器作用域才更新界面。 */
     suspend fun pause(ticketId: String?): String {
         val body = if (ticketId.isNullOrBlank()) "{}" else JSONObject().put("ticket", ticketId).toString()
-        return JSONObject(read("/api/mobile/pause", "POST", body)).optString("scope", "executor")
+        return parse(read("/api/mobile/pause", "POST", body)) { text ->
+            val receipt = JSONObject(text)
+            if (receipt.opt("ok") != true || receipt.opt("scope") != "executor") {
+                throw IOException("暂停未确认：队伍回执不完整")
+            }
+            "executor"
+        }
+    }
+
+    /** 恢复执行器：HTTP 成功还须有明确的恢复回执。 */
+    suspend fun resume(): String = parse(read("/api/mobile/resume", "POST", "{}")) { text ->
+        val receipt = JSONObject(text)
+        if (receipt.opt("ok") != true || receipt.opt("resumed") != true || receipt.opt("scope") != "executor") {
+            throw IOException("继续执行未确认：队伍回执不完整")
+        }
+        "executor"
     }
 
     /** 加一位 Bot。id 不合规或重名由后端判，错误原样带回去显示。 */

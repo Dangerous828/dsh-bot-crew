@@ -3,6 +3,7 @@ package com.dsh.botcrew
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -173,7 +174,7 @@ private class RefreshGuard {
 fun CrewRoot(
     client: CrewClient,
     palette: CrewPalette,
-    /** 现在走的是哪条路（P2P 直连 / 局域网 / 公网中转）。空串表示还算不出来。 */
+    /** 现在走的是哪条路（隧道已连接 / 局域网 / 公网中转）。空串表示还算不出来。 */
     route: String = "",
     onForget: () -> Unit,
 ) {
@@ -197,6 +198,9 @@ fun CrewRoot(
     val scope = rememberCoroutineScope()
     // 时间线刷新的单飞记号（见下面 refresh）。
     val refreshGuard = remember { RefreshGuard() }
+    var executorPaused by remember { mutableStateOf(false) }
+    // 动作回执回来之后，已在途的时间线不再覆盖它；下一趟拉取仍以后端为准。
+    var pauseRevision by remember { mutableStateOf(0) }
 
     // 消息结果条按票读产出（契约 §5.4）。挂在 CrewRoot 上、不挂在队伍页里：
     // 去后台/工作区/模型页再回来时，队伍页会整段重新组合，缓存要是跟着它一起没了，
@@ -222,6 +226,7 @@ fun CrewRoot(
             try {
                 do {
                     refreshGuard.again = false
+                    val requestedPauseRevision = pauseRevision
                     val next = client.timeline()
                     // 轮次只在「真的换了一份内容」时才加一。时间线每 6 秒读一次，如果每次都加，
                     // 所有消息的结果条就跟着每 6 秒重读一遍，整列消息行也跟着重组 ——
@@ -245,6 +250,7 @@ fun CrewRoot(
                             "changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
                             "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
                     }
+                    if (requestedPauseRevision == pauseRevision) executorPaused = next.status.paused
                     problem = null
                 } while (refreshGuard.again)
             } catch (error: Exception) {
@@ -302,7 +308,8 @@ fun CrewRoot(
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
                     ticket = ticketOf(conversation, onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId }),
                     // 执行器被全局暂停这件事压过单个 Bot 的 activity 词，所以从队伍状态里取。
-                    paused = conversation?.status?.paused == true,
+                    paused = executorPaused,
+                    onPausedChanged = { executorPaused = it; pauseRevision += 1 },
                     palette = palette,
                     preview = previewTicket,
                     previewView = previewView,
@@ -443,6 +450,7 @@ private fun EmptyState(
                 .padding(top = 17.dp)
                 .background(palette.accent, RoundedCornerShape(11.dp))
                 .clickable { formOpen = true; touched = null }
+                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                 .padding(horizontal = 26.dp, vertical = 11.dp),
         ) {
             Text("加第一位", fontSize = 14.sp, fontWeight = FontWeight(550), color = palette.surface)
@@ -566,6 +574,7 @@ private fun RowScope.SegmentChip(label: String, selected: Boolean, palette: Crew
             .clip(RoundedCornerShape(7.dp))
             .background(if (selected) palette.card else Color.Transparent)
             .clickable(onClick = onClick)
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .padding(vertical = 6.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -662,13 +671,15 @@ private fun CrewScreen(
                     // 花名册横排：头像块 + 名字。设计稿里头像 32dp、圆角 10。
                     // 裸文字按钮看不出「这是一个人」，头像块才看得出来。
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                     ) {
                         for ((index, bot) in shown.bots.withIndex()) {
                             Column(
                                 horizontalAlignment = Alignment.CenterHorizontally,
-                                modifier = Modifier.clickable { profile = bot },
+                                modifier = Modifier.clickable { profile = bot }
+                                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                             ) {
                                 Box(
                                     modifier = Modifier
@@ -998,6 +1009,7 @@ private fun BotCardSheet(
                         .fillMaxWidth()
                         .background(palette.accent, RoundedCornerShape(10.dp))
                         .clickable(onClick = onTalk)
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .padding(vertical = 11.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -1040,6 +1052,7 @@ private fun RowScope.SmallCardButton(label: String, palette: CrewPalette, onClic
             .weight(1f)
             .border(1.dp, palette.line, RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .padding(vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -1070,6 +1083,7 @@ private fun WorkspaceScreen(
     bot: BotCard?,
     ticket: WorkTicket?,
     paused: Boolean,
+    onPausedChanged: (Boolean) -> Unit,
     palette: CrewPalette,
     /** 代码卡带过来的票号；有值时这一页读的是它，而不是 bot 手上那张。 */
     preview: String? = null,
@@ -1129,7 +1143,7 @@ private fun WorkspaceScreen(
         ) {
             Box(
                 modifier = Modifier
-                    .size(30.dp)
+                    .size(48.dp)
                     .background(palette.card, RoundedCornerShape(9.dp))
                     .clickable(onClick = onBack),
                 contentAlignment = Alignment.Center,
@@ -1166,7 +1180,7 @@ private fun WorkspaceScreen(
             }
             Box(
                 modifier = Modifier
-                    .size(30.dp)
+                    .size(48.dp)
                     .border(1.dp, palette.line, RoundedCornerShape(9.dp))
                     // 全屏还没有对应的接口：点一下如实说出来，不做别的动作。
                     .clickable { touched = WorkspaceCopy.FULLSCREEN_NOTE },
@@ -1224,7 +1238,7 @@ private fun WorkspaceScreen(
                     horizontalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
                     // 在跑才亮那颗点：灰点表示它现在没在动，「不动」不该画成「在动」。
-                    val working = live.activity == "running" || live.activity == "thinking"
+                    val working = !paused && (live.activity == "running" || live.activity == "thinking")
                     Box(
                         modifier = Modifier
                             .size(6.dp)
@@ -1305,6 +1319,7 @@ private fun WorkspaceScreen(
                 // 两个按钮现在都动真格。画板把「让它停一下」画成实心强调色；
                 // 接口接上了，但一次请求没回来之前不让连点，所以忙碌时一并变淡。
                 WorkspaceButton(WorkspaceAction.Takeover, palette, enabled = !busy) {
+                    if (busy) return@WorkspaceButton
                     // 屏幕上显示的是哪张票，接手与暂停就作用在哪张票上：
                     // 从代码卡进来看的是这段改动所属的那张，不是这位 Bot 手上另一张。
                     val id = preview ?: ticket?.id
@@ -1327,12 +1342,23 @@ private fun WorkspaceScreen(
                         }
                     }
                 }
-                WorkspaceButton(WorkspaceAction.Pause, palette, enabled = !busy) {
+                WorkspaceButton(WorkspaceAction.Pause, palette, enabled = !busy,
+                    label = if (paused) "继续执行" else WorkspaceAction.Pause.label) {
+                    if (busy) return@WorkspaceButton
+                    val resuming = paused
                     busy = true
                     scope.launch {
                         try {
                             // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
-                            touched = WorkspaceCopy.pauseDone(client.pause(preview ?: ticket?.id))
+                            if (resuming) {
+                                client.resume()
+                                onPausedChanged(false)
+                                touched = "已继续执行（全局执行器）"
+                            } else {
+                                client.pause(preview ?: ticket?.id)
+                                onPausedChanged(true)
+                                touched = "已让它停一下（全局执行器）"
+                            }
                             // 停完重读：画面顶上那一行要说「停住了」，不能还写着「正在干活」。
                             reread()
                         } catch (error: Exception) {
@@ -1370,6 +1396,7 @@ private fun RowScope.WorkspaceButton(
     action: WorkspaceAction,
     palette: CrewPalette,
     enabled: Boolean = true,
+    label: String = action.label,
     onPress: (WorkspaceAction) -> Unit,
 ) {
     Box(
@@ -1378,10 +1405,11 @@ private fun RowScope.WorkspaceButton(
             .background(palette.card, RoundedCornerShape(10.dp))
             .border(1.dp, palette.line, RoundedCornerShape(10.dp))
             .clickable(enabled = enabled) { onPress(action) }
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .padding(vertical = 11.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(action.label, fontSize = 13.sp, color = if (enabled) palette.ink else palette.faint)
+        Text(label, fontSize = 13.sp, color = if (enabled) palette.ink else palette.faint)
     }
 }
 
@@ -1390,7 +1418,7 @@ private fun RowScope.WorkspaceButton(
 private fun GlassIconButton(glyph: String, tint: Color, palette: CrewPalette, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .size(32.dp)
+            .size(48.dp)
             .background(palette.card, RoundedCornerShape(9.dp))
             .border(1.dp, palette.line, RoundedCornerShape(9.dp))
             .clickable(onClick = onClick),
@@ -1413,7 +1441,7 @@ private fun GlassIconButton(glyph: String, tint: Color, palette: CrewPalette, on
  */
 @Composable
 private fun BackendIconButton(tint: Color, count: Int?, palette: CrewPalette, onClick: () -> Unit) {
-    Box(modifier = Modifier.size(32.dp)) {
+    Box(modifier = Modifier.size(48.dp)) {
         GlassIconButton(glyph = "后台", tint = tint, palette = palette, onClick = onClick)
         if (count != null && count > 0) {
             Box(
@@ -1485,7 +1513,8 @@ private fun BackendScreen(
                     fontSize = 12.sp,
                     fontWeight = if (tab == index) FontWeight(600) else FontWeight.Normal,
                     color = if (tab == index) palette.ink else palette.faint,
-                    modifier = Modifier.clickable { tab = index },
+                    modifier = Modifier.clickable { tab = index }
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 )
             }
         }
@@ -2050,6 +2079,7 @@ private fun TicketStrip(
                             }
                         }
                     }
+                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                     .padding(horizontal = 11.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2071,7 +2101,7 @@ private fun TicketStrip(
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(32.dp)
+                    .height(48.dp)
                     .background(palette.card, RoundedCornerShape(8.dp))
                     .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
                     // 点它 = 把这句在等的人带进输入框，省得人再想上下文。
@@ -2083,7 +2113,7 @@ private fun TicketStrip(
             }
             Box(
                 modifier = Modifier
-                    .size(width = 36.dp, height = 32.dp)
+                    .size(48.dp)
                     .background(palette.warn, RoundedCornerShape(8.dp))
                     .clickable { onPrefill(address) },
                 contentAlignment = Alignment.Center,
@@ -2225,9 +2255,10 @@ private fun SubagentCard(
         // 收起时也显示 —— 空的按钮块占着一大片白，比没有更难看。
         // 点开只改这一枚 open：读取是上面那趟 LaunchedEffect 的事，这里不再发第二个请求。
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp).clickable {
+            modifier = Modifier.fillMaxWidth().clickable {
                 open = !open
-            },
+            }.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val total = nodes?.let { countAgents(it) }
@@ -2455,6 +2486,7 @@ private fun CodeCard(
                                 }
                             }
                         }
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .padding(horizontal = 12.dp, vertical = 7.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -2504,6 +2536,7 @@ private fun CodeCard(
                                 }
                             }
                         }
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                         .padding(horizontal = 12.dp, vertical = 7.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -2586,7 +2619,7 @@ private fun SpeakButton(client: CrewClient, palette: CrewPalette, text: String) 
         TextButton(
             enabled = !playing,
             contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
-            modifier = Modifier.defaultMinSize(minHeight = 22.dp),
+            modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
             onClick = {
                 playing = true
                 note = SpeechCopy.PLAYING
@@ -3229,6 +3262,7 @@ private fun ModelScreen(
                                 .background(if (chosen) palette.accentSoft else palette.card)
                                 .border(1.dp, if (chosen) palette.accent else palette.line, RoundedCornerShape(8.dp))
                                 .clickable(enabled = !busy) { switchTo(current.provider, current.model, effort.id) }
+                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                                 .padding(horizontal = 12.dp, vertical = 7.dp),
                         ) {
                             Text(effort.name, fontSize = 12.sp,
@@ -3282,6 +3316,7 @@ private fun ModelRow(
             .clip(RoundedCornerShape(10.dp))
             .background(if (selected) palette.accentSoft else palette.card)
             .clickable(enabled = enabled, onClick = onClick)
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -3383,7 +3418,8 @@ private fun BotEditorSheet(
                 SmallCardButton("取消", palette, onClose)
                 Box(
                     modifier = Modifier.weight(1f).background(palette.accent, RoundedCornerShape(10.dp))
-                        .clickable(enabled = !busy, onClick = { save() }).padding(vertical = 11.dp),
+                        .clickable(enabled = !busy, onClick = { save() })
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp).padding(vertical = 11.dp),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(if (busy) "保存中…" else "保存", fontSize = 13.5.sp, fontWeight = FontWeight(550),
@@ -3414,6 +3450,7 @@ private fun BotEditorSheet(
                             }
                         }
                     }
+                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                     .padding(vertical = 11.dp),
                 contentAlignment = Alignment.Center,
             ) {

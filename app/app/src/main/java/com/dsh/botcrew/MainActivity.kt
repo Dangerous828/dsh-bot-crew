@@ -1,7 +1,6 @@
 package com.dsh.botcrew
 
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -19,19 +18,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
-    /**
-     * 隧道代理是进程级的（一个客户端句柄服务所有连接），Activity 走了必须放掉 ——
-     * 否则每次旋转屏幕都留一份 Go 运行时里的句柄。
-     */
-    override fun onDestroy() {
-        TailcatP2p.stop()
-        super.onDestroy()
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 配好的电脑存在本机，重启后不用再念一次码。
@@ -47,8 +41,8 @@ class MainActivity : ComponentActivity() {
             var way by remember { mutableStateOf<CrewRoute.Way?>(null) }
             // 本该有 P2P 却没接上时挂在界面上的一句话；一切正常时是空串。
             var p2pNote by remember { mutableStateOf("") }
-            // 隧道这条路上实测的一个来回。界面据此分「直连」和「中继」—— 两者都叫「隧道通」，
-            // 但一个 1.4ms、一个 137ms，混成一句话说就是在骗人。
+            // 隧道这条路上实测的一个来回。界面照实报出这个数，不拿它猜直连还是中继 ——
+            // RTT 快慢证明不了请求有没有经 DERP，那是没有实际路径信号时的臆测。
             var tunnelMillis by remember { mutableStateOf<Long?>(null) }
 
             LaunchedEffect(paired) {
@@ -75,30 +69,43 @@ class MainActivity : ComponentActivity() {
                 client = opened
                 way = CrewRoute.kindOf(entries.firstOrNull().orEmpty(), current, null)
 
-                // 隧道在后台接。手机经 DERP 引导首连要 5–15 秒（注册 + 打洞升级），
-                // 挡在启动路径上就是让人对着空屏等；先让人看到内容，接上了再自己升级。
-                val port = withContext(Dispatchers.IO) { TailcatP2p.start(current.p2pAddr) }
-                if (port == null) {
-                    // 地址空着是「这台电脑没公布 P2P」，不是故障，不必在界面上说。
-                    if (current.p2pAddr.isNotBlank()) p2pNote = P2P_DOWN
-                    return@LaunchedEffect
-                }
-                val probed = withContext(Dispatchers.IO) {
-                    TailcatP2p.probe(port, current.token, current.deviceId)
-                }
-                if (probed.ok) {
-                    // 记下端口再提队首：回调里的 kindOf 要认出这条是 P2P，界面才会改口。
-                    proxyPort = port
-                    opened.promote(CrewRoute.proxyBase(port))
-                    way = CrewRoute.Way.P2P
-                    tunnelMillis = probed.millis
-                    p2pNote = ""
-                    Log.i("CrewP2p", "隧道探通，一个来回 ${probed.millis}ms")
-                } else {
-                    // 代理留着不收：这次没探通不等于下一次请求用不上它，收摊交给 onDestroy。
-                    // 具体原因（缺库、地址过期、电脑不在线）只有日志分得清，界面上就一句。
-                    Log.i("CrewP2p", "隧道没接上：${TailcatP2p.state().detail}")
-                    p2pNote = P2P_DOWN
+                // 句柄只建一次：start 内部先 stop 再新建隧道客户端，反复 start 等于每次探测都重建句柄。
+                // 换网络后隧道在库内部自己重连，重试只复用这个端口去探，不再碰句柄。
+                var ownedPort: Int? = null
+                try {
+                    val port = withContext(Dispatchers.IO) {
+                        TailcatP2p.start(current.p2pAddr).also { ownedPort = it }
+                    }
+                    if (port == null) {
+                        if (current.p2pAddr.isNotBlank()) p2pNote = P2P_DOWN
+                        return@LaunchedEffect
+                    }
+                    // 只在前台探测；退到后台取消等待，再回前台重置退避。句柄始终复用。
+                    lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                        var failures = 0
+                        while (isActive) {
+                            val probed = withContext(Dispatchers.IO) {
+                                TailcatP2p.probe(port, current.token, current.deviceId)
+                            }
+                            if (probed.ok) {
+                                proxyPort = port
+                                opened.promote(CrewRoute.proxyBase(port))
+                                way = CrewRoute.Way.P2P
+                                tunnelMillis = probed.millis
+                                p2pNote = ""
+                                failures = 0
+                                delay(P2P_CHECK_INTERVAL_MS)
+                            } else {
+                                p2pNote = P2P_DOWN
+                                tunnelMillis = null
+                                delay(CrewRoute.retryDelay(failures))
+                                failures = (failures + 1).coerceAtMost(5)
+                            }
+                        }
+                    }
+                } finally {
+                    // 旧配对的延迟收尾不能关掉后来新建的代理。
+                    ownedPort?.let(TailcatP2p::stop)
                 }
             }
 
@@ -117,8 +124,7 @@ class MainActivity : ComponentActivity() {
                             client = ready,
                             palette = palette,
                             // 三条路哪条在用要说出来：出问题时「现在走的是公网中转」就是第一条线索。
-                            // 隧道这条还要带上实测往返：打洞失败时 tailcat 会退回 DERP 中继，
-                            // 那也是「通了」，但必须说成中继而不是直连。
+                            // 隧道这条带上实测往返，只说连上了、多快，不凭快慢断言是直连还是中继。
                             route = CrewRoute.label(way, tunnelMillis, p2pNote),
                             onForget = {
                                 pairing.clear()
@@ -134,6 +140,8 @@ class MainActivity : ComponentActivity() {
     private companion object {
         /** 界面上那句话。它是说明，不是错误码：真正的原因看 logcat 的 CrewP2p/CrewTailcat。 */
         const val P2P_DOWN = "P2P 没通"
+
+        const val P2P_CHECK_INTERVAL_MS = 30_000L
     }
 }
 

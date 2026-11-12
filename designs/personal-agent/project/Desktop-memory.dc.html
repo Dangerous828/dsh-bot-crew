@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Personal Agent · 桌面（记忆）</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+</style>
+</helmet>
+<!-- 右栏「记忆」：navLabel = 记忆；memoryPane 的三态与 memoryRow / memoryNote 都按 ui.go 写实 -->
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; display: flex; background: #FBF9F6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; color: #1F1D1A">
+
+  <aside style="width: 300px; flex: none; display: flex; flex-direction: column; gap: 18px; padding: 22px 14px; background: #FFFFFF; border-right: 1px solid #EDE8E1">
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 8px">
+      <div style="display: flex; align-items: center; gap: 9px">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1F1D1A" stroke-width="1.5" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" stroke-dasharray="2.5 3"/>
+          <circle cx="12" cy="12" r="3" fill="#1F1D1A" stroke="none"/>
+        </svg>
+        <span style="font-size: 15.5px; font-weight: 640; letter-spacing: -0.01em">我的队伍</span>
+      </div>
+      <button type="button" aria-label="新增一位 Bot" style="width: 28px; height: 28px; border-radius: 8px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #8A8377; font-size: 17px; cursor: pointer; line-height: 1">+</button>
+    </div>
+
+    <nav style="display: flex; flex-direction: column; gap: 2px" aria-label="Bot 花名册">
+      <a href="#conversation" style="display: flex; gap: 11px; align-items: flex-start; padding: 11px; border-radius: 11px; background: #F3F0EA; text-decoration: none; color: inherit">
+        <span style="flex: none; width: 36px; height: 36px; border-radius: 11px; background: #3E6B62; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 14.5px; font-weight: 620">林</span>
+        <span style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
+          <span style="font-size: 13.5px; font-weight: 600">林 <span style="font-size: 10.5px; color: #8A8377">前端 · 话少，先验再说</span></span>
+          <span style="font-size: 12px; color: #57524A; line-height: 1.45">正在改登录页的间距，还差两处</span>
+        </span>
+      </a>
+      <a href="#roster" style="display: flex; gap: 11px; align-items: flex-start; padding: 11px; border-radius: 11px; text-decoration: none; color: inherit">
+        <span style="flex: none; width: 36px; height: 36px; border-radius: 11px; background: #EAF1EC; display: flex; align-items: center; justify-content: center; color: #3E6B62; font-size: 14.5px; font-weight: 620">周</span>
+        <span style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
+          <span style="font-size: 13.5px; font-weight: 600">周 <span style="font-size: 10.5px; color: #8A8377">商务 · 先摆条款，再给选项</span></span>
+          <span style="font-size: 12px; color: #57524A; line-height: 1.45">等你确认合同里的付款条款</span>
+        </span>
+      </a>
+      <a href="#roster" style="display: flex; gap: 11px; align-items: flex-start; padding: 11px; border-radius: 11px; text-decoration: none; color: inherit">
+        <span style="flex: none; width: 36px; height: 36px; border-radius: 11px; background: #F6EEE6; display: flex; align-items: center; justify-content: center; color: #96603A; font-size: 14.5px; font-weight: 620">陈</span>
+        <span style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
+          <span style="font-size: 13.5px; font-weight: 600">陈 <span style="font-size: 10.5px; color: #8A8377">日程 · 只说时间和结论</span></span>
+          <span style="font-size: 12px; color: #8A8377; line-height: 1.45">待命 · 每早八点整理日程</span>
+        </span>
+      </a>
+    </nav>
+
+    <div style="display: flex; flex-direction: column; gap: 7px; padding: 0 8px">
+      <div style="font-size: 11px; font-weight: 600; color: #8A8377; letter-spacing: 0.05em">今天由谁接手</div>
+      <div style="display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: #1F1D1A">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#3E6B62" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+        林在跑，2 位在等
+      </div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 2px; border-top: 1px solid #EDE8E1; padding-top: 14px">
+      <a href="#backend" style="display: flex; align-items: center; gap: 9px; padding: 9px 8px; border-radius: 8px; text-decoration: none; color: #57524A; font-size: 13px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.6"/><rect x="3" y="14" width="18" height="6" rx="1.6"/></svg>
+        后台
+        <span style="margin-left: auto; font-size: 11px; color: #3E6B62; background: #EAF1EC; border-radius: 6px; padding: 1px 6px">4</span>
+      </a>
+      <a href="#models" style="display: flex; align-items: center; gap: 9px; padding: 9px 8px; border-radius: 8px; text-decoration: none; color: #57524A; font-size: 13px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>
+        模型
+        <span style="margin-left: auto; font-size: 11.5px; color: #8A8377">DeepSeek V4</span>
+      </a>
+      <a href="#artifacts" style="display: flex; align-items: center; gap: 9px; padding: 9px 8px; border-radius: 8px; text-decoration: none; color: #57524A; font-size: 13px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="M4 9h16"/></svg>
+        产出
+      </a>
+      <a href="#routines" style="display: flex; align-items: center; gap: 9px; padding: 9px 8px; border-radius: 8px; text-decoration: none; color: #57524A; font-size: 13px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        常规任务
+      </a>
+      <a href="#memory" style="display: flex; align-items: center; gap: 9px; padding: 9px 8px; border-radius: 8px; background: #F3F0EA; text-decoration: none; color: #1F1D1A; font-size: 13px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3E6B62" stroke-width="1.6" aria-hidden="true"><path d="M6 4h12v16l-6-4-6 4z"/></svg>
+        记忆
+      </a>
+    </div>
+  </aside>
+
+  <main id="conversation" style="flex: 1; min-width: 0; max-width: 840px; display: flex; flex-direction: column; background: #FBF9F6">
+    <header style="display: flex; align-items: center; gap: 12px; padding: 18px 28px; border-bottom: 1px solid #EDE8E1; background: #FFFFFF">
+      <span style="width: 38px; height: 38px; border-radius: 11px; background: #3E6B62; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 15px; font-weight: 620; flex: none">林</span>
+      <div style="display: flex; flex-direction: column; gap: 1px; min-width: 0">
+        <span style="font-size: 14.5px; font-weight: 640">林 · 前端</span>
+        <span style="font-size: 12px; color: #8A8377; display: flex; align-items: center; gap: 5px"><span style="width: 5px; height: 5px; border-radius: 50%; background: #3E6B62; display: inline-block"></span>正在工作 · 3 分钟</span>
+      </div>
+      <div style="margin-left: auto; display: flex; align-items: center; gap: 7px">
+        <button type="button" style="display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 9px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #1F1D1A; font-size: 12.5px; cursor: pointer">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8"/></svg>
+          看它的屏幕
+        </button>
+        <button type="button" aria-label="更多操作" style="width: 32px; height: 32px; border-radius: 9px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #8A8377; cursor: pointer">···</button>
+      </div>
+    </header>
+    <div style="flex: 1; overflow-y: auto; padding: 26px 36px; display: flex; flex-direction: column; gap: 20px">
+      <div style="display: flex; justify-content: flex-end">
+        <div style="max-width: 76%; background: #2C2A26; color: #FBF9F6; border-radius: 15px 15px 4px 15px; padding: 11px 15px; font-size: 14px; line-height: 1.55">登录页在手机上输入框太挤，帮我把间距调开一点</div>
+      </div>
+      <div style="display: flex; gap: 11px; align-items: flex-start">
+        <span style="flex: none; width: 28px; height: 28px; border-radius: 9px; background: #3E6B62; display: flex; align-items: center; justify-content: center; color: #FFFFFF; font-size: 12px; font-weight: 620">林</span>
+        <div style="display: flex; flex-direction: column; gap: 9px; max-width: 76%">
+          <div style="color: #1F1D1A; font-size: 14px; line-height: 1.6">输入框间距 12px，按钮贴底。改 16px，底部留 24px 安全区。</div>
+          <div style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid #EDE8E1; border-radius: 9px; background: #FFFFFF; font-size: 12px; color: #57524A">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3E6B62" stroke-width="2.2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+            两张截图已放进产出
+          </div>
+        </div>
+      </div>
+    </div>
+    <div style="padding: 14px 28px 20px; background: #FBF9F6">
+      <div style="display: flex; align-items: flex-end; gap: 9px; background: #FFFFFF; border: 1px solid #EDE8E1; border-radius: 13px; padding: 9px 9px 9px 15px">
+        <textarea rows="1" placeholder="跟林说点什么，或者交给别人" aria-label="消息" style="flex: 1; border: none; outline: none; resize: none; font-family: inherit; font-size: 14px; line-height: 1.5; color: #1F1D1A; background: transparent; padding: 5px 0"></textarea>
+        <button type="button" aria-label="发送" style="flex: none; width: 32px; height: 32px; border-radius: 10px; border: none; background: #3E6B62; color: #FFFFFF; cursor: pointer; display: flex; align-items: center; justify-content: center">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px; margin-top: 7px">
+        <span style="flex: 1; display: flex; align-items: center; gap: 5px; font-size: 11px; color: #A9A294"><span style="width: 5px; height: 5px; border-radius: 50%; background: #3E6B62"></span>林在跑，你现在发的话会排在它这一步之后</span>
+      </div>
+    </div>
+  </main>
+
+  <aside id="backend" style="width: 360px; flex: none; display: flex; flex-direction: column; gap: 12px; padding: 18px 16px 20px; background: #F8F5F1; border-left: 1px solid #EDE8E1">
+    <div style="font-size: 15px; font-weight: 640; color: #1F1D1A">记忆</div>
+    <div style="font-size: 11.5px; color: #8A8377">记得 1 条</div>
+
+    <div style="display: flex; flex-direction: column; gap: 6px">
+      <div style="display: flex; flex-direction: column; gap: 4px; padding: 12px; border: 1px solid #EDE8E1; border-radius: 10px; background: #FFFFFF">
+        <div style="display: flex; align-items: center; gap: 8px">
+          <span style="flex: 1; font-size: 12.5px; font-weight: 550; color: #1F1D1A">以后都用 pnpm，不要用 npm</span>
+        </div>
+        <div style="font-size: 11.5px; color: #57524A; line-height: 1.5">主人原话：「以后都用 pnpm」</div>
+        <div style="display: flex; align-items: center; gap: 7px">
+          <span style="flex: 1; font-size: 10.5px; color: #8A8377">lead · 你说的 · [日期]</span>
+          <button type="button" style="padding: 5px 9px; border-radius: 6px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #57524A; font-size: 11px; cursor: pointer">编辑</button>
+          <button type="button" style="padding: 5px 9px; border-radius: 6px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #57524A; font-size: 11px; cursor: pointer">不再记住</button>
+        </div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 4px; padding: 12px; border: 1px solid #EDE8E1; border-radius: 10px; background: #FFFFFF">
+        <div style="display: flex; align-items: center; gap: 8px">
+          <span style="flex: 1; font-size: 12.5px; font-weight: 550; color: #8A8377">[已不再记住的记忆]</span>
+          <span style="font-size: 11px; color: #8A8377">已不再记住</span>
+        </div>
+        <div style="font-size: 11.5px; color: #8A8377; line-height: 1.5">[正文首段]</div>
+        <div style="font-size: 10.5px; color: #8A8377">[谁记得 · 来源]</div>
+      </div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 5px; padding-top: 10px; border-top: 1px dashed #EDE8E1">
+      <div style="font-size: 10.5px; color: #A9A294; letter-spacing: 0.04em">这一栏的其它状态</div>
+      <div style="font-size: 11px; color: #8A8377; line-height: 1.6">正在读记忆…<br>还没有记住什么 — 这里是队伍的长期记忆：你定下的规矩、工单的结论。它办完的事会一条条记在这里。<br>读不到记忆 — 后端没有说原因，这一栏现在是空的</div>
+    </div>
+
+    <div style="margin-top: auto; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px dashed #EDE8E1">
+        <div style="display: flex; align-items: center; gap: 8px">
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+            <span style="font-size: 10.5px; font-weight: 600; color: #57524A">手机</span>
+            <span style="font-size: 9px; color: #8A8377">这一台与队伍配一次，之后两边都免配置。</span>
+          </div>
+          <button type="button" style="padding: 6px 10px; border-radius: 6px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #57524A; font-size: 11.5px; cursor: pointer">配对手机</button>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px">
+          <button type="button" style="padding: 5px 10px; border-radius: 6px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #57524A; font-size: 9px; cursor: pointer">导出备份</button>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px">
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 1px">
+            <span style="font-size: 9px; color: #57524A">[设备名]</span>
+            <span style="font-size: 9px; color: #8A8377">[平台 · 配对时间]</span>
+          </div>
+          <button type="button" style="padding: 4px 8px; border-radius: 6px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #B45252; font-size: 9px; cursor: pointer">撤掉</button>
+        </div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 7px; padding-top: 12px; border-top: 1px solid #EDE8E1">
+        <div style="font-size: 11.5px; color: #57524A">队伍就绪 · 空闲</div>
+        <div style="display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; color: #57524A"><span>队列</span><span style="color: #8A8377">[N] 等待 · 上限 [N] 并发</span></div>
+        <button type="button" style="margin-top: 4px; padding: 8px; border-radius: 8px; border: 1px solid #EDE8E1; background: #FFFFFF; color: #1F1D1A; font-size: 12px; cursor: pointer">全部暂停</button>
+      </div>
+    </div>
+  </aside>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

@@ -72,6 +72,34 @@
       "w": 390,
       "h": 844,
       "title": "手机 · 工作区"
+    },
+    "Desktop-memory.dc.html": {
+      "x": 0,
+      "y": 3004,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 记忆"
+    },
+    "Desktop-outputs.dc.html": {
+      "x": 1520,
+      "y": 3004,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 产出"
+    },
+    "Desktop-routines.dc.html": {
+      "x": 0,
+      "y": 4024,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 常规任务"
+    },
+    "Desktop-models.dc.html": {
+      "x": 1520,
+      "y": 4024,
+      "w": 1440,
+      "h": 900,
+      "title": "桌面 · 模型"
     }
   },
   "order": [
@@ -83,7 +111,11 @@
     "Mobile-dark.dc.html",
     "Mobile-roster.dc.html",
     "Mobile-card.dc.html",
-    "Mobile-workspace.dc.html"
+    "Mobile-workspace.dc.html",
+    "Desktop-memory.dc.html",
+    "Desktop-outputs.dc.html",
+    "Desktop-routines.dc.html",
+    "Desktop-models.dc.html"
   ],
   "notes": {},
   "designSystems": []

@@ -475,6 +475,34 @@ export class Runtime extends Service implements SourceHost {
    * - 队伍暂停（`paused()`）：原因 `paused`；
    * - 这条没指定 Bot，且队伍一个人都没有：原因 `no_recipient`。
    */
+  /**
+   * 看门狗的自愈那一半：把「因评估超时而静默停在账上」的决策捡回来重跑一轮。
+   *
+   * 只看最近一小时、kind 为 unavailable、原因是 timeout、且还没被自愈过的决策；每条给一次机会
+   * （由 `healed` 标记保证有界）。判官说「现在别接」的 unavailable 不在此列 —— 那是正常裁决。
+   *
+   * 进程若在「已经重排队、还没醒来跑」之间重启，下一次 tick 会看到这些 Trigger 已标 healed、遂跳过，
+   * 由那一轮 Eval 自己跑完，不会重复重排。
+   *
+   * @returns 真正被捡回来重跑的决策 id。
+   */
+  async runSelfHeal(now = Date.now()): Promise<string[]> {
+    if (this.paused()) return []
+    const since = new Date(now - 3_600_000).toISOString()
+    const healed: string[] = []
+    for (const decision of this.store.read.decisionsOfKinds(['unavailable'], 200)) {
+      if (decision.at < since) continue
+      if (!(decision.reason ?? []).some(reason => reason.code === 'timeout')) continue
+      try {
+        if (this.engine.recoverExpiredDecision(decision.id)) {
+          healed.push(decision.id)
+          console.log('[selfheal] requeued decision=%s thread=%s', decision.id, decision.threadKey)
+        }
+      } catch (error) { console.log('[selfheal] failed decision=%s error=%s', decision.id, String(error)) }
+    }
+    return healed
+  }
+
   async runRoutines(now = Date.now()): Promise<{ dispatched: string[]; held: string[] }> {
     const tasks = this.store.keys(KV.routines.task).flatMap(name => {
       const item = routineItemOf(this.store.get(name), now)
@@ -1154,6 +1182,7 @@ export class Runtime extends Service implements SourceHost {
     this.routineTimer = setInterval(() => {
       if (this.closing()) return
       void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
+      void this.runSelfHeal().catch(error => { console.log('[selfheal] tick failed: %s', String(error)) })
       void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })
       void this.runDaily().catch(error => { console.log('[daily] tick failed: %s', String(error)) })
     }, TICK_MS)

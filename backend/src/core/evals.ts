@@ -67,6 +67,36 @@ export class Evals extends EnginePart {
     this.repo.threads.save(thread)
     this.options.assessor.release?.(id)
   }
+  /**
+   * 自愈：把一条 `unavailable`（因其自身 Rounds 评估超时）的 Decision 捡回来重跑一轮。
+   *
+   * 为什么值得单独一条：一次 `unavailable` 意味着这活**没有人判**——请求就这么静默停在账上，
+   * 除非有人手动重发，否则再也不会有人看它一眼。这里给「超时」这一种一个自愈机会：把它的 Triggers
+   * 记上「已自愈过」（`healed`），入队重跑；评估真又挂了，会再记一条 `unavailable`，但这次不再自愈
+   * （`healed` 已经在），于是有界 —— 只会重试一次，不会无限循环。
+   *
+   * 只捡因超时的：judge 明确说了 `now is not the time` 的 `unavailable` 是正常裁决，重跑它等于跟判官作对。
+   * 只捡还没被重发过的：同一批 Triggers 若已经开了新 Eval，`requeue` 会返回 false，不动它。
+   *
+   * @returns 是否真的重排队了（false = 不是超时 / 已自愈过 / 已有新 Eval 持有）。
+   */
+  recoverExpired(decisionId: string): boolean {
+    const decision = this.repo.decisions.get(decisionId)
+    if (decision?.kind !== 'unavailable') return false
+    if (!(decision.reason ?? []).some(reason => reason.code === 'timeout')) return false
+    // 从没被 disposition 记过的 Trigger（直接入库、没走过 receive）也要能捡：没有记录就当没 healed。
+    const healed = decision.triggerIds.filter(id => !this.repo.triggers.disposition(id)?.healed)
+    if (!healed.length) return false
+    // 记「已自愈」与入队在同一处判：先标 healed，再 requeue；requeue 因已有 Eval 返回 false 时也算处理过。
+    for (const id of healed) {
+      const disposition = this.repo.triggers.disposition(id) ?? { fanout: [], at: this.now() }
+      this.repo.triggers.saveDisposition(id, { ...disposition, healed: true })
+    }
+    let queued = false
+    for (const id of healed) if (this.requeue(id)) { this.emit('trigger.requeued', { triggerId: id }); queued = true }
+    return queued
+  }
+
   /** Start one Eval of the Triggers queued on a Thread, judged by the gate, and ask the assessor for it. */
   start(threadKeyValue: string, policy: Policy): void {
     const thread = this.repo.threads.get(threadKeyValue)!

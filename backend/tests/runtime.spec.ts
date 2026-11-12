@@ -2079,3 +2079,29 @@ describe('runRoutines: 到点真的派出去，还是只记一句', () => {
     expect(result.held).toEqual([])
   })
 })
+
+describe('runSelfHeal: 超时的评估被捡回来重跑一次', () => {
+  it('re-queues a timed-out unavailable Decision once and leaves a deliberate one alone', async () => {
+    const instance = await restart()
+    // paused() 在未配完 setup 时为真；自愈本身要跑，就用 spy 把它放开。
+    vi.spyOn(instance as unknown as { paused: () => boolean }, 'paused').mockReturnValue(false)
+    // 先存两条 Trigger：自愈要把它们从 disposition 里摘出来才谈得上重排。
+    const now = new Date().toISOString()
+    const mkTrigger = (id: string): Trigger => ({ id, source: 'feishu', threads: [{ source: 'feishu', id: 'oc_team' }],
+      actor: { source: 'feishu', id: 'ou_alice' }, human: true, at: now, text: 'x',
+      channel: { source: 'feishu', thread: 'oc_team', address: { message: id, chat_id: 'oc_team' } }, meta: {} })
+    instance.store.triggers.save(mkTrigger('t-timeout'))
+    instance.store.triggers.save(mkTrigger('t-said'))
+    const threadKey = 'feishu:oc_team'
+    // 一条真的超时决策 + 一条判官说有意的 unavailable。
+    instance.store.decisions.save({ id: 'sh-timeout', evalId: 'e1', threadKey, triggerIds: ['t-timeout'], policyVersion: 'v1',
+      at: now, kind: 'unavailable', reason: [{ code: 'timeout' }], strength: 'inferred' })
+    instance.store.decisions.save({ id: 'sh-said', evalId: 'e2', threadKey, triggerIds: ['t-said'], policyVersion: 'v1',
+      at: now, kind: 'unavailable', reason: [said('now is not the time')], strength: 'inferred' })
+    const recovered = await instance.runSelfHeal()
+    expect(recovered).toContain('sh-timeout')
+    expect(recovered).not.toContain('sh-said')
+    // 第二次跑：超时那条已标 healed，不再重排（有界）。
+    expect(await instance.runSelfHeal()).not.toContain('sh-timeout')
+  })
+})

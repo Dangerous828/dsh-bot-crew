@@ -155,6 +155,11 @@ export class Engine {
    */
   reevaluate(triggerId: string): boolean { return this.repo.atomic(() => this.evals.reevaluate(triggerId)) }
   /**
+   * 自愈：把一条因超时记下 `unavailable` 的 Decision 的 Triggers 捡回来重跑一轮（只一次）。
+   * @returns 是否真的重排队了。
+   */
+  recoverExpiredDecision(decisionId: string): boolean { return this.repo.atomic(() => this.evals.recoverExpired(decisionId)) }
+  /**
    * A person dismisses the problem an unavailable Decision shows: the overview lists it no more.
    * @throws UserError for a Decision that is unknown or not unavailable.
    */

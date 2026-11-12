@@ -1656,3 +1656,39 @@ describe('ignores from the card', () => {
     expect(() => h.engine.decide('5', { kind: 'accept', title: 'Fix', scope: 'small', reason: 'chat' })).toThrow(new UserError('notExplicit'))
   })
 })
+
+describe('expired Eval self-heal', () => {
+  /** 造一条「评估连续超时三次」的决策：与既有超时用例同一路径。 */
+  function timedOut(h: ReturnType<typeof harness>) {
+    h.engine.receive(trigger('1')); h.pump()
+    const deliver = () => h.engine.candidateDelivered(h.requests.at(-1)!.evalId)
+    deliver(); h.tick(61); h.pump()
+    deliver(); h.tick(61); h.pump()
+    deliver(); h.tick(61); h.pump()
+    return h.repo.decisions.byThread('chat:t1').at(-1)!
+  }
+  it('requeues a timed-out Decision once, and a second attempt is refused', () => {
+    const h = harness()
+    const decision = timedOut(h)
+    expect(decision).toMatchObject({ kind: 'unavailable', reason: [{ code: 'timeout' }] })
+    const before = h.requests.length
+    // 自愈：把 Trigger 重新塞回 pending 并打上 healed 标记（假 assessor 不主动 request，由 pump 起 Eval）。
+    expect(h.engine.recoverExpiredDecision(decision.id)).toBe(true)
+    expect(h.repo.triggers.disposition('1')).toMatchObject({ healed: true })
+    expect(h.repo.threads.get('chat:t1')!.pending).toContain('1')
+    // 已经自愈过：同一批 Trigger 再捡不重排（有界）。
+    expect(h.engine.recoverExpiredDecision(decision.id)).toBe(false)
+    // pump 起一轮新的 Eval：又冒出一次 assessor.request，证明它真的回到了评估流程。
+    h.pump()
+    expect(h.requests.length).toBe(before + 1)
+  })
+  it('never self-heals an unavailable a judge decided on purpose', () => {
+    const h = harness()
+    h.engine.receive(trigger('1')); h.pump()
+    // 判官明确说「现在别接」：这是正常裁决，不是超时，自愈不该动它。
+    h.decide(h.requests.at(-1)!, { kind: 'unavailable', reason: 'now is not the time' })
+    const decision = h.repo.decisions.byThread('chat:t1').at(-1)!
+    expect(decision.reason).toEqual([{ code: 'said', values: { text: 'now is not the time' } }])
+    expect(h.engine.recoverExpiredDecision(decision.id)).toBe(false)
+  })
+})

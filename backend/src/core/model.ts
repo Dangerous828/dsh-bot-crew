@@ -53,6 +53,8 @@ export interface TriggerDisposition {
   context?: string[]
   /** A person, or the main Session for a message no ticket decides, sent it to Eval again; a hand-back does not set it. */
   requeued?: true
+  /** 评估因超时记 `unavailable` 之后，被自愈机制捡回来重跑过一次；用于保证自动重试有界（只一次）。 */
+  healed?: true
   /** The tickets whose Executor handed it back as beyond the ticket, each once, with why; it goes to Eval once none decides it. */
   handbacks?: { ticketId: string; reason: string; at: string }[]
   /** The tickets whose Executor acknowledged it or answered it, taking it up as within the ticket. */

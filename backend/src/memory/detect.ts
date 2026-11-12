@@ -10,6 +10,7 @@
  * 这里不做任何记忆读写，只回答「现在有没有中枢」，并据此构造 `MemoryPort`。
  */
 import { HubMemory } from './hub.ts'
+import { HubHttp } from './hub-client.ts'
 import { LocalMemory, type LocalMemoryHost } from './local.ts'
 import type { MemoryPort } from './port.ts'
 
@@ -58,6 +59,16 @@ export class HubProbe {
     return this.last
   }
 
+  /** 中枢基址（去尾斜杠）；没配就是空串。给 HTTP 客户端拼路径用。 */
+  base(): string {
+    return this.options.hub.replace(/\/+$/, '')
+  }
+
+  /** 单次探测/请求的超时（毫秒），与探测用同一个上限。 */
+  timeoutMs(): number {
+    return this.options.timeoutMs
+  }
+
   /** 现探一次并更新缓存，返回是否可达。hub 为空时直接返回 false 不探测。 */
   async refresh(now = Date.now()): Promise<boolean> {
     if (!this.options.hub) { this.last = false; this.at = now; return false }
@@ -78,7 +89,14 @@ export class HubProbe {
  * 没有中枢直接用 `LocalMemory`。两版共用同一个本机账本，管理面看到的是同一批条目。
  */
 export function pickMemoryPort(local: LocalMemory, probe: HubProbe): MemoryPort {
-  return new HubMemory({ reachable: () => probe.reachable(), fallback: local })
+  // 中枢可达时，检索与巩固走真实 HTTP（契约 08）；不可达或调用失败由 HubMemory 内部降级本机。
+  const client = new HubHttp({ base: probe.base(), timeoutMs: probe.timeoutMs() })
+  return new HubMemory({
+    reachable: () => probe.reachable(),
+    search: (query, filter) => client.search({ query, ...(filter.bots ? { bots: filter.bots } : {}), ...(filter.limit ? { limit: filter.limit } : {}) }),
+    consolidate: range => client.consolidate(range),
+    fallback: local,
+  })
 }
 
 export { LocalMemory, type LocalMemoryHost }

@@ -46,4 +46,23 @@ describe('pickMemoryPort', () => {
     const text = await port.recall({ channels: [] } as never, 'x')
     expect(typeof text).toBe('string')
   })
+
+  it('中枢可达时，检索真打 POST <hub>/memory/search，命中条目进注入', async () => {
+    const calls: string[] = []
+    const probe = new HubProbe({ hub: 'http://hub.local:8642', timeoutMs: 500, probe: async () => true })
+    await probe.refresh()
+    const local = new LocalMemory({ store, bots: () => ['lead'] })
+    // 注入假 fetch：必须先于构造端口生效，HubHttp 在构造时就抓住了 fetch。
+    const original = globalThis.fetch
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      calls.push(String(url))
+      return new Response(JSON.stringify({ entries: [{ name: 'bot-lead-a', body: '回复先给结论' }] }), { status: 200 })
+    }) as typeof fetch
+    try {
+      const port = pickMemoryPort(local, probe)
+      const text = await port.recall({ channels: [{ address: { bot_id: 'lead' } }] } as never, '风格')
+      expect(calls[0]).toBe('http://hub.local:8642/memory/search')
+      expect(text).toContain('回复先给结论')
+    } finally { globalThis.fetch = original }
+  })
 })

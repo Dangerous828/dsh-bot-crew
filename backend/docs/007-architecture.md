@@ -355,6 +355,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/memory/local.ts` | 本机版记忆端口：正则 settle + 二元组召回 + KV 账本，睡眠期巩固调便宜模型提炼；没中枢或中枢降级时用它 |
 | `src/memory/hub.ts` | 中枢版记忆端口：向量检索与睡眠期巩固走中枢，中枢不可用时降级到本机实现；本机不算 embedding、原始对话不上中枢 |
 | `src/memory/detect.ts` | 记忆中枢探测与降级：按设置里 `memory.hub` 探测 `/health`（带 TTL 缓存），通就用中枢版、不通就本机版；只回答「现在有没有中枢」，不做记忆读写 |
+| `src/memory/hub-client.ts` | 中枢记忆的 HTTP 客户端：按契约 08 调 `POST /memory/search` 与 `/memory/consolidate`，响应按形状校验，坏条目/缺计数不毒化调用方 |
 | `src/memory/distill.ts` | 睡眠期提炼器：`RuleDistiller` 是规则版默认（零模型、可回查，复用 settle 规则切句提炼），`makeLlmDistiller` 是 LLM 版工厂（给提示词、回 JSON，坏输出返回空不污染账本） |
 | `src/app/memory.ts` | 记忆账本：KV 一族 `memory:entry:`，按 Bot 命名空间和 `dedupe_key` 查重，纠错走 `superseded` 而非硬删，「忘掉」只翻状态 |
 | `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
@@ -456,6 +457,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-memory-recall.spec.ts` | recall 与 settle 的纯函数：二元组相关度、Bot 命名空间过滤、新鲜度压过旧条目、预算整条取舍、哪句话算「定下来的规矩」、哪种工单收尾值得记 |
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |
 | `tests/crew-memory-port.spec.ts` | 记忆端口：本机版写账/幂等/忘掉，中枢版第一步委托本机结果一致，本机巩固无提炼器时不假装修理过 |
+| `tests/crew-memory-hub-client.spec.ts` | 中枢 HTTP 客户端：按契约发检索请求并读回条目、5xx 抛错交降级、巩固计数缺项即作废、坏条目被丢掉 |
 | `tests/crew-memory-distill.spec.ts` | 睡眠期提炼与巩固：规则提炼器只提炼规矩句、同话题去重、LLM 版坏 JSON 返回空、端到端拉日志→提炼→入库、无日志不写 |
 | `tests/crew-memory-detect.spec.ts` | 中枢探测：空地址不探测、可达后 TTL 缓存、探测失败即不可达、工厂选出的端口中枢不可达时走本机 |
 | `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |

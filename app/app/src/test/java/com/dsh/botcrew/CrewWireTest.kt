@@ -1893,3 +1893,38 @@ class OutputsPendingTest {
         assertEquals(listOf("还没发/1", "正在读/1", "被取消/1", "读不到/1", "新一轮只有旧账/2"), seen)
     }
 }
+
+/** 常规任务写侧：增改删的请求体（契约 §5.5 POST /api/mobile/routines）。 */
+class RoutinesWriteTest {
+    @Test
+    fun createBodyCarriesTitleCycleAndSkipsEmptyBot() {
+        val withBot = org.json.JSONObject(RoutinesWrite.createBody("每天站会", "daily", "lead", true))
+        assertEquals("create", withBot.optString("action"))
+        assertEquals("每天站会", withBot.optString("title"))
+        assertEquals("daily", withBot.optString("cycle"))
+        assertEquals("lead", withBot.optString("bot_id"))
+        assertEquals(true, withBot.optBoolean("enabled"))
+        // 空 bot_id 不上送：账本里「谁有空谁接」是缺字段，不是空串。
+        val noBot = org.json.JSONObject(RoutinesWrite.createBody("每周复盘", "weekly", "", false))
+        assertFalse(noBot.has("bot_id"))
+        assertEquals(false, noBot.optBoolean("enabled"))
+    }
+
+    @Test
+    fun editBodyCarriesIdAndEmptyBotClearsIt() {
+        val body = org.json.JSONObject(RoutinesWrite.editBody("rt-1", "改标题", "hourly", "", false))
+        assertEquals("edit", body.optString("action"))
+        assertEquals("rt-1", body.optString("id"))
+        // 空 bot_id 显式上送空串 = 清掉「谁负责」。
+        assertEquals("", body.optString("bot_id"))
+        assertTrue(body.has("bot_id"))
+        assertEquals(false, body.optBoolean("enabled"))
+    }
+
+    @Test
+    fun removeBodyNamesTheId() {
+        val body = org.json.JSONObject(RoutinesWrite.removeBody("rt-9"))
+        assertEquals("remove", body.optString("action"))
+        assertEquals("rt-9", body.optString("id"))
+    }
+}

@@ -1464,6 +1464,26 @@ data class RoutinesView(
     val live: Boolean get() = state == "live"
 }
 
+/** 常规任务的写侧：把一条增改删写成 POST 的 body（契约 §5.5 `POST /api/mobile/routines`）。 */
+object RoutinesWrite {
+    /** 周期只认后端认的三个词；别的原样上送让后端拒，不在客户端猜。 */
+    val CYCLES = listOf("hourly", "daily", "weekly")
+
+    /** 新建：id 由后端生成，客户端不给。空 bot_id 不上送（= 谁有空谁接）。 */
+    fun createBody(title: String, cycle: String, botId: String, enabled: Boolean): String {
+        val body = JSONObject().put("action", "create").put("title", title).put("cycle", cycle).put("enabled", enabled)
+        if (botId.isNotBlank()) body.put("bot_id", botId)
+        return body.toString()
+    }
+
+    /** 改一条：id 指哪条；空 bot_id 上送空串 = 清掉「谁负责」，回到谁有空谁接。 */
+    fun editBody(id: String, title: String, cycle: String, botId: String, enabled: Boolean): String =
+        JSONObject().put("action", "edit").put("id", id).put("title", title).put("cycle", cycle)
+            .put("bot_id", botId).put("enabled", enabled).toString()
+
+    fun removeBody(id: String): String = JSONObject().put("action", "remove").put("id", id).toString()
+}
+
 object RoutinesWire {
     /**
      * 读一份 `GET /api/mobile/routines` 的回答。
@@ -1544,8 +1564,11 @@ object RoutinesCopy {
     const val EMPTY_TITLE = "还没有常规任务"
     const val EMPTY_BODY = "这里是定时要做的事的账本。一条都还没有；账本里的任务到点不会自己跑 —— 后端还没有调度器。"
 
-    /** 每次进屏都先说一句开关按不动，免得人按了几下才发现它只是个显示。 */
-    const val READ_ONLY = "开关只看不能按：这一版还没有改账本的接口。"
+    /** 面板已经能写账本了（契约 §5.5 POST 已开）。这句从「只看不能按」改成说清能做什么。 */
+    const val EDITABLE = "可以新增、修改、删除；到点仍由调度器按账本派单。"
+
+    /** 新增按钮上的字。 */
+    const val ADD = "＋ 新增一条"
 
     /**
      * 周期的中文说法。认不出的原词原样显示：不猜成「每天」——

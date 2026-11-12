@@ -224,6 +224,21 @@ class CrewClient(
      */
     suspend fun routines(): RoutinesView = RoutinesWire.parse(read("/api/mobile/routines", "GET"))
 
+    /** 新建一条常规任务。校验交给后端，错误原样带回去显示。 */
+    suspend fun createRoutine(title: String, cycle: String, botId: String, enabled: Boolean) {
+        read("/api/mobile/routines", "POST", RoutinesWrite.createBody(title, cycle, botId, enabled))
+    }
+
+    /** 改一条常规任务。 */
+    suspend fun editRoutine(id: String, title: String, cycle: String, botId: String, enabled: Boolean) {
+        read("/api/mobile/routines", "POST", RoutinesWrite.editBody(id, title, cycle, botId, enabled))
+    }
+
+    /** 删一条常规任务。 */
+    suspend fun removeRoutine(id: String) {
+        read("/api/mobile/routines", "POST", RoutinesWrite.removeBody(id))
+    }
+
     /**
      * 记忆：队伍长期记得的事。
      *

@@ -1619,13 +1619,35 @@ private fun RoutineScreen(
     // null 表示还没读回来。读失败时 view 也是 null，另有 problem 说明为什么。
     var view by remember { mutableStateOf<RoutinesView?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    // 正在编辑的那条（null = 不编辑）；新增用一个空模板。
+    var editing by remember { mutableStateOf<RoutineItem?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    var writeError by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableStateOf(0) }
 
-    LaunchedEffect(Unit) {
+    suspend fun reread() {
         try {
             view = client.routines()
             problem = null
         } catch (error: Exception) {
             problem = error.message
+        }
+    }
+    LaunchedEffect(reload) { reread() }
+
+    // 写一次（新增 / 修改 / 删除）；成功就关面板并重读，失败把后端那句原因留下。
+    fun write(run: suspend () -> Unit) {
+        scope.launch {
+            try {
+                run()
+                editing = null
+                adding = false
+                writeError = null
+                reload += 1
+            } catch (error: Exception) {
+                writeError = error.message
+            }
         }
     }
 
@@ -1639,6 +1661,7 @@ private fun RoutineScreen(
             TextButton(onClick = onBack) { Text("返回", color = palette.accent) }
             Text("常规任务", fontSize = 20.sp, fontWeight = FontWeight(660), color = palette.ink)
             Spacer(Modifier.weight(1f))
+            TextButton(onClick = { adding = true; editing = null; writeError = null }) { Text(RoutinesCopy.ADD, color = palette.accent) }
         }
         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
 
@@ -1722,7 +1745,7 @@ private fun RoutineScreen(
         }
         // 先把「开关按不动」说在前面：等按了几下才发现它只是个显示，比一开始就说清楚更伤人。
         Text(
-            RoutinesCopy.READ_ONLY,
+            RoutinesCopy.EDITABLE,
             fontSize = 11.sp,
             color = palette.hint,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
@@ -1733,7 +1756,7 @@ private fun RoutineScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(loaded.items, key = { it.id }) { item ->
-                RoutineRow(item, conversation, palette)
+                RoutineRow(item, conversation, palette, onClick = { editing = item; adding = false; writeError = null })
             }
         }
         // 脚注钉在列表下面，不滚走：账本有一百条的时候，「到点不会自己跑」这句话
@@ -1749,6 +1772,132 @@ private fun RoutineScreen(
             )
         }
     }
+
+    // 编辑浮层：新增或改一条。盖在整屏上，点「保存」才发请求，成功后关掉并重读。
+    val target = editing
+    if (adding || target != null) {
+        RoutineEditor(
+            existing = target,
+            bots = conversation?.bots.orEmpty(),
+            error = writeError,
+            palette = palette,
+            onCancel = { adding = false; editing = null; writeError = null },
+            onSave = { title, cycle, botId, enabled ->
+                if (target != null) write { client.editRoutine(target.id, title, cycle, botId, enabled) }
+                else write { client.createRoutine(title, cycle, botId, enabled) }
+            },
+            onRemove = target?.let { { write { client.removeRoutine(it.id) } } },
+        )
+    }
+}
+
+/**
+ * 增 / 改一条常规任务的浮层。与「改人设」同一套排版：标题、周期三选一、负责人可空、开关。
+ *
+ * 保存与删都走 POST（Connection 只认 GET/POST，PUT/DELETE 到不了插件，早先就是这么静默失败的）。
+ * 后端校验不通过时把那一句原因原样显示在这里，不在客户端猜。
+ */
+@Composable
+private fun RoutineEditor(
+    existing: RoutineItem?,
+    bots: List<BotCard>,
+    error: String?,
+    palette: CrewPalette,
+    onCancel: () -> Unit,
+    onSave: (title: String, cycle: String, botId: String, enabled: Boolean) -> Unit,
+    onRemove: (() -> Unit)?,
+) {
+    var title by remember { mutableStateOf(existing?.title ?: "") }
+    var cycle by remember { mutableStateOf(existing?.cycle ?: "daily") }
+    var botId by remember { mutableStateOf(existing?.botId ?: "") }
+    var enabled by remember { mutableStateOf(existing?.enabled ?: true) }
+    Box(
+        modifier = Modifier.fillMaxSize().background(palette.ink.copy(alpha = 0.4f)).clickable(onClick = onCancel),
+        contentAlignment = Alignment.Center,
+    ) {
+        // 内层再吃掉点击，免得点面板本体也把浮层关掉。
+        Column(
+            modifier = Modifier
+                .widthIn(max = 420.dp)
+                .fillMaxWidth(0.9f)
+                .background(palette.card, RoundedCornerShape(12.dp))
+                .border(1.dp, palette.line, RoundedCornerShape(12.dp))
+                .padding(18.dp)
+                .clickable(enabled = false) {},
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
+            Text(if (existing == null) "新增常规任务" else "改这条常规任务", fontSize = 17.sp, fontWeight = FontWeight(660), color = palette.ink)
+
+            Text("标题", fontSize = 11.sp, color = palette.faint)
+            OutlinedTextField(
+                value = title, onValueChange = { title = it }, singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 15.sp, color = palette.ink),
+                shape = RoundedCornerShape(9.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = palette.surface, unfocusedContainerColor = palette.surface,
+                    focusedBorderColor = palette.accent, unfocusedBorderColor = palette.line,
+                    focusedTextColor = palette.ink, unfocusedTextColor = palette.ink, cursorColor = palette.accent,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Text("周期", fontSize = 11.sp, color = palette.faint)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                RoutinesWrite.CYCLES.forEach { value ->
+                    val picked = cycle == value
+                    TextButton(onClick = { cycle = value }) {
+                        Text(
+                            RoutinesCopy.cycleName(value),
+                            color = if (picked) palette.surface else palette.muted,
+                            fontSize = 13.sp,
+                            modifier = Modifier.background(
+                                if (picked) palette.accent else palette.surface,
+                                RoundedCornerShape(8.dp),
+                            ).padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+            }
+
+            Text("谁负责（可空 = 谁有空谁接）", fontSize = 11.sp, color = palette.faint)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { botId = "" }) {
+                    Text("谁有空", fontSize = 12.5.sp, color = if (botId.isBlank()) palette.accent else palette.muted)
+                }
+                bots.forEach { bot ->
+                    TextButton(onClick = { botId = bot.id }) {
+                        Text(bot.name.ifBlank { bot.id }, fontSize = 12.5.sp, color = if (botId == bot.id) palette.accent else palette.muted)
+                    }
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("状态", fontSize = 11.sp, color = palette.faint)
+                TextButton(onClick = { enabled = !enabled }) {
+                    Text(RoutinesCopy.switchName(enabled), color = if (enabled) palette.accent else palette.muted,
+                        fontSize = 13.sp,
+                        modifier = Modifier.background(
+                            if (enabled) palette.accentSoft else palette.surface, RoundedCornerShape(8.dp),
+                        ).padding(horizontal = 10.dp, vertical = 6.dp))
+                }
+            }
+
+            if (error != null) {
+                Text(error, fontSize = 12.sp, lineHeight = 18.sp, color = palette.danger)
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                if (onRemove != null) {
+                    TextButton(onClick = onRemove) { Text("删掉", color = palette.danger) }
+                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onCancel) { Text("取消", color = palette.muted) }
+                Button(onClick = { onSave(title.trim(), cycle, botId, enabled) }, enabled = title.isNotBlank()) {
+                    Text("保存")
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -1759,7 +1908,7 @@ private fun RoutineScreen(
  * 画一个能拨的形状就是在许一个空诺 —— 拨过去什么也不会发生。
  */
 @Composable
-private fun RoutineRow(item: RoutineItem, conversation: Conversation?, palette: CrewPalette) {
+private fun RoutineRow(item: RoutineItem, conversation: Conversation?, palette: CrewPalette, onClick: () -> Unit = {}) {
     // 负责人的名字优先用花名册上的；不在花名册（或没这个人）时把 id 原样写出来，不空着。
     val botName = conversation?.bots?.firstOrNull { it.id == item.botId }?.name.orEmpty()
     Column(
@@ -1767,6 +1916,7 @@ private fun RoutineRow(item: RoutineItem, conversation: Conversation?, palette: 
             .fillMaxWidth()
             .background(palette.card, RoundedCornerShape(10.dp))
             .border(1.dp, palette.line, RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
             .padding(horizontal = 11.dp, vertical = 9.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {

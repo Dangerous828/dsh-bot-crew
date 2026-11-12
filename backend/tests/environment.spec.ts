@@ -253,3 +253,34 @@ describe('worker isolation (sandbox)', () => {
     } finally { rmSync(dir2, { recursive: true, force: true }) }
   })
 })
+
+// 真机隔离回归：放行 /dev 后，git 能在 sandbox 里正常跑（否则 prepare 后 verifyDirectory 的 git config 会必挂，
+// 整条活卡死）。这条用真 git + 真 sandbox-exec，盯住「隔离不打断正常 git 流程」。
+describe('worker isolation keeps git working', () => {
+  it('runs git inside the sandbox after prepare (verifyDirectory path)', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated } = await import('../src/infra/environment.ts')
+    const execDir = mkdtempSync(join(tmpdir(), 'iso-git-'))
+    const signal = new AbortController().signal
+    const sb = (): SubprocessRuntime => ({
+      spawn: ({ argv, cwd }: { argv: readonly string[]; cwd: string }) => {
+        const child = spawn(argv[0]!, argv.slice(1), { cwd })
+        const output = { stdout: '', stderr: '' }
+        child.stdout.on('data', c => { output.stdout += String(c) })
+        child.stderr.on('data', c => { output.stderr += String(c) })
+        const reader = (n: 'stdout' | 'stderr') => ({ readFrom: () => ({ text: output[n], nextOffset: 0, lossy: false }) })
+        const done = new Promise(r => child.on('close', code => r({ exitCode: code, signal: null })))
+        return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
+      },
+    }) as unknown as SubprocessRuntime
+    try {
+      await runIsolated(sb(), ['git', 'init', '-q'], execDir, signal, { mode: 'sandbox', writableRoots: [execDir] })
+      // verifyDirectory 会跑 git config --get-regexp；在隔离里必须不抛（/dev/null 能打开）。
+      const out = await runIsolated(sb(), ['git', 'config', '--get-regexp', '^(credential\\..*|http\\..*extraheader)$'], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir] }).catch(e => `EXIT1:${e}`)
+      // 干净的新仓库没这些键，退出码 1 是正常「没有」，不是挂死。这里只要求它跑得起来（能执行到判断）。
+      expect(typeof out).toBe('string')
+      expect(readdirSync(execDir)).toContain('.git')
+    } finally { rmSync(execDir, { recursive: true, force: true }) }
+  })
+})

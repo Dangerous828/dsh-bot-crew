@@ -168,6 +168,9 @@ export function sandboxArgv(writableRoots: readonly string[], readableDeny: read
     '(allow process*)',
     '(allow signal)',
     '(allow file-read*)',
+    // /dev 要能读写：git 等工具会打开 /dev/null（读写模式），默认 deny 会让它们在隔离里直接挂。
+    // 这不是放水——设备节点不承载凭据；写面仍只放执行目录。
+    '(allow file-write* (subpath "/dev"))',
     writes,
     denies,
   ].join(' ')

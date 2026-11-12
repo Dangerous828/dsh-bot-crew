@@ -73,6 +73,9 @@ export const RuleSchema = z.object({ id: RuleIdSchema, name: z.string().trim().m
   sensitive: z.boolean().default(false) }).strict()
 export type Rule = z.infer<typeof RuleSchema>
 export const RoleModelSchema = z.object({ provider: z.string().trim().min(1), model: z.string().trim().min(1), reasoningEffort: z.string().trim().min(1).optional() }).strict()
+/** 一个路由 + 可选的备选路由；主路由解析不通时按顺序往下试，全不通才算「模型不可用」。 */
+export const RoleRouteSchema = RoleModelSchema.extend({ backup: RoleModelSchema.optional() }).strict()
+export type RoleRoute = z.infer<typeof RoleRouteSchema>
 export type RoleModel = z.infer<typeof RoleModelSchema>
 
 export const AllowedSchema = z.object({ id: z.string().trim().min(1).max(200), name: z.string().trim().max(100).optional() }).strict()
@@ -114,15 +117,15 @@ export const ConnectionsConfigSchema = z.object({
 export const EvalConfigSchema = z.object({
   mode: z.enum(['off', 'observe', 'auto']).default('observe'),
   timeoutSeconds: z.number().int().min(LIMITS.evalTimeoutSeconds.min).max(LIMITS.evalTimeoutSeconds.max).default(120),
-  model: RoleModelSchema.nullable().default(null),
+  model: RoleRouteSchema.nullable().default(null),
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
 /** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
 export const ExecutorConfigSchema = z.object({
-  model: RoleModelSchema.nullable().default(null),
-  /** 每位 Bot 的模型；没写的成员用 `model`。键是 team 花名册里的 bot_id。 */
-  botModels: z.record(z.string().regex(/^[a-z0-9_-]+$/), RoleModelSchema).default({}),
+  model: RoleRouteSchema.nullable().default(null),
+  /** 每位 Bot 的模型；没写的成员用 `model`。键是 team 花名册里的 bot_id。可带 backup 路由。 */
+  botModels: z.record(z.string().regex(/^[a-z0-9_-]+$/), RoleRouteSchema).default({}),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),

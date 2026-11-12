@@ -63,3 +63,32 @@ it('inherits the host when unset and fails unavailable routes before recording a
   await expect(initializeRoleModel(ctx, agent, { provider: 'unknown', model: 'x' })).rejects.toThrow('unknown provider')
   expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
 })
+
+it('falls back to the backup route when the primary provider cannot be resolved', async () => {
+  const { ctx, agent, resolve, request } = await fixture()
+  resolve.mockImplementation(async (value: { provider: string }) => {
+    if (value.provider === 'primary') throw new Error('provider is down')
+    return value
+  })
+  await initializeRoleModel(ctx, agent, { provider: 'primary', model: 'main', backup: { provider: 'backup', model: 'reserve' } })
+  await ctx.systemPrompt.assemble()
+  expect(await request()).toEqual({ provider: 'backup', model: 'reserve' })
+})
+
+it('uses the primary when it resolves and never touches the backup', async () => {
+  const { ctx, agent, resolve } = await fixture()
+  resolve.mockImplementation(async (value: { provider: string }) => {
+    if (value.provider === 'backup') throw new Error('should not be tried')
+    return value
+  })
+  await initializeRoleModel(ctx, agent, { provider: 'primary', model: 'main', backup: { provider: 'backup', model: 'reserve' } })
+  expect(resolve).toHaveBeenCalledTimes(1)
+})
+
+it('throws the last error only when both the primary and the backup fail', async () => {
+  const { ctx, agent, resolve } = await fixture()
+  resolve.mockRejectedValue(new Error('everything is down'))
+  await expect(initializeRoleModel(ctx, agent, { provider: 'primary', model: 'main', backup: { provider: 'backup', model: 'reserve' } }))
+    .rejects.toThrow('everything is down')
+  expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
+})

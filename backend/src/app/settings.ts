@@ -7,7 +7,7 @@ import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, Settings
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
-import { resolveRoleModel } from './role-models.ts'
+import { resolveRoutedModel } from './role-models.ts'
 import { changedPaths, settingsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
 import { setupChanged, type Setup } from './setup.ts'
@@ -189,7 +189,8 @@ export class Settings {
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
     if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
+      // 带 backup 的路由：主路由通就算通过；主路由不通但 backup 通，也放行（运行时会自动退到 backup）。
+      try { await resolveRoutedModel(this.host.context, model) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)

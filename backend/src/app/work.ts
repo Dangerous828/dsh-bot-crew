@@ -172,6 +172,8 @@ export function switchModel(settings: Settings, requested: { provider: string; m
   const selected = {
     provider: requested.provider, model: requested.model,
     ...requested.reasoningEffort ?? previous?.reasoningEffort ? { reasoningEffort: requested.reasoningEffort ?? previous?.reasoningEffort } : {},
+    // 面板换主模型时把原来的备选保留下来：换主模型不该顺手把兜底路由清掉。
+    ...previous?.backup ? { backup: previous.backup } : {},
   }
   if (requested.bot_id) {
     return { ...settings, executor: { ...settings.executor,

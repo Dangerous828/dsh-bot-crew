@@ -102,6 +102,10 @@ type app struct {
 	// 新消息就不再把视图拽回底部 —— 那会让人正在读的一段被抢走。
 	chatPinned bool
 
+	// messageMenu 记着哪条 Bot 回复展开了「…」。听播报收在这个菜单里，
+	// 不再逐条挂在消息流下面把同一屏切成一段一段。
+	messageMenu string
+
 	// models 是能切成什么。没读过就是 nil，界面上说「正在读」而不是「没有」。
 	models      *ModelCatalog
 	modelsError string
@@ -1306,7 +1310,8 @@ func (s *app) anyRunning() bool {
 	return false
 }
 
-// subtitle 是标题下面那行小字：谁在跑。
+// subtitle 是标题下面那行小字：现在什么状态、跑了多久。
+// 时长只从工单创建时间算；算不出就只报状态，不补一个猜的分钟数。
 func (s *app) subtitle() string {
 	if s.conversation == nil {
 		return "正在读…"
@@ -1314,31 +1319,76 @@ func (s *app) subtitle() string {
 	if len(s.conversation.Bots) == 0 {
 		return "队伍里还没有 Bot"
 	}
-	who := s.selectedBot
-	if who == "" {
-		who = s.conversation.DefaultBotID
+	if s.conversation.Status.Paused {
+		return "已暂停"
 	}
-	return "和" + s.nameOf(who) + "说话"
+	for _, task := range s.conversation.Tasks {
+		if task.Open {
+			label := "正在工作"
+			if elapsed := elapsedLabel(task.CreatedAt); elapsed != "" {
+				label += " · " + elapsed
+			}
+			return label
+		}
+	}
+	return "都在待命"
 }
 
+// title 说「谁 · 干什么」，与设计稿一致；职能读不到就只写名字，不编一个头衔。
 func (s *app) title() string {
 	if s.conversation != nil {
-		if len(s.conversation.Messages) > 0 {
-			last := s.conversation.Messages[len(s.conversation.Messages)-1]
-			if last.Role == "agent" {
-				return s.nameOf(last.BotID) + " 在回你"
-			}
-		}
-		// 没有正在回话的 Bot 时写这位的名字：标题说的是「和谁」，不是「这是什么控件」。
 		who := s.selectedBot
 		if who == "" {
 			who = s.conversation.DefaultBotID
 		}
-		if who != "" {
-			return s.nameOf(who)
+		name := s.nameOf(who)
+		if role := s.jobTitle(who); role != "" {
+			return name + " · " + role
 		}
+		return name
 	}
 	return "对话"
+}
+
+// jobTitle 只取花名册里明写的职能（role）。人设是自由文本，不拿来当头衔，
+// 免得把「前端 · 话少」整句塞进主标题；缺职能就只显示名字。
+func (s *app) jobTitle(botID string) string {
+	if s.conversation == nil {
+		return ""
+	}
+	for _, bot := range s.conversation.Bots {
+		if bot.ID == botID {
+			return strings.TrimSpace(bot.Role)
+		}
+	}
+	return ""
+}
+
+// elapsedLabel 把工单创建时间算成「N 分钟 / N 小时」；认不出或超过一天就交回空串，
+// 页头不显示一个推测出来的时长。
+func elapsedLabel(at string) string {
+	if at == "" {
+		return ""
+	}
+	var started time.Time
+	parsed := false
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z"} {
+		if t, err := time.Parse(layout, at); err == nil {
+			started, parsed = t, true
+			break
+		}
+	}
+	if !parsed {
+		return ""
+	}
+	minutes := int(time.Since(started).Minutes())
+	if minutes < 1 || minutes > 24*60 {
+		return ""
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%d 分钟", minutes)
+	}
+	return fmt.Sprintf("%d 小时", minutes/60)
 }
 
 // runningTicket 找一张正在跑的票：插队要交给它。
@@ -1944,6 +1994,18 @@ func lastOfTicket(messages []Message, index int) bool {
 	return true
 }
 
+// messageKey 给一条消息一个稳定的菜单键：优先 ID，其次请求号，
+// 都没有才用时间加正文兜底（同一条消息每帧取到同一个值）。
+func messageKey(m Message) string {
+	if m.ID != "" {
+		return m.ID
+	}
+	if m.RequestID != "" {
+		return m.RequestID
+	}
+	return m.At + "|" + m.Text
+}
+
 func (s *app) message(c *ui.Context, p Palette, message Message, showResult bool) {
 	fromBot := message.Role == "agent"
 	// 画板的中栏是「头像 + 正文」的排版，不是「一排气泡」：
@@ -1974,16 +2036,29 @@ func (s *app) message(c *ui.Context, p Palette, message Message, showResult bool
 				// 头像本身已经说明了是谁。连续几段同一个人发言时，再加名字会把
 				// 消息流读成一连串带标题的段落，Rhythm 就散了。
 				ui.Text(c, message.Text).FontSize(FontText).LineHeight(1.6).TextColor(p.Ink)
-				// 听播报：只给已有的 Bot 回复，念的就是这一条的原话。
-				// 播报与播放都在后台线程，按下去界面不会卡住。
-				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					label := "听播报"
-					if s.actions != nil && s.actions.speaking {
-						label = "正在播报…"
-					}
-					ui.Text(c, label).FontSize(FontTiny).TextColor(p.Accent).
-						Cursor(ui.CursorPointer).OnClick(func() { s.speak(message.Text) })
-				})
+				// 听播报收进这一条的「…」菜单：只有展开的那条显示入口，
+				// 消息流不再每条下面都挂一个「听播报」。
+				if s.actions != nil {
+					key := messageKey(message)
+					ui.Row(c).FillWidth().Justify(ui.End).Gap(6).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "…").FontSize(FontTiny).TextColor(p.Faint).
+							Cursor(ui.CursorPointer).OnClick(func() {
+								if s.messageMenu == key {
+									s.messageMenu = ""
+								} else {
+									s.messageMenu = key
+								}
+							})
+						if s.messageMenu == key {
+							label := "听播报"
+							if s.actions.speaking {
+								label = "正在播报…"
+							}
+							ui.Text(c, label).FontSize(FontTiny).TextColor(p.Accent).
+								Cursor(ui.CursorPointer).OnClick(func() { s.speak(message.Text) })
+						}
+					})
+				}
 			} else {
 				// 自己发的话：右侧深色气泡，右下角收成 4px 尖角（画板 `15px 15px 4px`）。
 				// 气泡独占一行、不撑满剩余宽度：MaxWidth 是测量出的上限，
@@ -2372,6 +2447,30 @@ func (s *app) withdraw(requestID string) {
 	}()
 }
 
+// composerNote 把输入区的小字收成一条：错误 > 动作回执 > 录音 > 常态。
+// 优先级定死，屏幕上只留一行，但「都在待命」这类常态语义不丢。
+func (s *app) composerNote() (string, bool) {
+	if s.withdrawError != "" {
+		return "撤回没成功：" + s.withdrawError, true
+	}
+	if s.steerNote != "" {
+		return s.steerNote, strings.Contains(s.steerNote, "没成功")
+	}
+	if s.actions != nil {
+		if note := s.actions.speakNote; note != "" {
+			return note, strings.Contains(note, "没成功") || strings.Contains(note, "没放出来")
+		}
+		if note := s.actions.voiceNote; note != "" {
+			return note, strings.Contains(note, "没") || strings.Contains(note, "不了")
+		}
+	}
+	if s.conversation != nil && len(s.conversation.Declined) > 0 {
+		declined := s.conversation.Declined[len(s.conversation.Declined)-1]
+		return "有一条队伍看过了没动手：" + declined.Reason, false
+	}
+	return s.queueLine(), false
+}
+
 func (s *app) composer(c *ui.Context, p Palette) {
 	// 排队中的消息也能看见：说了会排在后面，就得让人认得出排的是哪几句，并且能撤。
 	if previews := queuedPreviews(s.conversation, queuedPreviewCount); len(previews) > 0 {
@@ -2401,37 +2500,8 @@ func (s *app) composer(c *ui.Context, p Palette) {
 			}
 		})
 	}
-	// 撤回失败的话独立一行：409 之后时间线会重读，排队块可能已经空了，
-	// 但那句「没撤成」还得让人看见。
-	if s.withdrawError != "" {
-		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
-			ui.Text(c, "撤回没成功："+s.withdrawError).FontSize(FontTiny).TextColor(p.Danger)
-		})
-	}
-	if s.steerNote != "" {
-		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
-			ui.Text(c, s.steerNote).FontSize(FontTiny).TextColor(p.Faint)
-		})
-	}
-	// 播报结果只写这一行：后端没接、声音不存在、afplay 失败都要把原因说清，
-	// 不挂到顶部那条全局断连横幅里。
-	if s.actions != nil && s.actions.speakNote != "" {
-		note, ink := s.actions.speakNote, p.Faint
-		if strings.HasPrefix(note, "播报没成功") {
-			ink = p.Danger
-		}
-		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
-			ui.Text(c, note).FontSize(FontTiny).TextColor(ink)
-		})
-	}
-	// 读过但不动手的那几条也要说一声，否则屏幕上只有自己说的话，分不清「还在想」和「不会回」。
-	if s.conversation != nil && len(s.conversation.Declined) > 0 {
-		declined := s.conversation.Declined[len(s.conversation.Declined)-1]
-		ui.Row(c).FillWidth().PaddingX(ContentInset).PaddingY(8).Children(func() {
-			ui.Text(c, "有一条队伍看过了没动手："+declined.Reason).
-				FontSize(FontTiny).TextColor(p.Faint)
-		})
-	}
+	// 状态带只在输入区画一条：常态 / 错误 / 动作回执 / 录音状态由 composerNote() 定优先级，
+	// 不再叠成三行小字。撤回、插队、播报、识别的结果都进同一条。
 	// 输入区：画板里整块落在页面底上（不是另一条横带），左右各内缩 28；
 	// 输入卡圆角 13、白底细边，发送键是框内右端 32×32 的圆角按钮。
 	ui.Column(c).FillWidth().PaddingX(28).PaddingY(20).Gap(7).Background(p.Surface).Children(func() {
@@ -2490,22 +2560,28 @@ func (s *app) composer(c *ui.Context, p Palette) {
 				default:
 					ui.Text(c, "正在处理录音…").FontSize(FontTiny).TextColor(p.Faint)
 				}
-				if s.actions.voiceNote != "" {
-					ui.Text(c, s.actions.voiceNote).FontSize(FontTiny).TextColor(p.Faint).
-						Grow(1).MinWidth(0).MaxLines(1).Ellipsis("…")
-				}
+				// 录音状态的文字回执并入下方状态带；这一行只放动作按钮。
 			})
 		}
-		// 这句说明的是异步队伍的语义：你现在发的话排在哪。
+		// 状态带只有这一条：常态 / 错误 / 录音回执按 composerNote 的优先级占位。
+		note, danger := s.composerNote()
 		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Width(5).Height(5).Radius(RadiusDot).
 				Background(func() ui.Color {
+					if danger {
+						return p.Danger
+					}
 					if s.anyRunning() {
 						return p.Accent
 					}
 					return p.Hint
 				}())
-			ui.Text(c, s.queueLine()).FontSize(FontTiny).TextColor(p.Faint)
+			ink := p.Faint
+			if danger {
+				ink = p.Danger
+			}
+			ui.Text(c, note).FontSize(FontTiny).TextColor(ink).
+				Grow(1).MinWidth(0).MaxLines(1).Ellipsis("…")
 		})
 	})
 }
@@ -3240,7 +3316,7 @@ func (s *app) forgetMemory(name string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := s.client.ForgetMemory(ctx, name); err != nil {
-			s.memoryCh <- memoryResult{note: "忘掉没成功：" + err.Error()}
+			s.memoryCh <- memoryResult{note: actionNote("不再记住没成功", err)}
 			s.wake()
 			return
 		}
@@ -3296,12 +3372,9 @@ func (s *app) memoryPane(c *ui.Context, p Palette) {
 			}
 		})
 	})
-	// 脚注钉在列表下面：它说的不是某一条，是整本账的性质。
-	ui.Text(c, memoryNote).FontSize(FontTiny).TextColor(p.Faint)
+	// 机制说明不常驻主界面：按钮措辞与「已不再记住」回执已经说清状态，
+	// 账本怎么存属于内部实现，收进帮助层，不必向用户念一遍。
 }
-
-// memoryNote 是这一栏必须说的那句实话：忘掉不删行，只是不再进它下一次开口的上下文。
-const memoryNote = "忘掉的条目不删，只是不再进它下一次开口时的上下文。"
 
 // memorySummary 是栏头那行字：记得几条、忘掉几条、被替代几条。都在用的时候只写第一条。
 func memorySummary(view MemoryView) string {
@@ -3330,7 +3403,7 @@ func (s *app) memoryRow(c *ui.Context, p Palette, item MemoryItem) {
 		ui.Row(c).FillWidth().Children(func() {
 			ui.Text(c, memoryTitle(item)).FontSize(FontBodyWide).FontWeight(WeightCard).TextColor(ink).Grow(1)
 			if faded {
-				ui.Text(c, "已忘掉").FontSize(FontTiny).TextColor(p.Faint)
+				ui.Text(c, "已不再记住").FontSize(FontTiny).TextColor(p.Faint)
 			}
 		})
 		if brief := memoryBrief(item.Body); brief != "" {
@@ -3339,10 +3412,11 @@ func (s *app) memoryRow(c *ui.Context, p Palette, item MemoryItem) {
 		ui.Row(c).FillWidth().Children(func() {
 			ui.Text(c, memoryDetail(item)).FontSize(FontTiny).TextColor(p.Faint).Grow(1)
 			if item.Active() {
-				// 改与忘掉都只作用这一条：编辑层里填的是这条现在的标题与正文。
+				// 改与「不再记住」都只作用这一条：编辑层里填的是这条现在的标题与正文。
 				ui.Button(c, "编辑").OnClick(func() { s.editMemory(item) })
-				// 忘掉不可撤销（不删行、但不再用），所以它是一次就生效的按钮，不做二次确认的假把式。
-				ui.Button(c, "忘掉").OnClick(func() { s.forgetMemory(item.Name) })
+				// 后端只翻状态、不删行，也没有恢复动作，所以不做二次确认的假把式，
+				// 更不挂一个按下去没有用的「撤销」。重读后这一条会标成「已不再记住」。
+				ui.Button(c, "不再记住").OnClick(func() { s.forgetMemory(item.Name) })
 			}
 		})
 	})

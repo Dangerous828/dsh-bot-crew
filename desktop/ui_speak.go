@@ -19,11 +19,11 @@ func (s *app) speak(text string) {
 		defer cancel()
 		clip, err := s.client.Speak(ctx, text)
 		if err != nil {
-			s.deliver(actionResult{kind: "speak", note: "播报没成功：" + err.Error()})
+			s.deliver(actionResult{kind: "speak", note: actionNote("播报没成功", err)})
 			return
 		}
 		if err := playWav(clip.WAV, systemPlay); err != nil {
-			s.deliver(actionResult{kind: "speak", note: "播报没成功：" + err.Error()})
+			s.deliver(actionResult{kind: "speak", note: actionNote("播报没成功", err)})
 			return
 		}
 		note := "已念完"

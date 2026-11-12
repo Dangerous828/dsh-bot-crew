@@ -24,7 +24,7 @@ func (s *app) startVoice() {
 	recorder := voiceRecorderOf(a)
 	go func() {
 		if err := recorder.start(); err != nil {
-			s.deliver(actionResult{kind: "voice", state: "", note: "录音没开始：" + err.Error()})
+			s.deliver(actionResult{kind: "voice", state: "", note: actionNote("录音没开始", err)})
 			return
 		}
 		s.deliver(actionResult{kind: "voice", state: "recording", note: "正在录音，点「停止并识别」把话变成草稿"})
@@ -43,12 +43,12 @@ func (s *app) stopVoice() {
 	go func() {
 		raw, err := recorder.stop()
 		if err != nil {
-			s.deliver(actionResult{kind: "voice", state: "", note: "录音没收好：" + err.Error()})
+			s.deliver(actionResult{kind: "voice", state: "", note: actionNote("录音没收好", err)})
 			return
 		}
 		wav, err := normalizeVoiceWav(raw)
 		if err != nil {
-			s.deliver(actionResult{kind: "voice", state: "", note: "录音不合后端规格：" + err.Error()})
+			s.deliver(actionResult{kind: "voice", state: "", note: actionNote("录音不合规格", err)})
 			return
 		}
 		if s.client == nil {
@@ -59,7 +59,7 @@ func (s *app) stopVoice() {
 		defer cancel()
 		text, err := s.client.Voice(ctx, wav)
 		if err != nil {
-			s.deliver(actionResult{kind: "voice", state: "", note: "没识别成功：" + err.Error()})
+			s.deliver(actionResult{kind: "voice", state: "", note: actionNote("没识别成功", err)})
 			return
 		}
 		s.deliver(actionResult{kind: "voice", state: "", note: "识别好了，文字只在草稿里，没发出去", text: text, ok: true})

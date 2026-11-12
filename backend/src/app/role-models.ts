@@ -41,12 +41,69 @@ export async function resolveRoutedModel(ctx: Context, model: RoutedModel): Prom
   throw last instanceof Error ? last : new Error(String(last))
 }
 
-/** Seed a role's configured model onto a brand-new session before its first request, leaving later manual or durable selections intact. */
+/** 从 session 的事件里取最后一次持久化的模型选择（没有则 undefined）。 */
+function durableSelection(agent: Agent): ModelSelection | undefined {
+  let last: ModelSelection | undefined
+  for (const event of agent.session.snapshotEvents()) {
+    if (event.type === 'model/selection') last = (event as { data?: ModelSelection }).data
+  }
+  return last
+}
+
+/**
+ * 判断一条已有 selection 是否「还在配置体系里、可以保留」。
+ *
+ * 背景（这是 #4 那类静默卡死的根因）：主 Session 的 selection 是历史落盘的，可能指向一个
+ * 如今已不可用的 provider（例如内建的 `deepseek-account`——它没有 `DEEPSEEK_API_KEY`，只靠
+ * bundled catalog 兜底列模型，所以 `listModels` 永远「成功」但它根本调不通）。以前 initializeRoleModel
+ * 「有 selection 就跳过」，于是队伍永远绑死在死 provider 上、Eval 卡在 evaluating 直到超时。
+ *
+ * 确定性判据（不依赖网络探测，因为 provider 的兜底目录会骗人）：
+ * 1. **provider 必须与配置路由 model 的 provider 一致**。本部署的可用凭据只有一套（magpie），
+ *    selection 的 provider 一旦偏离配置，就是脱管的死选择，必须纠正。
+ * 2. 同 provider 下再看 `listModels` 目录里是否真有这个 model（防同一 provider 改名/下线）。
+ *
+ * 两条都满足才保留；否则纠正为配置路由。
+ */
+async function selectionInConfigFamily(ctx: Context, selection: ModelSelection, config: RoutedModel): Promise<boolean> {
+  if (selection.provider !== config.provider) return false
+  try {
+    const models = await ctx.llm.listModels(selection.provider)
+    return models.some(info => info.id === selection.model)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Seed a role's configured model onto a session.
+ *
+ * 行为：
+ * - 全新 session（没有 requestHeader、没有 selection）→ 注入配置的路由（主→备取第一条通的）。
+ * - 已有 selection 且**仍在配置体系内且可解析** → 保留（尊重人为/durable 选择，不覆盖）。
+ * - 已有 selection 但 **provider 偏离配置体系 / 模型已不在目录**（如内建 deepseek-account 无凭据）→ **重新注入配置的路由**。
+ *   这一条是修「选了新模型、重启又回到已下线的旧模型、队伍静默卡死」的根因：
+ *   旧 selection 不该成为永久枷锁，模型不可用就该被纠正，并在启动一致性检查里同步暴露。
+ */
 export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoutedModel | null): Promise<void> {
   if (!model) return
-  if (agent.session.requestHeader() || agent.session.snapshotEvents().some(event => event.type === 'model/selection')) return
+  const existing = durableSelection(agent)
+  if (existing) {
+    // 已有 durable selection：还在配置体系内且可解析就保留；否则这就是「脱管的死选择」，必须真正纠正。
+    if (await selectionInConfigFamily(ctx, existing, model)) return
+    // 关键：纠正**不能只 append 一条 selection**——已有会话早发过请求，initializeRoleModel 的「首帧注入」
+    // 只作用于第一次请求，append 对老会话不生效（这正是「重启又回旧模型」的最后一层原因）。
+    // 必须用 session/selectModel 真正切换：它更新 host.current，让之后的每一次请求都用新模型。
+    const replacement = await resolveRoutedModel(ctx, model)
+    await ctx.sessionController.selectModel({ sessionId: agent.session.id as never,
+      provider: replacement.provider, model: replacement.model,
+      ...(replacement.reasoningEffort ? { reasoningEffort: ReasoningEffortId(replacement.reasoningEffort) } : {}) })
+    await ctx.sessionPersistence.flush()
+    return
+  }
+  if (agent.session.requestHeader()) return // 有 requestHeader 却读不到 selection：无从判断，保持原样（交给启动检查兜底）。
+  // 全新会话：用主/备里第一条能解析的路由，注入首帧选择（不动全局 DSH 默认）。
   const selected = await resolveRoutedModel(ctx, model)
-  // Avoid selectModel because it mutates the global DSH default; inject the selection for the initial request only.
   agent.session.append('model/selection', selected)
   let initial = true
   let assembled: ModelSelection | undefined

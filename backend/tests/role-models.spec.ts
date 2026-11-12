@@ -10,8 +10,12 @@ afterEach(async () => { await Promise.all(contexts.splice(0).map(ctx => ctx.fibe
 async function fixture() {
   const ctx = new Context(); contexts.push(ctx); await ctx.plugin(SystemPrompt)
   const resolve = vi.fn(async value => value)
+  // 真实目录：默认每个 provider 都「有」它的模型（用调用参数回填），个别测试可 mockImplementation 覆盖。
+  const listModels = vi.fn(async (provider: string) => [{ id: 'keep' }, { id: 'one' }, { id: 'main' }, { id: 'reserve' }, { id: 'new' }, { id: 'default' }, { id: 'seed' }])
   const flush = vi.fn(async () => {})
-  ctx.reflect.provide('llm', { resolveCallConfig: resolve })
+  const selectModel = vi.fn(async (request: { provider: string; model: string }) => ({ selected: { provider: request.provider, model: request.model } }))
+  ctx.reflect.provide('llm', { resolveCallConfig: resolve, listModels })
+  ctx.reflect.provide('sessionController', { selectModel })
   ctx.reflect.provide('sessionPersistence', { flush })
   const session = Session.create(SessionId('role-model'))
   const agent = { ctx, session } as Agent
@@ -19,7 +23,7 @@ async function fixture() {
   installModelSelection(ctx, host)
   const request = () => agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ provider: 'seed', model: 'seed' }))
   const record = (selection: ModelSelection) => { const event = session.append('request/header', { header: { config: selection }, reason: 'initial' }); ctx.emit('session/event', session, event) }
-  return { ctx, agent, host, resolve, flush, request, record }
+  return { ctx, agent, host, resolve, listModels, selectModel, flush, request, record }
 }
 it('keeps prompt variables and initial routing on the role model without saving the host default', async () => {
   const { ctx, agent, request, record, flush } = await fixture()
@@ -46,13 +50,35 @@ it('lets a later explicit selection win without changing the in-flight assembled
   await ctx.systemPrompt.assemble()
   expect(await request()).toEqual(manual)
 })
-it.each(['header', 'selection'])('preserves a resumed Session with existing %s', async kind => {
-  const { ctx, agent, resolve } = await fixture()
+it('preserves a resumed Session whose selection is still in the configured provider family', async () => {
+  const { ctx, agent, listModels } = await fixture()
   const existing = { provider: 'existing', model: 'keep' }
-  if (kind === 'header') agent.session.append('request/header', { header: { config: existing }, reason: 'initial' })
-  else agent.session.append('model/selection', existing)
+  agent.session.append('model/selection', existing)
+  // 配置的 provider 与 existing 一致（同族）、且目录里仍有 keep → 保留。
+  await initializeRoleModel(ctx, agent, { provider: 'existing', model: 'other' })
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
+  expect(listModels).toHaveBeenCalledWith('existing')
+})
+it('leaves a session that already sent its first request untouched when it has no readable selection', async () => {
+  const { ctx, agent, resolve } = await fixture()
+  // 有 requestHeader、但没有 model/selection 事件可读：无从判断，保持原样（交给启动检查兜底）。
+  agent.session.append('request/header', { header: { config: { provider: 'existing', model: 'keep' } }, reason: 'initial' })
   await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'new' })
   expect(resolve).not.toHaveBeenCalled()
+  expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
+})
+it('reclaims a resumed Session whose existing selection points at a gone provider (root fix)', async () => {
+  const { ctx, agent, listModels, selectModel } = await fixture()
+  // 主 Session 落盘的旧选择：provider 已下线（deepseek-account 那种情况）——拉它的目录直接抛错。
+  const dead = { provider: 'deepseek-account', model: 'deepseek-flash' }
+  const event = agent.session.append('model/selection', dead); ctx.emit('session/event', agent.session, event)
+  // 内建 deepseek-account：provider 与配置(magpie)不同族 → 直接判脱管纠正，无需依赖 listModels 抛错
+  // （它其实会用 bundled catalog 兜底返回假列表，所以不能信它的目录）。
+  listModels.mockImplementation(async () => [{ id: 'workbuddy/deepseek-v4.1-flash-500k' }])
+  // 配置里已经是能用的 workbuddy：旧死选择应被纠正成它，而不是跳过保持坏的。
+  await initializeRoleModel(ctx, agent, { provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' })
+  // 真正用 selectModel 切换（不是 append），这样老会话之后的请求也换模型，重启不再回旧状态。
+  expect(selectModel).toHaveBeenCalledWith(expect.objectContaining({ provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' }))
 })
 it('inherits the host when unset and fails unavailable routes before recording a selection', async () => {
   const { ctx, agent, resolve, request } = await fixture()

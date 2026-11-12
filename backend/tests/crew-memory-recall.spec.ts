@@ -180,3 +180,14 @@ describe('settle: ticket conclusions', () => {
 function lead(): string {
   return defaultBot({ bots: [{ bot_id: 'lead', name: 'Lead', role: 'default', memory_namespace: 'bot/lead' }], default_bot_id: 'lead' }).bot_id
 }
+
+describe('score: 使用强化', () => {
+  const entry = (over: Partial<MemoryEntry> = {}): MemoryEntry => ({
+    name: 'bot-lead-x', description: '回复先给结论', body: '回复先给结论', type: 'feedback', status: 'candidate',
+    importance: 5, toHub: false, dedupe_key: 'x', created: 1000, updated: 1000, bot_id: 'lead', state: 'active', ...over })
+  it('近期被召回过的，同等相关度下打分更高', () => {
+    const fresh = score('回复结论', entry({ lastUsedAt: 1000 }), 1000)
+    const stale = score('回复结论', entry({ lastUsedAt: 1000 }), 1000 + 60 * 86_400)
+    expect(fresh).toBeGreaterThan(stale)
+  })
+})

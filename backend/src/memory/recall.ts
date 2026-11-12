@@ -87,12 +87,15 @@ export function freshness(entry: Pick<MemoryEntry, 'updated'>, now = Date.now() 
   return 1 / (1 + days / 30)
 }
 
-/** 权重：相关度为主，新鲜度为辅；`importance`（1..5）只是同分时的次序。 */
+/** 权重：相关度为主，新鲜度为辅，再叠重要度与「常被命中」的加成；同分次序由 rank 决定。 */
 export function score(query: string, entry: MemoryEntry, now = Date.now() / 1000): number {
   const relevant = relevance(query, entry)
   if (relevant <= 0) return 0
   const weight = (entry.importance ?? 4) / 5
-  return relevant * (1 + freshness(entry, now) * 0.5) * (0.8 + weight * 0.4)
+  // 使用强化：偶尔被召回、被需要的记忆加权；长期躺着没被调起的，靠 freshness 自然降权。
+  // lastUsedAt 缺席（从没被召回）不加成也不惩罚 —— 新记忆还没机会证明自己。
+  const used = entry.lastUsedAt === undefined ? 0 : freshness({ updated: entry.lastUsedAt }, now) * 0.2
+  return relevant * (1 + freshness(entry, now) * 0.5 + used) * (0.8 + weight * 0.4)
 }
 
 export interface RecallOptions {

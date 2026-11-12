@@ -81,8 +81,10 @@ cd backend && ./scripts/dsh-superagent status|start|restart   # 默认 profile s
 - [x] 界面文案按实测延迟区分「P2P 直连 / 隧道中继（Xms）」（`CrewRoute.tunnelLabel`，40ms 为界，单测覆盖 1/12/39/40/137/146/null）
 - [x] 跨网段真机复验：手机在 `cp-net-6F`、Mac 在 `192.168.113.134`，App 探针稳态 **11ms** → 界面「P2P 直连」，与 LAN 基线同量级、比 DERP 的 130ms+ 低一个数量级，有实测支撑
 - [x] 代码入库并推送：`890dd2e`（20 改 + 15 新，`.so` 已忽略、`scripts/crew-watch/` 属他人未动）；后端 1667 例、App 201 例全过
+- [x] 宿主侧推送链路接上并入库：`c0a6599`（`Tunnel.push` + `runtime.attachPusher` + `index.ts` 接线，用真中转端到端验过）
+- [x] 设备号校验 bug 修掉并入库：`5b2556d` —— 见下面 §九，这条曾让推送 100% 静默失败
 - [ ] 家里路由器上重测打洞（那台若支持 UPnP，portmapper 已编译进来，可能真能直连）
-- [ ] 推送真机验：`pushRegister` / 断网 `push queued` / 重连 `push flushed`
+- [ ] **App 侧推送接收（从零开始，见 §九）**：`pushRegister` 上报、长连接收 `pushSend`、通知权限与展示
 - [ ] 播报、审批三档、语音、hourly 账、记忆 settle/recall 的真机验（交接旧文 §五 那批）
 - [ ] `--allow` 客户端白名单：目前靠 `--psk`（默认开）+ 应用层设备凭据；要收紧得让手机先上报 node key
 - [ ] jniLibs 的 `.so` 换版本后建议 `clean` 一次再打 APK（AGP 增量打包会留死字节，实测能多出 16.6MB）
@@ -103,3 +105,39 @@ cd backend && ./scripts/dsh-superagent status|start|restart   # 默认 profile s
 - K80（`PEDM00`，arm64-v8a，Android 14）：`svc power stayon true` + 锁屏禁不掉（`locksettings set-disabled true` 返回成功但 `get-disabled` 仍是 false，ColorOS 不认），**所以别让它息屏**；一旦息屏就要人工指纹解锁
 - 测试机网络：`7x_Acc_5G`（192.168.113.x，Mac 所在）与 `cp-net-6F`（192.168.111.x）是两个不同网段，可用来做跨网段验证
 - `~/.dsh/state/superagent/mobile-p2p-addr` 存当前 tc-addr；`mobile-public-url` 存公网入口
+
+## 九、推送链路的真实拓扑（2026-11-12 13:10 查清）
+
+这一段是给下一个接手的人的，因为「推送待办」过去几轮一直被当成「验一下」，实际是三条链里只通了一条。
+
+```
+宿主 pushNotice
+  └─① Tunnel.push → T.pushSend → wss://jarvis.kentonnie.top/crew-relay/tunnel
+        └─ 中转：device 在线就直送、离线留件（push delivered / push queued / push flushed）
+              └─② 手机长连接收 T.pushSend      ← 这一环不存在
+                    └─③ 系统通知展示            ← 这一环不存在
+```
+
+**① 宿主 → 中转：已通，真机验过**
+`Tunnel.push()` 只在 `state==='live'` 时发（连接建起来但没注册成功的那一段，中转不认这条隧道）；空正文也挡在宿主侧。真实验证：临时隧道 `kenton-mac-pushtest` 连上真中转，`push=true`，帧确实发出。中转 `/crew-relay/health` 返回 `tunnels:1`（就是宿主那条 `kenton-mac`）。
+
+**②③ 手机侧：一行代码都没有**
+- App 是**纯 HTTP**（`HttpURLConnection`），没有 WebSocket，所以发不出 `pushRegister`
+- 没有任何地方处理 `T.pushSend`
+- `AndroidManifest.xml` 里**没有通知权限、没有 Service、没有 FCM**
+
+所以待办「推送真机验」的真实工作量是**新建两条链**，不是验收。要做的最小版本：App 起一条到中转的 WS（或复用 P2P 隧道）→ 发 `pushRegister{deviceId, platform, token}` → 收 `pushSend` → 用 `NotificationManager` 弹出（Android 13+ 要 `POST_NOTIFICATIONS` 运行时权限）。系统推送（FCM/APNs）是第三档，要账号与凭据，`push.ts` 已按 `no_provider` 如实处理，可以不做。
+
+**踩过的坑：设备号正则曾让推送 100% 静默失败**
+`push.ts` 的 `DEVICE_ID` 原为 `/^dev_[a-z0-9]{6,40}$/`，注释还写「与设备表一致」；但设备表里三条真实记录是 `crew-desktop`、`d021988751fdd554`、`66e74d226c1e38fa`，**一个都不带 `dev_` 前缀**（手机报的是 `ANDROID_ID`）。中转侧 `pushRegister`/`pushSend` 两处同样的内联正则也直接 `return`。后果是每一帧都被丢、日志里连 `push delivered/queued` 都不出现 —— 最难查的那种。已在 `5b2556d` 修正为 `/^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$/`（只挡空、带空白、过长），测试样例也从假的 `dev_abc123` 换成真实形状。
+
+**中转地址与密钥**
+- 地址：`wss://jarvis.kentonnie.top/crew-relay/tunnel`；健康检查 `/crew-relay/health` 返回 `{ok,uptimeMs,tunnels}`
+- 配置在仓库外：`~/.config/crew-desktop/relay.env`（600），`dsh-superagent` 启动时 `set -a; . relay.env` 载入
+- 变量：`CREW_RELAY_URLS` / `CREW_RELAY_INSTANCE`（`kenton-mac`）/ `CREW_RELAY_SECRET` / `CREW_RELAY_ADMIN_TOKEN`
+- **不要**把密钥写进仓库或日志
+
+**手工验证脚本**（要外网，不进常规套件）
+```bash
+cd backend && ./node_modules/.bin/vitest run tests/manual/live-push.spec.ts
+```

@@ -11,7 +11,7 @@
 | 提交钩子 | pre-commit | 设计稿一致性、两端一致性、desktop vet + 测试全通过 |
 | 后端类型检查 | `./node_modules/.bin/tsc --noEmit` | 退出 0 |
 | 后端测试 | `./node_modules/.bin/vitest run --reporter=dot` | 102 文件 / 1729 例通过 |
-| 画板检查 | `artifact.mjs check designs/personal-agent` | 由画板补齐那一批跑，结果记在 #7 |
+| 画板检查 | `artifact.mjs check designs/personal-agent` | 13 张画板 / problems 0（四张右栏画板补齐后） |
 
 `pnpm build`（tsdown）与 `./scripts/doctor.sh` 的状态见各自小节；`pnpm build` 会重写 `backend/lib/`，运行态宿主加载的是它，跑之前先确认没有别的会话在改同目录。
 

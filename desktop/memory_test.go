@@ -86,6 +86,57 @@ func TestMemoryClientRoundTrip(t *testing.T) {
 	}
 }
 
+// 后端改记忆失败时仍是 HTTP 200，只在正文里写 ok:false（mobile-http.ts:536-546）。
+// 200 不等于成功：客户端必须把 reason 带回来，不能让界面以为已经改完。
+func TestMemoryWriteReportsBackendRefusal(t *testing.T) {
+	calls := []struct {
+		name string
+		call func(c *Client) error
+	}{
+		{"forget", func(c *Client) error { return c.ForgetMemory(context.Background(), "bot-lead-a") }},
+		{"edit", func(c *Client) error { return c.EditMemory(context.Background(), "bot-lead-a", "标题", "正文") }},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"ok":false,"reason":"后端还没有接入记忆"}`))
+			}))
+			defer server.Close()
+			err := tc.call(New(server.URL, "token", ""))
+			if err == nil {
+				t.Fatal("HTTP 200 + ok:false 被当成了成功")
+			}
+			if !strings.Contains(err.Error(), "后端还没有接入记忆") {
+				t.Errorf("没把后端的 reason 带回来：%v", err)
+			}
+		})
+	}
+}
+
+// forget 找不到那条时后端回 {ok:false, name}，没有 reason（mobile-http.ts:537）。
+// 没有 reason 也照样是失败，得给一句兜底的话。
+func TestMemoryWriteRefusalWithoutReasonStillFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":false,"name":"bot-lead-a"}`))
+	}))
+	defer server.Close()
+	err := New(server.URL, "token", "").ForgetMemory(context.Background(), "bot-lead-a")
+	if err == nil || err.Error() == "" {
+		t.Fatalf("ok:false 无 reason 必须报错，实际 %v", err)
+	}
+}
+
+// 成功那一侧是 200 + ok:true；修完不能把正常写入也报成失败。
+func TestMemoryWriteAcceptsOK(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"name":"bot-lead-a"}`))
+	}))
+	defer server.Close()
+	if err := New(server.URL, "token", "").EditMemory(context.Background(), "bot-lead-a", "标题", "正文"); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+}
+
 // 成本那一句：没上报的步数必须写出来，「读不到」绝不能写成 0。
 func TestSpendLineKeepsUnaccountedStepsVisible(t *testing.T) {
 	if got := spendLine(nil); got != "用量：没有模型调用记录" {

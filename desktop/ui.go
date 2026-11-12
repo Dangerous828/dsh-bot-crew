@@ -215,6 +215,9 @@ type app struct {
 	auditOf   map[string]*AuditRow
 	auditNote map[string]string
 	replyOf   map[string]*ReplySpends
+	// actions 是记忆编辑 / 播报 / 接手 / 语音输入这四个入口的状态。
+	// 后台线程只往 results 送结果，主线程在 drain 里应用，不跨线程碰同一份状态。
+	actions *actionState
 }
 
 // routinesResult 是一次读「常规任务」的结果。view 为 nil 时 note 说的是为什么读不到。
@@ -466,6 +469,9 @@ func (s *app) view(c *ui.Context) {
 		s.fitPaneWidths(c)
 		if s.editingBot != "" {
 			s.botEditor(c, p)
+		}
+		if s.actions != nil && s.actions.editingMemory != "" {
+			s.memoryEditor(c, p)
 		}
 	})
 }
@@ -811,6 +817,11 @@ func (s *app) drain(c *ui.Context) {
 		case result := <-s.memoryCh:
 			s.loadingMemory = false
 			s.memory, s.memoryNote = result.view, result.note
+			c.Invalidate()
+		case result := <-s.actions.results:
+			// 四个动作入口的结果都在这里落到状态上；播报失败、接手回执、识别草稿
+			// 都不该挂到顶部那条全局断连横幅里。
+			s.applyAction(result)
 			c.Invalidate()
 		case result := <-s.ticketOut:
 			delete(s.loadingTicket, result.ticket)
@@ -1963,6 +1974,16 @@ func (s *app) message(c *ui.Context, p Palette, message Message, showResult bool
 				// 头像本身已经说明了是谁。连续几段同一个人发言时，再加名字会把
 				// 消息流读成一连串带标题的段落，Rhythm 就散了。
 				ui.Text(c, message.Text).FontSize(FontText).LineHeight(1.6).TextColor(p.Ink)
+				// 听播报：只给已有的 Bot 回复，念的就是这一条的原话。
+				// 播报与播放都在后台线程，按下去界面不会卡住。
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					label := "听播报"
+					if s.actions != nil && s.actions.speaking {
+						label = "正在播报…"
+					}
+					ui.Text(c, label).FontSize(FontTiny).TextColor(p.Accent).
+						Cursor(ui.CursorPointer).OnClick(func() { s.speak(message.Text) })
+				})
 			} else {
 				// 自己发的话：右侧深色气泡，右下角收成 4px 尖角（画板 `15px 15px 4px`）。
 				// 气泡独占一行、不撑满剩余宽度：MaxWidth 是测量出的上限，
@@ -2392,6 +2413,17 @@ func (s *app) composer(c *ui.Context, p Palette) {
 			ui.Text(c, s.steerNote).FontSize(FontTiny).TextColor(p.Faint)
 		})
 	}
+	// 播报结果只写这一行：后端没接、声音不存在、afplay 失败都要把原因说清，
+	// 不挂到顶部那条全局断连横幅里。
+	if s.actions != nil && s.actions.speakNote != "" {
+		note, ink := s.actions.speakNote, p.Faint
+		if strings.HasPrefix(note, "播报没成功") {
+			ink = p.Danger
+		}
+		ui.Row(c).FillWidth().PaddingX(28).PaddingY(2).Children(func() {
+			ui.Text(c, note).FontSize(FontTiny).TextColor(ink)
+		})
+	}
 	// 读过但不动手的那几条也要说一声，否则屏幕上只有自己说的话，分不清「还在想」和「不会回」。
 	if s.conversation != nil && len(s.conversation.Declined) > 0 {
 		declined := s.conversation.Declined[len(s.conversation.Declined)-1]
@@ -2434,6 +2466,36 @@ func (s *app) composer(c *ui.Context, p Palette) {
 				}).OnClick(s.send)
 			}
 		})
+		// 语音输入：录音 → 16k mono WAV → 识别 → 文字只进草稿，绝不自动发。
+		// 权限、录音、转码、识别都在后台线程；取消会把临时文件与录音器一起收走。
+		if s.actions != nil {
+			ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+				switch s.actions.voiceState {
+				case "":
+					ui.Row(c).PaddingX(9).Height(28).Radius(RadiusChip).Background(p.Surface).
+						BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).
+						OnClick(s.startVoice).Children(func() {
+						ui.Text(c, "录音").FontSize(FontTiny).TextColor(p.Muted)
+					})
+				case "recording":
+					ui.Row(c).PaddingX(9).Height(28).Radius(RadiusChip).Background(p.AccentSoft).
+						Center().Cursor(ui.CursorPointer).OnClick(s.stopVoice).Children(func() {
+						ui.Text(c, "停止并识别").FontSize(FontTiny).TextColor(p.Accent)
+					})
+					ui.Row(c).PaddingX(9).Height(28).Radius(RadiusChip).Background(p.Card).
+						BorderWidth(1).BorderColor(p.Line).Center().Cursor(ui.CursorPointer).
+						OnClick(s.cancelVoice).Children(func() {
+						ui.Text(c, "取消").FontSize(FontTiny).TextColor(p.Warn)
+					})
+				default:
+					ui.Text(c, "正在处理录音…").FontSize(FontTiny).TextColor(p.Faint)
+				}
+				if s.actions.voiceNote != "" {
+					ui.Text(c, s.actions.voiceNote).FontSize(FontTiny).TextColor(p.Faint).
+						Grow(1).MinWidth(0).MaxLines(1).Ellipsis("…")
+				}
+			})
+		}
 		// 这句说明的是异步队伍的语义：你现在发的话排在哪。
 		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Width(5).Height(5).Radius(RadiusDot).
@@ -2728,6 +2790,8 @@ func (s *app) workPane(c *ui.Context, p Palette) {
 				})
 				ui.Text(c, s.emptyTabTitle()).FontSize(FontLabel).FontWeight(WeightName).TextColor(p.Muted)
 				ui.Text(c, "队伍接到的活会出现在这里。").FontSize(FontBody).TextColor(p.Hint)
+				// 没有在跑的票就没有「接手」这回事：空态也如实说，不画一个按下去没活儿的按钮。
+				ui.Text(c, "现在没有在跑的工单，没有可接手的活儿。").FontSize(FontTiny).TextColor(p.Faint)
 			})
 		}
 	} else {
@@ -3275,6 +3339,8 @@ func (s *app) memoryRow(c *ui.Context, p Palette, item MemoryItem) {
 		ui.Row(c).FillWidth().Children(func() {
 			ui.Text(c, memoryDetail(item)).FontSize(FontTiny).TextColor(p.Faint).Grow(1)
 			if item.Active() {
+				// 改与忘掉都只作用这一条：编辑层里填的是这条现在的标题与正文。
+				ui.Button(c, "编辑").OnClick(func() { s.editMemory(item) })
 				// 忘掉不可撤销（不删行、但不再用），所以它是一次就生效的按钮，不做二次确认的假把式。
 				ui.Button(c, "忘掉").OnClick(func() { s.forgetMemory(item.Name) })
 			}
@@ -3586,6 +3652,26 @@ func (s *app) taskCard(c *ui.Context, p Palette, task Task) {
 					}()
 				})
 			})
+		}
+		// 接手：只给还在跑的票。回执严格按后端 {ok, stopped} 说，没确认就不写「已接手」。
+		if task.Open {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Grow(1)
+				// 这一行自己接点击：接手是另一件事，不能让它顺手把卡片也展开了。
+				label := "接手 →"
+				if s.actions != nil && s.actions.takeoverBusy[task.ID] {
+					label = "接手中…"
+				}
+				ui.Text(c, label).FontSize(FontTiny).TextColor(p.Accent).
+					Cursor(ui.CursorPointer).OnClick(func() { s.takeoverTask(task) })
+			})
+		}
+		if s.actions != nil {
+			if note := s.actions.takeoverNote[task.ID]; note != "" {
+				ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
+					ui.Text(c, note).FontSize(FontTiny).TextColor(p.Muted)
+				})
+			}
 		}
 		// 执行经过：整张卡都能展开，收起来再点一次。
 		//
@@ -4202,16 +4288,23 @@ func shortTime(at string) string {
 //
 // 种类只决定点的颜色，不改文字 —— 读的人要的是「它做了什么」，
 // 不是一串状态码。
-func (s *app) workRow(c *ui.Context, p Palette, step WorkStep) {
-	dot := p.Faint
-	switch step.Kind {
-	case "tool":
-		dot = p.Accent
-	case "error":
-		dot = p.Danger
-	case "say":
-		dot = p.Warn
+// workDot 把一步的种类换成左边那个点的颜色。种类只决定颜色，不改文字；
+// 取值是后端 WorkStep.kind：said / did / checked（work.ts）。
+func workDot(kind string, p Palette) ui.Color {
+	switch kind {
+	case "did":
+		return p.Accent
+	case "said":
+		return p.Warn
+	case "checked":
+		return p.Muted
+	default:
+		return p.Faint
 	}
+}
+
+func (s *app) workRow(c *ui.Context, p Palette, step WorkStep) {
+	dot := workDot(step.Kind, p)
 	ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Start).PaddingY(3).Children(func() {
 		ui.Row(c).Width(5).Height(5).Radius(RadiusDot).Background(dot)
 		ui.Column(c).Grow(1).Gap(2).Children(func() {

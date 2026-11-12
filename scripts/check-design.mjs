@@ -121,11 +121,25 @@ for (const color of brandColors) {
 //     上面那份品牌色清单是手写的，漏了就会一直漏：空态的暖灰虚线框
 //     (#D9D3C9 / #B8B1A5) 和卡内行分隔 (#F4F0EA) 就是这么漏掉的 ——
 //     实现里拿 Line / Faint 顶替，画出来发灰，和画板不是一套。
+//     例外：画板色本身对比度不达标、实现在暗色调色板里统一换成了更深一档的色。
+//     这种「画板值 → 实现值」是有意的替换，不是漏实现；列在这里，实现里必须真有
+//     替换后的值，否则仍算问题。
+const DESKTOP_COLOR_REPLACED = new Map([
+  // #A9A294 在亮底上只有 2.41:1，达不到 WCAG AA；实现（theme.go Hint）换成 #6F6A60。
+  ['#A9A294', '#6F6A60'],
+])
 const allBoardColors = new Set()
 for (const { text } of desktopBoards) {
   for (const m of text.matchAll(/#[0-9A-Fa-f]{6}\b/g)) allBoardColors.add(m[0].toUpperCase())
 }
 for (const color of [...allBoardColors].sort()) {
+  const replacement = DESKTOP_COLOR_REPLACED.get(color)
+  if (replacement) {
+    if (!theme.toUpperCase().includes(replacement.toUpperCase())) {
+      problems.push(`桌面画板里的 ${color} 应替换为 ${replacement}，但 theme.go 里没有 ${replacement}`)
+    }
+    continue
+  }
   if (!theme.toUpperCase().includes(color)) {
     problems.push(`桌面画板里的 ${color} 在 theme.go 里没有对应值`)
   }

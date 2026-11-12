@@ -446,16 +446,35 @@ func (c *Client) Memory(ctx context.Context, bot string) (*MemoryView, error) {
 	return &view, nil
 }
 
+// memoryAck 是记忆写入的回执。后端失败时仍是 HTTP 200，只在正文里写 ok:false。
+type memoryAck struct {
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason"`
+}
+
 // ForgetMemory 让队伍忘掉一条。只翻状态，不删行。
 func (c *Client) ForgetMemory(ctx context.Context, name string) error {
-	body := map[string]string{"action": "forget", "name": name}
-	return c.do(ctx, http.MethodPost, "/api/mobile/memory", body, nil)
+	return c.memoryWrite(ctx, map[string]string{"action": "forget", "name": name})
 }
 
 // EditMemory 改一条的标题与正文。
 func (c *Client) EditMemory(ctx context.Context, name, description, text string) error {
-	body := map[string]string{"action": "edit", "name": name, "description": description, "body": text}
-	return c.do(ctx, http.MethodPost, "/api/mobile/memory", body, nil)
+	return c.memoryWrite(ctx, map[string]string{"action": "edit", "name": name, "description": description, "body": text})
+}
+
+// memoryWrite 改记忆账本。200 只说明请求到了，成没成要看正文的 ok。
+func (c *Client) memoryWrite(ctx context.Context, body map[string]string) error {
+	var ack memoryAck
+	if err := c.do(ctx, http.MethodPost, "/api/mobile/memory", body, &ack); err != nil {
+		return err
+	}
+	if !ack.OK {
+		if ack.Reason != "" {
+			return errors.New(ack.Reason)
+		}
+		return errors.New("队伍没有改这条记忆")
+	}
+	return nil
 }
 
 // SpendStep 是一次模型调用的账。用量与 DSH 的 TokenUsage 同名。

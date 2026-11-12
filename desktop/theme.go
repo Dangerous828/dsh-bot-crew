@@ -93,7 +93,7 @@ var LightPalette = Palette{
 	SelectedAlt: ui.Hex("#F3F0EA"), AccentSoft2: ui.Hex("#EAF1EC"), WarnSoft2: ui.Hex("#F6EEE6"),
 	WarnEdge: ui.Hex("#E9D9C9"), DangerEdge: ui.Hex("#E5C4C4"), Footer: ui.Hex("#F8F5F1"),
 	// 以下四个是从画板的实际计算样式里取的，源码里 grep 不到但它们真的画出来了。
-	Hint:       ui.Hex("#A9A294"), // 比 Faint 再淡一档：占位、极弱说明
+	Hint:       ui.Hex("#6F6A60"), // 占位与辅助说明在亮色底上仍有足够对比度
 	DangerSoft: ui.Hex("#FDF6F6"), // 失败卡的底
 	Raised:     ui.Hex("#F8F5F1"), // 比 Card 浅一点的那层
 	InkStrong:  ui.Hex("#171717"), // 标题那种更实的黑

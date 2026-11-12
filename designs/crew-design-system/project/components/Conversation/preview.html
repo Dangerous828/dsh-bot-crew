@@ -1,0 +1,46 @@
+<!-- @dsCard group="Composition" height=248 subtitle="对话：三档灰、无气泡 Bot 正文、右下 4px 尖角" -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin:0; background:var(--surface); color:var(--ink);
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; padding:22px 28px; }
+  .msg { display:flex; gap:11px; align-items:flex-start; margin-bottom:18px; }
+  .av { width:28px; height:28px; border-radius:var(--radius-md); background:var(--accent-soft);
+        color:var(--accent); font-size:14px; font-weight:640; flex:none;
+        display:flex; align-items:center; justify-content:center; }
+  .text { font-size:14px; line-height:1.6; max-width:76%; }
+  .meta { font-size:12px; color:var(--tertiary); margin-top:5px; }
+  .mine { margin-left:auto; background:var(--user-bubble); color:var(--user-ink);
+          padding:9px 14px; border-radius:var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
+          font-size:14px; line-height:1.6; max-width:60%; }
+  .wrap { display:flex; }
+  .rule { height:1px; background:var(--line); margin:18px 0; }
+  .legend { font-size:12px; color:var(--tertiary); line-height:1.7; }
+  .legend code { color:var(--muted); }
+</style>
+</head>
+<body>
+  <div class="msg">
+    <div class="av">大</div>
+    <div>
+      <div class="text">收到：查一下今天的天气，马上回你。</div>
+      <div class="meta">大哥 · 刚刚</div>
+    </div>
+  </div>
+  <div class="wrap"><div class="mine">今天天气怎么样</div></div>
+  <div class="rule"></div>
+  <div class="msg">
+    <div class="av">大</div>
+    <div>
+      <div class="text">按上海位置查：今天 9–18°C，现在 14°C，全天基本无雨。</div>
+      <div class="meta">大哥 · 2 分钟前</div>
+    </div>
+  </div>
+  <div class="legend">
+    <code>ink</code> 正文 16.00:1 · <code>muted</code> 7.37:1 · <code>tertiary</code> 5.12:1（旧 <code>hint</code> 只有 2.41:1）。<br>
+    分层靠 <code>--line</code> 与 <code>--space-*</code>，不靠「再淡一档的灰」。
+  </div>
+</body>
+</html>

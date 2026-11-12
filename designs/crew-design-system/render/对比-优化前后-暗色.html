@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Crew · 界面优化前后对照</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; }
+  body { width:1600px; background:#121114; color:#F2EFEA;
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+         padding:32px 40px 28px; }
+  header { margin-bottom:22px; }
+  h1 { font-size:26px; font-weight:640; margin:0 0 6px; letter-spacing:-.3px; }
+  .sub { font-size:13px; color:#C4BFB6; }
+  .sub code { background:#2A2830; padding:1px 5px; border-radius:4px; }
+
+  .pair { display:flex; gap:32px; }
+  .pane { width:744px; flex:none; }
+  .pane-head { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; }
+  .pane-title { font-size:16px; font-weight:640; }
+  .pane-note { font-size:12px; color:#C4BFB6; }
+  .pill { font-size:11px; padding:3px 9px; border-radius:5px; font-weight:600; }
+  .pill.oldp { background:#3A2A1C; color:#E0A574; }
+  .pill.newp { background:#1E3A34; color:#5FBFA8; }
+
+  /* 两版共用同一份组件定义，只换 CSS 变量 */
+  .old {
+    --surface:#17161A; --card:#232228; --selected:#2A2830; --line:#33313A;
+    --ink:#F2EFEA; --muted:#C4BFB6; --faint:#928C82; --hint:#6E6860;
+    --accent:#5FBFA8; --accent-soft:#1E3A34; --warn:#E0A574; --danger:#E58A80;
+    --glyph:#928C82;
+    --fs-meta:10.5px; --fs-small:11px; --fs-body:12px; --fs-msg:14px; --fs-title:15px;
+    --r-item:8px; --r-card:10px; --r-big:13px; --r-bubble:15px;
+  }
+  .new {
+    --surface:#17161A; --card:#232228; --selected:#343139; --line:#413E48;
+    --ink:#F2EFEA; --muted:#C4BFB6; --faint:#9A938A; --hint:#9A938A;
+    --accent:#5FBFA8; --accent-soft:#1E3A34; --warn:#E0A574; --danger:#E58A80;
+    --glyph:#756E65;
+    --fs-meta:12px; --fs-small:12px; --fs-body:13px; --fs-msg:14px; --fs-title:15px;
+    --r-item:8px; --r-card:12px; --r-big:16px; --r-bubble:12px;
+  }
+
+  .win { display:grid; grid-template-columns:186px 1fr 200px; height:508px;
+         background:var(--surface); border:1px solid var(--line); border-radius:var(--r-card);
+         overflow:hidden; }
+  .col { padding:14px 12px; min-width:0; }
+  .col + .col { border-left:1px solid var(--line); }
+  .ct { font-size:var(--fs-title); font-weight:640; color:var(--ink); margin-bottom:12px; }
+
+  /* 左栏：花名册 */
+  .bot { display:flex; gap:8px; align-items:flex-start; padding:8px; border-radius:var(--r-item); margin-bottom:4px; }
+  .bot.sel { background:var(--selected); }
+  .av { width:30px; height:30px; flex:none; border-radius:var(--r-item); background:var(--accent-soft);
+        color:var(--accent); font-size:14px; font-weight:640; display:flex; align-items:center; justify-content:center; }
+  .bn { font-size:var(--fs-body); font-weight:600; color:var(--ink); }
+  .br { font-size:var(--fs-meta); color:var(--faint); margin-top:2px; line-height:1.4; }
+  .bs { font-size:var(--fs-meta); color:var(--hint); margin-top:2px; }
+  .dot { width:5px; height:5px; border-radius:50%; background:var(--accent); display:inline-block; margin-right:4px; }
+  .sep { height:1px; background:var(--line); margin:12px 0; }
+  .nav { font-size:var(--fs-body); color:var(--muted); padding:6px 8px; display:flex; justify-content:space-between; }
+  .nav.on { background:var(--selected); border-radius:var(--r-item); color:var(--ink); }
+  .nav .tag { font-size:var(--fs-meta); color:var(--hint); }
+  .ledger { margin-top:14px; font-size:var(--fs-meta); color:var(--hint); line-height:1.7; }
+  .ledger b { color:var(--muted); font-weight:500; }
+
+  /* 中栏：对话 */
+  .head { display:flex; align-items:center; gap:9px; padding-bottom:10px; border-bottom:1px solid var(--line); }
+  .head .av { width:34px; height:34px; font-size:var(--fs-title); }
+  .hn { font-size:var(--fs-title); font-weight:640; color:var(--ink); }
+  .hs { font-size:var(--fs-meta); color:var(--hint); margin-top:3px; }
+  .flow { padding:14px 0; height:322px; }
+  .msg { display:flex; gap:8px; margin-bottom:14px; }
+  .msg .av { width:25px; height:25px; font-size:12px; border-radius:6px; }
+  .mtext { font-size:var(--fs-msg); line-height:1.6; color:var(--ink); }
+  .mtime { font-size:var(--fs-meta); color:var(--hint); margin-top:4px; }
+  .listen { font-size:var(--fs-meta); color:var(--accent); margin-top:3px; }
+  .mine { margin-left:auto; background:#3B3942; color:#F2EFEA; padding:7px 12px;
+          border-radius:var(--r-bubble) var(--r-bubble) 4px var(--r-bubble);
+          font-size:var(--fs-msg); max-width:70%; }
+  .composer { border:1px solid var(--line); background:var(--card); border-radius:var(--r-big);
+              padding:10px 12px; font-size:var(--fs-body); color:var(--hint); }
+  .status { font-size:var(--fs-meta); color:var(--hint); margin-top:8px; }
+  .err { font-size:var(--fs-meta); color:var(--danger); margin-top:4px; }
+
+  /* 右栏：工单卡 */
+  .tabs { display:flex; gap:4px; background:var(--selected); padding:3px; border-radius:var(--r-item); margin-bottom:12px; }
+  .tab { flex:1; text-align:center; font-size:var(--fs-meta); padding:4px 0; border-radius:6px; color:var(--muted); }
+  .tab.on { background:var(--card); color:var(--ink); font-weight:600; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:var(--r-card); padding:12px; margin-bottom:10px; }
+  .ct-title { font-size:var(--fs-body); font-weight:640; color:var(--ink); }
+  .ct-sub { font-size:var(--fs-meta); color:var(--hint); margin-top:5px; }
+  .ct-rule { height:1px; background:var(--line); margin:10px 0; }
+  .track { height:4px; border-radius:4px; background:var(--selected); overflow:hidden; }
+  .fill { height:100%; width:33%; background:var(--accent); }
+  .ct-foot { display:flex; justify-content:space-between; font-size:var(--fs-meta); color:var(--muted); margin-top:8px; }
+  .empty { font-size:var(--fs-body); color:var(--hint); line-height:1.6; padding:6px 2px; }
+
+  /* 局部放大 */
+  .zoom { margin-top:26px; display:flex; gap:20px; }
+  .zcard { flex:1; background:#232228; border:1px solid #413E48; border-radius:12px; padding:16px 18px; }
+  .zt { font-size:13px; font-weight:640; color:#F2EFEA; margin-bottom:4px; }
+  .zd { font-size:12px; color:#C4BFB6; margin-bottom:14px; line-height:1.5; }
+  .zrow { display:flex; gap:14px; align-items:center; }
+  .zbox { flex:1; border-radius:8px; padding:12px; }
+  .zbox.o { background:#17161A; border:1px solid #33313A; }
+  .zbox.n { background:#17161A; border:1px solid #413E48; }
+  .zlab { font-size:11px; color:#C4BFB6; margin-bottom:8px; font-weight:600; }
+  .znum { font-size:11px; margin-top:8px; font-weight:600; }
+  .znum.bad { color:#E58A80; } .znum.good { color:#5FBFA8; }
+  .sample-old { font-size:13px; color:#6E6860; }
+  .sample-new { font-size:13px; color:#9A938A; }
+  .strip { height:26px; border-radius:6px; background:#2A2830; border:1px solid #33313A; }
+  .strip.n2 { background:#343139; border:1px solid #413E48; }
+  .bar-old { font-size:12px; color:#F2EFEA; }
+  .bar-new { font-size:12px; color:#F2EFEA; }
+
+  footer { margin-top:22px; font-size:12px; color:#C4BFB6; line-height:1.7; border-top:1px solid #413E48; padding-top:14px; }
+  footer code { background:#2A2830; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Crew · 界面优化前后对照（暗色）</h1>
+  <div class="sub">两版共用<strong>同一份组件定义</strong>，只替换 CSS 变量（色值 / 字号 / 圆角）。布局、文案、内容完全一致 —— 差异全部来自 <code>tokens.json</code>。</div>
+</header>
+
+<div class="pair">
+
+  <section class="pane old">
+    <div class="pane-head"><span class="pill oldp">优化前 · 现状</span><span class="pane-note">灰阶 5 档 / 近白面 9 种 / 字号 19 档</span></div>
+    <div class="win">
+      <div class="col">
+        <div class="ct">我的队伍</div>
+        <div class="bot sel"><div class="av">大</div><div><div class="bn">大哥</div><div class="br">简练，先应一声，能转派就转派</div><div class="bs">· 待命</div></div></div>
+        <div class="bot"><div class="av">写</div><div><div class="bn">写手</div><div class="br">中文文案，克制，不堆词</div><div class="bs">· 待命</div></div></div>
+        <div class="bot"><div class="av">码</div><div><div class="bn">码农</div><div class="br">写代码前先看约定</div><div class="bs">· 待命</div></div></div>
+        <div class="sep"></div>
+        <div class="nav on">后台 <span class="tag">3</span></div>
+        <div class="nav">模型 <span class="tag">默认</span></div>
+        <div class="nav">产出</div>
+        <div class="nav">常规任务</div>
+        <div class="ledger"><b>今天由谁接手</b><br>✓ 都在待命</div>
+      </div>
+      <div class="col">
+        <div class="head"><div class="av">大</div><div><div class="hn">大哥 · 前端</div><div class="hs">正在跑 · 3 分钟</div></div></div>
+        <div class="flow">
+          <div class="msg"><div class="av">大</div><div><div class="mtext">收到：查一下今天的天气，马上回你。</div><div class="mtime">刚刚</div><div class="listen">听播报</div></div></div>
+          <div class="mine">今天天气怎么样</div>
+          <div class="msg" style="margin-top:14px"><div class="av">大</div><div><div class="mtext">按上海位置查：今天 9–18°C，现在 14°C，全天基本无雨。</div><div class="mtime">2 分钟前</div><div class="listen">听播报</div></div></div>
+        </div>
+        <div class="composer">跟队伍说点什么，或者交给别人</div>
+        <div class="status">都在待命，发出去就会接上</div>
+        <div class="err">播报没成功：text is required</div>
+      </div>
+      <div class="col">
+        <div class="ct">后台</div>
+        <div class="tabs"><div class="tab on">进行中</div><div class="tab">待你</div><div class="tab">已完成</div></div>
+        <div class="card">
+          <div class="ct-title">调开登录页间距</div>
+          <div class="ct-sub">码农 · 第 2 步 / 共 3 步</div>
+          <div class="ct-rule"></div>
+          <div class="track"><div class="fill"></div></div>
+          <div class="ct-foot"><span>已跑 2 分钟</span><span>看它怎么做 →</span></div>
+        </div>
+        <div class="sep"></div>
+        <div class="empty">队伍接到的活会出现在这里。</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane new">
+    <div class="pane-head"><span class="pill newp">优化后 · Crew 目标态</span><span class="pane-note">灰阶 3 档 / 面 4 种 / 字号 6 档</span></div>
+    <div class="win">
+      <div class="col">
+        <div class="ct">我的队伍</div>
+        <div class="bot sel"><div class="av">大</div><div><div class="bn">大哥</div><div class="br">简练，先应一声，能转派就转派</div><div class="bs">· 待命</div></div></div>
+        <div class="bot"><div class="av">写</div><div><div class="bn">写手</div><div class="br">中文文案，克制，不堆词</div><div class="bs">· 待命</div></div></div>
+        <div class="bot"><div class="av">码</div><div><div class="bn">码农</div><div class="br">写代码前先看约定</div><div class="bs">· 待命</div></div></div>
+        <div class="sep"></div>
+        <div class="nav on">后台 <span class="tag">3</span></div>
+        <div class="nav">模型 <span class="tag">默认</span></div>
+        <div class="nav">产出</div>
+        <div class="nav">常规任务</div>
+        <div class="ledger"><b>今天由谁接手</b><br>✓ 都在待命</div>
+      </div>
+      <div class="col">
+        <div class="head"><div class="av">大</div><div><div class="hn">大哥 · 前端</div><div class="hs">正在跑 · 3 分钟</div></div></div>
+        <div class="flow">
+          <div class="msg"><div class="av">大</div><div><div class="mtext">收到：查一下今天的天气，马上回你。</div><div class="mtime">刚刚</div><div class="listen">听播报</div></div></div>
+          <div class="mine">今天天气怎么样</div>
+          <div class="msg" style="margin-top:14px"><div class="av">大</div><div><div class="mtext">按上海位置查：今天 9–18°C，现在 14°C，全天基本无雨。</div><div class="mtime">2 分钟前</div><div class="listen">听播报</div></div></div>
+        </div>
+        <div class="composer">跟队伍说点什么，或者交给别人</div>
+        <div class="status">都在待命，发出去就会接上</div>
+        <div class="err">播报没成功：text is required</div>
+      </div>
+      <div class="col">
+        <div class="ct">后台</div>
+        <div class="tabs"><div class="tab on">进行中</div><div class="tab">待你</div><div class="tab">已完成</div></div>
+        <div class="card">
+          <div class="ct-title">调开登录页间距</div>
+          <div class="ct-sub">码农 · 第 2 步 / 共 3 步</div>
+          <div class="ct-rule"></div>
+          <div class="track"><div class="fill"></div></div>
+          <div class="ct-foot"><span>已跑 2 分钟</span><span>看它怎么做 →</span></div>
+        </div>
+        <div class="sep"></div>
+        <div class="empty">队伍接到的活会出现在这里。</div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="zoom">
+  <div class="zcard">
+    <div class="zt">① 空态说明文字</div>
+    <div class="zd">新用户第一次打开时唯一的指路信息（<code>ui.go:1501</code>、<code>:2730</code>）。</div>
+    <div class="zrow">
+      <div class="zbox o"><div class="zlab">优化前</div><div class="sample-old">队伍接到的活会出现在这里。</div><div class="znum bad">3.27:1 · 未过 AA</div></div>
+      <div class="zbox n"><div class="zlab">优化后</div><div class="sample-new">队伍接到的活会出现在这里。</div><div class="znum good">5.93:1 · PASS</div></div>
+    </div>
+  </div>
+  <div class="zcard">
+    <div class="zt">② 选中态与分隔线</div>
+    <div class="zd">旧版与底色差 1.4% / 2.4%，屏幕上等于没有层。</div>
+    <div class="zrow">
+      <div class="zbox o"><div class="zlab">优化前</div><div class="strip"></div><div class="znum bad">差 1.4% · 看不出选中</div></div>
+      <div class="zbox n"><div class="zlab">优化后</div><div class="strip n2"></div><div class="znum good">差 2.4% · 可辨</div></div>
+    </div>
+  </div>
+  <div class="zcard">
+    <div class="zt">③ 标题栏信息层（#7 C1）</div>
+    <div class="zd">这一处是内容改动，不属于色值优化，单独列出。</div>
+    <div class="zrow">
+      <div class="zbox o"><div class="zlab">优化前</div><div class="bar-old">大哥<br><span style="color:#6E6860">和大哥说话</span></div><div class="znum bad">零信息 · 重复身份</div></div>
+      <div class="zbox n"><div class="zlab">优化后</div><div class="bar-new">大哥 · 前端<br><span style="color:#9A938A">正在跑 · 3 分钟</span></div><div class="znum good">职能 + 状态 + 时长</div></div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  数值来源：<code>designs/crew-design-system/project/优化对照.md</code>（WCAG 相对亮度公式实算，14 组配对全部 PASS）· 现状色值来自 <code>designs/personal-agent/tokens.json</code> 与 <code>desktop/theme.go</code>。<br>
+  说明：本图是<strong>目标态示意</strong>，用 HTML 复刻三栏布局做变量对照，不是真机截屏；<code>desktop/theme.go</code>、<code>ui.go</code>、<code>CrewUi.kt</code> 尚未同步。真机验收需按 <code>designs/personal-agent/README.md</code> 的 <code>design-mock.py</code> 流程抓图。
+</footer>
+
+</body>
+</html>

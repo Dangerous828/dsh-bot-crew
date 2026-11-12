@@ -1,0 +1,36 @@
+<!-- @dsCard group="Composition" height=196 subtitle="标题栏：名字 · 职能 + 实时状态 · 时长" -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin:0; background:var(--surface); color:var(--ink);
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; padding:24px 28px; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .avatar { width:38px; height:38px; border-radius:var(--radius-md); background:var(--accent-soft);
+            color:var(--accent); display:flex; align-items:center; justify-content:center;
+            font-size:15px; font-weight:640; flex:none; }
+  .name { font-size:15px; font-weight:640; line-height:1.35; }
+  .role { color:var(--muted); font-size:13px; }
+  .status { font-size:12px; color:var(--tertiary); margin-top:3px; }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); display:inline-block; margin-right:6px; }
+  .divider { height:1px; background:var(--line); margin:20px 0 16px; }
+  .old { font-size:12px; color:var(--tertiary); }
+  .old b { color:var(--muted); font-weight:500; }
+  .bad { color:var(--danger); }
+  .tag { display:inline-block; font-size:11px; padding:2px 8px; border-radius:var(--radius-sm);
+         background:var(--accent-soft); color:var(--accent); margin-left:8px; vertical-align:2px; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="avatar">大</div>
+    <div>
+      <div class="name">大哥 <span class="role">· 前端</span><span class="tag">目标态</span></div>
+      <div class="status"><span class="dot"></span>正在跑 · 3 分钟</div>
+    </div>
+  </div>
+  <div class="divider"></div>
+  <div class="old"><b>现状</b>（<code>ui.go:1310</code>）：标题「大哥」，副标题「<span class="bad">和大哥说话</span>」——左边已有头像 + 名字，副标题零信息；设计稿 <code>Desktop-dark.dc.html:101-104</code> 给的「职能 + 实时状态 + 时长」三层被换掉了。</div>
+</body>
+</html>

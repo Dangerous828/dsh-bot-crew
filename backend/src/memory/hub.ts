@@ -12,9 +12,12 @@
  * - 中枢不可用时降级到本机实现，不阻塞 worker 开工。
  */
 import type { Ticket, Trigger } from '../core/index.ts'
+import { compose, injectText, type MemoryEntry } from './recall.ts'
 import type { Fact } from './settle.ts'
 import type { ConsolidateRange, ConsolidateResult, MemoryPort, UpsertResult } from './port.ts'
-import type { MemoryEntry } from './recall.ts'
+
+/** 注入给 worker 的记忆片段最多多少字（与 local 一致，两版行为对齐）。 */
+const HUB_RECALL_MAX_CHARS = 1200
 
 export interface HubMemoryHost {
   /** 中枢是否可达（探测在 detect.ts，这里只读结果）。不可达时全部走 fallback。 */
@@ -32,13 +35,25 @@ export class HubMemory implements MemoryPort {
   constructor(private readonly host: HubMemoryHost) {}
 
   /**
-   * 召回。第 1 步统一走本机兜底（行为与改造前一致）。
+   * 召回。中枢可达且提供了向量检索时走中枢（按意思找）；否则/失败退回本机（按字面找）。
    *
-   * TODO(hub)：当 `reachable()` 且 `search` 可用时，用中枢向量检索替换本机二元组召回；
-   * 拿到的 entries 用 `compose()`/`injectText()` 拼成注入片段（复用 recall.ts，别另写一套）。
+   * 中枢只回「命中的记忆条目」，拼注入片段的活复用本机那套 `compose`/`injectText`，不另写一套。
    */
-  recall(ticket: Ticket, query: string): string {
-    return this.host.fallback.recall(ticket, query)
+  async recall(ticket: Ticket, query: string): Promise<string> {
+    if (!this.host.reachable() || !this.host.search) return this.host.fallback.recall(ticket, query)
+    try {
+      const entries = await this.host.search(query, { limit: 6 })
+      if (!entries || entries.length === 0) return this.host.fallback.recall(ticket, query)
+      // 中枢已按相似度排好序，直接按预算拼接；命中条目记一笔「被调起」，供末位淘汰用。
+      const composed = compose(entries.map(entry => ({ entry, score: 1 })), HUB_RECALL_MAX_CHARS)
+      if (!composed.text) return this.host.fallback.recall(ticket, query)
+      this.host.fallback.touch?.(composed.taken.map(entry => entry.name))
+      console.log('[memory] recall mode=hub chars=%d taken=%s', composed.chars, JSON.stringify(composed.taken.map(e => e.name)))
+      return injectText(composed)
+    } catch (error) {
+      console.log('[memory] hub search failed, degraded: %s', String(error))
+      return this.host.fallback.recall(ticket, query)
+    }
   }
 
   hear(trigger: Pick<Trigger, 'text' | 'at' | 'actor'> & { channel?: Trigger['channel'] }): number {

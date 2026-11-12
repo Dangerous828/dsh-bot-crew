@@ -45,3 +45,29 @@ describe('记忆端口', () => {
     expect(await memory.consolidate()).toEqual({ facts: 0, merged: 0, superseded: 0 })
   })
 })
+
+describe('中枢语义召回', () => {
+  const ticket = { channels: [{ address: { bot_id: 'lead' } }] } as never
+  const entry = (name: string, body: string) => ({ name, bot_id: 'lead', description: body, body,
+    type: 'feedback' as const, status: 'candidate' as const, importance: 5, toHub: true, dedupe_key: name,
+    created: 1, updated: 1, state: 'active' as const })
+
+  it('中枢可达且有检索时走中枢：把命中条目拼成注入片段', async () => {
+    const local = new LocalMemory({ store, bots: () => ['lead'] })
+    const hub = new HubMemory({ reachable: () => true, fallback: local,
+      search: async () => [entry('bot-lead-a', '回复先给结论')] })
+    const text = await hub.recall(ticket, '回复风格')
+    expect(text).toContain('回复先给结论')
+  })
+
+  it('中枢不可达或检索抛错时退回本机，不抛', async () => {
+    local: {
+      const local = new LocalMemory({ store, bots: () => ['lead'] })
+      local.upsert('lead', fact({ description: '本机一条', body: '本机一条' }), 'host')
+      const down = new HubMemory({ reachable: () => false, fallback: local })
+      expect(typeof await down.recall(ticket, 'pnpm')).toBe('string')
+      const boom = new HubMemory({ reachable: () => true, fallback: local, search: async () => { throw new Error('x') } })
+      expect(typeof await boom.recall(ticket, 'pnpm')).toBe('string')
+    }
+  })
+})

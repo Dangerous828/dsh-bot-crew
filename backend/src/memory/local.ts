@@ -44,7 +44,7 @@ export class LocalMemory implements MemoryPort {
     this.ledger = new MemoryLedger(host.store)
   }
 
-  recall(ticket: Ticket, query: string): string {
+  async recall(ticket: Ticket, query: string): Promise<string> {
     const bot = botOf(ticket)
     const own = rank(this.ledger.all(), query, { bots: bot ? [bot] : [], topK: RECALL_TOP_K })
     const seen = new Set(own.map(hit => hit.entry.name))
@@ -119,6 +119,7 @@ export class LocalMemory implements MemoryPort {
 
   forget(name: string): boolean { return this.ledger.forget(name) }
   evict(now?: number): string[] { return this.ledger.evict(now) }
+  touch(names: readonly string[], now?: number): void { this.ledger.touch(names, now) }
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean { return this.ledger.edit(name, patch) }
   all(): MemoryEntry[] { return this.ledger.all() }
 }

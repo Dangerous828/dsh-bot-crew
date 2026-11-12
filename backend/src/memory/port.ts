@@ -37,8 +37,8 @@ export interface ConsolidateResult {
  * `who`/`at` 这类来源信息由调用方给，端口不自己猜。
  */
 export interface MemoryPort {
-  /** 给这张票的 worker 取一小片相关记忆，拼成注入片段。读不到返回空串（不是报错）。 */
-  recall(ticket: Ticket, query: string): string
+  /** 给这张票的 worker 取一小片相关记忆，拼成注入片段。读不到返回空串（不是报错）。中枢版可能需联网检索，故异步。 */
+  recall(ticket: Ticket, query: string): Promise<string>
   /** 人说的话里如果有定下来的规矩，记一条；返回写进去了几条。 */
   hear(trigger: Parameters<MemoryPortSeams['hear']>[0]): number
   /** 一票收尾，把结论记一条；返回写进去了几条。 */
@@ -51,6 +51,8 @@ export interface MemoryPort {
   forget(name: string): boolean
   /** 末位淘汰：遗忘区里超过 30 天且没被调起过的，真删行。返回删掉的名字。 */
   evict(now?: number): string[]
+  /** 记「这几条被召回为上下文」，供末位淘汰判断遗忘区里有没有被重新需要。 */
+  touch?(names: readonly string[], now?: number): void
   /** 主人改一条。 */
   edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean
   /** 全部条目（治理/展示用）。 */

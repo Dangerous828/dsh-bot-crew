@@ -53,7 +53,7 @@ export class MemoryLayer {
     this.ledger = this.local.ledger
   }
 
-  recall(ticket: Ticket, query: string): string {
+  recall(ticket: Ticket, query: string): Promise<string> {
     return this.port.recall(ticket, query)
   }
 

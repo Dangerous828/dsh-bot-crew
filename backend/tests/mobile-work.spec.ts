@@ -42,7 +42,7 @@ it('registers the work routes on the same authenticated carrier as the rest', ()
   expect(registered.map(route => route.path)).toEqual([
     '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/withdraw', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models', '/api/mobile/efforts',
     '/api/mobile/model', '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/outputs', '/api/mobile/routines', '/api/mobile/memory', '/api/mobile/spend', '/api/mobile/audit', '/api/mobile/voice', '/api/mobile/reply-spend', '/api/mobile/speak', '/api/mobile/takeover', '/api/mobile/retry', '/api/mobile/steer',
-    '/api/mobile/pause', '/api/mobile/bots',
+    '/api/mobile/pause', '/api/mobile/resume', '/api/mobile/bots',
   ])
 })
 

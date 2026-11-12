@@ -144,6 +144,13 @@
 - **未实现的审批能力不得虚构按钮或审批状态**。
 - 被撤回的消息不出现在 `items`，也不出现在 `queued`。
 
+### 队伍配置：`GET/POST /api/mobile/bots`
+
+手机端可写队伍配置：新增 `{bot_id,name,role?,persona?}`，编辑
+`{action:"edit",bot_id,name,persona?}`，移除 `{action:"remove",bot_id}`。
+编辑保留 `bot_id` 与记忆命名空间；移除 default 时由剩余第一位接任，移除全部成员后目录为空。
+写入只更新 `source:team` 配置并记录该 block 的 revision，保留 Source 的 enabled 状态；记忆不随移除删除。
+
 ### 进度：`tasks[].total_steps` · `steps_done`
 
 工单卡上的进度条要一个**分母**。分母只有一个出处：worker 自己写的待办清单
@@ -170,11 +177,10 @@
   `total_steps` 随之变小（进度条可能因此回退），这是真话，不做单调化。
 - 客户端没有别的进度来源：**不得**新增「进度查询」接口，也不得从 `/api/mobile/work`
   的 `steps` 反推分母。
-- 手机端这轮**只读不改**：`app/.../CrewWire.kt` 的 `WorkTicket` 还没有 `total_steps` /
-  `steps_done` 两个字段，`CrewUi.kt` 的 `TaskRow` 也没有进度条。要接的时候按本节做：
-  在 `WorkTicket` 上加两个 `Int`，`CrewWire` 里读同名字段（缺省 0），
-  `TaskRow` 里仅当 `totalSteps > 0` 时画一条 3dp 的轨道 + 按比例的填充，
-  与 `desktop/ui.go` 的 `progressOf` 同一口径（分母来自计划，不来自已发生条数）。不新增路由。
+- 桌面与手机已接计划进度：手机 `CrewWire` 解析 `total_steps` / `steps_done` 到
+  `WorkTicket.totalSteps` / `stepsDone`；字段缺省时本地取 0，表示没有可展示的计划。
+  两端 `progressOf` 都先判断分母，再把分子夹到 `[0, total]`；手机 `TaskRow` 只在
+  `totalSteps > 0` 时画轨道与比例填充。进度来自计划，不来自事件条数；无需新增路由。
 
 ### 等你决定：`tasks[].needs_person` · `question` · `options`
 
@@ -254,10 +260,11 @@
 - 代码块缺失或为空（`path` 与 `lines` 都没有）时不画代码卡，也不画这两个按钮：
   **没有改动就没有「采用」**。按钮是这张卡的一部分，不为它单独下发状态或开关。
   客户端可以采用之后把按钮标成「已采用」，但那是本次会话里的界面状态，不落盘、不回传。
-- 手机端这轮还没接这两个按钮，只有代码卡（`app/.../CrewUi.kt` 的 `CodeCard`）：
-  它读 `Message.code`，`ticket_ref` 与代码块里的 `id` / `ticket_ref` 还没解析，
-  所以「看看改完的样子」在手机上暂时无处可去。要接的时候按本节的同一套规则做，
-  不新增路由。
+- 两个按钮两端都接了：桌面端在 `desktop/ui.go`，手机端在 `app/.../CrewUi.kt` 的 `CodeCard`。
+  手机端读 `Message.code`，`ticket_ref` 取代码块自己的、其次取消息上的（`CrewWire.parseCode`），
+  两处都没有就如实说「这段改动没带工单号」。手机「采用」已调用 `client.send`，发送中
+  `adopting`、成功后 `adopted` 均禁重复点击；失败显示发送失败文案并允许重试，只有发送成功
+  才标「已采用」。该标记表示表态已发送，不证明文件已经落盘。**不新增路由。**
 
 ### 撤回排队消息：`POST /api/mobile/withdraw`
 
@@ -343,15 +350,28 @@
 
 | 动作 | 现在真实做到的事 | 回什么 |
 | --- | --- | --- |
-| `POST /api/mobile/takeover` `{ticket}` | 停掉**这一张**票（`engine.stopTicket`） | `{"ok":true,"stopped":true}`；票不存在 404，引擎不可用 503，停不下来 409 |
-| `POST /api/mobile/pause` `{ticket?}` | **全局**暂停执行器（`settings.pause(true)`）；带上票号只做校验，不会只停那一张 | `{"ok":true,"scope":"executor"}` |
+| `POST /api/mobile/takeover` `{ticket}` | 人工终止**这一张**票（`engine.stopTicket`），记为 `ended.by: human`、`outcome: stopped` | `{"ok":true,"stopped":true}`；票不存在 404，引擎不可用 503，停不下来 409 |
+| `POST /api/mobile/pause` `{ticket?}` | **全局**暂停执行器（`settings.pause(true, 'panel')`）；带上票号只做校验，不会只停那一张 | `{"ok":true,"scope":"executor"}` |
+| `POST /api/mobile/resume` 空 body 或 `{}` | **全局**恢复执行器（`settings.pause(false, 'panel')`），不指定单票 | `{"ok":true,"resumed":true,"scope":"executor"}` |
+
+`resume` 与其他手机动作沿用同一认证入口，只登记 POST；重复恢复仍返回成功。
+空 body 与 JSON 对象均可用，客户端推荐发送 `{}`；畸形 JSON、数组与 null 返回 400，超过 8KB 返回 413。
+缺恢复控制器返回 503，控制调用抛错返回 500 与可读错误，不返回成功；失败后应刷新时间线里的
+`status.paused` 再决定重试。`resumed:true` 表示恢复控制调用已成功完成，实际派单仍受队伍策略约束。
 
 ### 5.1.1 工作区画面上「有什么、没有什么」
 
-- **接管操作**现在等于「停这张票」，不是「把控制权交给手机」：手机上还没有能往 worker 终端敲字的通道。
+- **接管操作**现在等于「停这张票」，不是「把控制权交给手机」：手机上能往 worker 递话的只有
+  §5.3 的 steer（一句消息，在下一步边界读到），没有直接敲终端的通道。
   所以按钮回话只说「已接手，这个工单停了」，不说「现在归你操作」。
-- **让它停一下**停的是执行器，恢复要去桌面面板。`scope` 字段就是为这句话留的，界面必须把它说出来。
-- 像素级画面、全屏、往终端敲字：**都还没有**。按下去要如实说没接上，不做成看起来能用的形状。
+- **让它停一下 / 继续**分别调用 `pause` / `resume`，作用域都是整台执行器，界面按
+  `scope: "executor"` 说明；手机入口可直接恢复，不必转去桌面。
+- **接手是对单票的永久停止**：全局 `resume` 只解除暂停，不清除该票的人工终止记录，
+  不复活被 takeover 的票；继续做这件事需要重新接纳成新工作。
+- 会话活动快照已提供：活会话读不到时回退持久化存档，两者都读不到就返回 `unavailable`。
+  像素截帧与像素全屏尚未接入，快照不得呈现为可点击的远程桌面。
+  §5.3 的 steer 已支持新消息插队和排队消息认领；它递交一句话，在 worker 下一步边界读取，
+  没有直接终端操作通道。
 
 
 ## 5.2 模型：`GET /api/mobile/models` · `GET /api/mobile/efforts` · `POST /api/mobile/model`
@@ -388,8 +408,8 @@
 
 ## 5.3 插队：`POST /api/mobile/steer`
 
-把一条**还在排队**的消息直接交给正在跑的 worker：它在下一步边界先读到这句，不等队列轮询；
-当前正在执行的命令不会被中断。
+把一句新写的话，或一条仍在排队的消息，直接交给正在跑的 worker：它在下一步边界读到这句，
+不等队列轮询；当前正在执行的命令不会被中断。
 
 ```jsonc
 { "ticket": "tk-1", "request_id": "uuid-v4", "text": "可选：新写的一句" }
@@ -397,18 +417,20 @@
 
 - 带 `text`：**发送即插队**。这句先以「已读」写进网关时间线（路由不会再当新活接一遍），
   再 steer 给 worker；返回 `{"ok":true,...}`。
-- 不带 `text`：针对队列里已有的那条 `request_id`，先 claim（标记读走）再 steer；两个都必填。
+- 不带 `text`、为空或仅空白：针对队列里已有的那条 `request_id`，先 claim（标记读走）再 steer。
+- 两条语义都必填 `ticket` 与 `request_id`；`request_id` 最多 128 字符。
 
 成功：`200 {"ok":true,"ticket":"tk-1","request_id":"uuid-v4"}`。
 
 判定与顺序：
 
 - 工单必须仍在跑；已结束/不存在 → 409 `Ticket is not running`。
-- 先从网关队列**认领**这条消息（标记读走）。认领成功才说明它还没被路由读过，因此不会送两遍；
-  认领失败原样透传网关的 404 / 409（`no such message` / `message was already answered` /
-  `message was already picked up`）。
-- 认领后把它作为 steer 投递给 `worker-<ticket>`，消息前会加一句「主人插话（请优先处理…）」。
-- 已回复、已被读走、已撤回过都不能插队，返回 409 并提示刷新时间线。
+- 新写的话先走网关 `/send`，带 `steer:true`、`mentions:[]`，写成已读消息；已有排队消息先走
+  `/claim`，成功才说明尚未被路由读过。认领失败原样透传网关的 404 / 409（`no such message` /
+  `message was already answered` / `message was already picked up`）。两条分支不会同时执行。
+- 网关写入 / 认领成功后，才调用 `runtime.steer(ticket, request_id, text)`；只有它返回 true
+  才回成功，返回 false 则回 409。已写入或认领的消息此时可能已经是已读，客户端应刷新状态。
+- 认领已有消息时，已回复、已被读走、已撤回过均不再投递；按网关返回的 404 / 409 展示失败。
 
 ## 5.4 产出：`GET /api/mobile/outputs`
 
@@ -558,9 +580,9 @@
 - 只有这一条路由，**这一轮没有写接口**：改账（加 / 改 / 开关 / 删）还没有决定由谁来写，
   不先开一个只能看不能改的假入口。客户端不得在本地改完就当成落盘。
 
-### 手机端以后怎么接
+### 手机端怎么接
 
-手机端这一轮不动，接的时候按这四条做，**不新增路由**：
+手机端已接（`app/.../CrewUi.kt` 的 `RoutineScreen`），按这四条做，**不新增路由**：
 
 1. 在某处（队伍页头或「后台」旁的入口）进「常规任务」一屏，进屏时读一次本节这一条。
 2. `live` 逐条列：标题、周期（`hourly` / `daily` / `weekly` 翻成「每小时 / 每天 / 每周」，

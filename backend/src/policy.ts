@@ -147,7 +147,7 @@ export const SettingsSchema = z.object({
   remote: RemoteConfigSchema.default(() => RemoteConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
-export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
+export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'approval' | 'connections' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 
@@ -163,7 +163,8 @@ export const POLICY_REVISION = 'mandate-v3'
  * 这是真的发生过的事（新增一个带默认值的规则字段就会触发）。
  */
 export function policyVersion(settings: Settings): string {
-  return key(POLICY_REVISION, JSON.stringify(stable({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources })))
+  return key(POLICY_REVISION, JSON.stringify(stable({ rules: settings.policy.rules, mode: settings.eval.mode,
+    sources: settings.policy.sources, approval: settings.approval, connections: settings.connections })))
 }
 
 /** 递归按键排序后再交给 `JSON.stringify`：数组保序（顺序有意义），对象的键统一排。 */

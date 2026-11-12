@@ -53,6 +53,20 @@ describe('spendOf', () => {
     expect(spend.by_model[1]).toMatchObject({ provider: 'dsh', model: 'm1', steps: 1 })
   })
 
+  it('attributes usage to the recorded request route instead of the current default', () => {
+    const spend = spendOf([
+      { type: 'model/selection', ...{ provider: 'magpie', model: 'bot-model' } },
+      { type: 'request/header', ...{ header: { config: { provider: 'magpie', model: 'actual-model' } } } },
+      message({ usage: { inputTokens: 10, outputTokens: 5 } }),
+      { type: 'model/selection', ...{ provider: 'other', model: 'next-model' } },
+      message({ step: 2, usage: { inputTokens: 20, outputTokens: 5 } }),
+    ], { provider: 'magpie', model: 'current-default' })
+    expect(spend.recent.map(step => `${step.provider}/${step.model}`)).toEqual([
+      'magpie/actual-model', 'other/next-model',
+    ])
+    expect(spend.by_model.map(line => line.model)).toEqual(['actual-model', 'next-model'])
+  })
+
   it('keeps only the last few steps, so "the one just now" is answerable', () => {
     const events = Array.from({ length: RECENT_STEPS + 3 }, (_, index) => message({ turn: index, step: 1, usage: { inputTokens: 1, outputTokens: 1 } }))
     const spend = spendOf(events)

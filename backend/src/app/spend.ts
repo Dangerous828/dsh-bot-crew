@@ -56,6 +56,10 @@ export interface SpendEvent {
   usage?: Partial<Usage>
   data?: { provider?: string; model?: string; usage?: Partial<Usage> }
   time?: string
+  /** DSH 把选路记在独立事件中；实际请求头优先于配置默认值。 */
+  provider?: string
+  model?: string
+  header?: { config?: { provider?: string; model?: string } }
 }
 
 /** 最近几步留在 `recent` 里。够回答「刚才那一下」，又不至于把一屏塞满。 */
@@ -86,6 +90,23 @@ export function stepOf(event: SpendEvent, fallback: { provider?: string; model?:
   }
 }
 
+/** 按事件顺序还原每步选路，后来的模型设置不会改写之前的成本归属。 */
+export function spendSteps(events: readonly SpendEvent[], fallback: { provider?: string; model?: string } = {}): SpendStep[] {
+  let route = fallback
+  const steps: SpendStep[] = []
+  for (const event of events) {
+    if (event.type === 'model/selection' || event.type === 'request/header') {
+      const selected = event.type === 'request/header' ? event.header?.config : event
+      if (typeof selected?.provider === 'string' && selected.provider && typeof selected.model === 'string' && selected.model) {
+        route = { provider: selected.provider, model: selected.model }
+      }
+    }
+    const step = stepOf(event, route)
+    if (step) steps.push(step)
+  }
+  return steps
+}
+
 /**
  * 把一张票的会话事件算成一本账。
  *
@@ -93,15 +114,10 @@ export function stepOf(event: SpendEvent, fallback: { provider?: string; model?:
  * 那时候合计只覆盖「报了的那几步」。把它写出来，读的人才知道这个数能信到什么程度。
  */
 export function spendOf(events: readonly SpendEvent[], fallback: { provider?: string; model?: string } = {}): Spend {
-  const steps: SpendStep[] = []
-  let unaccounted = 0
-  for (const event of events) {
-    const step = stepOf(event, fallback)
-    if (!step) continue
-    // 有事件但没有用量：算一步「不知道」，不是零。
-    if (event.usage === undefined && event.data?.usage === undefined) unaccounted += 1
-    steps.push(step)
-  }
+  const steps = spendSteps(events, fallback)
+  // 有事件但没有用量：算一步「不知道」，不是零。
+  const unaccounted = events.filter(event => event.type === 'assistant/message'
+    && event.usage === undefined && event.data?.usage === undefined).length
   const sum = (pick: (usage: Usage) => number | undefined): number => steps.reduce((total, step) => total + number(pick(step.usage)), 0)
   const byModel = new Map<string, { provider: string; model: string; steps: number; input_tokens: number; output_tokens: number; total_tokens: number }>()
   for (const step of steps) {

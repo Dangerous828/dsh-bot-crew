@@ -144,6 +144,13 @@ export class Runtime extends Service implements SourceHost {
   private setupRetry?: ReturnType<typeof setTimeout>
   /** 待发件箱：手机离线时留件，连上来的第一时间补发。 */
   private readonly pushOutbox = new PushOutbox()
+  /**
+   * 经隧道送一条推送的那只手，由 `index.ts` 在隧道建好后注入。
+   *
+   * 为什么是回调而不是直接持有 tunnel：隧道是 index 层的接线（它要读环境变量、要管降级链），
+   * Runtime 不该知道中转地址长什么样。而且 `runtime` 先于隧道构造，晚一步注入才不会绕成环。
+   */
+  private pusher?: (message: PushMessage) => boolean
   /** 今天报过日报没有（`YYYY-MM-DD`），同一天只说一次。 */
   private dailySaid = ''
   /** 今天派出去的常规任务次数（日报用）。 */
@@ -509,17 +516,27 @@ export class Runtime extends Service implements SourceHost {
   /**
    * 把一条话送到主人的每台设备上。
    *
-   * 走 `push.ts` 的投递层：在线直送、离线留件。中转那侧真正在不在线由宿主判不了，
-   * 所以这里只判断「结果是不是人说得出的一句话」—— 送不到也要留一条可查的记录，
-   * 不能静默消失。
+   * 三档由近到远，与 `push.ts` 的设计一致：
+   *
+   * 1. **隧道**：队伍自己连中继的那条（`index.ts` 建的），设备此刻挂在中转上就直送，
+   *    中转自己判在线、自己留件 —— 这一档交给它，比宿主猜准。
+   * 2. **本地留件**：隧道没连上（或这台机器根本没配中继）时留在本进程里，
+   *    手机下次连上来时由这一层补发。
+   * 3. **系统推送**：要 APNs / FCM 凭据，这一层不内置；没配就如实说 `no_provider`。
+   *
+   * 顺序不能反：先落本地留件会让中转那一档永远用不上（本地先认了「已排队」），
+   * 于是同一句话在两边各存一份，设备重连时补发两次。
    */
   private pushNotice(notice: Notice): PushOutcome[] {
     const recipients: PushRecipient[] = this.devices().map(device => ({ deviceId: device.deviceId }))
     if (!recipients.length) return []
     const messages: PushMessage[] = pushFor(notice, recipients)
-    // 这条队伍自己挂着的隧道由中转判在线；宿主这一侧一律按「可能不在线」处理，
-    // 于是每条都先留件，再让中转在设备连上来时取走 —— 不会漏，也不会重复弹。
-    const outcomes = messages.map(message => deliver(message, { online: false, outbox: this.pushOutbox }))
+    const outcomes = messages.map((message): PushOutcome => {
+      // 隧道那一档：发出去就由中转接管（在线直送、离线留件都在它那边）。
+      // 返回 false 只表示「这条隧道现在发不了」，不是「这台设备不存在」。
+      if (this.pusher?.(message)) return { status: 'queued', deviceId: message.deviceId, depth: 0 }
+      return deliver(message, { online: false, outbox: this.pushOutbox })
+    })
     for (const outcome of outcomes) {
       console.log('[push] %s kind=%s device=%s', outcome.status, notice.kind, outcome.deviceId)
     }
@@ -822,6 +839,14 @@ export class Runtime extends Service implements SourceHost {
    * overwrite another's line.
    */
   claimHealth(name: string, initial?: Health): HealthEntry { return this.board.claim(name, initial) }
+
+  /**
+   * 接上「经中继送推送」那只手。隧道建好后由 `index.ts` 调一次。
+   *
+   * 传 `undefined` 表示这条路现在不可用（没配中继、或隧道要关了），通知就回落到本地留件。
+   * 这里不校验回调是否成功 —— 它返回 false 只说明这一条没发出去，留件的责任在中转与本地两层。
+   */
+  attachPusher(pusher: ((message: PushMessage) => boolean) | undefined): void { this.pusher = pusher }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
   context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }

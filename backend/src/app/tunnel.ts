@@ -13,6 +13,20 @@
  */
 import { T, decodeClosePayload, encodeClosePayload, encodeFrame, frameDecoder, jsonFrame, parseJson, type Frame } from './relay-protocol.ts'
 
+/**
+ * 一条要经中转发给手机的通知。字段与 `T.pushSend` 的载荷一致，也与 `push.ts` 的
+ * `PushMessage` 同形 —— 三者必须一起改，否则中转会把不认识的字段静默丢掉。
+ */
+export interface PushPayload {
+  deviceId: string
+  title: string
+  body: string
+  /** 点开之后跳到哪个会话 / 哪张票。可选。 */
+  sessionId?: string
+  /** 用来分组与去重：`followup` / `routine` / `report` / `daily`。 */
+  kind?: string
+}
+
 /** 宿主发 ping 的节奏。与参考实现一致：15s 一拍，45s 三拍没回就自己判死。 */
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000
 /** 多久收不到 pong 判死。必须比中转的 60s 早，见下面 `reconnect` 的注释。 */
@@ -99,6 +113,17 @@ export interface Tunnel {
   state(): TunnelState
   /** 当前连的是哪一条地址（降级链用它记录最后成功的那条）。 */
   relayUrl(): string
+  /**
+   * 让中转把一条推送发给某台手机。
+   *
+   * 为什么必须由宿主经隧道发、而不是宿主自己直连中转：中转只认「注册过的那条隧道」，
+   * 手机的推送登记（`pushRegister`）也是挂在这条隧道上的 —— 换个连接发，中转查不到
+   * 这台设备此刻在线，就会把它当成离线留件。
+   *
+   * 隧道没连上时返回 `false` 而不是抛：推送失败不该把调用方（记账、例行任务）拖垮，
+   * 留件的责任在中转那一侧，宿主这一层只负责把话说出去。
+   */
+  push(message: PushPayload): boolean
 }
 
 /** 一个在途的上游请求。 */
@@ -436,6 +461,21 @@ export function createTunnel(options: TunnelOptions): Tunnel {
     },
     state() { return state },
     relayUrl() { return addresses[cursor % addresses.length]! },
+    push(message) {
+      // 只在 live 时发：连接刚建起来但还没注册成功的那一段，中转不认这条隧道，
+      // 发出去会被当成陌生连接丢掉 —— 那种「发了但没到」比「没发」更难查。
+      if (state !== 'live' || !socket || socket.readyState !== 1) return false
+      // 空正文中转会丢（它按「有没有话说」判，不看标题），这里先挡掉，别让它白跑一趟。
+      if (!message.body.trim()) return false
+      sendJson(T.pushSend, 0, {
+        deviceId: message.deviceId,
+        title: message.title,
+        body: message.body,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        ...(message.kind ? { kind: message.kind } : {}),
+      })
+      return true
+    },
   }
 }
 

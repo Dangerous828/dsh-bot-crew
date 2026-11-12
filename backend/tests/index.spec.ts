@@ -4,7 +4,7 @@ import { apply } from '../src/index.ts'
 import { lanPort } from '../src/app/lan-server.ts'
 
 // Stub Runtime to capture the resolved Machine settings and restart callback.
-const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void; health: Map<string, unknown> }[])
+const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void; health: Map<string, unknown>; pusher?: (message: Record<string, unknown>) => boolean }[])
 vi.mock('../src/app/runtime.ts', () => ({ Runtime: class {
   ready = Promise.resolve()
   /** 健康项只记账：index.ts 给 P2P 那条路 claim 一个，用例从 runtimes 里读它。 */
@@ -15,6 +15,9 @@ vi.mock('../src/app/runtime.ts', () => ({ Runtime: class {
     return { get: () => this.health.get(name), set: (health: unknown) => { this.health.set(name, health) }, release: () => { this.health.delete(name) } }
   }
   configured() { return true }
+  /** 通知经隧道发出去的那只手；index.ts 在隧道建好后注入，用例从这里读注入了没有。 */
+  pusher?: (message: Record<string, unknown>) => boolean
+  attachPusher(pusher?: (message: Record<string, unknown>) => boolean) { this.pusher = pusher }
   async stop() {}
 } }))
 /** Simulate the Cordis loader updating a volatile configuration reference in place. */
@@ -79,16 +82,18 @@ it('refuses keys of the previous configuration before registering anything', asy
 // 少一条就是端口/连接泄漏，多一条就是没配也往外连。
 
 /** 把隧道模块换成一个只记账的替身：真的去连一个不存在的中转会让测试等重连。 */
-const tunnels = vi.hoisted(() => [] as { options: Record<string, unknown>; closed: boolean; started: boolean }[])
+const tunnels = vi.hoisted(() => [] as { options: Record<string, unknown>; closed: boolean; started: boolean; pushed?: Record<string, unknown>[] }[])
 vi.mock('../src/app/tunnel.ts', () => ({
   createTunnel: (options: Record<string, unknown>) => {
-    const entry = { options, closed: false, started: false }
+    const entry: { options: Record<string, unknown>; closed: boolean; started: boolean; pushed?: Record<string, unknown>[] } = { options, closed: false, started: false }
     tunnels.push(entry)
     return {
       start: async () => { entry.started = true },
       close: async () => { entry.closed = true },
       state: () => (entry.closed ? 'closed' : 'live'),
       relayUrl: () => String(options.relayUrl ?? ''),
+      // 通知经这条隧道发出去：记下来，测试要钉的是「接线接上了没有」，不是中转怎么处理。
+      push: (message: Record<string, unknown>) => { (entry.pushed ??= []).push(message); return !entry.closed },
     }
   },
 }))
@@ -187,6 +192,20 @@ it('hands every configured relay to the tunnel, primary first', async () => {
     // 顺序必须保持：第一条是自建，换顺序等于把兜底放到前面。
     expect(tunnels[0]!.options.relayUrl).toEqual(['wss://a.example/tunnel', 'wss://b.example/tunnel', 'wss://c.example/tunnel'])
     expect(logged.join('\n')).toMatch(/fallbacks configured: 2/)
+  })
+})
+
+it('routes notices through the relay tunnel once one is configured, and stops when it closes', async () => {
+  // 推送那条链缺的就是这一环：Runtime 先构造、隧道后建，中间必须有人把两只手接起来。
+  // 不接的话通知只会落本地留件 —— 手机在后台（隧道才是唯一的路）时永远收不到。
+  tunnels.length = 0
+  runtimes.length = 0
+  await withEnv({ CREW_RELAY_URLS: 'wss://relay.example/tunnel' }, async () => {
+    const runtime = runtimes[0]!
+    expect(typeof runtime.pusher).toBe('function')
+    // 注进来的那只手要真的走到隧道上，而不是一个自己造的对象。
+    expect(runtime.pusher!({ deviceId: 'dev_abc123', title: 't', body: 'b' })).toBe(true)
+    expect(tunnels[0]!.pushed).toEqual([{ deviceId: 'dev_abc123', title: 't', body: 'b' }])
   })
 })
 

@@ -164,6 +164,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
       onLog: line => ctx.logger.info('%s', line),
     })
     ctx.effect(() => async () => { await tunnel.close() })
+    // 通知改走这条隧道：中转认得这条连接，也知道手机在不在线，留件与补发都在它那边做。
+    // 放这儿而不是 Runtime 里，是因为 Runtime 先构造、隧道后建 —— 反过来就是循环依赖。
+    runtime.attachPusher(message => tunnel.push(message))
+    ctx.effect(() => () => { runtime.attachPusher(undefined) })
     // 起不来不该挡住整个插件：局域网那条路还在，本机功能照常。隧道会自己退避重连。
     void tunnel.start().catch((error: unknown) => { ctx.logger.warn('relay tunnel did not start: %s', String(error)) })
     if (relays.length > 1) ctx.logger.info('relay fallbacks configured: %d', relays.length - 1)

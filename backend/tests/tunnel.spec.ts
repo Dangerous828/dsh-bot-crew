@@ -405,3 +405,57 @@ it('refuses to be built without any relay address', async () => {
   expect(() => createTunnel({ relayUrl: [], instanceId: 'box', forward: async () => Response.json({}) }))
     .toThrow(/at least one relay url/)
 })
+
+it('sends a push to the relay, which hands it to the device that registered', async () => {
+  // 这条链是整个推送功能的最小定义：宿主把话说出去 → 中转记在设备名下 → 设备那条连接上收到。
+  // 用真中转而不是打桩，是因为「宿主发的帧和手机收的帧是不是同一帧」正是最容易错的地方。
+  const { port, relay: box } = await relay()
+  const { createTunnel } = await import('../src/app/tunnel.ts')
+  const host = createTunnel({ relayUrl: `ws://127.0.0.1:${port}/tunnel`, instanceId: 'box-1', forward: async () => Response.json({}) })
+  running[0]!.extra.push(() => { void host.close() })
+  await host.start()
+
+  // 手机那侧：一条独立的连接，先用 pushRegister 报到，再等宿主发的推送落下来。
+  // 用 Node 自带的 WebSocket（22+ 全局有），不为一条测试再引一个包。
+  const { jsonFrame, frameDecoder, parseJson } = await import('../src/app/relay-protocol.ts')
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/tunnel`)
+  const got: Record<string, unknown>[] = []
+  const feed = frameDecoder(frame => {
+    if (frame.type === T.pushSend) got.push(parseJson(frame.payload))
+  })
+  // Node 内置 WebSocket 把二进制帧交成 Blob（浏览器里是 ArrayBuffer），两种都收。
+  phone.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as Blob | ArrayBuffer
+    if (data instanceof Blob) void data.arrayBuffer().then(bytes => feed(new Uint8Array(bytes)))
+    else feed(new Uint8Array(data))
+  })
+  await new Promise<void>(resolve => phone.addEventListener('open', () => resolve(), { once: true }))
+  phone.send(new Uint8Array(jsonFrame(T.register, 0, { instanceId: 'phone-1' })))
+  phone.send(new Uint8Array(jsonFrame(T.pushRegister, 0, { deviceId: 'dev_abc123', platform: 'android', token: 't' })))
+  running[0]!.extra.push(() => { phone.close() })
+  // 等中转把这两帧处理完（它同步处理，但帧要经一次事件循环才到）。
+  await vi.waitFor(() => { expect(box.status('phone-1')).toBeDefined() }, { timeout: 3_000 })
+
+  expect(host.push({ deviceId: 'dev_abc123', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })).toBe(true)
+  await vi.waitFor(() => { expect(got).toHaveLength(1) }, { timeout: 3_000 })
+  expect(got[0]).toMatchObject({ deviceId: 'dev_abc123', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })
+})
+
+it('does not pretend to push while the tunnel is not live, or with nothing to say', async () => {
+  // 两种「发了但没到」都要在宿主这一层挡住：连接没注册成功（中转不认这条隧道）、正文是空的
+  // （中转按「有没有话说」判，标题不算）。返回 false 让调用方回落到本地留件。
+  const { createTunnel } = await import('../src/app/tunnel.ts')
+  const idle = createTunnel({ relayUrl: ['ws://127.0.0.1:1/tunnel'], instanceId: 'box', forward: async () => Response.json({}), backoff: { initialMs: 50, maxMs: 50, jitter: 0 } })
+  running.push({ relay: createRelay(), extra: [() => { void idle.close() }] })
+  // 还没 start：state 是 idle，中转那边根本没有这条隧道。
+  expect(idle.state()).not.toBe('live')
+  expect(idle.push({ deviceId: 'dev_abc123', title: 't', body: 'b' })).toBe(false)
+  await idle.close()
+
+  const { port } = await relay()
+  const live = createTunnel({ relayUrl: `ws://127.0.0.1:${port}/tunnel`, instanceId: 'box-2', forward: async () => Response.json({}) })
+  running[0]!.extra.push(() => { void live.close() })
+  await live.start()
+  expect(live.state()).toBe('live')
+  expect(live.push({ deviceId: 'dev_abc123', title: '有标题', body: '   ' })).toBe(false)
+})

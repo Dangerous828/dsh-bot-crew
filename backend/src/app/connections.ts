@@ -16,8 +16,14 @@
  * 这一层不连网络、不持有凭据：凭据在宿主的 MCP 配置里，这里只管**分类与放行规则**。
  */
 
-/** 一类对外能力。 */
-export type ConnectionKind = 'mail' | 'calendar' | 'files'
+/**
+ * 一类对外能力。
+ *
+ * 前三类是只读观察为主的既有能力；后四类是 Step 7「行动面扩展」接入的真实集成——
+ * 替人发消息、购物、支付、订票。它们一律**读先上、写必过审批**（`judgeCall` 里 readOnly 打开时写=ask），
+ * 支付/购物这类尤其不能裸跑。kind 只决定「叫什么、默认哪些工具算读」，真正拦人的始终是 judgeCall。
+ */
+export type ConnectionKind = 'mail' | 'calendar' | 'files' | 'messages' | 'shopping' | 'payments' | 'tickets'
 
 /** 一次工具调用的性质。`write` 一律要过审批。 */
 export type ToolNature = 'read' | 'write'
@@ -50,7 +56,16 @@ export const KIND_NAME: Readonly<Record<ConnectionKind, string>> = {
   mail: '邮箱',
   calendar: '日历',
   files: '文件',
+  messages: '消息',
+  shopping: '购物',
+  payments: '支付',
+  tickets: '订票',
 }
+
+/** 所有合法的 kind，用一份集合做运行时校验（与类型同源，别处加 kind 时改这里）。 */
+const VALID_KINDS: ReadonlySet<string> = new Set(Object.keys({
+  mail: 1, calendar: 1, files: 1, messages: 1, shopping: 1, payments: 1, tickets: 1,
+} satisfies Record<ConnectionKind, 1>))
 
 /** 内置的白名单：常见 MCP 服务器上哪些工具是读。 */
 const DEFAULT_READ: Readonly<Record<string, readonly string[]>> = {
@@ -58,6 +73,14 @@ const DEFAULT_READ: Readonly<Record<string, readonly string[]>> = {
   mail: ['list_messages', 'get_message', 'search_messages', 'list_labels', 'list_threads', 'get_thread'],
   calendar: ['list_events', 'get_event', 'list_calendars', 'search_events'],
   files: ['list_directory', 'read_file', 'search_files', 'stat', 'list_files'],
+  // 消息：读会话/列消息是读；发消息/建群是写（必审批）。
+  messages: ['list_channels', 'list_messages', 'get_message', 'search_messages', 'list_threads'],
+  // 购物：搜索/看商品/看购物车/看订单是读；下单/加购/结算/付款是写（必审批）。
+  shopping: ['search_products', 'get_product', 'list_cart', 'get_cart', 'list_orders', 'get_order'],
+  // 支付：看余额/看账单/看交易是读；转账/付款/退款是写（必审批，且这类最不该裸跑）。
+  payments: ['get_balance', 'list_transactions', 'get_transaction', 'list_payment_methods'],
+  // 订票：查余票/查车次/查订单是读；下单/占座/改签/退票是写（必审批）。
+  tickets: ['search_fares', 'list_offers', 'get_offer', 'list_bookings', 'get_booking'],
 }
 
 /**
@@ -131,12 +154,12 @@ export function connectionsOf(raw: unknown): ConnectionConfig {
     for (const item of source.connections) {
       const entry = item as { kind?: unknown; server?: unknown; readTools?: unknown; writeTools?: unknown }
       const kind = entry.kind
-      if (kind !== 'mail' && kind !== 'calendar' && kind !== 'files') continue
+      if (typeof kind !== 'string' || !VALID_KINDS.has(kind)) continue
       if (typeof entry.server !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(entry.server)) continue
       const list = (value: unknown): string[] => Array.isArray(value)
         ? value.filter(name => typeof name === 'string' && name.length > 0) as string[] : []
       connections.push({
-        kind, server: entry.server, readTools: list(entry.readTools),
+        kind: kind as ConnectionKind, server: entry.server, readTools: list(entry.readTools),
         ...(entry.writeTools === undefined ? {} : { writeTools: list(entry.writeTools) }),
       })
     }

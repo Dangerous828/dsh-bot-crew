@@ -136,3 +136,35 @@ describe('connectionsOf', () => {
       .toEqual([{ kind: 'calendar', server: 'cal', readTools: [] }])
   })
 })
+
+// Step 7 行动面扩展：新增的真实集成 kind（消息/购物/支付/订票）走同一套「读先上、写必审批」，
+// 尤其支付/购物这类绝不能裸跑——readOnly 打开时写操作必须 ask，关掉才 allow。
+describe('action-surface kinds (messages / shopping / payments / tickets)', () => {
+  const kinds = [
+    { kind: 'messages' as const, server: 'im', read: 'list_channels', write: 'send_message' },
+    { kind: 'shopping' as const, server: 'shop', read: 'search_products', write: 'place_order' },
+    { kind: 'payments' as const, server: 'pay', read: 'get_balance', write: 'transfer' },
+    { kind: 'tickets' as const, server: 'rail', read: 'search_fares', write: 'book_ticket' },
+  ]
+  for (const k of kinds) {
+    it(`treats ${k.kind} reads as allow and writes as ask under readOnly`, () => {
+      const cfg: ConnectionConfig = { connections: [{ kind: k.kind, server: k.server, readTools: [] }], readOnly: true }
+      // 没显式配 readTools 时吃内置白名单：约定里的读工具放行。
+      expect(judgeCall(cfg, k.server, k.read)).toMatchObject({ action: 'allow', kind: k.kind })
+      // 写（下单/转账/发消息/订票）要审批。
+      expect(judgeCall(cfg, k.server, k.write)).toMatchObject({ action: 'ask', kind: k.kind })
+    })
+  }
+
+  it('names each new kind in KIND_NAME so the panel and phone show a word', () => {
+    for (const k of kinds) expect(KIND_NAME[k.kind]).toBeTruthy()
+  })
+
+  it('reads the new kinds back from settings and skips unknown ones', () => {
+    const parsed = connectionsOf({ readOnly: true, connections: [
+      { kind: 'payments', server: 'pay', readTools: ['get_balance'] },
+      { kind: 'bogus', server: 'x', readTools: [] },
+    ] })
+    expect(parsed.connections.map(c => c.kind)).toEqual(['payments'])
+  })
+})

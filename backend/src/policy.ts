@@ -107,7 +107,7 @@ export const ApprovalConfigSchema = z.object({
  */
 export const ConnectionsConfigSchema = z.object({
   connections: z.array(z.object({
-    kind: z.enum(['mail', 'calendar', 'files']),
+    kind: z.enum(['mail', 'calendar', 'files', 'messages', 'shopping', 'payments', 'tickets']),
     server: z.string().regex(/^[A-Za-z0-9_-]{1,32}$/),
     readTools: z.array(z.string().min(1)).default([]),
     writeTools: z.array(z.string().min(1)).optional(),

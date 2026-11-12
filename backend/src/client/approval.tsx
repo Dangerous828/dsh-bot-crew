@@ -11,7 +11,7 @@ type Connections = Settings['connections']
 type Connection = Connections['connections'][number]
 
 const MODES = ['auto', 'ask', 'off'] as const
-const KINDS = ['mail', 'calendar', 'files'] as const
+const KINDS = ['mail', 'calendar', 'files', 'messages', 'shopping', 'payments', 'tickets'] as const
 type Kind = typeof KINDS[number]
 
 const splitList = (text: string): string[] => text.split(/[\s,]+/).map(item => item.trim()).filter(Boolean)

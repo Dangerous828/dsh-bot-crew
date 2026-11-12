@@ -328,6 +328,29 @@ def listener_pids(port):
         return []
 
 
+def process_started_at(pid):
+    """Wall-clock start time of a PID as a Unix timestamp, or None when it cannot be read."""
+    try:
+        out = subprocess.run(['ps', '-p', str(pid), '-o', 'etimes='],
+                             capture_output=True, text=True, check=False).stdout.strip()
+        return time.time() - float(out) if out else None
+    except (OSError, ValueError):
+        return None
+
+
+def launchd_label(pid):
+    """The launchd job label supervising `pid`, or None when nothing supervises it."""
+    try:
+        out = subprocess.run(['launchctl', 'list'], capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return None
+    for line in out.splitlines()[1:]:
+        fields = line.split('\t')
+        if len(fields) == 3 and fields[0].isdigit() and int(fields[0]) == pid:
+            return fields[2]
+    return None
+
+
 def ensure_gateway(profile=None):
     """Keep the mobile gateway running on the source that is already on disk.
 
@@ -357,6 +380,19 @@ def ensure_gateway(profile=None):
         args = process_args(pid)
         if 'mobilegw' not in args:
             raise RuntimeError(f'port {port} is held by PID {pid}, not the mobile gateway: {args.strip()}')
+        label = launchd_label(pid)
+        if label:
+            # launchd 的 KeepAlive 会在被杀的下一瞬把同一份脚本重新拉起来，这里再 spawn 一个必然撞
+            # Errno 48，然后以「exited immediately」报错 —— 而端口其实一直有人好好守着。
+            # 托管时把生命周期交回 launchd：代码没变就不动它，变了请它按 plist 重启那一份。
+            if str(gateway) not in args:
+                raise RuntimeError(f'launchd job {label} runs a different gateway ({args.strip()}); '
+                                   f'point it at {gateway} or stop that job first')
+            started = process_started_at(pid)
+            if started is not None and gateway.stat().st_mtime > started:
+                subprocess.run(['launchctl', 'kickstart', '-k', f'gui/{os.getuid()}/{label}'], check=False)
+                time.sleep(1.0)
+            return
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:

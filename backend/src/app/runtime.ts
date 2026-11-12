@@ -66,6 +66,7 @@ import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { MemoryLayer } from './memory-layer.ts'
 import { HubProbe, LocalMemory, pickMemoryPort } from '../memory/detect.ts'
+import { RuleDistiller, type Distiller } from '../memory/distill.ts'
 import { memoryView, type MemoryView } from './views/memory.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -126,6 +127,8 @@ export class Runtime extends Service implements SourceHost {
   readonly memory: MemoryLayer
   /** 记忆中枢可达性探测（供记忆层分叉与设置保存后刷新）。 */
   memoryProbe?: HubProbe
+  /** 睡眠期提炼器（默认规则版；中枢或装了便宜模型时可替换为 LLM 版）。 */
+  private readonly distiller: Distiller = new RuleDistiller()
   readonly ready: Promise<void>
   /**
    * DSH 的会话表，手机端的「子代理」卡片靠它从 worker 会话往下展开。
@@ -214,7 +217,11 @@ export class Runtime extends Service implements SourceHost {
       const memoryProbe = new HubProbe({ hub: memorySettings.hub, timeoutMs: memorySettings.timeoutMs,
         log: line => console.log(line) })
       const localMemory = new LocalMemory({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
-        ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [] })
+        ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [],
+        // 睡眠期提炼：默认规则版（零模型、可回查）；接中枢或便宜模型时换成 LLM 版。
+        distill: (text, at) => this.distiller.distill(text, at),
+        // 原始料：窗口内人写的 Trigger，按时间正序。
+        episodic: range => store.read.episodicRange(range) })
       this.memoryProbe = memoryProbe
       void memoryProbe.refresh().catch(() => undefined)
       this.memory = new MemoryLayer({
@@ -267,7 +274,10 @@ export class Runtime extends Service implements SourceHost {
           // 一票收尾：把结论记一条（只记 ready / dropped，过程不进账本）。
           if (event.type === 'ticket.ended') {
             const done = store.tickets.get(event.data.ticketId)
-            if (done) { try { this.memory.close(done) } catch (error) { console.log('[memory] settle failed: %s', String(error)) } }
+            if (done) { try { this.memory.close(done) } catch (error) { console.log('[memory] settle failed: %s', String(error)) }
+              // 睡眠期巩固的触发点：一票结束时顺手整理最近一天的原始对话（异步、不阻塞关闭）。
+              void this.memory.consolidate({ since: Math.floor(Date.now() / 1000) - 24 * 60 * 60 })
+                .catch(error => console.log('[memory] consolidate failed: %s', String(error))) }
           }
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))

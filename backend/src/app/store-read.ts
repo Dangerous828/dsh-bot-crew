@@ -8,6 +8,24 @@ export function storeReads(db: DatabaseSync) {
   return {
   /** Newest first by arrival (`rowid`) order rather than trigger timestamp. */
   recentTriggers: (offset = 0, limit = 50): Trigger[] => db.prepare('SELECT value FROM trigger ORDER BY rowid DESC LIMIT ? OFFSET ?').all(limit, offset).map(row => JSON.parse(String(row.value)) as Trigger),
+  /**
+   * 睡眠期巩固的原始料：`[since, until]` 窗口里人写的 Trigger，按时间正序，一段一条。
+   *
+   * 只取人说的（`human=1`）——机器人的回声、CI、自己的通知不是「记忆」的原料。
+   * `since`/`until` 用秒；省略 since 默认最近一天。返回 text + 秒级 at，供提炼器用。
+   */
+  episodicRange: (range: { since?: number; until?: number } = {}): { text: string; at: number }[] => {
+    const until = range.until ?? Math.floor(Date.now() / 1000)
+    const since = range.since ?? until - 24 * 60 * 60
+    const iso = (seconds: number): string => new Date(seconds * 1000).toISOString()
+    const rows = db.prepare(`SELECT value FROM trigger WHERE json_extract(value, '$.human') = 1
+      AND json_extract(value, '$.at') >= ? AND json_extract(value, '$.at') <= ? ORDER BY json_extract(value, '$.at') ASC`).all(iso(since), iso(until))
+    return rows.map(row => {
+      const trigger = JSON.parse(String(row.value)) as Trigger
+      const at = Math.floor(Date.parse(trigger.at) / 1000) || until
+      return { text: trigger.text, at }
+    })
+  },
   /** Per-source trigger counts since `since`, plus the latest arrival timestamp across all time. */
   triggerStats: (since: string): Record<string, { received: number; filtered: number; lastAt: string }> => {
     const result: Record<string, { received: number; filtered: number; lastAt: string }> = {}

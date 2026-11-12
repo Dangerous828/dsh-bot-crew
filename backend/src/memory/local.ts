@@ -99,8 +99,8 @@ export class LocalMemory implements MemoryPort {
     const owner = this.host.bots()[0] || 'lead'
     for (const batch of batches) {
       const text = batch.text.trim()
-      // 粗筛：太短的多半是一句闲聊，不值得花一次模型调用。
-      if (text.length < 40) continue
+      // 粗筛：太短的多半是一句闲聊，不值得花一次模型调用。（中文一个字信息量大，阈值取小。）
+      if (text.length < 16) continue
       let facts: Fact[]
       try { facts = await this.host.distill(text, batch.at) } catch (error) {
         console.log('[memory] consolidate distill failed: %s', String(error)); continue

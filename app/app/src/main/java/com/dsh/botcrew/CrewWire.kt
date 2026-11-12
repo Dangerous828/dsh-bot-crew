@@ -80,6 +80,14 @@ data class Conversation(
      * 徽标只在非 null 且大于 0 时出现 —— 把说不清画成 0，等于替队伍说它都读过了。
      */
     val unread: Int? = null,
+    /**
+     * 「回话未读」：队伍回了、主人还没看的有几条（契约 §5.6 的第二个数）。
+     *
+     * 与 [unread] 一样是三态：null 表示这份时间线说不清是谁读到了哪（还没上报过已读位置、
+     * 或上报的那条不在这份时间线里），与「确实是 0 条」不同。徽标只在非 null 且大于 0 时出现。
+     * 判定按「主人读到哪」，方向与 [unread]（队伍读没读走）相反，两者不能互相顶替。
+     */
+    val unreadReplies: Int? = null,
 )
 
 /** 一条被读过、但不打算动手的消息。 */
@@ -260,7 +268,7 @@ object CrewWire {
             Declined(requestId, row.optString("reason", ""))
         }
         return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined,
-            unreadOf(root))
+            unreadOf(root, "unread"), unreadOf(root, "unread_replies"))
     }
 
     /**
@@ -270,12 +278,15 @@ object CrewWire {
      * 客户端不拿 `items` 自己数一遍，那是第二份口径，迟早和后端对不上。
      * `count` 是 0 时照实返回 0：读得到、确实没有未读，和读不出来不是一件事。
      */
-    private fun unreadOf(root: JSONObject): Int? {
-        val unread = root.optJSONObject("unread") ?: return null
+    private fun unreadOf(root: JSONObject, field: String): Int? {
+        val unread = root.optJSONObject(field) ?: return null
         if (unread.optString("state") != "live") return null
         if (!unread.has("count") || unread.isNull("count")) return null
         return unread.optInt("count", -1).takeIf { it >= 0 }
     }
+
+    /** 上报已读位置：把主人读到的最后一条回话 id 交给后端，记成会话级水位（契约 §5.6）。 */
+    fun readBody(lastReadId: String): String = JSONObject().put("last_read_id", lastReadId).toString()
 
     /** 发消息的请求体。requestId 是幂等键，重试要沿用同一个。 */
     fun sendBody(text: String, mentions: List<String>, requestId: String): String {

@@ -384,6 +384,11 @@ func (s *app) refresh() {
 		if load, loadErr := s.client.CrewLoad(ctx); loadErr == nil {
 			s.crewLoadCh <- load
 		}
+		// 已读位置：把主人读到的最后一条回话 id 报上去（契约 §5.6）。只报队伍回的最后一条：
+		// 还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。尽力而为，失败不打断刷新。
+		if lastReply := lastAgentMessageID(conversation.Messages); lastReply != "" {
+			_ = s.client.ReportRead(ctx, lastReply)
+		}
 		s.arrived <- conversation
 		s.wake()
 	}()
@@ -1121,6 +1126,14 @@ func (s *app) navRow(c *ui.Context, p Palette, item navItem) {
 					ui.Text(c, badgeText(n)).FontSize(FontTiny).TextColor(p.WarnInk)
 				})
 			}
+			// 回话未读（契约 §5.6 的第二个数）：队伍回了、主人还没看的那几条。口径与上面那枚一致，
+			// 但用另一种底色 —— 方向相反（这枚是「该你看了」，上面那枚是「队伍还没读」），
+			// 同一个色会让人分不清是哪一边在等。算不出来时不画。
+			if n, ok := s.unreadRepliesCount(); ok {
+				ui.Row(c).PaddingX(6).Radius(RadiusChip).Background(p.AccentSoft).Children(func() {
+					ui.Text(c, badgeText(n)).FontSize(FontTiny).TextColor(p.Accent)
+				})
+			}
 			if n := s.openCount(); n > 0 {
 				ui.Row(c).PaddingX(6).Radius(RadiusChip).Background(p.AccentSoft).Children(func() {
 					ui.Text(c, fmt.Sprintf("%d", n)).FontSize(FontTiny).TextColor(p.Accent)
@@ -1145,6 +1158,31 @@ func (s *app) openCount() int {
 		}
 	}
 	return n
+}
+
+// lastAgentMessageID 是时间线上最后一条「队伍回的话」的 id，没有就返回空串。
+//
+// 上报已读位置只认这一条：它才是「主人读到哪」那根水位线的落点。
+// 从后往前找，命中第一条 role==agent 即停 —— 时间线从旧到新，最后一条回话就在末尾附近。
+func lastAgentMessageID(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "agent" && messages[i].ID != "" {
+			return messages[i].ID
+		}
+	}
+	return ""
+}
+
+// unreadRepliesCount 是「回话未读」徽标上的数，以及该不该画（契约 §5.6 的第二个数）。
+//
+// 口径与 unreadCount 完全一致：算得出来（live）且大于 0 才画。它数的是「队伍回了、主人还没看」，
+// 方向与 unread 相反，所以不能拿 unread 的数冒充它。
+func (s *app) unreadRepliesCount() (int, bool) {
+	if s.conversation == nil || !s.conversation.UnreadReplies.Known() {
+		return 0, false
+	}
+	n := s.conversation.UnreadReplies.CountOf()
+	return n, n > 0
 }
 
 // unreadCount 是「未读」徽标上的数，以及这个数该不该画（契约 §5.6）。

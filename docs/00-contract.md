@@ -653,7 +653,10 @@
 - 认证与其余 `/api/mobile/*` 相同（§7）：走 Connection 的已认证入口，凭据由 `phone-gate.ts` 判。
   不新开无鉴权路由。
 - 客户端进对话屏时上报一次最新读到的回话 id；不上报就没有这一格，不是后端出错。
-  `TODO(app, 2026-11-12)`、`TODO(desktop, 2026-11-12)`：两端客户端还没接这条上报与下面这一格的展示。
+  App 端已接：进对话屏、有新回话时用 `CrewClient.reportRead(lastAgentId)` 上报（取时间线上最后一条 `role==agent` 的 `id`），
+  失败尽力而为不打断看消息；`unreadReplies` 已解析成三态字段（`null` = 说不清，不画徽标）。
+  桌面端也已接：`refresh` 拉到时间线后用 `Client.ReportRead(lastAgentMessageID(...))` 上报最后一条回话 id，
+  左栏「后台」入口同时挂 `unreadReplies` 徽标（与未读徽标同口径、异底色）。
 
 ### `unread_replies`：`GET /timeline` 上的第二个数
 

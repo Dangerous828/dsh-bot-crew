@@ -798,6 +798,12 @@ private fun CrewScreen(
                     // 从前这里用「消息条数」当 key，而时间线每 6 秒读一次、把整份换成新对象，
                     // 条数在排队、回复、撤回之间来回变，每变一次就滚一次 —— 没人碰它，屏幕自己在跳。
                     val lastMessageId = shown.messages.lastOrNull()?.id ?: ""
+                    // 进对话屏 / 有新回话时，把主人读到的最后一条回话 id 报上去（契约 §5.6）。
+                    // 只报队伍回的最后一条；还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。
+                    val lastAgentId = shown.messages.lastOrNull { it.fromBot }?.id ?: ""
+                    LaunchedEffect(lastAgentId) {
+                        if (lastAgentId.isNotEmpty()) client.reportRead(lastAgentId)
+                    }
                     // 第一次拿到消息时要落到底（打开就该看到最新一句）；之后只跟着新消息走。
                     var settled by remember { mutableStateOf(false) }
                     LaunchedEffect(lastMessageId) {

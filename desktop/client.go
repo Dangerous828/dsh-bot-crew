@@ -667,6 +667,9 @@ type Conversation struct {
 	// Unread 是「人发出去、队伍还没读走」的条数（契约 §5.6）。Count 是 nil 表示这份时间线
 	// 说不清（网关没报告读走状态）—— 那时不画徽标，不把说不清当成 0。
 	Unread Unread
+	// UnreadReplies 是「队伍回了、主人还没看」的条数（契约 §5.6 的第二个数）。三态口径与 Unread
+	// 一致：Known 才是算得出来，nil 是不说清。方向与 Unread 相反，两者不能互相顶替。
+	UnreadReplies Unread
 	// Model is what the crew is answering with right now; the roster footer shows it.
 	Model string
 }
@@ -736,7 +739,8 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		Queued       []string      `json:"queued"`
 		Declined     []Declined    `json:"declined"`
 		// Unread 缺省时是零值：Count 为 nil、State 为空 —— 两种都不算 known，徽标不出现。
-		Unread Unread `json:"unread"`
+		Unread        Unread `json:"unread"`
+		UnreadReplies Unread `json:"unread_replies"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/mobile/timeline", nil, &payload); err != nil {
 		return nil, err
@@ -747,7 +751,18 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 	}
 	return &Conversation{Messages: payload.Items, Bots: payload.Bots, DefaultBotID: payload.DefaultBotID,
 		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined,
-		Unread: payload.Unread, Model: payload.Model}, nil
+		Unread: payload.Unread, UnreadReplies: payload.UnreadReplies, Model: payload.Model}, nil
+}
+
+// ReportRead 把主人读到的最后一条回话 id 报给后端，记成会话级已读水位（契约 §5.6）。
+//
+// 这是一次「记水位」的后台小事：失败不该打断人看消息，所以调用方只在拿得到最后一条回话时尽力上报，
+// 不因为它失败就报错。后端记不住水位时，`unread_replies` 会退回 unknown —— 那是三态里正当的一格。
+func (c *Client) ReportRead(ctx context.Context, lastReadID string) error {
+	if lastReadID == "" {
+		return nil
+	}
+	return c.do(ctx, http.MethodPost, "/api/mobile/read", map[string]string{"last_read_id": lastReadID}, nil)
 }
 
 // Send 把一句话送进对话。mentions 里是点名的 bot_id，可以没有。

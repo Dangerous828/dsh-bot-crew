@@ -1031,6 +1031,36 @@ class OutputsBarTest {
         assertNull(CrewWire.parseTimeline("""{"items":[],"unread":{"state":"live"}}""").unread)
     }
 
+    // ── 回话未读：unread_replies（契约 §5.6 的第二个数）────────────
+    // 方向与 unread 相反：这里数「队伍回、主人没看」。三态口径与 unread 一致。
+
+    @Test
+    fun readsTheUnreadRepliesCountTheBackendReported() {
+        val body = """{"items":[],"bots":[],"default_bot_id":"",
+            "unread_replies":{"count":3,"state":"live"}}"""
+        assertEquals(3, CrewWire.parseTimeline(body).unreadReplies)
+        val none = """{"items":[],"unread_replies":{"count":0,"state":"live"}}"""
+        assertEquals(0, CrewWire.parseTimeline(none).unreadReplies)
+    }
+
+    @Test
+    fun anUncountableReplyCountIsNotZero() {
+        // state 不是 live（还没上报已读位置）：不认 count。
+        val unknown = """{"items":[],"unread_replies":{"count":null,"state":"unknown","reason":"还没报过"}}"""
+        assertNull(CrewWire.parseTimeline(unknown).unreadReplies)
+        // 老后端整段没有这一格：不下结论。
+        assertNull(CrewWire.parseTimeline("""{"items":[]}""").unreadReplies)
+        // live 却没有 count：自相矛盾，也不当 0。
+        assertNull(CrewWire.parseTimeline("""{"items":[],"unread_replies":{"state":"live"}}""").unreadReplies)
+    }
+
+    @Test
+    fun readBodyCarriesTheLastReadId() {
+        // 上报已读位置走的是契约里的 {last_read_id}。
+        val body = CrewWire.readBody("r7")
+        assertEquals("r7", org.json.JSONObject(body).optString("last_read_id"))
+    }
+
     @Test
     fun theBadgeNeverGrowsPastTwoDigits() {
         // 15dp 的胶囊放不下三位数；99 是它能完整写下的最大值。

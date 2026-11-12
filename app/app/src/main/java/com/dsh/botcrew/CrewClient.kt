@@ -129,6 +129,22 @@ class CrewClient(
     suspend fun timeline(): Conversation =
         parse(read("/api/mobile/timeline", "GET"), CrewWire::parseTimeline)
 
+    /**
+     * 上报已读位置：进对话屏时把主人读到的最后一条回话 id 交给后端（契约 §5.6）。
+     *
+     * 失败不该打断主人看消息：这是一次「记水位」的后台小事，网络抖一下下次进屏再报就是。
+     * 所以这里吞掉异常，只做尽力而为 —— 后端记不住水位时，`unread_replies` 会退回 unknown，
+     * 那是三态里正当的一格，不是错误。
+     */
+    suspend fun reportRead(lastReadId: String) {
+        if (lastReadId.isBlank()) return
+        try {
+            read("/api/mobile/read", "POST", CrewWire.readBody(lastReadId))
+        } catch (_: java.io.IOException) {
+            // 尽力而为：下次进屏再报。
+        }
+    }
+
     /** 发一条消息。requestId 由调用方生成并保留，重试时沿用。 */
     suspend fun send(text: String, mentions: List<String>, requestId: String) {
         read("/api/mobile/send", "POST", CrewWire.sendBody(text, mentions, requestId))

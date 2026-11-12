@@ -274,3 +274,48 @@ func TestUnreadBadgeNeverNeedsAWiderRowThanTheRail(t *testing.T) {
 		t.Errorf("三位数应压成 99+，得到 %q", got)
 	}
 }
+
+func TestUnreadRepliesCountMirrorsTheUnreadRules(tt *testing.T) {
+	// 回话未读与未读同一套三态口径：算得出来（live）且大于 0 才画。
+	// 方向相反，但「说不清不等于 0」这条对两者一视同仁。
+	number := func(n int) *int { return &n }
+	cases := []struct {
+		name                string
+		unread              Unread
+		want                int
+		show                bool
+	}{
+		{"有回话未读", Unread{Count: number(3), State: "live"}, 3, true},
+		{"确实是 0", Unread{Count: number(0), State: "live"}, 0, false},
+		{"算不出来", Unread{Count: nil, State: "unknown", Reason: "还没报过"}, 0, false},
+		{"老后端缺字段", Unread{}, 0, false},
+		{"live 却没有数", Unread{State: "live"}, 0, false},
+	}
+	for _, c := range cases {
+		s := &app{conversation: &Conversation{UnreadReplies: c.unread}}
+		got, show := s.unreadRepliesCount()
+		if got != c.want || show != c.show {
+			tt.Errorf("%s: 得到 (%d, %v)，想要 (%d, %v)", c.name, got, show, c.want, c.show)
+		}
+	}
+	if _, show := (&app{}).unreadRepliesCount(); show {
+		tt.Error("没有对话时不该画回话未读徽标")
+	}
+}
+
+func TestLastAgentMessageIDPicksTheNewestReply(tt *testing.T) {
+	// 上报已读位置认的是「队伍回的最后一条」，不是主人自己发的最后一条。
+	messages := []Message{
+		{ID: "u1", Role: "user"},
+		{ID: "r1", Role: "agent"},
+		{ID: "u2", Role: "user"},
+		{ID: "r2", Role: "agent"},
+	}
+	if got := lastAgentMessageID(messages); got != "r2" {
+		tt.Errorf("想要 r2，得到 %q", got)
+	}
+	// 一条回话都没有：空串（调用方据此不上报）。
+	if got := lastAgentMessageID([]Message{{ID: "u1", Role: "user"}}); got != "" {
+		tt.Errorf("没有回话时该是空串，得到 %q", got)
+	}
+}

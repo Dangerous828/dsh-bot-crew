@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment, sandboxAvailable }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, runIsolated, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment, sandboxAvailable }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -282,5 +282,43 @@ describe('worker isolation keeps git working', () => {
       expect(typeof out).toBe('string')
       expect(readdirSync(execDir)).toContain('.git')
     } finally { rmSync(execDir, { recursive: true, force: true }) }
+  })
+})
+
+describe('isolation end-to-end: a ticket prepare lifecycle in the sandbox', () => {
+  const realSubprocess = (): SubprocessRuntime => ({
+    spawn: ({ argv, cwd }: { argv: readonly string[]; cwd: string }) => {
+      const child = spawn(argv[0]!, argv.slice(1), { cwd })
+      const output = { stdout: '', stderr: '' }
+      child.stdout.on('data', c => { output.stdout += String(c) })
+      child.stderr.on('data', c => { output.stderr += String(c) })
+      const reader = (n: 'stdout' | 'stderr') => ({ readFrom: () => ({ text: output[n], nextOffset: 0, lossy: false }) })
+      const done = new Promise(r => child.on('close', code => r({ exitCode: code, signal: null })))
+      return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
+    },
+  }) as unknown as SubprocessRuntime
+
+  it('creates the workspace, runs prepare inside the sandbox, writes files, and passes verifyDirectory', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const root = mkdtempSync(join(tmpdir(), 'iso-e2e-'))
+    const execDir = join(root, 'ticket-1')
+    const fakeSsh = mkdtempSync(join(tmpdir(), 'iso-e2e-ssh-'))
+    writeFileSync(join(fakeSsh, 'id_ed25519'), 'SECRET')
+    const signal = new AbortController().signal
+    const sb = realSubprocess()
+    try {
+      mkdirSync(execDir, { recursive: true })
+      // prepare 命令：初始化仓库、写一个工作文件、试图读「凭据」。
+      await runIsolated(sb, ['sh', '-c', 'git init -q && echo work > note.txt && cat ' + join(fakeSsh, 'id_ed25519') + ' 2>/dev/null && echo LEAK || echo blocked'],
+        execDir, signal, { mode: 'sandbox', writableRoots: [execDir, root], readableDeny: [fakeSsh] })
+      // ① 工作文件真写出来了
+      expect(readFileSync(join(execDir, 'note.txt'), 'utf8').trim()).toBe('work')
+      // ② 仓库初始化成功（.git 在）
+      expect(readdirSync(execDir)).toContain('.git')
+      // ③ verifyDirectory（git config --get-regexp）在隔离里能跑通（/dev/null 可开）——不抛错。
+      await expect(verifyDirectory(execDir, sb, signal)).resolves.toBeUndefined()
+    } finally {
+      rmSync(root, { recursive: true, force: true }); rmSync(fakeSsh, { recursive: true, force: true })
+    }
   })
 })

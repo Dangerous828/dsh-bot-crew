@@ -2147,3 +2147,20 @@ it('keeps the approval gate judging writes the same with worker isolation turned
   expect(runtime.judgeConnection('mail', 'send_message').action).toBe('ask')
   expect(runtime.judgeConnection('random-server', 'do_something').action).toBe('deny')
 })
+
+// Step 2 集成：isolation=sandbox 时 prepare 命令真的被 sandbox-exec 包起来（不是配置了没接线）。
+it('wraps the prepare command in sandbox-exec when worker isolation is sandbox', async () => {
+  const { sandboxAvailable } = await import('../src/infra/environment.ts')
+  if (!sandboxAvailable()) { expect(true).toBe(true); return } // 本机是 macOS，会真跑
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor,
+    isolation: 'sandbox', prepare: 'true' } })
+  subprocess.spawn.mockClear()
+  await acceptedTicket(feishu('iso1', '@bot 隔离准备'))
+  // 找 prepare 那次 spawn：argv 应以 sandbox-exec 起头、且包含原来的 sh -c true。
+  const specs = subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[] })
+  const wrapped = specs.find(spec => spec.argv[0] === '/usr/bin/sandbox-exec')
+  expect(wrapped).toBeTruthy()
+  expect(wrapped!.argv).toEqual(expect.arrayContaining(['/usr/bin/sandbox-exec', '-p']))
+  expect(wrapped!.argv.join(' ')).toContain('sh -c true')
+  expect(wrapped!.argv.join(' ')).toContain('(deny default)')
+})

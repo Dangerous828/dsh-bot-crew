@@ -32,7 +32,7 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/pair', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/screen', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered' },
-    { path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/routines', methods: ['GET', 'POST'], requestBody: 'buffered' },
     { path: '/api/mobile/memory', methods: ['GET', 'POST'], requestBody: 'buffered' },
     { path: '/api/mobile/spend', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/audit', methods: ['GET'], requestBody: 'buffered' },
@@ -667,4 +667,30 @@ it('serves the routines ledger and keeps "nothing yet" apart from "could not rea
   const failed = await phoneHandler(broken, undefined, fetchless)(new Request('http://dsh/api/mobile/routines'))
   expect(failed.status).toBe(200)
   expect(await failed.json()).toMatchObject({ state: 'unavailable', items: [], runner: 'none' })
+})
+
+it('writes a routine through POST and refuses a bad action or missing field', async () => {
+  const fetchless = vi.fn() as unknown as typeof fetch
+  const requested: Array<{ action: string; input: Record<string, unknown> }> = []
+  const wired = { ...host(), writeRoutine: (action: string, input: Record<string, unknown>) => {
+    requested.push({ action, input })
+    if (action === 'create' && !input.title) return { ok: false, reason: 'title is required' }
+    return { ok: true, record: { id: 'rt-1', title: String(input.title ?? ''), cycle: 'daily', enabled: true } }
+  } } as unknown as HttpHost
+  const post = (body: string) => phoneHandler(wired, undefined, fetchless)(new Request('http://dsh/api/mobile/routines',
+    { method: 'POST', body }))
+  const created = await post(JSON.stringify({ action: 'create', title: '每天站会', cycle: 'daily', bot_id: 'lead' }))
+  expect(created.status).toBe(200)
+  expect(await created.json()).toMatchObject({ ok: true, record: { id: 'rt-1', title: '每天站会' } })
+  expect(requested[0]).toMatchObject({ action: 'create', input: { title: '每天站会', cycle: 'daily', bot_id: 'lead' } })
+  // 非法 action：400，不落到 writeRoutine。
+  const bad = await post(JSON.stringify({ action: 'nuke' }))
+  expect(bad.status).toBe(400)
+  // 规则校验失败：400 带原因。
+  const empty = await post(JSON.stringify({ action: 'create' }))
+  expect(empty.status).toBe(400)
+  // 宿主没接写侧：503。
+  const bare = await phoneHandler(host(), undefined, fetchless)(new Request('http://dsh/api/mobile/routines',
+    { method: 'POST', body: JSON.stringify({ action: 'create', title: 'x', cycle: 'daily' }) }))
+  expect(bare.status).toBe(503)
 })

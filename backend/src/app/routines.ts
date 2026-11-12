@@ -119,6 +119,75 @@ export function routineItemOf(record: unknown, now = Date.now()): RoutineItem | 
   }
 }
 
+/** 一条新任务的 id：`rt-` 加一段十六进制。客户端自造的 id 一律不认，防止覆写别的键。 */
+export function newRoutineId(): string {
+  // 不引 node:crypto 到纯函数模块里：这里只要够长的随机串，collision 概率可忽略。
+  return `rt-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`
+}
+
+/** 写侧能改的字段：标题、周期、负责的 Bot、开关。id 与 last_run 不由客户端写。 */
+export interface RoutineDraft {
+  title: string
+  /** 写侧传进来的原始周期串：build/edit 内部用 parseCycle 才认，非法即拒（严格只认三个词）。 */
+  cycle: string
+  bot_id?: string
+  enabled?: boolean
+}
+
+/** 一次写入的结果：`ok` 加落库的那条，或一句人话的原因。 */
+export type RoutineWrite =
+  | { ok: true; record: RoutineRecord }
+  | { ok: false; reason: string }
+
+/**
+ * 新建一条：校验标题、周期、Bot（位掩码），造出完整记录。
+ *
+ * 只做校验与造记录，不碰存储 —— 落 KV 由运行时那层做（与 `routinesView` 读侧对称）。
+ * id 由调用方给（`id`），这样运行时能用同一套 `newRoutineId` 生成，测试也能固定。
+ */
+export function buildRoutine(draft: Partial<RoutineDraft>, id: string, now = Date.now()): RoutineWrite {
+  const title = typeof draft.title === 'string' ? draft.title.trim() : ''
+  if (!title) return { ok: false, reason: 'title is required' }
+  if (title.length > MAX_TITLE_CHARS) return { ok: false, reason: `title is at most ${MAX_TITLE_CHARS} characters` }
+  const cycle = parseCycle(draft.cycle)
+  if (!cycle) return { ok: false, reason: 'cycle must be hourly, daily or weekly' }
+  const botId = typeof draft.bot_id === 'string' ? draft.bot_id.trim() : ''
+  if (botId && !/^[a-z0-9_-]+$/.test(botId)) return { ok: false, reason: 'bot_id must be lowercase letters, digits, _ or -' }
+  const record: RoutineRecord = {
+    id,
+    title,
+    cycle,
+    ...(botId ? { bot_id: botId } : {}),
+    enabled: draft.enabled !== false,
+    created_at: new Date(now).toISOString(),
+  }
+  return { ok: true, record }
+}
+
+/**
+ * 改一条：在既有记录上覆盖允许改的字段。`created_at` 与 `last_run` 保留 —— 改标题不该把
+ * 「上次跑过」这件事抹掉，也不该把周期从此刻重新起算。
+ */
+export function editRoutine(current: RoutineRecord, draft: Partial<RoutineDraft>): RoutineWrite {
+  const title = draft.title === undefined ? current.title : (typeof draft.title === 'string' ? draft.title.trim() : '')
+  if (!title) return { ok: false, reason: 'title must not be empty' }
+  if (title.length > MAX_TITLE_CHARS) return { ok: false, reason: `title is at most ${MAX_TITLE_CHARS} characters` }
+  const cycle = draft.cycle === undefined ? current.cycle : parseCycle(draft.cycle)
+  if (!cycle) return { ok: false, reason: 'cycle must be hourly, daily or weekly' }
+  const botId = draft.bot_id === undefined ? (current.bot_id ?? '') : (typeof draft.bot_id === 'string' ? draft.bot_id.trim() : '')
+  if (botId && !/^[a-z0-9_-]+$/.test(botId)) return { ok: false, reason: 'bot_id must be lowercase letters, digits, _ or -' }
+  const enabled = draft.enabled === undefined ? current.enabled : draft.enabled !== false
+  const { bot_id: _drop, ...rest } = current
+  const record: RoutineRecord = {
+    ...rest,
+    title,
+    cycle,
+    ...(botId ? { bot_id: botId } : {}),
+    enabled,
+  }
+  return { ok: true, record }
+}
+
 /** 数一数开着的、关掉的有几条。 */
 export function countRoutines(items: readonly RoutineItem[]): { enabled: number; paused: number } {
   return items.reduce((counts, item) => {

@@ -156,9 +156,23 @@
 编辑保留 `bot_id` 与记忆命名空间；移除 default 时由剩余第一位接任，移除全部成员后目录为空。
 写入只更新 `source:team` 配置并记录该 block 的 revision，保留 Source 的 enabled 状态；记忆不随移除删除。
 
-**能力边界**：手机端可写队伍配置（`bots` POST，本节）；`routines` 是唯一明确只读的账本（§5.5 这一轮没有写接口，
-`memory` 等其他账本见 §5.7 的 `POST /api/mobile/memory`）。
-`TODO(backend, 2026-11-12)`：`routines` 的写接口未开，改账仍只能在宿主机上做。
+**能力边界**：手机端可写队伍配置（`bots` POST，本节），也可写 `routines` 账本（`POST /api/mobile/routines`：
+`{action:"create",title,cycle,bot_id?,enabled?}` / `{action:"edit",id,title?,cycle?,bot_id?,enabled?}` /
+`{action:"remove",id}`）；`memory` 见 §5.7 的 `POST /api/mobile/memory`。其余账本仍只读。
+
+### 写常规任务：`POST /api/mobile/routines`
+
+`GET /routines` 只读账本；写侧开口在同一个路径的 `POST`，三种 `action`：
+
+| 请求 | 做到的事 | 回什么 |
+| --- | --- | --- |
+| `{action:"create",title,cycle,bot_id?,enabled?}` | 新建一条；`id` 由服务端生成（客户端不能自造 id） | `{ok:true,record:{id,title,cycle,...,created_at}}` |
+| `{action:"edit",id,title?,cycle?,bot_id?,enabled?}` | 覆盖允许改的字段；`created_at` 与 `last_run` 保留 | `{ok:true,record:{...}}` |
+| `{action:"remove",id}` | 删除一条 | `{ok:true}` |
+
+- `title` 必填、≤100 字符；`cycle` 只认 `hourly`/`daily`/`weekly`；`bot_id` 给了就要合 `^[a-z0-9_-]+$`（空串=谁有空谁接）。
+  校验不过 400 并带一句人话 `reason`；宿主没接写侧 503。写只落 `routines` 前缀下的 KV，与读侧同一本账，**不派单**：
+  到点真派单仍由调度器按账本跑。
 
 ### 进度：`tasks[].total_steps` · `steps_done`
 

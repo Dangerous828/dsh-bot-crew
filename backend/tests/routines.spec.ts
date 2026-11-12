@@ -96,3 +96,28 @@ describe('routinesView', () => {
     expect((await routinesView(() => many, NOW)).items).toHaveLength(100)
   })
 })
+
+describe('写侧：buildRoutine / editRoutine', () => {
+  it('builds a valid record and rejects missing title, bad cycle and bad bot_id', async () => {
+    const { buildRoutine } = await import('../src/app/routines.ts')
+    const good = buildRoutine({ title: '每周复盘', cycle: 'weekly', bot_id: 'lead' }, 'rt-1', NOW)
+    expect(good.ok).toBe(true)
+    if (good.ok) expect(good.record).toMatchObject({ id: 'rt-1', title: '每周复盘', cycle: 'weekly', bot_id: 'lead', enabled: true })
+    expect(buildRoutine({ title: '  ', cycle: 'daily' }, 'rt-2', NOW)).toMatchObject({ ok: false })
+    expect(buildRoutine({ title: 'x', cycle: '每5分钟' }, 'rt-3', NOW)).toMatchObject({ ok: false })
+    expect(buildRoutine({ title: 'x', cycle: 'daily', bot_id: 'Bad' }, 'rt-4', NOW)).toMatchObject({ ok: false })
+  })
+
+  it('edits in place, keeping created_at and last_run', async () => {
+    const { editRoutine } = await import('../src/app/routines.ts')
+    const current = { id: 'r1', title: 'old', cycle: 'daily' as const, bot_id: 'lead', enabled: true,
+      created_at: '2026-11-01T00:00:00.000Z', last_run: '2026-11-10T00:00:00.000Z' }
+    const edited = editRoutine(current, { title: 'new', enabled: false })
+    expect(edited.ok).toBe(true)
+    if (edited.ok) expect(edited.record).toMatchObject({ id: 'r1', title: 'new', cycle: 'daily', bot_id: 'lead', enabled: false,
+      created_at: '2026-11-01T00:00:00.000Z', last_run: '2026-11-10T00:00:00.000Z' })
+    // 清掉 bot_id：回「谁有空谁接」。
+    const cleared = editRoutine(current, { bot_id: '' })
+    if (cleared.ok) expect(cleared.record.bot_id).toBeUndefined()
+  })
+})

@@ -40,6 +40,9 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   outputs?: (tickets: readonly OutputsTicket[]) => Promise<OutputsView>
   /** 「常规任务」：把 KV 里的那张定时账本合成一栏；宿主没接时路由如实说读不到。 */
   routines?: () => Promise<RoutinesView>
+  /** 常规任务写侧：新增 / 修改 / 删除一条（契约 §5.5）。宿主没接时 POST 说 503。 */
+  writeRoutine?: (action: 'create' | 'edit' | 'remove', input: { id?: string; title?: string; cycle?: string; bot_id?: string; enabled?: boolean }) =>
+    { ok: boolean; record?: unknown; reason?: string }
   /** 记忆：读一栏；`forget` / `edit` 是主人亲手改账本。宿主没接时路由如实说读不到。 */
   memories?: (options: { bot?: string }) => Promise<MemoryView>
   /** 成本账：一张票用了哪个模型、花了多少 token；读不到会话时 `spend` 缺席（不是 0）。 */
@@ -344,7 +347,7 @@ const OPERATIONS = {
   // 「产出」：队伍交出来的文件。不带 `?ticket=` 时列最近几张票的产出，带就只看那一张。
   outputs: { methods: ['GET'] },
   // 「常规任务」：定时要做的事的账本。这一轮只读，不改账。
-  routines: { methods: ['GET'] },
+  routines: { methods: ['GET', 'POST'] },
   // 记忆：主人能看、能改、能忘。忘掉只翻状态，不删行。
   memory: { methods: ['GET', 'POST'] },
   // 钱与账：一张票花了多少、这条链谁派的谁判的谁干的。都是只读。
@@ -416,7 +419,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Pairing request too large' })
     }
     if (operation === 'steer') body = await incoming.text()
-    if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'read' || (operation === 'bots' && incoming.method === 'POST')) {
+    if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'read' || (operation === 'bots' && incoming.method === 'POST') || (operation === 'routines' && incoming.method === 'POST')) {
       // 控制请求与花名册只带几个短字段，和配对请求同量级。
       body = await incoming.text()
       if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
@@ -461,8 +464,26 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       || operation === 'spend' || operation === 'audit' || operation === 'voice' || operation === 'reply-spend' || operation === 'speak') {
       await runtime.ready
       if (operation === 'routines') {
-        // 「常规任务」：KV 里那张定时账本。宿主没接这项能力时说「读不到」，
-        // 不说「还没有常规任务」—— 那是在替队伍编一句话。
+        // 「常规任务」：GET 读账本，POST 新增/修改/删除一条（契约 §5.5 已开写接口）。
+        if (incoming.method === 'POST') {
+          const write = runtime.writeRoutine?.bind(runtime)
+          if (!write) return response(503, { error: 'Routine editing is unavailable' })
+          const raw = body
+          let value: { action?: unknown; id?: unknown; title?: unknown; cycle?: unknown; bot_id?: unknown; enabled?: unknown }
+          try { value = JSON.parse(raw ?? '') } catch { return response(400, { error: 'Invalid JSON' }) }
+          const action = value?.action
+          if (action !== 'create' && action !== 'edit' && action !== 'remove') return response(400, { error: 'action must be create, edit or remove' })
+          const outcome = write(action, {
+            ...(typeof value.id === 'string' ? { id: value.id } : {}),
+            ...(typeof value.title === 'string' ? { title: value.title } : {}),
+            ...(typeof value.cycle === 'string' ? { cycle: value.cycle } : {}),
+            ...(typeof value.bot_id === 'string' ? { bot_id: value.bot_id } : {}),
+            ...(typeof value.enabled === 'boolean' ? { enabled: value.enabled } : {}),
+          })
+          if (!outcome.ok) return response(400, { ok: false, reason: outcome.reason ?? 'write failed' })
+          return response(200, outcome.record ? { ok: true, record: outcome.record } : { ok: true })
+        }
+        // GET：KV 里那张定时账本。宿主没接这项能力时说「读不到」，不说「还没有常规任务」—— 那是在替队伍编一句话。
         const readRoutines = runtime.routines?.bind(runtime)
         if (!readRoutines) {
           return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
@@ -1036,7 +1057,7 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       // 产出：队伍交出来的文件（worker 写过的那些）。和 screen 一样是宿主侧纯读，不经过网关。
       connection.fetch.register({ path: '/api/mobile/outputs', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       // 常规任务：主人写下的定时账本（契约 §5.5）。这一轮只读，不能在这里改账。
-      connection.fetch.register({ path: '/api/mobile/routines', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/routines', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
       // 记忆：主人的长期账本。GET 读一栏，POST 改一条（forget / edit）。
       connection.fetch.register({ path: '/api/mobile/memory', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
       // 成本与审计：一张票花了多少、这条链谁派的谁判的谁干的。只读。

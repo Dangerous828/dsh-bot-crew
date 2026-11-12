@@ -26,7 +26,7 @@ import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../
 import { ticketCard } from './cards.ts'
 import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
 import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
-import { routinesView, routineItemOf, type RoutinesView } from './routines.ts'
+import { buildRoutine, editRoutine, routinesView, routineItemOf, newRoutineId, type RoutineRecord, type RoutinesView } from './routines.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText } from './followup.ts'
 import { spendOf, spendSteps, type Spend, type SpendEvent } from './spend.ts'
@@ -458,6 +458,38 @@ export class Runtime extends Service implements SourceHost {
   editMemory(name: string, patch: { description?: string; body?: string; importance?: number }): boolean {
     return this.memory.ledger.edit(name, patch)
   }
+  /**
+   * 新建 / 修改 / 删除一条常规任务（手机端可写，契约 §5.5）。
+   *
+   * 只写 `routines` 前缀下的 KV，与读侧同一本账。id 由服务端生成，客户端不能自造 id
+   * （否则能覆写别的键）。返回 `{ok, record}` 或 `{ok:false, reason}` —— 原因给一句人话，
+   * 不把 zod/内部错误漏上屏。
+   */
+  writeRoutine(action: 'create' | 'edit' | 'remove', input: { id?: string; title?: string; cycle?: string; bot_id?: string; enabled?: boolean }): { ok: boolean; record?: RoutineRecord; reason?: string } {
+    if (action === 'remove') {
+      const id = typeof input.id === 'string' ? input.id.trim() : ''
+      if (!id) return { ok: false, reason: 'id is required' }
+      if (!this.store.get(KV.routines.task(id))) return { ok: false, reason: 'no such routine' }
+      this.store.delete(KV.routines.task(id))
+      return { ok: true }
+    }
+    if (action === 'create') {
+      const built = buildRoutine(input, newRoutineId())
+      if (!built.ok) return { ok: false, reason: built.reason }
+      this.store.set(KV.routines.task(built.record.id), built.record)
+      return { ok: true, record: built.record }
+    }
+    // edit
+    const id = typeof input.id === 'string' ? input.id.trim() : ''
+    if (!id) return { ok: false, reason: 'id is required' }
+    const current = this.store.get(KV.routines.task(id))
+    if (!current) return { ok: false, reason: 'no such routine' }
+    const edited = editRoutine(current, input)
+    if (!edited.ok) return { ok: false, reason: edited.reason }
+    this.store.set(KV.routines.task(id), edited.record)
+    return { ok: true, record: edited.record }
+  }
+
   async routines(): Promise<RoutinesView> {
     return routinesView(() => this.store.keys(KV.routines.task).flatMap(name => {
       const record = this.store.get(name)

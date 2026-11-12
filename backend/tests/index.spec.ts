@@ -204,8 +204,8 @@ it('routes notices through the relay tunnel once one is configured, and stops wh
     const runtime = runtimes[0]!
     expect(typeof runtime.pusher).toBe('function')
     // 注进来的那只手要真的走到隧道上，而不是一个自己造的对象。
-    expect(runtime.pusher!({ deviceId: 'dev_abc123', title: 't', body: 'b' })).toBe(true)
-    expect(tunnels[0]!.pushed).toEqual([{ deviceId: 'dev_abc123', title: 't', body: 'b' }])
+    expect(runtime.pusher!({ deviceId: 'd021988751fdd554', title: 't', body: 'b' })).toBe(true)
+    expect(tunnels[0]!.pushed).toEqual([{ deviceId: 'd021988751fdd554', title: 't', body: 'b' }])
   })
 })
 

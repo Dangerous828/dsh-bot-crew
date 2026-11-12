@@ -30,7 +30,9 @@ async function host(port: number, instanceId = 'box-1'): Promise<RelayClient> {
   return client
 }
 
-const DEVICE = 'dev_abc123'
+// 真实设备号是手机报的 ANDROID_ID（16 位十六进制）。早先用带 `dev_` 前缀的假值当样例，
+// 正好掩盖了「宿主设备表里一个都不带前缀、于是每帧都被判非法」这个 bug。
+const DEVICE = 'd021988751fdd554'
 
 it('hands a push to a device that has registered itself', async () => {
   const { port } = await relay()
@@ -72,7 +74,7 @@ it('ignores a push with a malformed device id or an empty body', async () => {
   const box = await host(port)
   box.json(T.pushRegister, 0, { deviceId: 'not-a-device', platform: 'android', token: 't' })
   box.json(T.pushSend, 0, { deviceId: DEVICE, title: 'x', body: '   ' })
-  box.json(T.pushSend, 0, { deviceId: 'bad', title: 'x', body: '真的有事' })
+  box.json(T.pushSend, 0, { deviceId: 'has space', title: 'x', body: '真的有事' })
   // 合法的这一条应当照常送到（前面两条被丢掉，连接没断）。
   box.json(T.pushRegister, 0, { deviceId: DEVICE, platform: 'android', token: 't' })
   box.json(T.pushSend, 0, { deviceId: DEVICE, title: '正常', body: '真的有事' })

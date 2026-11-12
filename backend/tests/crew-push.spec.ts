@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { deliver, DEVICE_ID, MAX_QUEUE_PER_DEVICE, PushOutbox, QUEUE_TTL_MS } from '../src/app/push.ts'
 
-const DEVICE = 'dev_abc123'
+// 真实设备号是手机报的 ANDROID_ID（16 位十六进制），不是带前缀的假值 ——
+// 早先用 `dev_abc123` 当样例，正好掩盖了「设备表里一个都不带 dev_ 前缀」这个 bug。
+const DEVICE = 'd021988751fdd554'
 const message = (over: Record<string, unknown> = {}) => ({ deviceId: DEVICE, title: '有事', body: '队伍在等你', ...over })
 
 describe('PushOutbox', () => {
@@ -77,10 +79,16 @@ describe('deliver', () => {
 
   it('refuses a bad device id and an empty body', () => {
     const outbox = new PushOutbox()
-    expect(deliver(message({ deviceId: 'nope' }), { online: true, outbox })).toMatchObject({ status: 'rejected' })
+    expect(deliver(message({ deviceId: 'has space' }), { online: true, outbox })).toMatchObject({ status: 'rejected' })
+    expect(deliver(message({ deviceId: '' }), { online: true, outbox })).toMatchObject({ status: 'rejected' })
     expect(deliver(message({ body: '   ' }), { online: true, outbox })).toMatchObject({ status: 'rejected' })
-    expect(DEVICE_ID.test('dev_abc123')).toBe(true)
-    expect(DEVICE_ID.test('dev_abc1234567890123456789012345678901234567890')).toBe(false)
+    // 设备表里真实存在的三种形状都要过：手机报的 ANDROID_ID、桌面手写名、以及旧的 dev_ 写法。
+    for (const id of ['d021988751fdd554', '66e74d226c1e38fa', 'crew-desktop', 'dev_abc123']) {
+      expect(DEVICE_ID.test(id), id).toBe(true)
+      expect(deliver(message({ deviceId: id }), { online: true, outbox }), id).toMatchObject({ status: 'delivered' })
+    }
+    expect(DEVICE_ID.test('has space')).toBe(false)
+    expect(DEVICE_ID.test('x'.repeat(65))).toBe(false)
   })
 
   it('honours the per-device cap through deliver as well', () => {

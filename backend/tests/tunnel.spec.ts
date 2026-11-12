@@ -431,14 +431,14 @@ it('sends a push to the relay, which hands it to the device that registered', as
   })
   await new Promise<void>(resolve => phone.addEventListener('open', () => resolve(), { once: true }))
   phone.send(new Uint8Array(jsonFrame(T.register, 0, { instanceId: 'phone-1' })))
-  phone.send(new Uint8Array(jsonFrame(T.pushRegister, 0, { deviceId: 'dev_abc123', platform: 'android', token: 't' })))
+  phone.send(new Uint8Array(jsonFrame(T.pushRegister, 0, { deviceId: 'd021988751fdd554', platform: 'android', token: 't' })))
   running[0]!.extra.push(() => { phone.close() })
   // 等中转把这两帧处理完（它同步处理，但帧要经一次事件循环才到）。
   await vi.waitFor(() => { expect(box.status('phone-1')).toBeDefined() }, { timeout: 3_000 })
 
-  expect(host.push({ deviceId: 'dev_abc123', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })).toBe(true)
+  expect(host.push({ deviceId: 'd021988751fdd554', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })).toBe(true)
   await vi.waitFor(() => { expect(got).toHaveLength(1) }, { timeout: 3_000 })
-  expect(got[0]).toMatchObject({ deviceId: 'dev_abc123', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })
+  expect(got[0]).toMatchObject({ deviceId: 'd021988751fdd554', title: '到点派了一件事', body: '「写周报」已经交给 写手。', kind: 'routine' })
 })
 
 it('does not pretend to push while the tunnel is not live, or with nothing to say', async () => {
@@ -449,7 +449,7 @@ it('does not pretend to push while the tunnel is not live, or with nothing to sa
   running.push({ relay: createRelay(), extra: [() => { void idle.close() }] })
   // 还没 start：state 是 idle，中转那边根本没有这条隧道。
   expect(idle.state()).not.toBe('live')
-  expect(idle.push({ deviceId: 'dev_abc123', title: 't', body: 'b' })).toBe(false)
+  expect(idle.push({ deviceId: 'd021988751fdd554', title: 't', body: 'b' })).toBe(false)
   await idle.close()
 
   const { port } = await relay()
@@ -457,5 +457,5 @@ it('does not pretend to push while the tunnel is not live, or with nothing to sa
   running[0]!.extra.push(() => { void live.close() })
   await live.start()
   expect(live.state()).toBe('live')
-  expect(live.push({ deviceId: 'dev_abc123', title: '有标题', body: '   ' })).toBe(false)
+  expect(live.push({ deviceId: 'd021988751fdd554', title: '有标题', body: '   ' })).toBe(false)
 })

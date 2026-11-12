@@ -68,6 +68,17 @@ const PENDING_TTL_MS = 24 * 60 * 60 * 1000
 /** 一台设备多久没动静算掉线。比心跳间隔宽一倍，避免网络抖一下就判死。 */
 const DEVICE_STALE_MS = 90_000
 
+/**
+ * 设备号的形状。
+ *
+ * 真值来自手机自己报的 `ANDROID_ID`（16 位小写十六进制），桌面那条是手写名字。
+ * **不能要求 `dev_` 前缀** —— 早先这里写的是 `/^dev_[a-z0-9]{6,40}$/`，而宿主设备表里
+ * 一个都不带前缀，于是每一帧 pushRegister / pushSend 都被当成非法设备号直接丢掉，
+ * 表现是「推送静默不生效」，日志里什么都没有。身份校验归宿主的设备表与凭据，
+ * 中转只挡「空、带空白、长得离谱」。
+ */
+const DEVICE_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$/
+
 interface Tunnel {
   instanceId: string
   connection: WebSocketConnection
@@ -392,7 +403,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
         // 手机说自己是谁：记下它此刻挂在这条隧道上，并把攒着的几条补发出去。
         const body = parseJson(frame.payload)
         const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
-        if (!/^dev_[a-z0-9]{6,40}$/.test(deviceId)) return
+        if (!DEVICE_ID.test(deviceId)) return
         const channel = devices.get(deviceId) ?? { deviceId, seenAt: Date.now(), pending: [] }
         channel.instanceId = tunnel.instanceId
         channel.seenAt = Date.now()
@@ -404,7 +415,7 @@ export function createRelay(options: RelayOptions = {}): Relay {
         // 宿主说要发一条：设备在线就直接写下去，不在线就攒着。
         const body = parseJson(frame.payload)
         const deviceId = typeof body.deviceId === 'string' ? body.deviceId : ''
-        if (!/^dev_[a-z0-9]{6,40}$/.test(deviceId)) return
+        if (!DEVICE_ID.test(deviceId)) return
         const title = typeof body.title === 'string' ? body.title : ''
         const text = typeof body.body === 'string' ? body.body : ''
         if (!text.trim()) return

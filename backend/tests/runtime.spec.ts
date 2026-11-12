@@ -1098,6 +1098,39 @@ it('runs the prepare command once for a new ticket, under the execution root wit
   expect(waitsForPerson(runtime.store.tickets.get(failed.ticket.id)!)).toBe(true)
 })
 
+it('uses each recorded model window for reply usage after a model switch', async () => {
+  const { ticket } = await acceptedTicket()
+  const resolveModelInfo = vi.fn(async (_provider: string, model: string) => ({ contextWindow: model === 'small' ? 100 : 1000 }))
+  Object.assign(services.llm as object, { resolveModelInfo })
+  controller.inspect.mockResolvedValue({ events: [
+    { type: 'request/header', header: { config: { provider: 'magpie', model: 'small' } } },
+    { type: 'assistant/message', usage: { inputTokens: 90, outputTokens: 1 } },
+    { type: 'model/selection', provider: 'magpie', model: 'large' },
+    { type: 'assistant/message', usage: { inputTokens: 100, outputTokens: 2 } },
+  ] })
+  const spend = await runtime.replySpends(ticket.id)
+  expect(spend?.replies).toMatchObject([
+    { route: 'magpie/small', context_window: 100, context_left: 10 },
+    { route: 'magpie/large', context_window: 1000, context_left: 900 },
+  ])
+  expect(resolveModelInfo).toHaveBeenCalledWith('magpie', 'small')
+  expect(resolveModelInfo).toHaveBeenCalledWith('magpie', 'large')
+})
+
+it('uses a bot-specific fallback route for a worker with no recorded selection', async () => {
+  const { ticket } = await acceptedTicket()
+  runtime.store.tickets.save({ ...runtime.store.tickets.get(ticket.id)!, channels: [
+    { ...ticket.channels[0]!, address: { ...ticket.channels[0]!.address, bot_id: 'coder' } },
+  ] })
+  const settings = runtime.store.settings()
+  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor,
+    model: { provider: 'magpie', model: 'team-default' },
+    botModels: { coder: { provider: 'magpie', model: 'coder-model' } },
+  } })
+  controller.inspect.mockResolvedValue({ events: [{ type: 'assistant/message', usage: { inputTokens: 10, outputTokens: 1 } }] })
+  expect((await runtime.spend(ticket.id))?.recent[0]).toMatchObject({ provider: 'magpie', model: 'coder-model' })
+})
+
 it('counts a ticket whose directory the host prepared before prepare commands existed as prepared', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   await runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'offline' })
@@ -1848,3 +1881,61 @@ it('retries a pending setup on its own instead of staying paused until a manual 
   expect(next.health.runtime).toMatchObject({ state: 'ready' })
   await next.stop()
 }, 30_000)
+
+describe('runRoutines: 到点真的派出去，还是只记一句', () => {
+  // 这一段之前一条测试都没有：`routines.spec.ts` 只测 due 怎么算、账怎么记，
+  // 而「到点之后真的变成一张票」和「暂停时只记一句 held」是两条完全不同的行为，
+  // 也正是交接文档第 88 条待办要验的东西。
+  const HOUR = 60 * 60 * 1000
+  const dueTask = (over: Partial<{ id: string; bot_id: string; enabled: boolean; created_at: string }> = {}) => ({
+    id: over.id ?? 'task-1', title: '写周报', cycle: 'hourly' as const,
+    ...(over.bot_id ? { bot_id: over.bot_id } : {}),
+    enabled: over.enabled ?? true,
+    // 一小时零一分钟之前建的：hourly 的下一次已经过去了，所以到点。
+    created_at: over.created_at ?? new Date(Date.now() - HOUR - 60_000).toISOString(),
+  })
+
+  it('names why it held a due task instead of silently skipping it', async () => {
+    // 这个测试环境里 setup 还没配完（`paused()` 的实现是 `!setup.configured() || settings.paused`），
+    // 所以到点的任务一定被 held。这里要钉的不是「能不能派」，而是「不派的时候说不说得清」——
+    // 静默跳过是最难查的那种：人只会看到「到点了但什么也没发生」。
+    const instance = await restart()
+    instance.store.set(KV.routines.task('task-1'), dueTask({ bot_id: 'lead' }))
+    const result = await instance.runRoutines()
+    expect(result.dispatched).toEqual([])
+    expect(result.held).toEqual(['task-1'])
+    // 没派出去就不能记成跑过。
+    const after = instance.store.get(KV.routines.task('task-1')) as Record<string, unknown>
+    expect(after.last_run).toBeUndefined()
+  })
+
+  it('holds a due task while the crew is paused, and does not record it as run', async () => {
+    const instance = await restart()
+    instance.store.set(KV.routines.task('task-1'), dueTask({ bot_id: 'lead' }))
+    instance.store.saveSettings({ ...instance.store.settings(), paused: true })
+
+    const result = await instance.runRoutines()
+    expect(result.dispatched).toEqual([])
+    expect(result.held).toEqual(['task-1'])
+    // 没跑成就不能记成跑过 —— 否则暂停期间的那几拍会被吞掉，恢复后也不再补。
+    const after = instance.store.get(KV.routines.task('task-1')) as Record<string, unknown>
+    expect(after.last_run).toBeUndefined()
+  })
+
+  it('leaves a task that is not due alone', async () => {
+    const instance = await restart()
+    // 刚建好：hourly 的下一次还没到。
+    instance.store.set(KV.routines.task('fresh'), dueTask({ id: 'fresh', created_at: new Date().toISOString() }))
+    const result = await instance.runRoutines()
+    expect(result.dispatched).toEqual([])
+    expect(result.held).toEqual([])
+  })
+
+  it('skips a disabled task even when its time has passed', async () => {
+    const instance = await restart()
+    instance.store.set(KV.routines.task('off'), dueTask({ id: 'off', enabled: false }))
+    const result = await instance.runRoutines()
+    expect(result.dispatched).toEqual([])
+    expect(result.held).toEqual([])
+  })
+})

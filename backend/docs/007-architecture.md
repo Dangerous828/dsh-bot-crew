@@ -457,6 +457,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |
 | `tests/crew-memory-port.spec.ts` | 记忆端口：本机版写账/幂等/忘掉，中枢版第一步委托本机结果一致，本机巩固无提炼器时不假装修理过 |
 | `tests/crew-memory-distill.spec.ts` | 睡眠期提炼与巩固：规则提炼器只提炼规矩句、同话题去重、LLM 版坏 JSON 返回空、端到端拉日志→提炼→入库、无日志不写 |
+| `tests/crew-memory-detect.spec.ts` | 中枢探测：空地址不探测、可达后 TTL 缓存、探测失败即不可达、工厂选出的端口中枢不可达时走本机 |
 | `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |
 | `tests/crew-routine-runner.spec.ts` | 常规任务调度：只派开着的且到点的、逾期久的先派、停机两天后不补跑、没跑过就写「第一次」 |
 | `tests/crew-followup.spec.ts` | 跟进：等人的门槛比在跑的低、长跑不催命、已结束的不追、说不清多久就不提醒、同一件事只算一次 |

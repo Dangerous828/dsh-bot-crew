@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
-import { ApprovalConfigSchema, ConnectionsConfigSchema, EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
+import { ApprovalConfigSchema, ConnectionsConfigSchema, MemoryConfigSchema, EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
@@ -29,7 +29,7 @@ interface Block {
   merge(settings: SettingsValue, value: unknown, id: string): SettingsValue
   guard?(current: SettingsValue, candidate: SettingsValue, origin: SettingsOrigin): void
 }
-const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'approval' | 'connections' | 'source', Block> = {
+const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'approval' | 'connections' | 'memory' | 'source', Block> = {
   policy: {
     parse: (value, sources) => {
       const policy = PolicyConfigSchema.parse(value)
@@ -60,6 +60,14 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'approval' | 'connections'
     // 外部连接同样属于授权范围：非面板来源不得新增写连接或关闭只读闸。
     guard: (current, candidate, origin) => {
       if (origin !== 'panel' && JSON.stringify(current.connections) !== JSON.stringify(candidate.connections)) throw new UserError('panelOnlyConnections')
+    },
+  },
+  memory: {
+    parse: value => MemoryConfigSchema.parse(value),
+    merge: (settings, value) => ({ ...settings, memory: value as SettingsValue['memory'] }),
+    // 记忆中枢地址是部署设施，只允许管理页改；模型工具不得把记忆偷送到别处。
+    guard: (current, candidate, origin) => {
+      if (origin !== 'panel' && JSON.stringify(current.memory) !== JSON.stringify(candidate.memory)) throw new UserError('panelOnlyMemory')
     },
   },
   source: {
@@ -137,6 +145,7 @@ export class Settings {
       executor: { revision: revision('executor'), value: settings.executor },
       approval: { revision: revision('approval'), value: settings.approval },
       connections: { revision: revision('connections'), value: settings.connections },
+      memory: { revision: revision('memory'), value: settings.memory },
       policy: { revision: revision('policy'), rules: rules.map(rule => ({ id: rule.id, name: rule.name, enabled: rule.enabled })),
         allowed: Object.fromEntries(Object.entries(parts).map(([id, part]) => [id, part.allowed.length])), read: 'settings/policy' },
       sources: sources.instances(settings).map(({ id, kind, enabled, installed }) =>
@@ -151,7 +160,7 @@ export class Settings {
     const { store, sources } = this.host
     const settings = store.settings(), id = block.startsWith('source:') ? block.slice('source:'.length) : undefined
     const instance = id === undefined ? undefined : sources.instances(settings).find(item => item.id === id)
-    const value = block === 'pause' ? { paused: settings.paused } : block === 'policy' || block === 'eval' || block === 'executor' || block === 'approval' || block === 'connections' ? settings[block]
+    const value = block === 'pause' ? { paused: settings.paused } : block === 'policy' || block === 'eval' || block === 'executor' || block === 'approval' || block === 'connections' || block === 'memory' ? settings[block]
       : instance ? { enabled: instance.enabled, config: instance.config } : undefined
     if (value === undefined) throw new UserError('unknownBlock', { block })
     return { block, revision: store.blockRevision(block as SettingsSave), value }

@@ -161,7 +161,7 @@ export const SettingsSchema = z.object({
   memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
-export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'approval' | 'connections' | `source:${string}`
+export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'approval' | 'connections' | 'memory' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 

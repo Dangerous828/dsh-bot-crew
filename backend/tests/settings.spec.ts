@@ -120,3 +120,13 @@ it('saves approval and connections from the panel, bumps the policy version, and
   await expect(settings.save('connections', { readOnly: true, connections: [] }, store.blockRevision('connections'), 'tool'))
     .rejects.toThrow(new UserError('panelOnlyConnections'))
 })
+
+it('saves the memory hub block from the panel and refuses a non-panel change', async () => {
+  h = await startRuntime()
+  const { settings, store } = h.runtime
+  const rev = store.blockRevision('memory')
+  await settings.save('memory', { hub: 'http://hub.local:8642', timeoutMs: 2000 }, rev, 'panel')
+  expect(store.settings().memory).toEqual({ hub: 'http://hub.local:8642', timeoutMs: 2000 })
+  await expect(settings.save('memory', { hub: '', timeoutMs: 1500 }, store.blockRevision('memory'), 'tool'))
+    .rejects.toThrow(new UserError('panelOnlyMemory'))
+})

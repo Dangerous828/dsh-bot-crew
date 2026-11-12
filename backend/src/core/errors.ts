@@ -40,6 +40,7 @@ export const USER_ERRORS = {
   panelOnlyAccounts: ['refused', 'Source fields that setup reads, such as account CLIs, can only be changed in the management panel'],
   panelOnlyApproval: ['refused', 'The approval mode and budget threshold can only be changed in the management panel'],
   panelOnlyConnections: ['refused', 'External connections can only be changed in the management panel'],
+  panelOnlyMemory: ['refused', 'The memory hub address can only be changed in the management panel'],
   setupComplete: ['refused', 'Setup is complete'],
   modelUnavailable: ['refused', 'The {block} model is not available: {error}'],
   promptTooLong: ['refused', 'Prompt configuration exceeds {limit} characters'],

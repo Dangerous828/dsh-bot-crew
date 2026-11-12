@@ -213,8 +213,11 @@ export class Runtime extends Service implements SourceHost {
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
       // 记忆中枢：按设置里的 memory.hub 探测决定走中枢版还是本机版；两版共用同一个本机账本。
+      // 允许环境变量 DSH_SUPERAGENT_MEMORY_HUB 兜底：设置里没填时用它，省去先开面板。
       const memorySettings = store.settings().memory
-      const memoryProbe = new HubProbe({ hub: memorySettings.hub, timeoutMs: memorySettings.timeoutMs,
+      const envHub = (process.env.DSH_SUPERAGENT_MEMORY_HUB ?? '').trim()
+      const memoryHub = memorySettings.hub || (/^https?:\/\//.test(envHub) ? envHub : '')
+      const memoryProbe = new HubProbe({ hub: memoryHub, timeoutMs: memorySettings.timeoutMs,
         log: line => console.log(line) })
       const localMemory = new LocalMemory({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
         ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [],

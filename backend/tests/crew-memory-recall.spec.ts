@@ -123,10 +123,28 @@ describe('settle: which sentences are durable', () => {
     expect(looksDurable('从今以后别动 launchd 那个任务')).toBe(true)
   })
 
+  it('recognises the most natural way to state one: 以后都先说…', () => {
+    // 这一条曾经漏了：原来的动作表只有 按/用/要/就/走/叫/这么/这样/别，
+    // 「先」不在其中，于是「以后都先说结论」——最自然的那种说法——反而认不出来。
+    // 交接文档里给的验证话术正好是这一句，照着验会失败。
+    expect(looksDurable('以后都先说结论')).toBe(true)
+    expect(looksDurable('以后先说结论')).toBe(true)
+    expect(looksDurable('以后都要先说结论')).toBe(true)
+    expect(looksDurable('以后每次先跑测试')).toBe(true)
+  })
+
   it('treats ordinary chatter as not worth remembering', () => {
     expect(looksDurable('今天天气不错')).toBe(false)
     expect(looksDurable('好')).toBe(false)
     expect(looksDurable('帮我看看这个文件')).toBe(false)
+  })
+
+  it('does not turn a put-off into a rule', () => {
+    // 「以后再看吧」「以后再说」和「以后再说清楚」长得一样，靠句式分不开。
+    // 所以「再」这一支整个不收：宁可漏一句推脱，也不往账本里塞废话。
+    expect(looksDurable('以后再看吧')).toBe(false)
+    expect(looksDurable('以后再说')).toBe(false)
+    expect(looksDurable('以后有空再说')).toBe(false)
   })
 
   it('builds a fact with a single-line description and a stable dedupe key', () => {

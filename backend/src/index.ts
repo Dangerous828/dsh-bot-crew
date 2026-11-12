@@ -7,11 +7,15 @@ import { deviceStoreOf } from './app/remote.ts'
 import { bindCandidates, createLanServer, lanPort } from './app/lan-server.ts'
 import { createDiscovery } from './app/discovery.ts'
 import { publicEntry } from './app/public-entry.ts'
+import { createP2p } from './app/p2p.ts'
 import { createTunnel } from './app/tunnel.ts'
 import { phoneGate } from './app/phone-gate.ts'
 import { createPairingThrottle } from './app/pairing-throttle.ts'
 import { parseRelayCandidates } from './app/relay-chain.ts'
 import { createHash } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { networkInterfaces } from 'node:os'
 import { Config, machineOf, type DeploymentConfig } from './deployment.ts'
 
@@ -60,10 +64,13 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     }))
   // 手机换一次网就要重输一次地址，是这套东西最容易卡住人的地方。这里把队伍广播出去，
   // 手机用系统 NSD 就能自己找到它。广播失败只是少一条捷径，手输地址照旧可用。
+  /** tailcat 起来之后才有地址，所以广播取的是这个变量而不是一个定值。 */
+  let p2pAddr: string | undefined
   const discovery = createDiscovery({
     stateDir: machine.stateDir,
     name: process.env.CREW_DISCOVERY_NAME?.trim() || undefined,
     publicUrl: publicEntry(machine.stateDir),
+    p2pAddr: () => p2pAddr,
     onError: error => ctx.logger.warn('mDNS announce failed: %s', String(error)),
   })
   const lan = createLanServer({
@@ -78,9 +85,41 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   // 所有可达地址都绑上，因为只绑一块会漏掉别的网络（本机与模拟器走的是回环）。
   const candidates = bindCandidates(Object.entries(networkInterfaces()).flatMap(([name, list]) =>
     (list ?? []).map(item => ({ address: item.address, family: item.family, internal: item.internal, name }))))
+  // 手机那条 P2P 路：tailcat serve 把手机要访问的端口暴露进 WireGuard 隧道 ——
+  // magicsock 打洞成功就走直连，打不通自动落到 DERP，两条都是 UDP，比 HTTP 中转少一跳。
+  // 二进制不在就当作这台机器没有这条通道：局域网与中转照旧，别的功能一点不受影响。
+  const phonePort = lanPort(machine.stateDir)
+  const p2pHealth = runtime.claimHealth('p2p', { state: 'starting', detail: 'Waiting for the phone listener' })
+  const p2p = createP2p({
+    binary: fileURLToPath(new URL('../tools/tailcat', import.meta.url)),
+    port: phonePort,
+    onAddr: addr => {
+      p2pAddr = addr
+      // 落盘只有一个用处：后端刚重启、tailcat 还没喷出新地址的那几秒，手机仍然拿得到上次
+      // 那个地址（地址由密钥决定，所以旧地址依然有效），不必被降级到中转。
+      try { writeFileSync(join(machine.stateDir, 'mobile-p2p-addr'), `${addr}\n`) }
+      catch (error) { ctx.logger.warn('could not record the p2p address: %s', String(error)) }
+      // 地址变了就让广播跟着变：手机在任何一个网络下看见一次就够了。
+      discovery.publish(phonePort)
+    },
+    onState: (state, detail) => p2pHealth.set({ state, detail, at: new Date().toISOString() }),
+    logger: message => ctx.logger.info('%s', message),
+  })
+  ctx.effect(() => async () => { await p2p.stop() })
+  // 无条件起：这条通道的失败模式（二进制缺、NAT 打不通）和监听绑不上是两件事，把它们串成
+  // 先后条件后，监听那边一次抖动就会让打洞能力整轮缺失。监听没起来时上面的 then 会把健康项
+  // 标红，那才是要人看的那一格。
+  p2p.start()
+
   lan.listenAll(lanPort(machine.stateDir), candidates)
     .then(bound => {
-      if (bound.length === 0) { ctx.logger.warn('phone listener found no address to bind'); return }
+      if (bound.length === 0) {
+        ctx.logger.warn('phone listener found no address to bind')
+        // 隧道暴露的是那个端口：监听没起来时起隧道，等于公布一个没人听的地址，
+        // 而 tailcat 自身会健康地报 ready —— 那是最难查的一种「看起来都好」。
+        p2pHealth.set({ state: 'error', detail: 'No phone listener to expose', at: new Date().toISOString() })
+        return
+      }
       const port = lanPort(machine.stateDir)
       // 真的绑上了才广播：没绑上就广播，手机找到的会是一个拒绝连接的地址。
       discovery.publish(port)

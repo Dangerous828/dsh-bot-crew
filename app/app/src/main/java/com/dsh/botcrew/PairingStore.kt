@@ -24,27 +24,55 @@ class PairingStore(context: Context) {
     }
 
     /** 本机真的存过的那份；内置的那份不算，它在 load 里作为回落。 */
-    fun stored(): PairedCrew? {
-        val device = store.getString("deviceId", null) ?: return null
-        val token = store.getString("token", null) ?: return null
-        val base = store.getString("base", null) ?: return null
-        // 老装机存下来的那份没有 fallbackBase：读成空串，等下次在同一 Wi-Fi 下重新发现时补上。
-        return PairedCrew(device, token, base, store.getString("fallbackBase", "").orEmpty())
-    }
+    fun stored(): PairedCrew? = PairingRecord.read(store.all)
 
     fun save(paired: PairedCrew) {
-        store.edit()
-            .putString("deviceId", paired.deviceId)
-            .putString("token", paired.token)
-            .putString("base", paired.base)
-            .putString("fallbackBase", paired.fallbackBase)
-            .apply()
+        // 先清再写：字段是一组固定的键，逐条 put 会把上次残留的、这次不该有的值留在盘上。
+        val editor = store.edit().clear()
+        for ((key, value) in PairingRecord.write(paired)) editor.putString(key, value)
+        editor.apply()
     }
 
     /** 忘掉这台电脑。断开连接用它，不是「退出登录」。 */
     fun clear() {
         store.edit().clear().apply()
     }
+}
+
+/**
+ * 盘上那几格与 [PairedCrew] 之间的搬运。
+ *
+ * 单独抽出来是因为 SharedPreferences 在 JVM 单测里跑不了，而这层映射必须被测到：
+ * 少读一格不会报错，只会表现为「每次启动都当成没配过」，或者某个入口静默消失。
+ */
+object PairingRecord {
+    const val DEVICE = "deviceId"
+    const val TOKEN = "token"
+    const val BASE = "base"
+    const val FALLBACK = "fallbackBase"
+    const val P2P = "p2pAddr"
+
+    /** 缺前三格就不算一份配对；其余两格缺了读成空串，那是「这台电脑没有那条路」。 */
+    fun read(values: Map<String, Any?>): PairedCrew? {
+        val device = values[DEVICE] as? String ?: return null
+        val token = values[TOKEN] as? String ?: return null
+        val base = values[BASE] as? String ?: return null
+        return PairedCrew(
+            deviceId = device,
+            token = token,
+            base = base,
+            fallbackBase = values[FALLBACK] as? String ?: "",
+            p2pAddr = values[P2P] as? String ?: "",
+        )
+    }
+
+    fun write(paired: PairedCrew): Map<String, String> = mapOf(
+        DEVICE to paired.deviceId,
+        TOKEN to paired.token,
+        BASE to paired.base,
+        FALLBACK to paired.fallbackBase,
+        P2P to paired.p2pAddr,
+    )
 }
 
 /** 设备自报的名字。配对时电脑靠它认人，所以取个能一眼认出来的。 */

@@ -64,13 +64,20 @@ class PairingClient(private val base: String) {
 /**
  * 配好之后存下来的东西。存在本机，下次开 App 直接用。
  *
- * [fallbackBase] 是「出了家门」那条路：同一 Wi-Fi 之外，局域网那个地址根本不存在。
- * 它在配对时由 mDNS 广播里的 `pub` 一并带过来（电脑自己在广播里说自己出门的地址），
- * 所以人从来不用手输第二遍。空串表示这台电脑没配外网入口 —— 那不是错，只是只能在附近用。
+ * 三条路各占一格，角色固定，谁也不顶替谁：
+ *
+ * - [base] 是配对那一刻的局域网地址（同一 Wi-Fi 下最快的一条）；
+ * - [fallbackBase] 是电脑的出门地址（`https://...`，配对时由 mDNS 的 `pub` 一并带过来）；
+ * - [p2pAddr] 是电脑的隧道地址（tc-addr，配对时由 `p2p` 带过来），它是直连，比中转快得多。
+ *
+ * 两条可空的都是空串而不是 null：空串就是「这台电脑没有那条路」，那不是错误，
+ * 只是那个场景下走不通。三格分开存是为了让选路顺序（P2P → 局域网 → 公网）永远成立 ——
+ * 把「上次哪条通」写回 base 会让下一次启动先试公网，把更快的路排到后面。
  */
 data class PairedCrew(
     val deviceId: String,
     val token: String,
     val base: String,
     val fallbackBase: String = "",
+    val p2pAddr: String = "",
 )

@@ -52,7 +52,7 @@ import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
 import { handoffEndNotice } from './notices.ts'
-import { HealthBoard } from '../infra/health.ts'
+import { HealthBoard, type HealthEntry } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
 import { Setup } from './setup.ts'
@@ -814,6 +814,14 @@ export class Runtime extends Service implements SourceHost {
     return { delivered: true }
   }
   get health(): Readonly<Record<string, Health>> { return this.board.all }
+
+  /**
+   * Let a component outside Runtime report its own health (the phone's P2P channel does:
+   * whether a direct tunnel is up is not Runtime's business, but the operator needs it on
+   * the same panel). Throws when the name is already taken, so one component cannot silently
+   * overwrite another's line.
+   */
+  claimHealth(name: string, initial?: Health): HealthEntry { return this.board.claim(name, initial) }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
   context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }

@@ -9,55 +9,96 @@ import java.net.URLEncoder
 import java.net.URL
 
 /**
- * 连一段对话。base 形如 http://10.0.2.2:18882（模拟器里 10.0.2.2 是宿主机）。
+ * 连一段对话。
  *
- * [fallbackBase] 是同一台电脑的「出门」入口（配对时由 mDNS 的 `pub` 一并带过来）。
- * 两条路谁先用不是配置出来的，是**试出来的**：先走当前这条，连不上就换另一条。同一 Wi-Fi
- * 下局域网直连永远更快，出门之后局域网那条根本不存在 —— 与其让人去设置里开关，不如让它自己认。
+ * [entries] 是按优先级排好的入口，由 [CrewRoute] 拼出来：P2P 代理 → 局域网 → 公网。
+ * 走哪条不是配置出来的，是**试出来的**：先用当前这条，连不上就按顺序试下一条。
+ * 同一 Wi-Fi 下局域网直连更快，出门之后局域网那条根本不存在 ——
+ * 与其让人去设置里开关，不如让它自己认。
+ *
+ * 入口表可以在运行期重排（[promote]）：P2P 那条是后台接上的，接通之前这张表里没有它。
  */
 class CrewClient(
-    initialBase: String,
+    entries: List<String>,
     private val token: String,
     /** 队伍自己签发的设备凭据。独立监听那道门认它，不认网关 token。 */
     private val deviceId: String? = null,
-    /** 出门那条路的入口；空表示这台电脑没配外网入口。 */
-    private val fallbackBase: String? = null,
-    /** 换了路并真的成功之后才回调：上层据此把它记住，下次启动就不必先失败一次。 */
-    private val onBaseSwitched: ((String) -> Unit)? = null,
+    /** 换了入口并真的成功之后才回调：上层据此把「现在在哪条路上」说出来。 */
+    private val onRouteSwitched: ((String) -> Unit)? = null,
 ) {
-    /** 配对时记下的那条（局域网）。用来判断「现在用的是哪一条」。 */
-    private val primaryBase = initialBase
-
-    /** 当前实际在用的入口。会变：出门换到公网，回家再换回来。 */
+    /**
+     * 试的顺序。空串在这里没有意义，构造时就丢掉。
+     *
+     * 重排时整张表换成一个新值，不原地改：一条请求跑到一半时表被换掉，它手里那份仍然完整。
+     */
     @Volatile
-    private var base: String = initialBase
+    private var order: List<String> = entries.map(CrewPairing::normalize).filter(String::isNotBlank)
 
-    /** 另一条路；没配或者只有一条路时为 null。 */
-    private fun other(): String? {
-        val alt = fallbackBase?.takeIf { it.isNotBlank() } ?: return null
-        return if (base == primaryBase) alt else primaryBase
+    /**
+     * 当前在用的入口。存地址而不是下标 —— 表一旦重排，同一个下标指的就是另一条路了。
+     */
+    @Volatile
+    private var current: String = order.firstOrNull().orEmpty()
+
+    /** 现在在用的入口。语音与播报那两条直连的请求也走它。 */
+    private val base: String get() = current.ifEmpty { order.firstOrNull().orEmpty() }
+
+    /** 现在会按什么顺序试。给测试和日志看。 */
+    fun routeOrder(): List<String> = order
+
+    /**
+     * 把一条**已经确认可用**的入口提到队首。
+     *
+     * P2P 是后台接上的：接通前这张表里只有局域网和公网，探通之后不提上来，这一整次会话
+     * 就都还在绕远路。表与「在用的那条」在同一个锁里一起换，读的人不会看到只换了一半的状态。
+     */
+    fun promote(entry: String) {
+        val clean = CrewPairing.normalize(entry)
+        if (clean.isEmpty()) return
+        synchronized(this) {
+            order = listOf(clean) + order.filter { it != clean }
+            current = clean
+        }
     }
 
     /**
      * 发一次请求并把正文读回来。每个接口只差路径、方法与 body，
      * 连接的开合收在这一处：漏一次 disconnect 就是一条泄漏的 socket。
      *
-     * 换路只发生在「连不上」的时候，且只换一次。401 不算：那是凭据问题，换一条路同样进不去，
-     * 只会让人多等一次超时，还把错误说成「连不上」。
+     * 换路只发生在「连不上」的时候：先当前这条，再按表上的顺序绕一圈。401 不换路：
+     * 那是凭据问题，换一条同样进不去，只会让人多等一次超时，还把错误说成「连不上」。
+     *
+     * 记住「哪条通」是为了不再重蹈：出门之后每条请求都先试一遍不存在的局域网地址，
+     * 就是每次都要多等一次超时。代价是 P2P 断了之后要等下次启动才会被重新拣起来 ——
+     * 隧道重连本身在库内部做，真的恢复了也是一次新的请求周期。
      */
     private suspend fun read(path: String, method: String, body: String? = null): String =
         withContext(Dispatchers.IO) {
-            try {
-                attempt(base, path, method, body)
-            } catch (error: CrewRejected) {
-                throw error
-            } catch (error: IOException) {
-                val alt = other() ?: throw error
-                val text = attempt(alt, path, method, body)
-                base = alt
-                onBaseSwitched?.invoke(alt)
-                text
+            // 这一趟用自己拿到的那份表：中途被 promote 换掉，它照旧按旧表跑完。
+            val table = order
+            if (table.isEmpty()) throw IOException("队伍地址不对：没有可用的入口")
+            // 从当前在用的那条开始绕一圈；current 不在表里（不该发生）就从第一条起。
+            val start = table.indexOf(current).coerceAtLeast(0)
+            var failure: IOException? = null
+            for (step in table.indices) {
+                val entry = table[(start + step) % table.size]
+                try {
+                    val text = attempt(entry, path, method, body)
+                    // 表没被换过才把「现在用哪条」写回去。换过说明 P2P 刚升级上来，
+                    // 这一次成功走的是旧路，不该把「当前入口」改回旧的那条。
+                    if (entry != current && table === order) {
+                        current = entry
+                        onRouteSwitched?.invoke(entry)
+                    }
+                    return@withContext text
+                } catch (error: CrewRejected) {
+                    throw error
+                } catch (error: IOException) {
+                    // 报出去的仍是第一条路的错：那才是人最先遇到的那个现象。
+                    if (failure == null) failure = error
+                }
             }
+            throw failure ?: IOException("队伍地址不对：没有可用的入口")
         }
 
     private fun attempt(entry: String, path: String, method: String, body: String?): String {

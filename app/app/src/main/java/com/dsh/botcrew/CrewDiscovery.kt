@@ -84,10 +84,14 @@ object CrewDiscovery {
                 // 同一个 Wi-Fi 下配过一次，之后换到任何网络都照着它连 —— 这是不装任何客户端
                 // 也能跨网的全部机关。没有这一格就只是这台机器没配外网入口，局域网照旧可用。
                 val public = serviceInfo.attributes?.get("pub")?.toString(Charsets.UTF_8)?.trim()
+                // `p2p` 是同一台电脑的隧道地址（tc-addr，内嵌密钥）。它比 `pub` 更值钱也更容易
+                // 过期：电脑换了密钥或没起 serve 时这里就是空的，那时退回上面那两条路。
+                val p2p = serviceInfo.attributes?.get("p2p")?.toString(Charsets.UTF_8)?.trim()
                 onFound(CrewBeacon(
                     name = serviceInfo.serviceName,
                     base = "http://$shaped:$port",
                     publicBase = public?.takeIf { it.isNotEmpty() }.orEmpty(),
+                    p2pAddr = p2p?.takeIf { it.isNotEmpty() }.orEmpty(),
                 ))
             }
         })
@@ -99,8 +103,16 @@ object CrewDiscovery {
  *
  * [publicBase] 是同一台电脑的出门地址（`https://...`），空串表示它没配。它不填进地址框 ——
  * 同一 Wi-Fi 下直连更快也更稳；只在局域网那条路连不上时才拿来兜底。
+ *
+ * [p2pAddr] 是这台电脑的隧道地址（tc-addr），空串表示它没起 P2P。它比另外两条都值钱：
+ * 换了网络还能直连同一台电脑，且那条路是端到端加密的。
  */
-data class CrewBeacon(val name: String, val base: String, val publicBase: String = "")
+data class CrewBeacon(
+    val name: String,
+    val base: String,
+    val publicBase: String = "",
+    val p2pAddr: String = "",
+)
 
 /**
  * 发现流上的一件事：看见一台，或者一台不见了。

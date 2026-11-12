@@ -1,0 +1,4 @@
+# 隧道本体约 16MB（Go 编出来的 arm64 共享库），不入库：
+# 用 backend/scripts/build-tailcat-android 重建到 arm64-v8a/libtailcat.so。
+# JNI 包装（libtailcatjni.so）不在这里 —— 它由 cpp/ 里的 CMake 每次编译生成。
+arm64-v8a/libtailcat.so

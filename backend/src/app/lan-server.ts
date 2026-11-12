@@ -63,6 +63,7 @@ export function createLanServer(options: LanServerOptions): LanServer {
   let pending: Promise<void> | undefined
   // 首次配对的放行把「凭据」换成了「一支 6 位码」：100 万种、5 分钟。没有次数限制的话，
   // 局域网里一台机器可以在一分钟内穷举完。按来源网段限速，让猜码变得不划算。
+  // 这个实例由调用方传进来，与中转隧道那条路共用一份计数（见 pairing-throttle.ts）。
   const pairingAllowed = options.pairingAllowed ?? createPairingThrottle()
 
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -77,6 +78,9 @@ export function createLanServer(options: LanServerOptions): LanServer {
     // 首次配对是个死锁：这台设备还没有凭据，而这条路又要求凭据。所以只有「交一支码」这一跳放行，
     // 码本身就是它的凭据（6 位、5 分钟、兑换即作废，配对策略为 deny 时一律拒绝）。
     // 别的路径不受影响 —— 放行的是一支码，不是整个消息面。
+    // 这里的 remoteAddress 在 P2P 那条路上永远是回环：tailcat 把隧道里的连接代理到
+    // 127.0.0.1:<本端口>，对端身份在这一层不成立。限速因此按「最严口径」共用一个桶，
+    // 判断依据写在 pairing-throttle.ts 的模块注释里。
     const pairing = path === '/api/mobile/pair' && request.method === 'POST'
     if (pairing && !pairingAllowed(request.socket.remoteAddress)) {
       response.writeHead(429, { 'content-type': 'application/json' })

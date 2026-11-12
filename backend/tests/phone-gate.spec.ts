@@ -70,4 +70,24 @@ describe('pairing throttle', () => {
     expect(pairingKey('::ffff:192.168.31.50')).toBe('192.168.31.0/24')
     expect(pairingKey('::ffff:192.168.31.51')).toBe('192.168.31.0/24')
   })
+
+  // 经 P2P 隧道进来的手机在监听上都是 127.0.0.1（tailcat 把连接代理到回环），本机代理也在那里。
+  // 回环只表示「本机自己」，所以所有写法折进同一个桶：分成 IPv4 与 IPv6 两个桶等于给同一个
+  // 来源集合两份额度，那是变松。
+  it('puts every loopback spelling in one bucket', () => {
+    expect(pairingKey('127.0.0.1')).toBe(pairingKey('127.0.0.5'))
+    expect(pairingKey('::1')).toBe(pairingKey('127.0.0.1'))
+    expect(pairingKey('::ffff:127.0.0.1')).toBe(pairingKey('127.0.0.1'))
+    // 链路本地不是回环，别被顺手折进去。
+    expect(pairingKey('fe80::1')).not.toBe(pairingKey('::1'))
+  })
+
+  it('spends one budget on every tunnel arrival, and a LAN address keeps its own', () => {
+    const allowed = createPairingThrottle()
+    for (let attempt = 0; attempt < 20; attempt += 1) expect(allowed('127.0.0.1')).toBe(true)
+    // 隧道上的手机共用这一个桶：第 21 次是 429，换一条隧道连接也一样。
+    expect(allowed('127.0.0.1')).toBe(false)
+    // 同一 Wi-Fi 下直连的手机按自己的网段计数，不受隧道刷量影响。
+    expect(allowed('192.168.31.50')).toBe(true)
+  })
 })

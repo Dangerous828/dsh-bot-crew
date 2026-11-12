@@ -1,0 +1,33 @@
+#!/bin/sh
+# 重建手机 P2P 那条路的电脑端助手（tailcat）。
+#
+# tailcat 是 Tailscale 官方的 data-plane-only 复刻（magicsock 打洞 + WireGuard + DERP 兜底，
+# 没有 Tailscale 账号、不改本机路由表）。它的地址由保存的密钥决定，所以同一台机器每次重建
+# 都拿到同一个 tc-addr —— 手机存一次就够了。
+#
+# 产物约 30MB 单平台，不入库。用法：
+#
+#   ./scripts/build-tailcat            # 编到 tools/tailcat
+#   ./scripts/build-tailcat v0.6.0     # 指定 tag
+#
+# 需要 Go（go.mod 指定了 1.27.2，低于此版本由 GOTOOLCHAIN 自动下载）与 C 编译器（cgo）。
+set -eu
+
+TAG=${1:-}
+OUT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/tools/tailcat
+WORK=${TMPDIR:-/tmp}/tailcat-build
+
+if [ -n "$TAG" ]; then
+  rm -rf "$WORK"
+  git clone --depth 1 --branch "$TAG" https://github.com/tailscale/tailcat "$WORK"
+elif [ -d "$WORK/.git" ]; then
+  git -C "$WORK" pull --ff-only --depth 1
+else
+  rm -rf "$WORK"
+  git clone --depth 1 https://github.com/tailscale/tailcat "$WORK"
+fi
+
+cd "$WORK"
+CGO_ENABLED=1 go build -o "$OUT" ./cmd/tailcat
+echo "built $(du -h "$OUT" | cut -f1) -> $OUT"
+"$OUT" version 2>/dev/null | head -2 || true

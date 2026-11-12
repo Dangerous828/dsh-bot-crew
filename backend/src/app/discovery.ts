@@ -46,6 +46,13 @@ export interface DiscoveryOptions {
    * 发现一次，永久可用。没配就只广播局域网，和原来一字不差。
    */
   publicUrl?: string
+  /**
+   * 手机那条 P2P 路的地址（tailcat 的 tc-addr）。它是**后到的** —— 隧道进程起来才有，
+   * 所以给取值器而不是值：每次广播现读，地址换了就跟着换。
+   *
+   * 和 `pub` 一起给，手机发现一次就把三条路都记住了：P2P 地址、公网入口、局域网地址。
+   */
+  p2pAddr?: () => string | undefined
   /** 广播失败时的去处。默认吞掉：mDNS 不可用（容器、无组播、端口被占）不该拖垮后端。 */
   onError?: (error: unknown) => void
 }
@@ -68,6 +75,8 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
   let current: number | undefined
   /** 上一次广播时写进去的那条公网入口。它变了也得重播，否则手机永远拿着旧的地址出门。 */
   let currentPublic: string | undefined
+  /** 上一次广播时写进去的 tc-addr，同样为了「变了就重播」。 */
+  let currentP2p: string | undefined
 
   /**
    * 广播出错时的统一去处。底层异步报错（组播被系统收走、socket 关了）之后，这条记录已经不会再应答：
@@ -81,7 +90,8 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
 
   return {
     publish(port) {
-      if (current === port && currentPublic === publicUrl) return
+      const p2p = options.p2pAddr?.()
+      if (current === port && currentPublic === publicUrl && currentP2p === p2p) return
       // 换端口就先撤掉旧的：同一个名字广播两次会让手机看到两条记录，选哪条都可能是死的。
       if (service) {
         const previous = service
@@ -90,12 +100,13 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
       }
       current = port
       currentPublic = publicUrl
+      currentP2p = p2p
       try {
         bonjour ??= new Bonjour()
         service = bonjour.publish({
           name, type: SERVICE_TYPE, port, protocol: 'tcp',
           // pub 是「出了门往哪走」。它和 port 一起给，所以手机发现一次就把两条路都记住了。
-          txt: { crew, port: String(port), ...(publicUrl ? { pub: publicUrl } : {}) },
+          txt: { crew, port: String(port), ...(publicUrl ? { pub: publicUrl } : {}), ...(p2p ? { p2p } : {}) },
         })
         const announced = service
         announced.on('error', error => fail(error, announced))
@@ -107,6 +118,7 @@ export function createDiscovery(options: DiscoveryOptions): Discovery {
     async stop() {
       current = undefined
       currentPublic = undefined
+      currentP2p = undefined
       const published = service
       service = undefined
       if (published) {

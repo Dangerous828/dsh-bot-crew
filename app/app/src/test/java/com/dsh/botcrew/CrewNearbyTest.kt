@@ -156,4 +156,30 @@ class CrewNearbyTest {
         assertEquals("", local.single().publicBase)
     }
 
+    // 隧道地址也得穿过这张表：配对时是从这一行把它存进去的，丢了这一格，P2P 那条路
+    // 就再也不会被尝试 —— 而且不会报错，只是永远走局域网。
+    @Test
+    fun theTunnelAddressSurvivesDiscoveryTable() {
+        val beacon = CrewBeacon(
+            "dsh-crew-a",
+            "http://10.0.0.1:43499",
+            "https://crew.example.top",
+            "tcpAAAAtunneladdress",
+        )
+        val spots = CrewNearby.add(emptyList(), beacon)
+        assertEquals("tcpAAAAtunneladdress", spots.single().p2pAddr)
+
+        // 同一台重新广播：电脑重启后密钥可能换了地址，以最新一次为准。
+        val moved = CrewNearby.add(spots, beacon.copy(p2pAddr = "tcpBBBBnewaddress"))
+        assertEquals(1, moved.size)
+        assertEquals("tcpBBBBnewaddress", moved.single().p2pAddr)
+
+        // 没起 P2P 的电脑：空串，不是 null —— 上层据此知道「这条路今天不存在」。
+        val noTunnel = CrewNearby.add(
+            emptyList(),
+            CrewBeacon("dsh-crew-b", "http://10.0.0.2:43499", "https://crew.example.top"),
+        )
+        assertEquals("", noTunnel.single().p2pAddr)
+    }
+
 }

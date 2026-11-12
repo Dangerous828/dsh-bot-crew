@@ -1,12 +1,19 @@
 import { expect, it, vi } from 'vitest'
 import { Config, type Machine } from '../src/deployment.ts'
 import { apply } from '../src/index.ts'
+import { lanPort } from '../src/app/lan-server.ts'
 
 // Stub Runtime to capture the resolved Machine settings and restart callback.
-const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void }[])
+const runtimes = vi.hoisted(() => [] as { machine: Machine; restart: () => void; health: Map<string, unknown> }[])
 vi.mock('../src/app/runtime.ts', () => ({ Runtime: class {
   ready = Promise.resolve()
+  /** 健康项只记账：index.ts 给 P2P 那条路 claim 一个，用例从 runtimes 里读它。 */
+  readonly health = new Map<string, unknown>()
   constructor(_ctx: unknown, readonly machine: Machine, readonly restart: () => void) { runtimes.push(this) }
+  claimHealth(name: string, initial?: unknown) {
+    this.health.set(name, initial)
+    return { get: () => this.health.get(name), set: (health: unknown) => { this.health.set(name, health) }, release: () => { this.health.delete(name) } }
+  }
   configured() { return true }
   async stop() {}
 } }))
@@ -87,6 +94,21 @@ vi.mock('../src/app/tunnel.ts', () => ({
 }))
 // relay-chain 有真实实现，这里不 mock：配置解析本身就是接线的一部分。
 
+// P2P 那条路同理换成替身：真跑 `tools/tailcat serve` 会开一条真 WireGuard 隧道、在 HOME 下建密钥，
+// 而这里要钉的只是「起来了没有、停得掉没有」。解析地址的纯函数仍用真实现。
+const p2ps = vi.hoisted(() => [] as { options: Record<string, unknown>; started: boolean; stopped: boolean }[])
+vi.mock('../src/app/p2p.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/app/p2p.ts')>()
+  return {
+    ...actual,
+    createP2p: (options: Record<string, unknown>) => {
+      const entry = { options, started: false, stopped: false }
+      p2ps.push(entry)
+      return { start: () => { entry.started = true }, stop: async () => { entry.stopped = true }, addr: () => undefined }
+    },
+  }
+})
+
 /** 用一份指定的环境跑一次 apply，并收集 ctx.effect 注册的清理函数。 */
 async function withEnv(environment: Record<string, string | undefined>, body: (cleanup: (() => Promise<void>)[], logged: string[]) => Promise<void>): Promise<void> {
   const saved: Record<string, string | undefined> = {}
@@ -116,6 +138,23 @@ it('does not dial out when no relay is configured', async () => {
   await withEnv({ CREW_RELAY_URLS: undefined }, async (_cleanups, logged) => {
     expect(tunnels).toHaveLength(0)
     expect(logged.join('\n')).toMatch(/only reach this machine on the LAN/)
+  })
+})
+
+// P2P 那条路是手机跨网络的直连，不经过中转：它无条件起，与 CREW_RELAY_URLS 无关。
+// 这里钉住的是「端口就是手机要走的那条监听」以及「插件停的时候跟着停」。
+it('starts the direct tunnel on the phone listener port, and stops it with the plugin', async () => {
+  p2ps.length = 0
+  await withEnv({ CREW_RELAY_URLS: undefined }, async cleanups => {
+    expect(p2ps).toHaveLength(1)
+    expect(p2ps[0]!.started).toBe(true)
+    // 端口取自状态目录，和局域网监听同一个：手机在那条路上连的就是这套消息面。
+    expect(p2ps[0]!.options).toMatchObject({ port: lanPort('/srv/state') })
+    expect(String(p2ps[0]!.options.binary)).toMatch(/tools\/tailcat$/)
+    // 二进制不在只会让这条通道报错，别的照旧 —— 所以健康项一开始就是 starting 而不是 ready。
+    expect(runtimes.at(-1)!.health.get('p2p')).toMatchObject({ state: 'starting' })
+    for (const cleanup of cleanups) await cleanup()
+    expect(p2ps[0]!.stopped).toBe(true)
   })
 })
 

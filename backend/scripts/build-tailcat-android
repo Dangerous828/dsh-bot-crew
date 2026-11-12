@@ -1,0 +1,107 @@
+#!/bin/sh
+# 重建手机端那条 P2P 路的原生库：libtailcat.so（Android arm64）。
+#
+# 手机不装任何 VPN 客户端，靠的就是这个库：tailcat 把 magicsock 打洞、WireGuard 加密、
+# gVisor netstack 全封在里面（官方 C ABI，见 cmd/libtailcat/tailcat.h）。App 侧只在
+# 回环上起一个代理，把本地端口转进隧道 —— 业务代码完全不知道底下换了一条路。
+#
+# 产物约 16MB，不入库（app/app/src/main/jniLibs/ 下那份由本脚本生成）。用法：
+#
+#   ./scripts/build-tailcat-android                  # 编到 app 的 jniLibs
+#   ./scripts/build-tailcat-android v0.6.0           # 指定 tag
+#
+# 需要：Android NDK（路径见 NDK 变量，或 export ANDROID_NDK）、Go（go.mod 要 1.27.2，低了由
+# GOTOOLCHAIN 自动下载）、以及 16KB page 对齐 —— NDK r27+ 默认就是，Android 15 起强制要求。
+set -eu
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+OUT_DIR="$REPO/app/app/src/main/jniLibs/arm64-v8a"
+NDK=${ANDROID_NDK:-${ANDROID_HOME:-$HOME/Library/Android/sdk}/ndk/28.2.13676358}
+TC="$NDK/toolchains/llvm/prebuilt/darwin-x86_64"
+API=${TAILCAT_ANDROID_API:-26}
+TAG=${1:-}
+WORK=${TMPDIR:-/tmp}/tailcat-build
+
+if [ ! -x "$TC/bin/aarch64-linux-android${API}-clang" ]; then
+  echo "no NDK clang at $TC/bin/aarch64-linux-android${API}-clang" >&2
+  echo "set ANDROID_NDK to a NDK r27+ directory" >&2
+  exit 1
+fi
+
+if [ -n "$TAG" ]; then
+  rm -rf "$WORK"; git clone --depth 1 --branch "$TAG" https://github.com/tailscale/tailcat "$WORK"
+elif [ -d "$WORK/.git" ]; then
+  git -C "$WORK" pull --ff-only --depth 1
+else
+  rm -rf "$WORK"; git clone --depth 1 https://github.com/tailscale/tailcat "$WORK"
+fi
+
+mkdir -p "$OUT_DIR"
+cd "$WORK"
+
+# 官方 build-tags 把 portmapper（UPnP / NAT-PMP）裁掉了。手机和电脑常在不同 Wi-Fi 后面，
+# 能在路由器上开一个端口，打洞成功率就差一大截 —— 实测同一组 AP 上这三项开着也未必打得通
+# （很多商业 AP 不开 UPnP），但开着只是多试一次，关着则等于放弃那条路。
+TAGS=$(tr ',' '\n' < build-tags.txt | grep -v 'ts_omit_portmapper' | paste -sd, -)
+
+# Android 的 App uid 拿不到 NETLINK_ROUTE，Go 的 net.Interfaces() 必然失败，netmon.New 于是报
+# `netlinkrib: permission denied` —— 隧道连第一步都走不到。tailscale 把这一格留给调用方：
+# feature/androidbin 只在「linux 非 android」或「android 无 cgo」时注册兜底，cgo 的 Android
+# 库要自己来。这里补一个 //go:build android 的文件，照 androidbin 的思路合成一个网卡
+# （不枚举，只 dial UDP 让内核选出站源地址）—— 打洞需要的是「我出网的地址」，不是网卡清单。
+cat > cmd/libtailcat/netmon_android.go <<'GO'
+//go:build android
+
+package main
+
+import (
+	"net"
+	"net/netip"
+	"time"
+
+	"tailscale.com/net/netmon"
+)
+
+func init() { netmon.HookInterfacesFallback.Set(fallbackInterfaces) }
+
+func fallbackInterfaces() ([]netmon.Interface, error) {
+	var addrs []net.Addr
+	if ip, ok := outboundIP("udp4", "8.8.8.8:53"); ok {
+		addrs = append(addrs, &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(32, 32)})
+	}
+	if ip, ok := outboundIP("udp6", "[2001:4860:4860::8888]:53"); ok {
+		addrs = append(addrs, &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(128, 128)})
+	}
+	fake := &net.Interface{Index: 1, MTU: 1500, Name: "android", Flags: net.FlagUp}
+	return []netmon.Interface{{Interface: fake, AltAddrs: addrs}}, nil
+}
+
+func outboundIP(network, addr string) (netip.Addr, bool) {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	c, err := d.Dial(network, addr)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	defer c.Close()
+	ua, ok := c.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	ip, ok := netip.AddrFromSlice(ua.IP)
+	if !ok || !ip.IsValid() || ip.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap(), true
+}
+GO
+
+# 用官方 build-tags.txt 裁剪：只留数据面，二进制小约 16%。
+GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+  CC="$TC/bin/aarch64-linux-android${API}-clang" \
+  CXX="$TC/bin/aarch64-linux-android${API}-clang++" \
+  go build -buildmode=c-shared -tags "$TAGS" -ldflags "-s -w" \
+  -o "$OUT_DIR/libtailcat.so" ./cmd/libtailcat
+
+echo "built $(du -h "$OUT_DIR/libtailcat.so" | cut -f1) -> $OUT_DIR/libtailcat.so"
+# 16KB 段对齐是 Android 15+ 的硬要求，编译完顺手验一下，省得等到真机上才发现装不上。
+"$TC/bin/llvm-readelf" -l "$OUT_DIR/libtailcat.so" | grep -q '0x4000' && echo "16KB page aligned: yes"

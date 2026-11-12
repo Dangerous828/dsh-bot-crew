@@ -141,3 +141,24 @@ it('leaves the public entry out when none is configured', async () => {
     await discovery.stop()
   }
 })
+
+// P2P 那条路的地址是后到的：tailcat 起来才有，所以广播每次现读取值器。手机在同一 Wi-Fi 下
+// 看见这一次，就把三条路（局域网端口、公网入口、tc-addr）都记住了，出了门不必再问人要地址。
+it('announces the P2P address, and follows it when it changes', async () => {
+  let addr: string | undefined
+  const discovery = createDiscovery({ stateDir: '/tmp/state-p2p', p2pAddr: () => addr })
+  try {
+    discovery.publish(43499)
+    // 隧道还没起来：这一格不写，「什么都没有」不能变成手机上一条连不上的地址。
+    expect(stub.options?.txt ?? {}).not.toHaveProperty('p2p')
+    addr = `tcp${'B'.repeat(60)}`
+    discovery.publish(43499)
+    expect(stub.options?.txt).toMatchObject({ p2p: addr })
+    // 换了网络重新协商出新地址：端口没变也得重播，否则手机永远拿着旧地址去连。
+    addr = `tcp${'A'.repeat(60)}`
+    discovery.publish(43499)
+    expect(stub.options?.txt).toMatchObject({ p2p: addr })
+  } finally {
+    await discovery.stop()
+  }
+})

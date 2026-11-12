@@ -22,3 +22,6 @@ node_modules
 node_modules/
 state/
 .claude/settings.local.json
+
+# tailcat 助手是编译产物（约 30MB 单平台），不进 git：用 scripts/build-tailcat 重建
+/backend/tools/tailcat

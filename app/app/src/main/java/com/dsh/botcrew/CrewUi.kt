@@ -170,7 +170,13 @@ private class RefreshGuard {
 }
 
 @Composable
-fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
+fun CrewRoot(
+    client: CrewClient,
+    palette: CrewPalette,
+    /** 现在走的是哪条路（P2P 直连 / 局域网 / 公网中转）。空串表示还算不出来。 */
+    route: String = "",
+    onForget: () -> Unit,
+) {
     var conversation by remember { mutableStateOf<Conversation?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
@@ -261,6 +267,16 @@ fun CrewRoot(client: CrewClient, palette: CrewPalette, onForget: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize(), color = palette.surface) {
         // 让出状态栏与导航栏：断连横幅排在最前，不加的话会顶到系统时间上去。
         Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
+            // 走的是哪条路：一行小字常驻。它不是装饰 —— 连不上时人最先要问的就是
+            // 「现在是不是在绕公网」，这一行直接回答，不必让人去猜。
+            if (route.isNotEmpty()) {
+                Text(
+                    text = "现在走：$route",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.muted,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
             // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
             problem?.let {
                 Text(

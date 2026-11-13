@@ -1218,12 +1218,15 @@ export class Runtime extends Service implements SourceHost {
     if (this.masterArchiveGuardInstalled) return
     if (typeof this.ctx.waterfall !== 'function') return // 精简组合/测试替身没有事件总线就不装。
     this.masterArchiveGuardInstalled = true
-    this.ctx.on('workspace/session-activity', async ({ sessionId }, next) => {
+    const dispose = this.ctx.on('workspace/session-activity', async ({ sessionId }, next) => {
       const activity = await next()
       if (sessionId !== this.masterId) return activity
       this.ctx.logger.warn('dsh-superagent: 拒绝归档主 Session %s（它是队伍总路由，归档会让所有 turn 在 pre-step 被拒）', this.masterId)
-      return [{ kind: 'orchestrator' }, ...activity]
+      return [{ kind: 'orchestrator' }, ...(activity ?? [])]
     })
+    // 与其它监听器一样登记进 disposers：同 ctx 热重载 / shutdown 时解绑，并复位标记，
+    // 否则新实例会因 installed 仍为 true 而不再装守卫，旧 masterId 也随闭包留下来。
+    this.disposers.push(() => { dispose(); this.masterArchiveGuardInstalled = false })
   }
 
   /**

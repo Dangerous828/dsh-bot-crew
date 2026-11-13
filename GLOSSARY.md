@@ -72,6 +72,14 @@ Bot 卡在某个问题上等人回答的状态。表现为 Ticket 上的一条 q
 一台宿主在中转上的名字。手机用它选机器，所以必须稳定 —— 换了它，手机就要重新找路。
 不显式配置时由状态目录算出来。
 
+**crew 指纹**
+mDNS TXT 的 `crew` 字段（`backend/src/app/discovery.ts` 的 `crewFingerprint`），同样是
+由状态目录算出的短哈希，与网卡、IP、网段都无关。手机配对时把它存进 `PairedCrew.crew`，
+重新发现时靠它认「还是同一台」并刷新随网段变化的局域网地址。
+与 `instanceId` 同源但用途不同：`instanceId` 是**中转上的机器名**（手机选路），
+`crew` 是**局域网广播里的队伍身份**（手机认人）。两者都不是 DSH 的 Session id
+（那是 `masterId`）；三套词别混用。
+
 **降级链**
 从便宜到贵排好的三条路：`lan` → `relay.self` → `relay.fallback`（`docs/06-relay.md`）。
 兜底与被兜底不能共享故障域，否则兜底等于没有。

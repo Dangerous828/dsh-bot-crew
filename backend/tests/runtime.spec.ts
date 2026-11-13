@@ -1918,6 +1918,30 @@ it('refuses to archive the main Session at admission, and leaves other sessions 
   expect(await guard('worker-any-ticket')).toEqual([])
 })
 
+// 上面那例只断言「手工派发 waterfall 有这一项」，守卫没装上、事件名写错、activity
+// 形状不对都可能漏过去。这一例走宿主的真实链路：archiveSession 先问 waterfall，
+// 拿到非空活动就拒绝写盘。守卫失效时主 Session 会被真的写进集合，此例必须红。
+it('the guard actually stops archiveSession from writing the main Session', async () => {
+  const instance = await restart()
+  await instance.ready
+  const ctx = (instance as unknown as { ctx: Context & { waterfall: (...args: unknown[]) => Promise<unknown> } }).ctx
+  const registry = services.workspaceRegistry as unknown as {
+    archivedSessionIds: string[]; archiveSession: (id: string) => Promise<void> }
+  registry.archivedSessionIds = []
+  // 复刻宿主 WorkspaceRegistry.archiveSession 的准入顺序（不依赖上游实现的私有状态）：
+  // waterfall 报了活动就抛，不写集合；没活动才落盘。
+  registry.archiveSession = async (id: string) => {
+    const activity = await ctx.waterfall('workspace/session-activity', { sessionId: id }, async () => []) as unknown[]
+    if (activity.length > 0) throw new Error(`cannot archive ${id}: session is active`)
+    registry.archivedSessionIds.push(id)
+  }
+  await expect(registry.archiveSession(instance.masterId)).rejects.toThrow('session is active')
+  expect(registry.archivedSessionIds).not.toContain(instance.masterId)
+  // worker 不被误挡，照常进集合。
+  await registry.archiveSession('worker-any-ticket')
+  expect(registry.archivedSessionIds).toContain('worker-any-ticket')
+})
+
 // 这一例钉的是「巡检真的挂在每拍上」：直接调 ensureMasterActive 会漏掉挂载点被删的情况。
 it('checks the main Session archive state on every routine tick', async () => {
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })

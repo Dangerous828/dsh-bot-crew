@@ -3,6 +3,7 @@ package com.dsh.botcrew
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -36,7 +37,10 @@ object CrewDiscovery {
         // 只记名字的话，同一台电脑换 Wi-Fi、IP 变了重新广播时服务名不变，这一条就被吞掉，
         // 已配对那边永远收不到新地址，「跟着寻址走」也就无从谈起。签名把地址与路由都算进去：
         // 完全相同的重复上报仍然只发一次，内容变了就必须再发一条。
-        val seen = mutableMapOf<String, String>()
+        // NsdManager 的 onServiceFound / resolve / onServiceLost 不保证在同一线程回调，
+        // 普通 mutableMapOf 跨 binder 线程读写会丢更新。用并发 Map，且用 compare-and-set
+        // 式的 put 只让「签名真的变了」的那次发出事件。
+        val seen = ConcurrentHashMap<String, String>()
 
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
@@ -46,8 +50,9 @@ object CrewDiscovery {
                 if (!info.serviceType.startsWith("_dsh-crew")) return
                 resolve(manager, info) { beacon ->
                     val signature = CrewNearby.signature(beacon)
-                    if (seen[beacon.name] != signature) {
-                        seen[beacon.name] = signature
+                    // putIfAbsent / replace 是原子的：两个线程同时解析同一台时只发一条。
+                    val previous = seen.putIfAbsent(beacon.name, signature)
+                    if (previous == null || (previous != signature && seen.replace(beacon.name, previous, signature))) {
                         trySend(CrewSighting.Found(beacon))
                     }
                 }

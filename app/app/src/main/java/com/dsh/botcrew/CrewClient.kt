@@ -8,6 +8,10 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 
+/** 入口表统一清洗：补 scheme、丢空串、去重。构造与换表共用，别让两条路各写一份。 */
+private fun cleanEntries(entries: List<String>): List<String> =
+    entries.map(CrewPairing::normalize).filter(String::isNotBlank).distinct()
+
 /**
  * 连一段对话。
  *
@@ -32,7 +36,7 @@ class CrewClient(
      * 重排时整张表换成一个新值，不原地改：一条请求跑到一半时表被换掉，它手里那份仍然完整。
      */
     @Volatile
-    private var order: List<String> = entries.map(CrewPairing::normalize).filter(String::isNotBlank)
+    private var order: List<String> = cleanEntries(entries)
 
     /**
      * 当前在用的入口。存地址而不是下标 —— 表一旦重排，同一个下标指的就是另一条路了。
@@ -75,7 +79,7 @@ class CrewClient(
      * （多半是 P2P 代理）只要还在新表里就继续用它。
      */
     fun replaceEntries(entries: List<String>) {
-        val clean = entries.map(CrewPairing::normalize).filter(String::isNotBlank).distinct()
+        val clean = cleanEntries(entries)
         if (clean.isEmpty()) return
         synchronized(this) {
             // 本地回环代理是 P2P 主路。它在 probe 成功时才被 promote 进来，而广播可能

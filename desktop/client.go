@@ -668,10 +668,10 @@ type CrewLoad struct {
 // 它是一条「说不清就说明白」的链：这条告警一定写在 /state 上，桌面右栏据此显示横幅，
 // 不依赖 App 的系统推送（那条已停）。
 type WatchdogAlert struct {
-	At    string `json:"at"`
-	Kind  string `json:"kind"`
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	At         string `json:"at"`
+	Kind       string `json:"kind"`
+	Title      string `json:"title"`
+	Body       string `json:"body"`
 	DecisionID string `json:"decisionId"`
 }
 
@@ -728,6 +728,13 @@ type Conversation struct {
 	UnreadReplies Unread
 	// Model is what the crew is answering with right now; the roster footer shows it.
 	Model string
+	// SessionID 是这份时间线属于哪一段会话：S1 的 timeline 会回显 session_id /
+	// session_api / sessions / default_session_id 四字段。老响应没有这些字段时由 Timeline
+	// 按本次请求的会话回填（缺省 main），绝不把别的会话的消息认成这一段。
+	SessionID        string
+	SessionAPI       int
+	Sessions         []string
+	DefaultSessionID string
 }
 
 // Unread 是「未读」这一格的全部内容：数，以及这个数算不算得出来。
@@ -766,11 +773,211 @@ type Client struct {
 	http     *http.Client
 	// managementBase 是管理面的根（网页端口）。空表示还没发现，退回消息面（会 404）。
 	managementBase string
+	// activeSession 是这次连的是哪一段会话（GLOSSARY：不是 DSH 的 Session）。
+	// 空或 main 都不追加 query —— 老调用逐字不变。
+	activeSession string
+	// sessionCapable 是能力位先验的结论，由 Sessions() / CreateSession() 的 200 置上。
+	// 没确认之前，pickSession 直接拒掉任何显式非 main 请求：门禁做成传输层的机制，
+	// 不靠「UI 动作都记得先查 sessionsChecked」这种约定（契约 §2 的硬要求）。
+	sessionCapable bool
 }
 
 // New 造一个客户端。base 形如 http://127.0.0.1:18882。
 func New(base, token, deviceID string) *Client {
 	return &Client{base: base, token: token, deviceID: deviceID, http: &http.Client{Timeout: 15 * time.Second}}
+}
+
+// ── 会话（契约 §1 / §2：session_id 只走 query，默认 main 不带参数） ──────────
+
+// defaultSessionID 与网关的 DEFAULT_SESSION_ID 是同一个值。
+const defaultSessionID = "main"
+
+// sessionAPIBit 是能力位的值（GLOSSARY 里叫「能力位」，不是版本号）。
+// 缺它或不是 1，就当老后端：锁 main，不发非 main 请求。
+const sessionAPIBit = 1
+
+// 锁 main 时界面上那两句实话。客户端错误与界面文案共用同一份字面值，
+// 改一句话只改这一处，不让两个文件各写一遍。
+const (
+	legacySessionNote       = "这台后端还只支持一个会话"
+	unavailableSessionsNote = "读不到会话列表"
+)
+
+// sessionIDShape 与 S1 消息面的 SESSION_NAME 逐字一致：小写字母/数字开头，最多 32 位。
+var sessionIDShape = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+
+func validSessionID(id string) bool { return sessionIDShape.MatchString(id) }
+
+var (
+	// ErrSessionsUnsupported：404 或响应缺 session_api:1 —— 这台后端还只支持一个会话。
+	ErrSessionsUnsupported = errors.New(legacySessionNote)
+	// ErrSessionsUnavailable：网络错误 / 非 404 的坏响应 —— 如实说读不到会话列表。
+	ErrSessionsUnavailable = errors.New(unavailableSessionsNote)
+	// ErrInvalidSessionID：形状不对的会话名在提交前就被本地挡住，一个请求都不发。
+	ErrInvalidSessionID = errors.New("会话名只能用小写字母、数字和连字符，且不超过 32 位")
+)
+
+// SessionsView 是会话名单的回应。GET 与 POST 的形状不同，别按同一份解析：
+//   - GET  /api/mobile/sessions → {sessions, default_session_id, session_api}
+//   - POST /api/mobile/sessions → {id, sessions, session_api}（没有 default_session_id）
+//
+// sessions 是字符串数组，main 恒在首位；名单本身不落盘，每次启动从后端拉。
+type SessionsView struct {
+	Sessions         []string `json:"sessions"`
+	DefaultSessionID string   `json:"default_session_id,omitempty"`
+	SessionAPI       int      `json:"session_api"`
+	ID               string   `json:"id,omitempty"`
+}
+
+// WithSession 换一段会话，返回一份新的 Client（与 WithManagement 一样不改原件）。
+// 形状不在这里判：pickSession 会在真正发请求时明确报 ErrInvalidSessionID，
+// 绝不把一个坏值静默当成 main —— C4 串线正是从这个「静默」开始的。
+func (c *Client) WithSession(id string) *Client {
+	clone := *c
+	clone.activeSession = id
+	return &clone
+}
+
+// ActiveSession 是这段客户端当前连的是哪一段会话（不是 DSH 的 Session）；没显式选过就是 main。
+func (c *Client) ActiveSession() string {
+	if c.activeSession == "" {
+		return defaultSessionID
+	}
+	return c.activeSession
+}
+
+// pickSession 决定这一次请求用哪一段：显式传入的优先，其次 Client 当前状态，缺省 main。
+// 非法值直接报错，绝不静默回落 main —— 静默回落正是 C4 串线的入口。
+func (c *Client) pickSession(override []string) (string, error) {
+	chosen := c.activeSession
+	if len(override) > 0 {
+		chosen = override[0]
+	}
+	if chosen == "" {
+		return defaultSessionID, nil
+	}
+	if !validSessionID(chosen) {
+		return "", ErrInvalidSessionID
+	}
+	// 能力位先验没过就不许发非 main：这是 C4 串线在客户端一侧的最后一道机制。
+	// 哪怕 UI 动作绕过 sessionsChecked，请求也出不了门。
+	if chosen != defaultSessionID && !c.sessionCapable {
+		return "", fmt.Errorf("%w：能力位先验还没通过，非 main 请求没有发出去", ErrSessionsUnavailable)
+	}
+	return chosen, nil
+}
+
+// confirmSessions 记下「这份响应证明了 session_api:1」。只有拿到能力位的
+// GET / POST 200 会调它；老后端与读不到一律保持 false。
+func (c *Client) confirmSessions() { c.sessionCapable = true }
+
+// sessionQuery 只给「会话相关」的请求追加 query。已有 query 用 & 接，默认 main 原样返回。
+// do() / auth() 一个字都不改：会话字段只在构造 path 的这一层出现。
+func sessionQuery(path, session string) string {
+	if session == "" || session == defaultSessionID {
+		return path
+	}
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + "session_id=" + url.QueryEscape(session)
+}
+
+// sessionPath 把「选哪一段 + 怎么拼 query」收在一处，所有会话请求共用。
+// 第二个返回值是本次选中的会话：timeline 回填老响应的 SessionID 时要用。
+func (c *Client) sessionPath(path string, session []string) (string, string, error) {
+	chosen, err := c.pickSession(session)
+	if err != nil {
+		return "", "", err
+	}
+	return sessionQuery(path, chosen), chosen, nil
+}
+
+// decodeSessions 解一份名单，并把「200 但缺能力位」判成老后端（GET / POST 共用）。
+func decodeSessions(response *http.Response) (*SessionsView, error) {
+	var view SessionsView
+	if err := json.NewDecoder(response.Body).Decode(&view); err != nil {
+		return nil, err
+	}
+	if view.SessionAPI != sessionAPIBit {
+		return nil, ErrSessionsUnsupported
+	}
+	return &view, nil
+}
+
+// Sessions 是启动 / 首次进入时的能力位先验。三态分开说，不静默降级：
+// 200 + session_api:1 启用；404 或响应缺能力位 = 老后端；网络错误 = 读不到会话列表。
+func (c *Client) Sessions(ctx context.Context) (*SessionsView, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/mobile/sessions", nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSessionsUnavailable, err)
+	}
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSessionsUnavailable, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, ErrSessionsUnsupported
+	}
+	if response.StatusCode >= 300 {
+		return nil, fmt.Errorf("%w：队伍返回 %d", ErrSessionsUnavailable, response.StatusCode)
+	}
+	view, err := decodeSessions(response)
+	if err != nil {
+		if errors.Is(err, ErrSessionsUnsupported) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", ErrSessionsUnavailable, err)
+	}
+	c.confirmSessions()
+	return view, nil
+}
+
+// CreateSession 新建一段会话。非法 id 本地拒绝；400 / 409 / 503 与网络错误都原样带回来，
+// 由界面如实说，不新增本地条目。名单管理本身不是会话读写，这条不带 session_id。
+func (c *Client) CreateSession(ctx context.Context, id string) (*SessionsView, error) {
+	if !validSessionID(id) {
+		return nil, ErrInvalidSessionID
+	}
+	body, err := json.Marshal(map[string]string{"id": id})
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/mobile/sessions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		detail, readErr := io.ReadAll(io.LimitReader(response.Body, 512))
+		if readErr != nil {
+			return nil, fmt.Errorf("新建会话没成功（%d）：读不出队伍的回应：%w", response.StatusCode, readErr)
+		}
+		return nil, fmt.Errorf("新建会话没成功（%d）：%s", response.StatusCode, bytes.TrimSpace(detail))
+	}
+	// POST 的 200 也算一次事实：sessions[] 要刷新，切不切会话看能力位。
+	// 万一后端建了会话却没报 session_api:1，界面会刷新名单并锁 main 如实说，
+	// 不把「200」翻成「新建失败」，也不静默切到非 main（C4）。
+	var view SessionsView
+	if err := json.NewDecoder(response.Body).Decode(&view); err != nil {
+		return nil, err
+	}
+	if view.SessionAPI == sessionAPIBit {
+		c.confirmSessions()
+	}
+	if view.ID == "" {
+		view.ID = id
+	}
+	return &view, nil
 }
 
 // WithManagement 指向管理面（网页端口）。
@@ -784,7 +991,12 @@ func (c *Client) WithManagement(base string) *Client {
 }
 
 // Timeline 拉整段对话。消息按时间从旧到新。
-func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
+// 可选 session 只给显式指定用；不带参数时按 Client 当前会话（缺省 main 不追加 query）。
+func (c *Client) Timeline(ctx context.Context, session ...string) (*Conversation, error) {
+	path, chosen, err := c.sessionPath("/api/mobile/timeline", session)
+	if err != nil {
+		return nil, err
+	}
 	var payload struct {
 		Items        []Message     `json:"items"`
 		Bots         []BotCard     `json:"bots"`
@@ -797,33 +1009,53 @@ func (c *Client) Timeline(ctx context.Context) (*Conversation, error) {
 		// Unread 缺省时是零值：Count 为 nil、State 为空 —— 两种都不算 known，徽标不出现。
 		Unread        Unread `json:"unread"`
 		UnreadReplies Unread `json:"unread_replies"`
+		// S1 的四字段回显；老响应没有时按本次请求的会话回填。
+		SessionID        string   `json:"session_id"`
+		SessionAPI       int      `json:"session_api"`
+		Sessions         []string `json:"sessions"`
+		DefaultSessionID string   `json:"default_session_id"`
 	}
-	if err := c.do(ctx, http.MethodGet, "/api/mobile/timeline", nil, &payload); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, &payload); err != nil {
 		return nil, err
 	}
 	// 有些历史消息的正文是 URL 编码过的：解回人话再交出去。
 	for i := range payload.Items {
 		payload.Items[i].Text = readable(payload.Items[i].Text)
 	}
+	sessionID := payload.SessionID
+	if !validSessionID(sessionID) {
+		sessionID = chosen
+	}
 	return &Conversation{Messages: payload.Items, Bots: payload.Bots, DefaultBotID: payload.DefaultBotID,
 		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined,
-		Unread: payload.Unread, UnreadReplies: payload.UnreadReplies, Model: payload.Model}, nil
+		Unread: payload.Unread, UnreadReplies: payload.UnreadReplies, Model: payload.Model,
+		SessionID: sessionID, SessionAPI: payload.SessionAPI, Sessions: payload.Sessions,
+		DefaultSessionID: payload.DefaultSessionID}, nil
 }
 
 // ReportRead 把主人读到的最后一条回话 id 报给后端，记成会话级已读水位（契约 §5.6）。
 //
 // 这是一次「记水位」的后台小事：失败不该打断人看消息，所以调用方只在拿得到最后一条回话时尽力上报，
 // 不因为它失败就报错。后端记不住水位时，`unread_replies` 会退回 unknown —— 那是三态里正当的一格。
-func (c *Client) ReportRead(ctx context.Context, lastReadID string) error {
+func (c *Client) ReportRead(ctx context.Context, lastReadID string, session ...string) error {
 	if lastReadID == "" {
 		return nil
 	}
-	return c.do(ctx, http.MethodPost, "/api/mobile/read", map[string]string{"last_read_id": lastReadID}, nil)
+	path, _, err := c.sessionPath("/api/mobile/read", session)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, path,
+		map[string]string{"last_read_id": lastReadID}, nil)
 }
 
 // Send 把一句话送进对话。mentions 里是点名的 bot_id，可以没有。
 // 返回的 requestID 是这次发送的幂等键：重试要沿用它，不能重新生成。
-func (c *Client) Send(ctx context.Context, text string, mentions []string) (requestID string, err error) {
+func (c *Client) Send(ctx context.Context, text string, mentions []string, session ...string) (requestID string, err error) {
+	path, _, err := c.sessionPath("/api/mobile/send", session)
+	if err != nil {
+		return "", err
+	}
 	requestID, err = newRequestID()
 	if err != nil {
 		return "", err
@@ -832,7 +1064,7 @@ func (c *Client) Send(ctx context.Context, text string, mentions []string) (requ
 		mentions = []string{}
 	}
 	body := map[string]any{"text": text, "request_id": requestID, "mentions": mentions}
-	return requestID, c.do(ctx, http.MethodPost, "/api/mobile/send", body, nil)
+	return requestID, c.do(ctx, http.MethodPost, path, body, nil)
 }
 
 // withdrawPath 是撤回排队消息的那条路。契约集中在这里：
@@ -844,12 +1076,16 @@ var ErrSteerTooLate = errors.New("这条已经被队伍读走了，插不进去"
 
 // SteerText 发送即插队：把新写的一句直接交给正在跑的 worker，不经过排队。
 // 网关会把它插成已读，路由不会再把这句当新活接一遍。
-func (c *Client) SteerText(ctx context.Context, ticketID, requestID, text string) error {
+func (c *Client) SteerText(ctx context.Context, ticketID, requestID, text string, session ...string) error {
+	path, _, err := c.sessionPath("/api/mobile/steer", session)
+	if err != nil {
+		return err
+	}
 	body, err := json.Marshal(map[string]string{"ticket": ticketID, "request_id": requestID, "text": text})
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/mobile/steer", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -872,12 +1108,16 @@ func (c *Client) SteerText(ctx context.Context, ticketID, requestID, text string
 }
 
 // Steer 把一条排队消息直接交给正在跑的 worker：它在下一步边界先读，不等队列轮询。
-func (c *Client) Steer(ctx context.Context, ticketID, requestID string) error {
+func (c *Client) Steer(ctx context.Context, ticketID, requestID string, session ...string) error {
+	path, _, err := c.sessionPath("/api/mobile/steer", session)
+	if err != nil {
+		return err
+	}
 	body, err := json.Marshal(map[string]string{"ticket": ticketID, "request_id": requestID})
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/mobile/steer", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -906,16 +1146,20 @@ var ErrWithdrawalTooLate = errors.New("这条已经被队伍读过了，撤不�
 // Withdraw 撤掉一条还没被队伍读到的排队消息。
 // 409 是「已经读过了，撤不回来」——那不是网络错误，要把话说清楚，
 // 让人知道这条消息不会再消失，而不是以为网络抖了一下。
-func (c *Client) Withdraw(ctx context.Context, requestID string) error {
+func (c *Client) Withdraw(ctx context.Context, requestID string, session ...string) error {
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
 		return fmt.Errorf("没有要撤回的请求号")
+	}
+	path, _, err := c.sessionPath(withdrawPath, session)
+	if err != nil {
+		return err
 	}
 	body, err := json.Marshal(map[string]string{"request_id": requestID})
 	if err != nil {
 		return fmt.Errorf("编码请求: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+withdrawPath, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("构造请求: %w", err)
 	}
@@ -938,12 +1182,16 @@ func (c *Client) Withdraw(ctx context.Context, requestID string) error {
 }
 
 // SendAgain 用同一个幂等键重发。网关会认出这是同一次发送，不会在对话里留下第二条。
-func (c *Client) SendAgain(ctx context.Context, requestID, text string, mentions []string) error {
+func (c *Client) SendAgain(ctx context.Context, requestID, text string, mentions []string, session ...string) error {
+	path, _, err := c.sessionPath("/api/mobile/send", session)
+	if err != nil {
+		return err
+	}
 	if mentions == nil {
 		mentions = []string{}
 	}
 	body := map[string]any{"text": text, "request_id": requestID, "mentions": mentions}
-	return c.do(ctx, http.MethodPost, "/api/mobile/send", body, nil)
+	return c.do(ctx, http.MethodPost, path, body, nil)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, into any) error {

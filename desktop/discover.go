@@ -254,6 +254,9 @@ type Credential struct {
 	DeviceID string `json:"deviceId"`
 	Token    string `json:"token"`
 	Base     string `json:"base"`
+	// Session 是上次打开的那一段会话。老凭据没有这个键：读出来是空串，由
+	// currentSessionFrom 回落 main；omitempty 让没选过会话的文件保持原样。
+	Session string `json:"session,omitempty"`
 }
 
 // credentialPath 是凭据的落点。~/.config 是 macOS 的标准位置；
@@ -303,4 +306,28 @@ func saveCredential(path string, saved Credential) error {
 	// WriteFile 只在新建时用 0600：已存在的文件（比如早先手动放的）不会被改权限。
 	// 凭据是能做任意请求的东西，写一次就收紧一次。
 	return os.Chmod(path, 0o600)
+}
+
+// currentSessionFrom 只读凭据文件里的当前会话。缺键、坏文件、坏 id 一律回落 main：
+// 名单本身不落盘，启动时还要拿 GET /sessions 的能力位先验过一遍才算数。
+func currentSessionFrom(path string) string {
+	saved, ok := loadCredential(path)
+	if !ok || !validSessionID(saved.Session) {
+		return defaultSessionID
+	}
+	return saved.Session
+}
+
+// saveCurrentSession 只改当前会话这一个键，其余凭据原样保留、权限照旧收紧。
+// 还没配好凭据时不凭空造一个文件：那样下次启动会把它当成「配过了」。
+func saveCurrentSession(path, id string) error {
+	if !validSessionID(id) {
+		return ErrInvalidSessionID
+	}
+	saved, ok := loadCredential(path)
+	if !ok {
+		return fmt.Errorf("还没有配好凭据，当前会话这次记不住")
+	}
+	saved.Session = id
+	return saveCredential(path, saved)
 }

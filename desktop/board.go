@@ -1,7 +1,8 @@
 // board.go —— 聊天模式右栏的事务板。
 //
-// 数据源只有一次 /timeline 读回来的 Conversation：tasks[] 是事务，
-// Queued 是「已接受、还没回复、还能撤回」的请求号，不是任务集。
+// 数据源是「当前这一段会话」的 Conversation（conversations[currentSession] 的视图）：
+// 切到别的会话时这块板跟着换缓存，绝不把另一段的 tasks[] / Queued 摆出来。
+// tasks[] 是事务，Queued 是「已接受、还没回复、还能撤回」的请求号，不是任务集。
 // 所以「还没回的话」这组按 request_id 反查 items 里的原话，不伪装成工单。
 // 反编造：查不到正文就跳过、分组为空就不画该组、没有计划就不画进度条。
 package main

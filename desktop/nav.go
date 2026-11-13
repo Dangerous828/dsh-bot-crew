@@ -30,6 +30,20 @@ const (
 // 事务板排在第一行：它是默认落在右栏的那一页。枚举值仍按常量块算，顺序不动取值。
 var navOrder = []navItem{navBoard, navBackend, navModel, navOutput, navRoutine, navMemory}
 
+// 会话那两句实话定义在 client.go（与 ErrSessionsUnsupported / ErrSessionsUnavailable 同源），
+// 左栏的话术与客户端错误不再各写一份。
+
+// sessionListed 是「这段会话在后端给的名单里」。名单的唯一真源是 GET /sessions，
+// 本地不凭空加一段：切到名单外的 id 只会把 main 的消息当成别的会话读出来。
+func sessionListed(id string, sessions []string) bool {
+	for _, listed := range sessions {
+		if listed == id {
+			return true
+		}
+	}
+	return false
+}
+
 // navLabel 是这一项上写的字。图标字和文字分开写：图标换字号时才不会把文字也带歪。
 // navIcon 是这一项用的图标名（`icons` 里那几条路径之一）；认不出就退回空串，由调用方画字形。
 func navIcon(item navItem) string {

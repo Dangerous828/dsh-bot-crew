@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -22,12 +23,41 @@ type app struct {
 	client *Client
 	input  string
 
-	conversation *Conversation
-	problem      string
-	sending      bool
+	// conversation 是「当前这一段会话」的视图指针，真正的账在 conversations 里：
+	// 一段会话一份 Conversation，切回 A 时把指针指回 A，绝不拿 B 的消息顶上。
+	// 保留这个指针，是为了让消息流 / 事务板 / 花名册这些只读当前对话的画法不必各改一遍；
+	// 老后端锁 main 时，map 里就只有 main 这一份，结构与今天完全一致。
+	conversation  *Conversation
+	conversations map[string]*Conversation
+	// currentSession 是现在打开的是哪一段（缺省 main）。名单本身不持久化，
+	// 每次启动从 GET /sessions 拉；只有这个 id 落进凭据文件。
+	currentSession string
+	// sessions 是后端给的会话名单（字符串数组，main 恒在首位）。
+	sessions []string
+	// sessionAPI 是能力位先验的结论：false 一律锁 main，不发任何非 main 请求。
+	sessionAPI bool
+	// sessionsChecked 是先验是否已回来。没回来之前连时间线都不发。
+	sessionsChecked bool
+	// sessionBusy 挡住探测与新建叠在一起；sessionNote 是左栏那句实话。
+	sessionBusy  bool
+	sessionNote  string
+	sessionDraft string
+	// credentialFile 只给测试换落点；空串就是真正的 ~/.config/crew-desktop/credential.json。
+	credentialFile string
+	// 两个会话动作的结果通道，后台线程只往里送，主线程在 drain 里应用。
+	sessionsCh       chan sessionsResult
+	createdSessionCh chan createdSessionResult
 
-	// refreshing 挡住并发刷新，省得每次调用都开一个请求。
-	refreshing bool
+	problem string
+	sending bool
+
+	// refreshing 挡住同一段会话的并发刷新，省得每次调用都开一个请求。
+	// refreshingSession 记着在途的是哪一段：切到另一段时不能让旧请求把新会话饿住，
+	// 旧结果按 SessionID 落进它自己的缓存，不会串到当前视图（见 applyConversation）。
+	// 后台 goroutine 只改这一对字段，所以由 refreshMu 护住，不与其他状态混在一起。
+	refreshMu         sync.Mutex
+	refreshing        bool
+	refreshingSession string
 	// 后台线程把结果放这里，主线程在下一帧取走，避免跨线程碰同一份状态。
 	arrived chan *Conversation
 	failed  chan string
@@ -340,6 +370,21 @@ type workResult struct {
 	err    error
 }
 
+// sessionsResult 是启动 / 首次进入那次能力位先验的结果。三态由 Client.Sessions 分开，
+// 这里只负责把结论落到界面状态上。
+type sessionsResult struct {
+	view *SessionsView
+	err  error
+}
+
+// createdSessionResult 是新建会话的回执。id 带回来，才知道该切到哪一段；
+// 失败时 view 一定是 nil，界面据此不新增任何本地条目。
+type createdSessionResult struct {
+	view *SessionsView
+	err  error
+	id   string
+}
+
 // 三栏宽度的边界。左/右栏各有一个上下限，中栏永远吃剩下的宽度。
 // 数字不是设计稿上的：设计稿只给了 329 / 393 两个落点，范围是给拖拽留的余量。
 const (
@@ -365,16 +410,316 @@ const (
 // 不调的话通道里的结果要等到用户碰一下窗口才被 drain 收走，界面就停在「正在读…」。
 func (s *app) wake() { s.services.Invalidate() }
 
+// ── 会话：名单、能力位先验、缓存隔离、切换与新建 ─────────────────────────
+
+// sessionCredentialPath 是当前会话的落点。默认与凭据同文件，测试可换临时目录。
+func (s *app) sessionCredentialPath() string {
+	if s.credentialFile != "" {
+		return s.credentialFile
+	}
+	return credentialPath()
+}
+
+// lockToMain 是能力位先验失败后的唯一动作：锁在 main、名单只剩 main、
+// 客户端也不带任何 query，并在左栏如实说清是哪一种失败。
+func (s *app) lockToMain(note string) {
+	s.sessionAPI = false
+	s.sessions = []string{defaultSessionID}
+	s.currentSession = defaultSessionID
+	s.sessionNote = note
+}
+
+// probeSessions 是启动 / 首次进入时的先验。结果只走通道，主线程在 drain 里应用。
+func (s *app) probeSessions() {
+	if s.sessionBusy {
+		return
+	}
+	s.sessionBusy = true
+	client := s.client
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		view, err := client.Sessions(ctx)
+		s.sessionsCh <- sessionsResult{view: view, err: err}
+		s.wake()
+	}()
+}
+
+// applySessions 把能力位先验的三态落到状态上：
+// 200 + session_api:1 启用切换；404 / 缺能力位视为老后端；其余（含网络错误）说读不到。
+// 老后端 / 读不到都锁 main，绝不静默降级，也不发一条非 main 请求。
+func (s *app) applySessions(result sessionsResult) {
+	s.sessionBusy = false
+	s.sessionsChecked = true
+	switch {
+	case result.err == nil && result.view != nil && result.view.SessionAPI == sessionAPIBit:
+		s.sessionAPI = true
+		s.sessions = append([]string(nil), result.view.Sessions...)
+		if !sessionListed(s.currentSession, s.sessions) {
+			s.currentSession = defaultSessionID
+			if validSessionID(result.view.DefaultSessionID) && sessionListed(result.view.DefaultSessionID, s.sessions) {
+				s.currentSession = result.view.DefaultSessionID
+			}
+		}
+		s.sessionNote = ""
+		// 这份响应本身就是能力位证据：让 Client 的传输层门禁也放行非 main，
+		// 而不是靠 UI 状态去「约定」不发。
+		if s.client != nil {
+			s.client.confirmSessions()
+		}
+	case errors.Is(result.err, ErrSessionsUnsupported):
+		s.lockToMain(legacySessionNote)
+	default:
+		s.lockToMain(unavailableSessionsNote)
+	}
+	if s.client != nil {
+		s.client = s.client.WithSession(s.currentSession)
+	}
+	// 先验过了才轮到时间线：这一步发的就是当前会话（锁 main 时逐字是老路径）。
+	s.refresh()
+}
+
+// applyCreatedSession 处理新建回执。失败只写一句实话，名单与缓存一格不动；
+// 成功用 POST 返回的 sessions[] 刷新名单（它没有 default_session_id），再切过去。
+func (s *app) applyCreatedSession(result createdSessionResult) {
+	s.sessionBusy = false
+	if result.err != nil || result.view == nil {
+		if result.err == nil {
+			result.err = errors.New("后端没有回会话名单")
+		}
+		s.sessionNote = actionNote("新建会话没成功", result.err)
+		return
+	}
+	s.sessionsChecked = true
+	// POST 200 先用它自己的 sessions[] 刷新名单（这份响应没有 default_session_id）。
+	s.sessions = append([]string(nil), result.view.Sessions...)
+	id := result.view.ID
+	if id == "" {
+		id = result.id
+	}
+	s.sessionDraft = ""
+	if result.view.SessionAPI != sessionAPIBit {
+		// 后端建了会话却没报能力位：名单刷新了，但仍锁 main 并如实说，不静默切过去。
+		s.sessionAPI, s.currentSession, s.sessionNote = false, defaultSessionID, legacySessionNote
+		return
+	}
+	s.sessionAPI = true
+	if s.client != nil {
+		s.client.confirmSessions()
+	}
+	s.sessionNote = ""
+	if !s.switchSession(id) {
+		s.sessionNote = "新建了，但后端名单里没有这段会话，先重读一次"
+	}
+}
+
+// createSession 提交前先本地校验 id；老后端与非法 id 一个请求都不发。
+func (s *app) createSession() {
+	id := strings.TrimSpace(s.sessionDraft)
+	if !validSessionID(id) {
+		s.sessionNote = ErrInvalidSessionID.Error()
+		return
+	}
+	if !s.sessionAPI {
+		s.sessionNote = legacySessionNote
+		return
+	}
+	if s.sessionBusy || s.client == nil {
+		return
+	}
+	s.sessionBusy = true
+	s.sessionNote = "正在新建会话…"
+	client := s.client
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		view, err := client.CreateSession(ctx, id)
+		s.createdSessionCh <- createdSessionResult{view: view, err: err, id: id}
+		s.wake()
+	}()
+}
+
+// switchSession 切到名单里的一段会话。切走 / 切回都只从 conversations 取自己的缓存；
+// 跨会话的临时 UI 态（展开的票、回执、滚动位置、结果条缓存）一并清掉，
+// 免得 A 的「已答」挂在 B 的卡片上。当前会话同步写进凭据文件。
+func (s *app) switchSession(id string) bool {
+	if !validSessionID(id) {
+		s.sessionNote = ErrInvalidSessionID.Error()
+		return false
+	}
+	if !s.sessionAPI {
+		s.sessionNote = legacySessionNote
+		return false
+	}
+	if !sessionListed(id, s.sessions) {
+		s.sessionNote = "这个会话不在名单里"
+		return false
+	}
+	if id == s.currentSession {
+		s.sessionNote = ""
+		s.refresh()
+		return true
+	}
+	s.currentSession = id
+	if s.client != nil {
+		s.client = s.client.WithSession(id)
+	}
+	if err := saveCurrentSession(s.sessionCredentialPath(), id); err != nil {
+		s.sessionNote = actionNote("当前会话这次没记住", err)
+	} else {
+		s.sessionNote = ""
+	}
+	// 每会话一份独立缓存：messages / queued / declined / unread / unread_replies /
+	// tasks 全在各自的 Conversation 里，这里只换指针，不复制、不合并。
+	s.conversation = s.conversations[id]
+	s.chatPinned, s.chatScroll = false, ui.ScrollState{}
+	s.chatScroll.Y = math.MaxFloat32
+	s.openTicket, s.workSteps, s.workError = "", nil, ""
+	s.agents = nil
+	s.answerNote, s.answerTicket, s.answerAsked = "", "", ""
+	s.steerNote, s.withdrawError = "", ""
+	s.messageMenu, s.previewNote = "", ""
+	s.screen, s.screenFull, s.screenNote = nil, false, ""
+	s.perTicket = map[string]*OutputsView{}
+	s.refresh()
+	return true
+}
+
+// applyConversation 把一次时间线结果放进它自己那一份缓存。
+// 切换前在途的旧会话响应只入自己的 map，不覆盖当前视图 —— 那是另一种串线。
+func (s *app) applyConversation(conversation *Conversation) {
+	if conversation == nil {
+		return
+	}
+	id := conversation.SessionID
+	if !validSessionID(id) {
+		id = s.currentSession
+	}
+	s.conversations[id] = conversation
+	if id != s.currentSession {
+		// 迟到 / 别的会话的时间线只入自己的缓存：连名单都不许改写，
+		// 免得 timeline 回显变成 GET /sessions 之外的第二真源。
+		return
+	}
+	// 只有当前会话、且确有 session_api:1 的回显才用来跟上后端的名单。
+	if conversation.SessionAPI == sessionAPIBit && s.sessionAPI && len(conversation.Sessions) > 0 {
+		s.sessions = append([]string(nil), conversation.Sessions...)
+	}
+	before := 0
+	if s.conversation != nil {
+		before = len(s.conversation.Messages)
+	}
+	s.conversation, s.problem = conversation, ""
+	// 答完之后这张票可能已经换了一组新问题：刚才那句回执是按上一道题说的，
+	// 不能跟到新问题下面（「已按这个答了」短暂出现在新问题卡上，就是它）。
+	if s.answerNote != "" && !s.answerIsCurrent() {
+		s.answerNote = ""
+	}
+	// 聊天是「越新越靠下」：第一次读到时直接落到最底，之后只有
+	// 用户本来就在底部（没往上翻）才跟着新消息走。
+	switch {
+	case before == 0:
+		s.chatPinned = true
+		s.chatScroll.Y = math.MaxFloat32
+	case len(conversation.Messages) > before && s.chatPinned:
+		s.chatScroll.Y = math.MaxFloat32
+	}
+	// 时间线变了，产出也可能变了（worker 刚写完一个文件）。按票缓存的结果条
+	// 与整栏都重读一遍；不清掉就会一直停在上一次。
+	s.perTicket = map[string]*OutputsView{}
+	if s.navTab == navOutput {
+		s.loadOutputs()
+	}
+	if s.navTab == navRoutine {
+		s.loadRoutines()
+	}
+	if s.navTab == navMemory {
+		s.loadMemory()
+	}
+}
+
+// sessionPane 是左栏的会话列表。能力位没先验过之前什么都不画（不假装成功）；
+// 老后端只留那句实话，不画切换条、不给新建入口，也不发任何非 main 请求。
+func (s *app) sessionPane(c *ui.Context, p Palette) {
+	if !s.sessionsChecked {
+		return
+	}
+	ui.Column(c).FillWidth().MinWidth(0).ClipX().Gap(5).Children(func() {
+		ui.Row(c).FillWidth().MinWidth(0).ClipX().AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "会话").FontSize(FontTiny).FontWeight(WeightName).
+				LetterSpacing(0.55).TextColor(p.Faint)
+			ui.Row(c).Grow(1)
+			if s.sessionAPI {
+				ui.Row(c).PaddingX(8).PaddingY(4).Radius(RadiusChip).Background(p.Card).
+					BorderWidth(1).BorderColor(p.Line).Cursor(ui.CursorPointer).Children(func() {
+					ui.Text(c, "新建").FontSize(FontTiny).TextColor(p.Muted)
+				}).OnClick(s.createSession)
+			}
+		})
+		if !s.sessionAPI {
+			if s.sessionNote != "" {
+				ui.Text(c, s.sessionNote).FontSize(FontTiny).TextColor(p.Muted).MaxLines(2)
+			}
+			return
+		}
+		for _, id := range s.sessions {
+			sessionID := id
+			soft, tint := p.Card, p.Muted
+			if sessionID == s.currentSession {
+				soft, tint = p.SelectedAlt, p.Ink
+			}
+			ui.Row(c).FillWidth().MinWidth(0).ClipX().PaddingX(9).PaddingY(6).
+				Radius(RadiusItem).Background(soft).Cursor(ui.CursorPointer).Children(func() {
+				ui.Text(c, sessionID).FontSize(FontSmall).TextColor(tint).MaxLines(1).Ellipsis("…")
+			}).OnClick(func() { s.switchSession(sessionID) })
+		}
+		ui.Row(c).FillWidth().MinWidth(0).ClipX().AlignItems(ui.Center).Children(func() {
+			ui.TextInput(c, &s.sessionDraft).Placeholder("新会话名").Grow(1).
+				PlaceholderColor(p.Faint).TextColor(p.Ink).CaretColor(p.Accent).
+				Background(p.Card).OnSubmit(s.createSession)
+		})
+		if s.sessionNote != "" {
+			ui.Text(c, s.sessionNote).FontSize(FontTiny).TextColor(p.Warn).MaxLines(2)
+		}
+	})
+}
+
 func (s *app) refresh() {
-	if s.client == nil || s.refreshing {
+	if s.client == nil {
+		return
+	}
+	// 能力位先验是硬门禁：没确认 session_api:1 之前，一条时间线都不发。
+	// 上次打开的是非 main 也一样 —— 老后端会静默把它当 main 读写（C4 串线）。
+	if !s.sessionsChecked {
+		s.probeSessions()
+		return
+	}
+	// 只挡「同一段会话」的重复刷新：切到另一段时立刻读它自己的时间线，
+	// 否则新会话会一直停在「正在读对话…」。旧结果按 SessionID 各归各的缓存。
+	s.refreshMu.Lock()
+	if s.refreshing && s.refreshingSession == s.currentSession {
+		s.refreshMu.Unlock()
 		return
 	}
 	s.refreshing = true
+	s.refreshingSession = s.currentSession
+	finishedSession := s.currentSession
+	s.refreshMu.Unlock()
+	// 把这次刷新用的客户端在主线程捕获下来：切会话会换掉 s.client，在途的
+	// Timeline / ReportRead 不能跟着换成新会话的 query，否则 A 的已读会上报到 B。
+	client := s.client
 	go func() {
-		defer func() { s.refreshing = false }()
+		defer func() {
+			// 只清掉自己那一段的在途标记：另一段可能还在路上。
+			s.refreshMu.Lock()
+			if s.refreshingSession == finishedSession {
+				s.refreshing = false
+			}
+			s.refreshMu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		conversation, err := s.client.Timeline(ctx)
+		conversation, err := client.Timeline(ctx)
 		if err != nil {
 			s.failed <- actionErrorText(err)
 			s.wake()
@@ -382,23 +727,23 @@ func (s *app) refresh() {
 		}
 		// 树跟着第一次刷新一起读。读失败不算错：对话照样能用，只是这一栏空着。
 		if len(conversation.Tasks) > 0 {
-			if tree, treeErr := s.client.Agents(ctx, conversation.Tasks[0].ID); treeErr == nil {
+			if tree, treeErr := client.Agents(ctx, conversation.Tasks[0].ID); treeErr == nil {
 				s.tree <- tree
 			}
 		}
 		// 槽位情况也顺手读一次：它在管理面上，读不到就留 nil，底部那一行就不画。
 		// 不影响对话 —— 一个数读不到，不该让整段对话报错。
-		if load, loadErr := s.client.CrewLoad(ctx); loadErr == nil {
+		if load, loadErr := client.CrewLoad(ctx); loadErr == nil {
 			s.crewLoadCh <- load
 		}
 		// 看门狗告警：与槽位同一次 /state 读不回（各发一份请求也行，读不到就不画横幅）。
-		if wd, wdErr := s.client.CrewWatchdog(ctx); wdErr == nil {
+		if wd, wdErr := client.CrewWatchdog(ctx); wdErr == nil {
 			s.watchdogCh <- wd
 		}
 		// 已读位置：把主人读到的最后一条回话 id 报上去（契约 §5.6）。只报队伍回的最后一条：
 		// 还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。尽力而为，失败不打断刷新。
 		if lastReply := lastAgentMessageID(conversation.Messages); lastReply != "" {
-			_ = s.client.ReportRead(ctx, lastReply)
+			_ = client.ReportRead(ctx, lastReply)
 		}
 		s.arrived <- conversation
 		s.wake()
@@ -412,11 +757,13 @@ func (s *app) send() {
 		return
 	}
 	s.sending = true
+	// 会话动作在发起那一刻锁定客户端与花名册：切会话不该把这句话发到另一段。
+	client, conversation := s.client, s.conversation
 	go func() {
 		defer func() { s.sending = false }()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation)); err != nil {
+		if _, err := client.Send(ctx, text, mentionsIn(text, conversation)); err != nil {
 			s.failed <- actionErrorText(err)
 			s.wake()
 			return
@@ -591,41 +938,18 @@ func (s *app) drain(c *ui.Context) {
 		select {
 		case conversation := <-s.arrived:
 			if conversation != nil {
-				before := 0
-				if s.conversation != nil {
-					before = len(s.conversation.Messages)
-				}
-				s.conversation, s.problem = conversation, ""
-				// 答完之后这张票可能已经换了一组新问题：刚才那句回执是按上一道题说的，
-				// 不能跟到新问题下面（「已按这个答了」短暂出现在新问题卡上，就是它）。
-				if s.answerNote != "" && !s.answerIsCurrent() {
-					s.answerNote = ""
-				}
-				// 聊天是「越新越靠下」：第一次读到时直接落到最底，之后只有
-				// 用户本来就在底部（没往上翻）才跟着新消息走。往上翻着读历史
-				// 时把视图拽回底部，等于把人正在看的一段抢走。
-				switch {
-				case before == 0:
-					s.chatPinned = true
-					s.chatScroll.Y = math.MaxFloat32
-				case len(conversation.Messages) > before && s.chatPinned:
-					s.chatScroll.Y = math.MaxFloat32
-				}
-				// 时间线变了，产出也可能变了（worker 刚写完一个文件）。按票缓存的结果条
-				// 与整栏都重读一遍；不清掉就会一直停在上一次。
-				s.perTicket = map[string]*OutputsView{}
-				if s.navTab == navOutput {
-					s.loadOutputs()
-				}
-				if s.navTab == navRoutine {
-					s.loadRoutines()
-				}
-				if s.navTab == navMemory {
-					s.loadMemory()
-				}
+				s.applyConversation(conversation)
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
 				c.Invalidate()
 			}
+		case result := <-s.sessionsCh:
+			// 启动 / 首次进入的能力位先验：三态都在这里落到状态上，不静默降级。
+			s.applySessions(result)
+			c.Invalidate()
+		case result := <-s.createdSessionCh:
+			// 新建回执：失败只写实话，成功才用后端名单刷新并切过去。
+			s.applyCreatedSession(result)
+			c.Invalidate()
 		case tree := <-s.tree:
 			s.agents = tree
 			c.Invalidate()
@@ -636,15 +960,25 @@ func (s *app) drain(c *ui.Context) {
 		case credential := <-s.paired:
 			// 配对成功：先把凭据落到本机，再换上新的 client。存不下来也要说清楚 ——
 			// 这一次能连、下次启动又要重配，是两件不同的事。
-			if err := saveCredential(credentialPath(), credential); err != nil {
+			// 当前会话与凭据同文件：换队伍也别把上次打开的那一段丢掉
+			// （名单是否还有它，交给新后端的 GET /sessions 判）。
+			credential.Session = s.currentSession
+			if err := saveCredential(s.sessionCredentialPath(), credential); err != nil {
 				s.pairingNote = actionNote("配上了，但凭据存不下来", err)
 			} else {
 				s.pairingNote = "已配对，下次启动免配置"
 			}
+			// 换队伍后先验还没回来：客户端先停在 main（不带任何 query），
+			// 由 applySessions 按新后端的名单和能力位决定是否切过去。
 			s.client = New(credential.Base, credential.Token, credential.DeviceID)
 			// 横幅要跟着换：连的是新地址了，再失败时不能还报旧的那个。
 			s.endpoint = credential.Base
 			s.problem = ""
+			// 会话名单属于后端：换了一支队伍就重新先验，旧名单与旧缓存都不带过去。
+			s.sessionsChecked, s.sessionAPI, s.sessionBusy = false, false, false
+			s.sessions, s.sessionNote = nil, ""
+			s.conversations = map[string]*Conversation{}
+			s.conversation = nil
 			c.Invalidate()
 			s.refresh()
 		case result := <-s.steps:
@@ -907,6 +1241,9 @@ func (s *app) roster(c *ui.Context, p Palette) {
 					ui.Text(c, "«").FontSize(FontBodyWide).TextColor(p.Faint)
 				})
 			})
+
+			// 会话列表：能力位没先验过时整块不画，老后端只留一句实话。
+			s.sessionPane(c, p)
 
 			ui.Column(c).FillWidth().Gap(2).Children(func() {
 				if s.conversation == nil || len(s.conversation.Bots) == 0 {
@@ -1477,11 +1814,12 @@ func (s *app) sendSteer(ticketID string) {
 		s.modelError <- actionNote("插队没成功", idErr)
 		return
 	}
+	client := s.client
 	go func() {
 		defer func() { s.sending = false }()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if err := s.client.SteerText(ctx, ticketID, requestID, text); err != nil {
+		if err := client.SteerText(ctx, ticketID, requestID, text); err != nil {
 			s.modelError <- actionNote("插队没成功", err)
 			s.wake()
 			return
@@ -1503,10 +1841,11 @@ func (s *app) steer(requestID, ticketID string) {
 	}
 	s.steering[requestID] = true
 	s.steerNote = ""
+	client := s.client
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		s.steerDone <- steerResult{requestID: requestID, err: s.client.Steer(ctx, ticketID, requestID)}
+		s.steerDone <- steerResult{requestID: requestID, err: client.Steer(ctx, ticketID, requestID)}
 		s.wake()
 	}()
 }
@@ -1865,10 +2204,11 @@ func (s *app) answer(task Task, option AttentionOption) {
 	s.answers[slot] = true
 	asked := answerSignature(task)
 	s.answerNote, s.answerTicket, s.answerAsked = "", task.ID, asked
+	client, conversation := s.client, s.conversation
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation))
+		_, err := client.Send(ctx, text, mentionsIn(text, conversation))
 		s.answered <- answerResult{key: slot, ticket: task.ID, asked: asked, err: err}
 		s.wake()
 	}()
@@ -2104,12 +2444,12 @@ func (s *app) message(c *ui.Context, p Palette, message Message, showResult bool
 					ui.Row(c).FillWidth().Justify(ui.End).Gap(6).AlignItems(ui.Center).Children(func() {
 						ui.Text(c, "…").FontSize(FontTiny).TextColor(p.Faint).
 							Cursor(ui.CursorPointer).OnClick(func() {
-								if s.messageMenu == key {
-									s.messageMenu = ""
-								} else {
-									s.messageMenu = key
-								}
-							})
+							if s.messageMenu == key {
+								s.messageMenu = ""
+							} else {
+								s.messageMenu = key
+							}
+						})
 						if s.messageMenu == key {
 							label := "听播报"
 							if s.actions.speaking {
@@ -2323,10 +2663,11 @@ func (s *app) adopt(block CodeBlock, botID string) {
 	}
 	s.adopting[key] = true
 	delete(s.adoptNotes, key)
+	client, conversation := s.client, s.conversation
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_, err := s.client.Send(ctx, text, mentionsIn(text, s.conversation))
+		_, err := client.Send(ctx, text, mentionsIn(text, conversation))
 		s.adopted <- adoptResult{key: key, err: err}
 		s.wake()
 	}()
@@ -2500,10 +2841,11 @@ func (s *app) withdraw(requestID string) {
 	}
 	s.withdrawing[requestID] = true
 	s.withdrawError = ""
+	client := s.client
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		s.withdrawn <- withdrawResult{requestID: requestID, err: s.client.Withdraw(ctx, requestID)}
+		s.withdrawn <- withdrawResult{requestID: requestID, err: client.Withdraw(ctx, requestID)}
 		s.wake()
 	}()
 }

@@ -29,14 +29,19 @@ func effectiveDeviceID(device string) string {
 // 表现就是「数据早到了，界面却一直停在正在读…」。
 func newApp(client *Client) *app {
 	return &app{
-		client:     client,
-		arrived:    make(chan *Conversation, 4),
-		failed:     make(chan string, 4),
-		sent:       make(chan string, 4),
-		tree:       make(chan []AgentNode, 4),
-		paired:     make(chan Credential, 4),
-		pairFailed: make(chan string, 4),
-		steps:      make(chan workResult, 4),
+		client: client,
+		// 会话：每会话一份缓存、两条结果通道都在建窗口时 make，别留 nil 通道。
+		conversations:    map[string]*Conversation{},
+		currentSession:   defaultSessionID,
+		sessionsCh:       make(chan sessionsResult, 4),
+		createdSessionCh: make(chan createdSessionResult, 4),
+		arrived:          make(chan *Conversation, 4),
+		failed:           make(chan string, 4),
+		sent:             make(chan string, 4),
+		tree:             make(chan []AgentNode, 4),
+		paired:           make(chan Credential, 4),
+		pairFailed:       make(chan string, 4),
+		steps:            make(chan workResult, 4),
 		// 模型那两条也在这里 make：忘掉一条，切模型就会永远停在「正在换…」。
 		modelList:     make(chan *ModelCatalog, 4),
 		modelSwitched: make(chan modelSwitchResult, 4),
@@ -71,14 +76,14 @@ func newApp(client *Client) *app {
 		adoptNotes: map[string]string{},
 		adoptedOK:  map[string]bool{},
 
-		pauseDone:     make(chan pauseResult, 2),
+		pauseDone: make(chan pauseResult, 2),
 		// 槽位情况（排队几条、上限几张并发）：不 make 的话，右栏底部会永远缺那一行。
 		crewLoadCh: make(chan *CrewLoad, 4),
 		watchdogCh: make(chan *Watchdog, 4),
-		botSaved:      make(chan botSaveResult, 2),
-		devicesCh:     make(chan devicesResult, 4),
-		revoking:      map[string]bool{},
-		exportCh:      make(chan exportResult, 2),
+		botSaved:   make(chan botSaveResult, 2),
+		devicesCh:  make(chan devicesResult, 4),
+		revoking:   map[string]bool{},
+		exportCh:   make(chan exportResult, 2),
 		// 宽度先落在设计稿的两个值上；拖过之后只记在内存里。
 		sidebarWidth: SidebarWidth,
 		backendWidth: BackendWidth,
@@ -262,6 +267,9 @@ func main() {
 		client = client.WithManagement("http://" + net.JoinHostPort(host, strconv.Itoa(located.Target.WebPort)))
 	}
 	s := newApp(client)
+	// 上次打开的是哪一段会话（凭据缺键 / 坏值回落 main）。名单与能力位仍由
+	// refresh() 的 GET /sessions 先验决定：先验没过之前不发任何非 main 请求。
+	s.currentSession = currentSessionFrom(credentialPath())
 	s.target = located.Target
 	s.endpoint = located.Base
 	// 全局调试态：CREW_DEBUG=1 时才建动作表、开本地 unix socket 控制口。

@@ -98,6 +98,8 @@ class MainActivity : ComponentActivity() {
                             CrewDiscovery.find(this@MainActivity).collect { sighting ->
                                 val found = sighting as? CrewSighting.Found ?: return@collect
                                 val refreshed = CrewNearby.refresh(applied, found.beacon) ?: return@collect
+                                // PairingStore.save() 自己保留盘上的当前会话（唯一写入口是
+                                // saveSession），这里只管更新网段相关的入口表，不补任何字段。
                                 pairing.save(refreshed)
                                 applied = refreshed
                                 opened.replaceEntries(CrewRoute.entries(refreshed, proxyPort))
@@ -151,6 +153,10 @@ class MainActivity : ComponentActivity() {
                                 pairing.clear()
                                 paired = null
                             },
+                            // 上次停在哪个会话从配对记录恢复；切会话只写这一格，不动 paired，
+                            // 免得重启 LaunchedEffect 把正在跑的 P2P 隧道打断。
+                            initialSession = pairing.session(),
+                            onSessionChange = { session -> pairing.saveSession(session) },
                         )
                     }
                 }

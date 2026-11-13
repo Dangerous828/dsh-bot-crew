@@ -1,5 +1,8 @@
 package com.dsh.botcrew
 
+import java.net.URLEncoder
+import org.json.JSONObject
+
 /**
  * 三条路谁先谁后，以及「现在走的是哪条」。
  *
@@ -121,4 +124,36 @@ object CrewRoute {
         }
         return if (note.isEmpty()) text else "$text（$note）"
     }
+}
+
+/**
+ * 会话这一段的纯路径规则（契约 §1）。
+ *
+ * 传输形态只走 query：网关 `session_of()` 只读 `urlsplit(path).query`，body 与 header 一概不认。
+ * 默认 `main` 与显式 `main` 都**不带参数** —— 老路径逐字不变，只有非 main 才追加。
+ * 拼路径与判 id 都放在这里，不塞进网络层：单元测试直接钉住拼出来的那一条 request line。
+ */
+object SessionRoute {
+    /** 缺省会话。老调用、老响应、锁 main 都落到它。 */
+    const val MAIN = "main"
+
+    /** 与 S1 `SESSION_ID` 逐字一致：小写字母/数字开头，其后允许 `-`，总长 1..32。 */
+    private val ID = Regex("^[a-z0-9][a-z0-9-]{0,31}$")
+
+    fun validId(id: String): Boolean = ID.matches(id)
+
+    /**
+     * 给一条会话相关的路径追加 `session_id`。
+     *
+     * 已经有别的 query 时接着拼 `&`，不覆盖原参数；main/null/空串一律原样返回。
+     * URLEncoder 是因为 id 万一带着 `&` 也不能拼出第二个参数（本地校验先挡，这里再兜一层）。
+     */
+    fun path(raw: String, sessionId: String?): String {
+        if (sessionId.isNullOrEmpty() || sessionId == MAIN) return raw
+        val separator = if ('?' in raw) '&' else '?'
+        return raw + separator + "session_id=" + URLEncoder.encode(sessionId, "UTF-8")
+    }
+
+    /** `POST /api/mobile/sessions` 的请求体只有一个 id（契约 §2）。 */
+    fun body(id: String): String = JSONObject().put("id", id).toString()
 }

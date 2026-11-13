@@ -47,6 +47,16 @@ class CrewClient(
     /** 现在在用的入口。语音与播报那两条直连的请求也走它。 */
     private val base: String get() = current.ifEmpty { order.firstOrNull().orEmpty() }
 
+    /**
+     * 会话相关的路径统一在这里拼；非会话接口一律不调它（契约 §1 的接口白名单）。
+     *
+     * **没有隐式默认值**：调用方不传 sessionId 就逐字走老路径。
+     * 每个请求在发起那一刻显式带上自己的会话 id，切会话时在途的旧请求不会被
+     * 一个可变的全局状态改写到新会话上 —— 那是串线的口子。
+     */
+    private fun sessionPath(path: String, sessionId: String?): String =
+        SessionRoute.path(path, sessionId)
+
     /** 现在会按什么顺序试。给测试和日志看。 */
     fun routeOrder(): List<String> = order
 
@@ -125,7 +135,12 @@ class CrewClient(
                     throw error
                 } catch (error: IOException) {
                     // 报出去的仍是第一条路的错：那才是人最先遇到的那个现象。
-                    if (failure == null) failure = error
+                    // 唯一例外：后续入口明确回了 HTTP 状态（例如老后端的 404）——
+                    // 「对端明确拒绝」比「第一条路连不上」更能说明后端是什么，
+                    // 能力位先验据此才不会把老后端误报成链路故障。
+                    if (failure == null || (error is CrewHttpStatus && failure !is CrewHttpStatus)) {
+                        failure = error
+                    }
                 }
             }
             throw failure ?: IOException("队伍地址不对：没有可用的入口")
@@ -155,9 +170,31 @@ class CrewClient(
     private suspend fun <T> parse(body: String, decode: (String) -> T): T =
         withContext(Dispatchers.Default) { decode(body) }
 
+    /**
+     * 会话名单的能力位先验（契约 §2）。这条接口本身不带 session_id：
+     * 它由宿主侧直接答，名单才是唯一真源。404 / 链路错换成带状态码的
+     * [SessionsUnavailable]，界面据此锁 main 并如实提示，绝不静默降级。
+     */
+    suspend fun sessions(): SessionsView = try {
+        parse(read("/api/mobile/sessions", "GET"), CrewWire::parseSessions)
+    } catch (error: CrewHttpStatus) {
+        throw SessionsUnavailable(error.status, error.message ?: SessionCopy.UNREADABLE)
+    } catch (error: IOException) {
+        throw SessionsUnavailable(0, error.message ?: SessionCopy.UNREADABLE)
+    }
+
+    /**
+     * 新建会话。id 先在本地按 S1 形状校验，非法的不发给后端（契约 §2）。
+     * 400 / 409 / 503 的错误体原文随 IOException 抛给界面如实展示，不新增本地条目。
+     */
+    suspend fun createSession(id: String): SessionsView {
+        if (!SessionRoute.validId(id)) throw IllegalArgumentException(SessionCopy.INVALID_ID)
+        return parse(read("/api/mobile/sessions", "POST", SessionRoute.body(id)), CrewWire::parseSessions)
+    }
+
     /** 拉整段对话。失败时抛出带人话的异常，界面直接显示。 */
-    suspend fun timeline(): Conversation =
-        parse(read("/api/mobile/timeline", "GET"), CrewWire::parseTimeline)
+    suspend fun timeline(sessionId: String? = null): Conversation =
+        parse(read(sessionPath("/api/mobile/timeline", sessionId), "GET"), CrewWire::parseTimeline)
 
     /**
      * 上报已读位置：进对话屏时把主人读到的最后一条回话 id 交给后端（契约 §5.6）。
@@ -166,34 +203,35 @@ class CrewClient(
      * 所以这里吞掉异常，只做尽力而为 —— 后端记不住水位时，`unread_replies` 会退回 unknown，
      * 那是三态里正当的一格，不是错误。
      */
-    suspend fun reportRead(lastReadId: String) {
+    suspend fun reportRead(lastReadId: String, sessionId: String? = null) {
         if (lastReadId.isBlank()) return
         try {
-            read("/api/mobile/read", "POST", CrewWire.readBody(lastReadId))
+            read(sessionPath("/api/mobile/read", sessionId), "POST", CrewWire.readBody(lastReadId))
         } catch (_: java.io.IOException) {
             // 尽力而为：下次进屏再报。
         }
     }
 
     /** 发一条消息。requestId 由调用方生成并保留，重试时沿用。 */
-    suspend fun send(text: String, mentions: List<String>, requestId: String) {
-        read("/api/mobile/send", "POST", CrewWire.sendBody(text, mentions, requestId))
+    suspend fun send(text: String, mentions: List<String>, requestId: String, sessionId: String? = null) {
+        read(sessionPath("/api/mobile/send", sessionId), "POST", CrewWire.sendBody(text, mentions, requestId))
     }
 
     /** 撤回一条还在排队、没被队伍读走的消息。已经读走/回复的由后端拒绝。 */
-    suspend fun withdraw(requestId: String) {
-        read("/api/mobile/withdraw", "POST", JSONObject().put("request_id", requestId).toString())
+    suspend fun withdraw(requestId: String, sessionId: String? = null) {
+        read(sessionPath("/api/mobile/withdraw", sessionId), "POST",
+            JSONObject().put("request_id", requestId).toString())
     }
 
     /** 插队：把排队中的一条直接交给正在跑的工单，它在下一步边界先读。 */
-    suspend fun steer(ticketId: String, requestId: String) {
-        read("/api/mobile/steer", "POST",
+    suspend fun steer(ticketId: String, requestId: String, sessionId: String? = null) {
+        read(sessionPath("/api/mobile/steer", sessionId), "POST",
             JSONObject().put("ticket", ticketId).put("request_id", requestId).toString())
     }
 
     /** 发送即插队：新写的一句不进队列，直接交给正在跑的工单。 */
-    suspend fun steerText(ticketId: String, requestId: String, text: String) {
-        read("/api/mobile/steer", "POST",
+    suspend fun steerText(ticketId: String, requestId: String, text: String, sessionId: String? = null) {
+        read(sessionPath("/api/mobile/steer", sessionId), "POST",
             JSONObject().put("ticket", ticketId).put("request_id", requestId).put("text", text).toString())
     }
 
@@ -440,7 +478,9 @@ class CrewClient(
             if (status == 401) throw CrewRejected("队伍拒绝了这次请求：token 不对")
             if (status >= 300) {
                 val detail = connection.errorStream?.bufferedReader()?.use { it.readText() }?.take(200).orEmpty()
-                throw IOException("队伍返回 $status：$detail")
+                // 404 是「老后端没有 /sessions」的判据，409/503 是新建的如实错误；
+                // 保留原来的整句 message，另外把状态码带出来给能力位先验分类。
+                throw CrewHttpStatus(status, "队伍返回 $status：$detail")
             }
         } catch (error: IOException) {
             connection.disconnect()
@@ -455,3 +495,12 @@ class CrewClient(
 
 /** 对端明确拒绝了凭据：地址是通的，换一条路也一样进不去。 */
 private class CrewRejected(message: String) : IOException(message)
+
+/** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码。 */
+private class CrewHttpStatus(val status: Int, message: String) : IOException(message)
+
+/**
+ * 会话名单读不回来。status=404 表示老后端（锁 main 并显示那句提示），其它非 0 状态
+ * 与 0（链路错）都算「读不到会话列表」。界面一律不假装名单为空、也不假装成功。
+ */
+class SessionsUnavailable(val status: Int, message: String) : IOException(message)

@@ -28,9 +28,29 @@ class PairingStore(context: Context) {
 
     fun save(paired: PairedCrew) {
         // 先清再写：字段是一组固定的键，逐条 put 会把上次残留的、这次不该有的值留在盘上。
+        // SESSION 是唯一例外 —— 当前会话只有一个写入口 [saveSession]。
+        // 重新发现 / 刷新入口表这类全量写必须保留盘上现值，否则一次广播就把人切到的
+        // 会话抹回 main。机制落在这一层，不靠每个调用点记得补值。
+        val currentSession = session()
         val editor = store.edit().clear()
-        for ((key, value) in PairingRecord.write(paired)) editor.putString(key, value)
+        for ((key, value) in PairingRecord.writeForSave(paired, currentSession)) editor.putString(key, value)
         editor.apply()
+    }
+
+    /**
+     * 上次停在哪个会话。名单不落盘（每次启动从后端拉），只持久化当前这一格。
+     * 缺键 / 坏值一律回落 main，与 [PairingRecord.read] 同一条规矩。
+     */
+    fun session(): String = PairingRecord.session(store.all)
+
+    /**
+     * 只改当前会话这一个键：不动凭据与三条路，也不重建连接。
+     *
+     * 切会话时改 `paired` 状态会重启 MainActivity 的 P2P 隧道（那段 LaunchedEffect
+     * 以 paired 为 key），所以这里刻意单独写盘，界面状态与隧道都留在原处。
+     */
+    fun saveSession(session: String) {
+        store.edit().putString(PairingRecord.SESSION, session).apply()
     }
 
     /** 忘掉这台电脑。断开连接用它，不是「退出登录」。 */
@@ -52,6 +72,14 @@ object PairingRecord {
     const val FALLBACK = "fallbackBase"
     const val P2P = "p2pAddr"
     const val CREW = "crew"
+    /** 当前会话。老装机没有这一格：读成 main，行为与旧版逐字一致。 */
+    const val SESSION = "session"
+
+    /** 当前会话单独读：缺键、空串、形状不对都回落 main。 */
+    fun session(values: Map<String, Any?>): String {
+        val saved = values[SESSION] as? String ?: return SessionRoute.MAIN
+        return saved.trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
+    }
 
     /** 缺前三格就不算一份配对；其余几格缺了读成空串，那是「这台电脑没有这项」。 */
     fun read(values: Map<String, Any?>): PairedCrew? {
@@ -65,6 +93,7 @@ object PairingRecord {
             fallbackBase = values[FALLBACK] as? String ?: "",
             p2pAddr = values[P2P] as? String ?: "",
             crew = values[CREW] as? String ?: "",
+            session = session(values),
         )
     }
 
@@ -75,7 +104,17 @@ object PairingRecord {
         FALLBACK to paired.fallbackBase,
         P2P to paired.p2pAddr,
         CREW to paired.crew,
+        SESSION to paired.session,
     )
+
+    /**
+     * 整份保存时用的映射：SESSION 取盘上现值，不取传入的 [PairedCrew.session]。
+     *
+     * 抽成纯函数是为了给「全量写不会抹掉当前会话」留测试证据 ——
+     * SharedPreferences 本身在 JVM 单测里跑不了，机制这一层必须测得到。
+     */
+    fun writeForSave(paired: PairedCrew, currentSession: String): Map<String, String> =
+        write(paired) + (SESSION to currentSession)
 }
 
 /** 设备自报的名字。配对时电脑靠它认人，所以取个能一眼认出来的。 */

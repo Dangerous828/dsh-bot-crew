@@ -4,6 +4,8 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +33,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -86,7 +89,7 @@ val TriagePalette = LightPalette.copy(
 internal data class BoardWaiting(val requestId: String, val text: String, val messageId: String)
 
 /**
- * 四组都从同一份 Conversation 投影出来：
+ * 四组都从**当前会话那一份** Conversation 投影出来：
  * - waiting：queued 里能按 requestId 反查到正文的话；
  * - running / deciding / done：只按 open 与 needsPerson 分，不自己解释 state 词表。
  */
@@ -122,6 +125,97 @@ internal fun boardUnread(conversation: Conversation?): Int {
         conversation.messages.any { it.requestId == requestId && it.text.isNotBlank() }
     }
     return waiting + conversation.tickets.count { it.open && it.needsPerson.isNotEmpty() }
+}
+
+/**
+ * 会话切换条（契约 §4）。只有能力位先验通过时才画：老后端 / 读不到名单时调用方
+ * 改画那句如实提示，这里连一格都不出现。
+ *
+ * 名单来自 `GET /sessions`，本地不新增条目：新建成功由后端返回的 sessions[] 刷新；
+ * 形状不对的 id 在本地就挡住，连 POST 都不发；失败原文照实摆出来。
+ */
+@Composable
+fun SessionBar(
+    state: SessionState,
+    palette: CrewPalette,
+    onSwitch: (String) -> Unit,
+    onCreate: (String) -> Unit,
+    onDismissError: () -> Unit = {},
+) {
+    if (!state.switchable) return
+    var adding by remember { mutableStateOf(false) }
+    var draft by remember { mutableStateOf("") }
+    var localError by remember { mutableStateOf("") }
+    Column(modifier = Modifier.fillMaxWidth().background(palette.card)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            for (session in state.sessions) {
+                val selected = session.id == state.current
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) palette.accent else palette.segment)
+                        .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+                        .clickable(enabled = !selected) { onSwitch(session.id) }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        session.name.ifBlank { session.id },
+                        fontSize = 12.sp,
+                        color = if (selected) palette.surface else palette.muted,
+                    )
+                }
+            }
+            TextButton(onClick = { adding = !adding; localError = "" }) {
+                Text(SessionCopy.ADD, color = palette.accent, fontSize = 12.sp)
+            }
+        }
+        if (adding) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it; localError = "" },
+                    label = { Text(SessionCopy.ID_HINT, fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(onClick = {
+                    val id = draft.trim()
+                    if (!SessionRoute.validId(id)) {
+                        localError = SessionCopy.INVALID_ID
+                    } else {
+                        onCreate(id)
+                        draft = ""
+                        adding = false
+                    }
+                }) { Text(SessionCopy.CREATE, fontSize = 12.sp) }
+            }
+        }
+        if (localError.isNotEmpty()) {
+            Text(localError, color = palette.danger, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp))
+        }
+        if (state.error.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(state.error, color = palette.danger, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                TextButton(onClick = onDismissError) { Text(SessionCopy.DISMISS, color = palette.accent, fontSize = 11.sp) }
+            }
+        }
+    }
 }
 
 /** 顶栏那一行：普通 segmented「聊天 / 分拣台」，聊天模式下多一个带未读数的「事务板」。 */

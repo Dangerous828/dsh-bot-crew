@@ -177,8 +177,17 @@ fun CrewRoot(
     /** 现在走的是哪条路（隧道已连接 / 局域网 / 公网中转）。空串表示还算不出来。 */
     route: String = "",
     onForget: () -> Unit,
+    /** 上次停在哪个会话（从配对记录恢复）；名单本身每次启动都从后端拉。 */
+    initialSession: String = SessionRoute.MAIN,
+    /** 当前会话变了就落盘。只写这一格，不改 paired，免得重建 P2P 隧道。 */
+    onSessionChange: (String) -> Unit = {},
 ) {
-    var conversation by remember { mutableStateOf<Conversation?>(null) }
+    // 每会话一份 Conversation：切回 A 只显示 A 的缓存，绝不借 B 的消息来顶。
+    // 老后端锁 main 时这张表只有一项，与从前单份 Conversation 的结构完全一致。
+    var sessionState by remember {
+        mutableStateOf(SessionState(current = initialSession.takeIf(SessionRoute::validId) ?: SessionRoute.MAIN))
+    }
+    val conversation: Conversation? = sessionState.shown
     var problem by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
@@ -203,22 +212,25 @@ fun CrewRoot(
     var executorPaused by remember { mutableStateOf(false) }
     // 动作回执回来之后，已在途的时间线不再覆盖它；下一趟拉取仍以后端为准。
     var pauseRevision by remember { mutableStateOf(0) }
+    // 名单先验失败后，人点「重试」就再问一次；不改变锁 main 的结论。
+    var sessionRetry by remember { mutableStateOf(0) }
 
     // 消息结果条按票读产出（契约 §5.4）。挂在 CrewRoot 上、不挂在队伍页里：
     // 去后台/工作区/模型页再回来时，队伍页会整段重新组合，缓存要是跟着它一起没了，
     // 每张票都会在切屏后的第一帧重新发一遍请求 —— 那正是「切屏掉帧」的一半来源。
     // 放在这一层，切回来时结果条是现成的，一帧都不用等。
     // 轮次还是按时间线走：每读回一份新内容就重读一轮，见 OutputsCache 的说明。
-    val outputs = remember { OutputsCache() }
+    // 按会话重建：结果条与代理树都按票号缓存，票号是会话内的数据，切会话不能复用。
+    val outputs = remember(sessionState.current) { OutputsCache() }
     // 子代理树（第一张工单派了谁）。同样挂在这一层：它画在消息列表末尾，
     // 从后台/工作区回来时人第一眼就看那一块，缓存跟着页面走的话每次都要等一趟网络。
-    val agents = remember { AgentsCache() }
+    val agents = remember(sessionState.current) { AgentsCache() }
 
     fun refresh() {
         // 同一时刻只跑一趟。两趟叠在一起时，先发出去的那趟可能带着更旧的时间线后回来，
         // 把较新的那份盖掉；轮次「变了才加一」也跟着算错，结果条按错轮的账本重读一遍。
-        // 途中又被要求刷新（发完消息马上想看排队的回执）就记一笔，跑完补一趟 —— 不吞掉，
-        // 吞掉就得等下一个 6 秒才看得见自己刚发的话。
+        // 途中又被要求刷新（发完消息马上想看排队的回执，或刚切了会话）就记一笔，
+        // 跑完补一趟 —— 不吞掉，吞掉就得等下一个 6 秒才看得见自己刚发的话。
         if (refreshGuard.running) {
             refreshGuard.again = true
             return
@@ -229,27 +241,31 @@ fun CrewRoot(
                 do {
                     refreshGuard.again = false
                     val requestedPauseRevision = pauseRevision
-                    val next = client.timeline()
+                    // 每一轮重新读「这一刻该请求哪个会话」：先验未回来 / 锁 main 时是 null，
+                    // 老路径逐字不变；切会话时只置了 again，这一轮便会用新的 id 去拉。
+                    // key 与请求是同一个值 —— 旧会话的在途刷新写回旧会话那一格，绝不串线。
+                    val requestedSession = sessionState.requestSession
+                    val key = requestedSession ?: SessionRoute.MAIN
+                    val next = client.timeline(requestedSession)
                     // 轮次只在「真的换了一份内容」时才加一。时间线每 6 秒读一次，如果每次都加，
                     // 所有消息的结果条就跟着每 6 秒重读一遍，整列消息行也跟着重组 ——
                     // 列表在这个环里反复重新布局，人什么都不做也看着它在动。
                     //
                     // 这一步比较（Conversation 的逐字段 equals，含每条消息的文本与代码行）
                     // 放在后台：时间线里有几百条消息时，它是实打实的 CPU 活，正卡在人滑动的那一帧上。
-                    // 结论「变了没变」拿回主线程来用，而写 conversation 的只有这一趟
-                    // （上面那个单飞记号），中间不会有人插进来把它改成别的东西。
-                    val current = conversation
+                    // 比的是这个会话自己的那份缓存，不拿别的会话来当基准。
+                    val current = sessionState.conversations[key]
                     val changed = withContext(Dispatchers.Default) { current != next }
                     // 只有真变了才写回去。写这一下本身也会做一次 equals（状态按结构比）——
                     // 每 6 秒在主线程上把几百条消息比一遍，正是我们要省掉的那笔。
                     // 等值的时候不写：界面不会重组，比较也一次不发生在主线程上。
                     if (changed) {
-                        conversation = next
+                        sessionState = SessionFlow.withConversation(sessionState, key, next)
                         timelineEpoch += 1
                         // 只有内容真的变了才记一行。每 6 秒都记的话，日志会被噪声淹掉，
                         // 也就看不出「哪一次是真的变了」。看：adb logcat -s CrewTimeline
                         android.util.Log.i("CrewTimeline",
-                            "changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
+                            "session=$key changed msgs=${next.messages.size} tickets=${next.tickets.size} " +
                             "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
                     }
                     if (requestedPauseRevision == pauseRevision) executorPaused = next.status.paused
@@ -261,6 +277,41 @@ fun CrewRoot(
                 refreshGuard.running = false
             }
         }
+    }
+
+    /**
+     * 进入另一格会话：切过去与新建成功后走同一段，草稿/幂等键/结果条轮次一律不复用。
+     * 请求路径不靠任何全局状态 —— 各处显式读 [SessionState.requestSession]，
+     * 在途的旧请求仍带着它发起那一刻的会话 id。
+     */
+    fun enterSession(next: SessionState) {
+        sessionState = next
+        onSessionChange(next.current)
+        draft = ""
+        pendingSend = null
+        timelineEpoch += 1
+        refresh()
+    }
+
+    // 能力位先验（契约 §2 / §9.5 C4）：启动 / 首次进入时先问一次名单，失败后可由「重试」再问。
+    // 200 且 session_api: 1 → 正常启用切换；404 或缺能力位 → 锁 main 并如实说老后端；
+    // 网络错 → 锁 main 并如实说读不到。三态都不假装成功、不静默降级。
+    // 名单是后端的唯一真源：恢复的会话不在名单里时由 SessionFlow 回落到 default。
+    LaunchedEffect(sessionRetry) {
+        val next = try {
+            SessionFlow.accept(sessionState, client.sessions())
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: SessionsUnavailable) {
+            if (error.status == 404) SessionFlow.unsupported(sessionState) else SessionFlow.unreadable(sessionState)
+        } catch (error: Exception) {
+            // 不静默吞错：解析崩了、或者别的意外都留一条 logcat，界面仍如实说「读不到」。
+            android.util.Log.w("CrewSessions", "读不到会话列表", error)
+            SessionFlow.unreadable(sessionState)
+        }
+        sessionState = next
+        onSessionChange(next.current)
+        refresh()
     }
 
     // 队伍回话可能要几分钟。只读一次的话，屏幕会永远停在「已发出去」那一格；
@@ -284,6 +335,57 @@ fun CrewRoot(
                     color = palette.muted,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
+            }
+            // 会话切换条只在能力位先验通过时画；老后端 / 读不到名单时如实提示并锁 main，
+            // 一条切换条都不出现，也一个非 main 请求都不发（禁止静默降级）。
+            if (sessionState.switchable) {
+                SessionBar(
+                    state = sessionState,
+                    palette = palette,
+                    onSwitch = { id ->
+                        val next = SessionFlow.switch(sessionState, id)
+                        if (next.current != sessionState.current) enterSession(next)
+                    },
+                    onCreate = { id ->
+                        val check = SessionFlow.create(sessionState, id)
+                        sessionState = check.state
+                        if (check.accepted) {
+                            scope.launch {
+                                try {
+                                    // 名单只认后端返回的 sessions[]：本地不新增条目。
+                                    val view = client.createSession(id)
+                                    val next = SessionFlow.applyCreated(sessionState, view, id)
+                                    // 名单里没有新 id 时 applyCreated 只给错误，不切、不刷。
+                                    if (next.current != sessionState.current) enterSession(next) else sessionState = next
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (error: Exception) {
+                                    // 400 invalid_session / 409 unsupported_session / 503 原文直译。
+                                    // 异常本身留 logcat：不静默吞掉根因。
+                                    android.util.Log.w("CrewSessions", "新建会话失败", error)
+                                    sessionState = SessionFlow.createFailed(
+                                        sessionState, error.message?.takeIf(String::isNotBlank) ?: error.toString(),
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    onDismissError = { sessionState = SessionFlow.clearError(sessionState) },
+                )
+            } else if (sessionState.note.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = sessionState.note,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.muted,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // 后端升级 / 网络恢复后重问一次名单；结果回来之前仍锁 main，不先放行。
+                    TextButton(onClick = { sessionRetry += 1 }) { Text("重试", color = palette.accent) }
+                }
             }
             // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
             problem?.let {
@@ -356,6 +458,8 @@ fun CrewRoot(
                     // 队伍这一屏内部再分聊天 / 分拣台：切镜头不换 Screen、不重建时间线。
                     mode = mode,
                     onModeChange = { mode = it },
+                    // 先验未完成 / 锁 main 时是 null，深层所有会话请求一律走老路径。
+                    sessionId = sessionState.requestSession,
                 )
             }
 
@@ -621,6 +725,12 @@ private fun CrewScreen(
     /** 聊天 / 分拣台：只切渲染，群聊的滚动位置与草稿都留在这一页里。 */
     mode: Mode = Mode.Chat,
     onModeChange: (Mode) -> Unit = {},
+    /**
+     * 这一刻该把会话请求发到哪一格。每次重组拿到的都是当前值，但协程在发起时
+     * 捕获的是它启动那一刻的参数 —— 切会话时在途的旧请求仍发往旧会话。
+     * null = 老路径（先验未完成 / 锁 main），一个 `?session_id=` 都不带。
+     */
+    sessionId: String? = null,
 ) {
     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
     var profile by remember { mutableStateOf<BotCard?>(null) }
@@ -639,7 +749,7 @@ private fun CrewScreen(
         onSending(true)
         scope.launch {
             val ok = try {
-                client.send(text, CrewWire.mentionsIn(text, conversation?.bots.orEmpty()), requestIdFor(text))
+                client.send(text, CrewWire.mentionsIn(text, conversation?.bots.orEmpty()), requestIdFor(text), sessionId)
                 onDraft("")
                 onSent()
                 true
@@ -841,6 +951,7 @@ private fun CrewScreen(
                                 // 在时间线上的最后一条回复挂结果条，见 OutputsCopy.lastOfTicket。
                                 // 这份判断整列只算一次，见上面的 resultEnds。
                                 showResult = !scrolling && resultEnds.getOrElse(index) { false },
+                                sessionId = sessionId,
                             )
                         }
                         if (shown.tickets.isNotEmpty()) {
@@ -852,6 +963,7 @@ private fun CrewScreen(
                             item(key = "tickets") {
                                 TicketStrip(
                                     shown, palette, client,
+                                    sessionId = sessionId,
                                     // 草稿空着才补一句 `@名字 `；已经写了一半的不动它 ——
                                     // 点一下就把人写了一半的话冲掉，比什么都不做更糟。
                                     onPrefill = { name ->
@@ -876,7 +988,7 @@ private fun CrewScreen(
                     // 只报队伍回的最后一条；还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。
                     val lastAgentId = shown.messages.lastOrNull { it.fromBot }?.id ?: ""
                     LaunchedEffect(lastAgentId) {
-                        if (lastAgentId.isNotEmpty()) client.reportRead(lastAgentId)
+                        if (lastAgentId.isNotEmpty()) client.reportRead(lastAgentId, sessionId)
                     }
                     // 第一次拿到消息时要落到底（打开就该看到最新一句）；之后只跟着新消息走。
                     var settled by remember { mutableStateOf(false) }
@@ -924,7 +1036,7 @@ private fun CrewScreen(
                         onSteer = { requestId, ticketId ->
                             scope.launch {
                                 withdrawNote = try {
-                                    client.steer(ticketId, requestId)
+                                    client.steer(ticketId, requestId, sessionId)
                                     "已插话，队伍做完当前这一步会先处理这句"
                                 } catch (error: Exception) {
                                     error.message ?: "插队没成功"
@@ -934,7 +1046,7 @@ private fun CrewScreen(
                         onWithdraw = { requestId ->
                             scope.launch {
                                 withdrawNote = try {
-                                    client.withdraw(requestId)
+                                    client.withdraw(requestId, sessionId)
                                     onSent()
                                     null
                                 } catch (error: Exception) {
@@ -947,7 +1059,7 @@ private fun CrewScreen(
                             val requestId = requestIdFor(text)
                             scope.launch {
                                 withdrawNote = try {
-                                    client.steerText(ticketId, requestId, text)
+                                    client.steerText(ticketId, requestId, text, sessionId)
                                     onDraft("")
                                     onSent()
                                     "已插话，队伍做完当前这一步会先处理这句"
@@ -961,7 +1073,7 @@ private fun CrewScreen(
                         onSending(true)
                         scope.launch {
                             try {
-                                client.send(text, CrewWire.mentionsIn(text, shown.bots), requestId)
+                                client.send(text, CrewWire.mentionsIn(text, shown.bots), requestId, sessionId)
                                 onDraft("")
                                 onSent()
                             } catch (error: Exception) {
@@ -2252,6 +2364,8 @@ private fun TicketStrip(
      */
     onPrefill: (String) -> Unit,
     onSent: () -> Unit,
+    /** 这张卡上的回答发到哪一格；发起时固定，不跟着切会话变。 */
+    sessionId: String? = null,
 ) {
     // 对话里只露一张「等你决定」，其余在后台里看。
     val waiting = conversation.tickets.firstOrNull { it.needsPerson.isNotEmpty() } ?: return
@@ -2308,6 +2422,7 @@ private fun TicketStrip(
                                     text,
                                     CrewWire.mentionsIn(text, conversation.bots),
                                     java.util.UUID.randomUUID().toString(),
+                                    sessionId,
                                 )
                                 note = AnswerCopy.ANSWER_DONE
                                 // 重读时间线：答完之后这张卡要么消失，要么换成下一道题。
@@ -2610,6 +2725,8 @@ private fun CodeCard(
     client: CrewClient,
     /** 拿到快照之后交给上层：手机上没有桌面端那块常驻画面区，去看它的屏幕最顺。 */
     onScreen: (String, ScreenView) -> Unit,
+    /** 「采用」那句话发到哪一格。 */
+    sessionId: String? = null,
 ) {
     // 卡的身份。key 由解析层给（后端的 id，或缺省时拼的「票号|文件名」）——
     // 同一段对话里并排两张卡时，「采用中 / 已采用」与回执都按它各记各的，不串台。
@@ -2716,6 +2833,7 @@ private fun CodeCard(
                                         text,
                                         CrewWire.mentionsIn(text, bots),
                                         java.util.UUID.randomUUID().toString(),
+                                        sessionId,
                                     )
                                     adopted = true
                                     note = CodeCopy.ADOPT_DONE
@@ -2922,6 +3040,8 @@ private fun MessageRow(
     showResult: Boolean = false,
     showName: Boolean = true,
     topGap: Dp = 0.dp,
+    /** 代码卡的「采用」发到哪一格；由队伍屏在发起那一刻传下来。 */
+    sessionId: String? = null,
 ) {
     // 这一条自己的「结果读回来了」记号。它是每条消息各记各的：某张票的产出读回来时，
     // 只有挂着它的那一条重画（见下面 remember 的键）。
@@ -2999,6 +3119,7 @@ private fun MessageRow(
                         palette = palette,
                         client = client,
                         onScreen = onScreen,
+                        sessionId = sessionId,
                     )
                 }
                 // 结果条：「✓ 两张图片已放进产出」。只在「这条话带票号、那张票确实有产出」时画，

@@ -75,6 +75,9 @@ class PairingClient(private val base: String) {
  * 只是那个场景下走不通。三格分开存是为了让选路顺序（P2P → 局域网 → 公网）永远成立 ——
  * 把「上次哪条通」写回 base 会让下一次启动先试公网，把更快的路排到后面。
  * 网段相关的只有 base；重新发现同一台时按 crew 更新它，而不是记住旧网段的 IP。
+ *
+ * [session] 是上次停在哪个会话（契约 §3）。它不参与选路：只是启动时恢复的那一格，
+ * 名单本身每次启动从 `GET /sessions` 拉。缺键回落 `main`，老装机逐字兼容。
  */
 data class PairedCrew(
     val deviceId: String,
@@ -83,4 +86,5 @@ data class PairedCrew(
     val fallbackBase: String = "",
     val p2pAddr: String = "",
     val crew: String = "",
+    val session: String = SessionRoute.MAIN,
 )

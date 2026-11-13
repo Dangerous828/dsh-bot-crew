@@ -106,10 +106,186 @@ data class Conversation(
      * 判定按「主人读到哪」，方向与 [unread]（队伍读没读走）相反，两者不能互相顶替。
      */
     val unreadReplies: Int? = null,
+    /**
+     * 这份时间线属于哪个会话（S1 的 timeline 回显 `session_id`）。
+     *
+     * 老响应没有这个字段：按 `main` 回落，绝不把一段老数据当成刚切过去的那个会话。
+     * 有值也只是展示与缓存的键，发请求用哪个会话由 [SessionState.requestSession] 说了算。
+     */
+    val sessionId: String = SessionRoute.MAIN,
+    /** 会话显示名。S1 的名单只给 id，没有单独的名字时按 id 显示。 */
+    val name: String = SessionRoute.MAIN,
 )
 
 /** 一条被读过、但不打算动手的消息。 */
 data class Declined(val requestId: String, val reason: String)
+
+/** 名单里的一条会话。S1 只发 id；`name` 缺省与 id 相同，供切换条画那一格。 */
+data class SessionInfo(val id: String, val name: String = id)
+
+/**
+ * `GET / POST /api/mobile/sessions` 的回答。
+ *
+ * GET 是 `{sessions, default_session_id, session_api}`；POST 是 `{id, sessions, session_api}`
+ * —— **没有 default_session_id**，解析一律按 main 回落，别按 GET 的形状硬读。
+ * `session_api` 只认整数 1：缺位、0、别的类型都算老后端（契约 §2，禁止静默降级）。
+ */
+data class SessionsView(
+    val sessions: List<SessionInfo>,
+    val defaultSessionId: String = SessionRoute.MAIN,
+    val sessionApi: Boolean = false,
+    /** POST 回显的新建 id；GET 为空串。 */
+    val createdId: String = "",
+)
+
+/**
+ * 能力位先验的四格。PENDING 是先验还没回来：那时一切请求都走老路径、切换条不画。
+ *
+ * LIVE 才允许切换；UNSUPPORTED（404 / 缺 session_api）与 UNREADABLE（网络错）都锁 main，
+ * 各自如实说一句话，绝不假装「只有一个会话也能切」。
+ */
+enum class SessionCapability { PENDING, LIVE, UNSUPPORTED, UNREADABLE }
+
+/**
+ * 手机这一刻的会话账本。它是不可变值：每次转换都换一份新的，Compose 状态才会重画。
+ *
+ * [conversations] 是「互不串」的判据：每会话一份 Conversation，`shown` 只按 [current] 取。
+ * 切换时不清空别人的缓存，但也绝不拿上一格的消息、queued、declined、unread、
+ * unread_replies、tickets 来顶当前这一格 —— 那些字段全都来自各自会话的 timeline 响应。
+ * 老后端（锁 main）时这张表只有 main 一项，结构与以前的单份 Conversation 完全一致。
+ */
+data class SessionState(
+    val capability: SessionCapability = SessionCapability.PENDING,
+    val sessions: List<SessionInfo> = emptyList(),
+    val current: String = SessionRoute.MAIN,
+    val defaultSessionId: String = SessionRoute.MAIN,
+    /** 锁 main 时如实显示的那句提示；LIVE 时为空。 */
+    val note: String = "",
+    /** 新建失败的原文（400 / 409 / 503 / 本地校验）。 */
+    val error: String = "",
+    val conversations: Map<String, Conversation> = emptyMap(),
+) {
+    val switchable: Boolean get() = capability == SessionCapability.LIVE
+
+    /**
+     * 这一刻的请求该带哪个会话。先验未完成 / 锁 main 时返回 null —— 老路径逐字不变，
+     * 一个非 main 请求都不发。LIVE 且 main 时返回 "main"，由 [SessionRoute.path] 去掉参数。
+     */
+    val requestSession: String? get() = if (switchable) current else null
+
+    /** 当前会话自己的那份时间线；还没拉到就是空，界面画加载而不是借别人的消息。 */
+    val shown: Conversation? get() = conversations[current]
+}
+
+/** 新建前的本地校验结果：accepted=false 时连 POST 都不发。 */
+data class SessionCreate(val state: SessionState, val accepted: Boolean)
+
+/** 会话切换条与锁 main 那几句话。纯文案，测试直接钉住。 */
+object SessionCopy {
+    const val OLD_BACKEND = "这台后端还只支持一个会话"
+    const val UNREADABLE = "读不到会话列表"
+    const val INVALID_ID = "会话 id 只能用 a-z、0-9 和 -，最多 32 位"
+    const val ADD = "＋ 新建会话"
+    const val ID_HINT = "新会话 id（a-z、0-9、-）"
+    const val CREATE = "建好并切过去"
+    const val DISMISS = "知道了"
+
+    /** 200 却没把新 id 列进名单：如实说，不假装切过去了。 */
+    fun missingCreated(id: String): String = "后端名单里没有刚新建的会话：$id"
+}
+
+/**
+ * 会话状态的全部转换。纯函数、不碰网络与 Compose，能力位先验三态与缓存隔离都在这里被测到。
+ *
+ * 名单本身不持久化：每次启动从 `GET /sessions` 拉，后端是唯一真源。恢复的当前会话
+ * 若已不在名单里，回落到 `default_session_id`（S1 恒为 main）。
+ */
+object SessionFlow {
+    private fun listed(rows: List<SessionInfo>): List<SessionInfo> =
+        (listOf(SessionInfo(SessionRoute.MAIN)) + rows).distinctBy { it.id }
+
+    /** 200 且 session_api: 1 → 正常启用；缺能力位 → 一律锁 main，不静默当成可用。 */
+    fun accept(state: SessionState, view: SessionsView): SessionState {
+        if (!view.sessionApi) return unsupported(state)
+        val rows = listed(view.sessions)
+        val current = if (rows.any { it.id == state.current }) state.current else view.defaultSessionId
+        return state.copy(
+            capability = SessionCapability.LIVE,
+            sessions = rows,
+            current = if (rows.any { it.id == current }) current else SessionRoute.MAIN,
+            defaultSessionId = view.defaultSessionId,
+            note = "",
+            error = "",
+            // 名单里已经没有的会话，缓存也不留着：下次切回来不能显示一份后端已不认的账。
+            conversations = state.conversations.filterKeys { id -> rows.any { it.id == id } },
+        )
+    }
+
+    /** 404 或 200 缺能力位：锁 main、如实提示、只留 main 那份缓存。 */
+    fun unsupported(state: SessionState): SessionState =
+        lock(state, SessionCapability.UNSUPPORTED, SessionCopy.OLD_BACKEND)
+
+    /** 网络错：锁 main、如实说读不到，不假装成功。 */
+    fun unreadable(state: SessionState): SessionState =
+        lock(state, SessionCapability.UNREADABLE, SessionCopy.UNREADABLE)
+
+    private fun lock(state: SessionState, capability: SessionCapability, note: String): SessionState = state.copy(
+        capability = capability,
+        sessions = emptyList(),
+        current = SessionRoute.MAIN,
+        defaultSessionId = SessionRoute.MAIN,
+        note = note,
+        error = "",
+        conversations = state.conversations.filterKeys { it == SessionRoute.MAIN },
+    )
+
+    /** 只有 LIVE 且 id 在名单里才切。锁定态与 PENDING 一律原地不动。 */
+    fun switch(state: SessionState, id: String): SessionState {
+        if (!state.switchable || state.sessions.none { it.id == id }) return state
+        return state.copy(current = id, error = "")
+    }
+
+    /**
+     * 一次 timeline 读回来按「发起时的会话 id」入账。
+     *
+     * 旧会话的在途请求晚回来也写回旧会话那一格，绝不会盖到当前显示的这份上。
+     */
+    fun withConversation(state: SessionState, id: String, conversation: Conversation): SessionState = state.copy(
+        conversations = state.conversations + (id to conversation.copy(
+            sessionId = id,
+            name = conversation.name.ifBlank { id },
+        )),
+    )
+
+    /** 提交前的本地闸门：形状不对直接拒绝，不新增条目、不发请求。 */
+    fun create(state: SessionState, id: String): SessionCreate {
+        if (!state.switchable) return SessionCreate(state.copy(error = SessionCopy.OLD_BACKEND), false)
+        if (!SessionRoute.validId(id)) return SessionCreate(state.copy(error = SessionCopy.INVALID_ID), false)
+        return SessionCreate(state.copy(error = ""), true)
+    }
+
+    /** 200 → 用返回的 sessions[] 刷新名单并切到新会话；失败与「没能力位」都不新增本地条目。 */
+    fun applyCreated(state: SessionState, view: SessionsView, id: String): SessionState {
+        if (!view.sessionApi) return unsupported(state)
+        val rows = listed(view.sessions)
+        val target = view.createdId.ifEmpty { id }
+        // 200 却没把新 id 列进名单：如实报错，不假装切过去了，也不动当前会话。
+        if (rows.none { it.id == target }) return createFailed(state, SessionCopy.missingCreated(target))
+        return state.copy(
+            capability = SessionCapability.LIVE,
+            sessions = rows,
+            current = target,
+            // POST 响应没有 default_session_id：GET 那次读到的才是真源，别覆盖成回落值。
+            note = "",
+            error = "",
+        )
+    }
+
+    /** 400 invalid_session / 409 unsupported_session / 503：如实展示错误，名单与当前会话不动。 */
+    fun createFailed(state: SessionState, message: String): SessionState = state.copy(error = message)
+
+    fun clearError(state: SessionState): SessionState = state.copy(error = "")
+}
 
 /**
  * 消息面的线上格式。只说两件事：把回话读成对话，把一句话写成请求。
@@ -209,6 +385,36 @@ object CrewWire {
     /** 这张票上这个选项的键：正在发的那一下与结果回来时按它对应上。 */
     fun answerSlot(ticketId: String, optionId: String): String = "$ticketId|$optionId"
 
+    /**
+     * 读 `GET / POST /api/mobile/sessions` 的回答。
+     *
+     * S1 的 `sessions` 是 **id 字符串数组**；也认 `{id, name}` 形状的条目（带显示名时用它的）。
+     * 坏行（空串、非法 id、重复）丢掉，不自己编一条进名单。POST 响应没有
+     * `default_session_id`，缺字段一律回落 main；`session_api` 只认整数 1。
+     */
+    fun parseSessions(body: String): SessionsView {
+        val root = JSONObject(body)
+        val sessions = mutableListOf<SessionInfo>()
+        val raw = root.optJSONArray("sessions") ?: JSONArray()
+        for (index in 0 until raw.length()) {
+            val row = raw.optJSONObject(index)
+            val id = (row?.optString("id") ?: raw.optString(index)).trim()
+            if (!SessionRoute.validId(id) || sessions.any { it.id == id }) continue
+            val name = row?.optString("name")?.trim().takeIf { !it.isNullOrBlank() } ?: id
+            sessions.add(SessionInfo(id, name))
+        }
+        return SessionsView(
+            sessions = sessions,
+            defaultSessionId = root.optString("default_session_id").trim()
+                .takeIf(SessionRoute::validId) ?: SessionRoute.MAIN,
+            // 只认 JSON 数字 1：字符串 "1"、true、0 都不是 S1 的能力位。
+            sessionApi = (root.opt("session_api") as? Number)?.toInt() == SESSION_API,
+            createdId = root.optString("id").trim().takeIf(SessionRoute::validId).orEmpty(),
+        )
+    }
+
+    private const val SESSION_API = 1
+
     fun parseTimeline(body: String): Conversation {
         val root = JSONObject(body)
         val messages = mutableListOf<Message>()
@@ -286,8 +492,12 @@ object CrewWire {
             if (requestId.isBlank()) return@mapNotNull null
             Declined(requestId, row.optString("reason", ""))
         }
+        // S1 的 timeline 回显四字段，其中 session_id 是这份时间线真正属于哪一格。
+        // 老响应一个字段都没有：按 main 兼容，不把老数据挂到刚切过去的会话上。
+        val sessionId = root.optString("session_id").trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
+        val sessionName = root.optString("session_name").trim().takeIf(String::isNotBlank) ?: sessionId
         return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined,
-            unreadOf(root, "unread"), unreadOf(root, "unread_replies"))
+            unreadOf(root, "unread"), unreadOf(root, "unread_replies"), sessionId, sessionName)
     }
 
     /**

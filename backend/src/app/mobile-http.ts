@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { HttpHost } from './http.ts'
-import { canRetry, ticketStage } from '../core/index.ts'
+import { canRetry, liveTicket, ticketStage } from '../core/index.ts'
 import { SettingsConflict } from './settings.ts'
 import type { Settings } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
@@ -821,8 +821,14 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         if (!asked) return response(400, { error: 'Invalid JSON' })
         const id = typeof asked.ticket === 'string' ? asked.ticket : ''
         if (!id) return response(400, { error: 'ticket is required' })
-        if (!runtime.store.tickets.get(id)) return response(404, { error: 'No such ticket' })
+        const ticket = runtime.store.tickets.get(id)
+        if (!ticket) return response(404, { error: 'No such ticket' })
         if (!runtime.engine) return response(503, { error: 'Ticket control is unavailable' })
+        // 已结束的票必须如实拒绝，不能回 stopped: true 假成功。
+        // Tickets.stop() → end() 遇到 !liveTicket 是静默 return（票已经不在跑了，
+        // 结束它是空操作），路由若无条件报成功，界面就会显示「已接手：这张票停下了」
+        // —— 那是一句假话，而且调用方拿不到任何信号。所以这里先判票还活着。
+        if (!liveTicket(ticket)) return response(409, { error: 'Ticket is already ended' })
         try { runtime.engine.stopTicket(id) } catch { return response(409, { error: 'Ticket cannot be stopped' }) }
         return response(200, { ok: true, stopped: true })
       }

@@ -516,6 +516,22 @@ it('takes over exactly the ticket it names, and refuses an unknown one', async (
   expect(engine.stopTicket).toHaveBeenCalledTimes(1)
 })
 
+it('refuses to take over a ticket that already ended instead of claiming it stopped', async () => {
+  // Tickets.stop() → end() 对已结束的票是静默 return（结束它是空操作）。
+  // 路由若无条件回 stopped: true，界面会显示「已接手：这张票停下了」—— 那是假话。
+  const engine = { stopTicket: vi.fn() }
+  const endedAt = new Date().toISOString()
+  const handler = phoneHandler(controlHost({
+    tickets: { done: { id: 'done', ended: { by: 'executor', outcome: 'completed', at: endedAt } } }, engine,
+  }), undefined, vi.fn() as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/takeover', { method: 'POST',
+    body: '{"ticket":"done"}' }))
+  expect(result.status).toBe(409)
+  expect(await result.json()).toEqual({ error: 'Ticket is already ended' })
+  // 而且根本不该去调 stopTicket：调用方拿到 409 就不会以为停下了。
+  expect(engine.stopTicket).not.toHaveBeenCalled()
+})
+
 it('pauses the executor and says so, because no per-ticket pause exists', async () => {
   const pauseControl = { pause: vi.fn(async () => ({ paused: true })) }
   const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1' } }, settingsControl: pauseControl }), undefined,

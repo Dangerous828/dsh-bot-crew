@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -146,7 +147,37 @@ val DarkPalette = CrewPalette(
  * 常规任务（契约 §5.5）从后台那一屏进：桌面端它也是后台左栏里的一项，
  * 手机这一屏就是从「后台」页头点进去的同一个位置。
  */
-private enum class Screen { Crew, Backend, Workspace, Models, Routine, Memory }
+internal enum class Screen { Crew, Backend, Workspace, Models, Routine, Memory }
+
+/**
+ * 这一屏的对外名字。调试口的 `tab.set` 认它，与桌面端 nav.* 那套面板名对齐 ——
+ * 同一个脚本能驱动两端，名字就不能各起一套。
+ */
+internal fun screenName(screen: Screen): String = when (screen) {
+    Screen.Crew -> "crew"
+    Screen.Backend -> "backend"
+    Screen.Workspace -> "workspace"
+    Screen.Models -> "models"
+    Screen.Routine -> "routine"
+    Screen.Memory -> "memory"
+}
+
+/** [screenName] 的反向：认不出来的名字返回 null，由调用方明确报错，不静默回落。 */
+internal fun screenFromName(name: String): Screen? = when (name) {
+    "crew" -> Screen.Crew
+    "backend" -> Screen.Backend
+    "workspace" -> Screen.Workspace
+    "models" -> Screen.Models
+    "routine" -> Screen.Routine
+    "memory" -> Screen.Memory
+    else -> null
+}
+
+/** 镜头名字。调试口的 `mode.set` 与桌面端 mode.set 同一套词。 */
+internal fun modeName(mode: Mode): String = when (mode) {
+    Mode.Chat -> "chat"
+    Mode.Triage -> "triage"
+}
 
 /**
  * 该 Bot 手上最近那张还没结束的票：接手与暂停都只对这张有意义。
@@ -181,6 +212,11 @@ fun CrewRoot(
     initialSession: String = SessionRoute.MAIN,
     /** 当前会话变了就落盘。只写这一格，不改 paired，免得重建 P2P 隧道。 */
     onSessionChange: (String) -> Unit = {},
+    /**
+     * 调试口的挂载点。null 表示开关没开 —— 那时一个调试对象都不建，
+     * 界面这一层与没有这套东西时逐字相同。
+     */
+    debug: DebugBridge? = null,
 ) {
     // 每会话一份 Conversation：切回 A 只显示 A 的缓存，绝不借 B 的消息来顶。
     // 老后端锁 main 时这张表只有一项，与从前单份 Conversation 的结构完全一致。
@@ -291,6 +327,63 @@ fun CrewRoot(
         pendingSend = null
         timelineEpoch += 1
         refresh()
+    }
+
+    /**
+     * 调试口这一半：把界面状态摊平给 `state.dump`，把动作落到界面本来就有的那几个入口上。
+     *
+     * 只在开关开启时挂上去（[debug] 为 null 时一个对象都不建）；退出这一屏时摘掉，
+     * 免得调试口还拿着已经离开组合的状态去改。写法用 remember + DisposableEffect：
+     * 闭包里读的都是 `by remember { mutableStateOf(...) }` 的委托，每次调用拿到的是这一刻的值，
+     * 所以这个对象不必随每帧重建。
+     */
+    if (debug != null) {
+        val target = remember(debug) {
+            CrewDebugScreen(
+                state = { sessionState },
+                tab = { screenName(screen) },
+                mode = { modeName(mode) },
+                timelineEpoch = { timelineEpoch },
+                paused = { executorPaused },
+                problem = { problem },
+                draft = { draft },
+                sending = { sending },
+                entries = { client.routeOrder() },
+                currentEntry = { client.currentEntry() },
+                onRefresh = { refresh() },
+                // 切会话走 enterSession：落盘、清草稿、重拉时间线一次做完，与点切换条同一条路。
+                onEnterSession = { next -> enterSession(next) },
+                onSend = { text, requestId ->
+                    // 与输入框那条路逐字一致：mentions 从当前时间线的花名册算，
+                    // 会话 id 取「这一刻该发到哪一格」，发完让时间线重读一遍。
+                    sending = true
+                    scope.launch {
+                        try {
+                            client.send(
+                                text,
+                                CrewWire.mentionsIn(text, conversation?.bots.orEmpty()),
+                                requestId,
+                                sessionState.requestSession,
+                            )
+                            draft = ""
+                            refresh()
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            problem = error.message ?: "发送失败"
+                        } finally {
+                            sending = false
+                        }
+                    }
+                },
+                onTab = { name -> screenFromName(name)?.let { screen = it } },
+                onMode = { name -> mode = if (name == "triage") Mode.Triage else Mode.Chat },
+            )
+        }
+        DisposableEffect(debug) {
+            debug.screen = target
+            onDispose { if (debug.screen === target) debug.screen = null }
+        }
     }
 
     // 能力位先验（契约 §2 / §9.5 C4）：启动 / 首次进入时先问一次名单，失败后可由「重试」再问。

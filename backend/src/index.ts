@@ -63,8 +63,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     const raw = headers?.['x-crew-session']
     // 同名多值不许猜第一个（网关 get_all 的口径）：拼成一个肯定过不了形状校验的值，
     // 交给消息面回 400 invalid_session，绝不静默按 main 落库。
+    // 空串也必须原样带下去：消息面的口径是「头存在但值为空 = 显式非法 → 400」，
+    // 这里若把空串丢掉，请求就变成「没带会话」并被 200 落进 main —— 那正是 C4 静默串线。
     const value = Array.isArray(raw) ? raw.join(', ') : raw
-    return typeof value === 'string' && value ? { 'x-crew-session': value } : {}
+    return typeof value === 'string' ? { 'x-crew-session': value } : {}
   }
   const ask = (request: { method: string; url: string; headers?: Record<string, string | string[] | undefined> }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<Response> =>
     answer(new Request(`http://dsh${request.url}`, {

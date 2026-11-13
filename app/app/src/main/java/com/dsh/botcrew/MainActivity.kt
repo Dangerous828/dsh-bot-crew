@@ -11,6 +11,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,11 +29,28 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    /**
+     * 调试口的挂载点。开关没开时它一直是 null —— 那时不建 socket、不建总线、不建桥，
+     * 界面这一层与没有这套东西时逐字相同。
+     */
+    private var debugBridge: DebugBridge? = null
+    private var debugServer: CrewDebugServer? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 配好的电脑存在本机，重启后不用再念一次码。
         val pairing = PairingStore(this)
         val thisDevice = deviceId(this)
+
+        // 调试口：debug 构建默认开，release 永远不开（见 CrewDebug 的注释）。
+        // 起不来只记一行日志，界面照常 —— 调试口是外挂，不是界面的一部分。
+        val debugOn = CrewDebug.enabled(BuildConfig.DEBUG, CrewDebug.systemProperty(CrewDebug.PROP))
+        val bridge = if (debugOn) DebugBridge() else null
+        debugBridge = bridge
+        if (bridge != null) {
+            val server = CrewDebugServer(CrewDebug(bridge))
+            if (server.start()) debugServer = server
+        }
 
         setContent {
             val palette = if (isSystemInDarkTheme()) DarkPalette else LightPalette
@@ -132,6 +150,24 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // 调试口的外壳那一半：配对、走哪条路、隧道往返。
+            // 用 SideEffect 而不是在组合体里直接写：组合可能被丢弃重来，
+            // 副作用只在这一次组合真的生效之后才落地。
+            if (bridge != null) {
+                SideEffect {
+                    bridge.shell = DebugShell(
+                        paired = paired != null,
+                        crew = paired?.crew.orEmpty(),
+                        device = paired?.deviceId.orEmpty(),
+                        way = way?.name?.lowercase().orEmpty(),
+                        tunnelMillis = tunnelMillis,
+                        p2pNote = p2pNote,
+                        route = CrewRoute.label(way, tunnelMillis, p2pNote),
+                        session = pairing.session(),
+                    )
+                }
+            }
+
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val current = paired
@@ -157,11 +193,25 @@ class MainActivity : ComponentActivity() {
                             // 免得重启 LaunchedEffect 把正在跑的 P2P 隧道打断。
                             initialSession = pairing.session(),
                             onSessionChange = { session -> pairing.saveSession(session) },
+                            // 调试口：只在开关开启时挂上去（null 时 CrewRoot 连一个对象都不建）。
+                            debug = bridge,
                         )
                     }
                 }
             }
         }
+    }
+
+    /**
+     * 关掉调试口。与桌面端 ctx.Done() 那一路对应：listener 一关，accept 就退出，
+     * abstract socket 随进程一起消失，不留死文件。
+     */
+    override fun onDestroy() {
+        debugServer?.stop()
+        debugServer = null
+        debugBridge?.screen = null
+        debugBridge = null
+        super.onDestroy()
     }
 
     private companion object {

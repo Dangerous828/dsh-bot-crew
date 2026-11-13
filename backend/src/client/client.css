@@ -88,6 +88,7 @@
 .dt-subhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-secondary); }
 .dt-rules, .dt-changes { list-style: none; margin: 0; padding: 0; }
 .dt-field-head { display: inline-flex; align-items: center; gap: 4px; color: var(--dsw-alias-label-secondary); }
+.dt-inline-tip { display: inline-flex; align-items: center; gap: 4px; }
 .dt-info { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; padding: 0; border: 0; background: none; color: var(--dsw-alias-label-caption); cursor: help; }
 .dt-info:hover, .dt-info:focus-visible { color: var(--dsw-alias-label-secondary); }
 .dt-info:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; border-radius: 50%; }

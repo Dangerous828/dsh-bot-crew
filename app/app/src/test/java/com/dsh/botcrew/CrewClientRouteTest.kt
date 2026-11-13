@@ -108,4 +108,24 @@ class CrewClientRouteTest {
         crew.replaceEntries(listOf("", "  "))
         assertEquals(listOf("http://a:1"), crew.routeOrder())
     }
+
+    // proxyPort 还没就绪时（广播早于 P2P 探测成功）收到刷新：新表不含回环代理也不能把主路踢掉。
+    @Test
+    fun aRefreshBeforeTheProxyIsReadyKeepsTheP2pEntry() {
+        val crew = client("http://192.168.31.127:43499")
+        val proxy = CrewRoute.proxyBase(43001)
+        crew.promote(proxy)
+        crew.replaceEntries(listOf("http://10.0.0.9:43499", "https://crew.example.top"))
+        assertEquals(proxy, crew.currentEntry())
+        assertEquals(proxy, crew.routeOrder().first())
+    }
+
+    // 当前入口不是本地代理（还在 LAN 上）时，不加任何东西，按新表正常回落。
+    @Test
+    fun aRefreshOnLanDoesNotInventAProxyEntry() {
+        val crew = client("http://old:1", "https://crew.example.top")
+        crew.replaceEntries(listOf("http://new:3", "https://crew.example.top"))
+        assertEquals(listOf("http://new:3", "https://crew.example.top"), crew.routeOrder())
+        assertEquals("http://new:3", crew.currentEntry())
+    }
 }

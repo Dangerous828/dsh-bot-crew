@@ -225,8 +225,9 @@ it('shows the current isolation level on the Execution status line', async () =>
   expect(line).toContain(zh['isolation.none'])
   // 未隔离那档用警示色，别让人一眼扫过去以为是开着的。
   expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('warning')
-  // 提示里要说清 agent 自由命令仍不在隔离范围内。
-  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('title')).toContain('自由命令')
+  // 说明走全站一致的 (?) tooltip，不是裸 title；断言无障碍属性而不是控件实现。
+  const tip = document.querySelector('.dt-status-line .dt-lv-value .dt-info')
+  expect(tip?.getAttribute('aria-label')).toContain('自由命令')
 })
 
 it('shows the sandbox level with its honest boundary, not "fully isolated"', async () => {
@@ -237,7 +238,7 @@ it('shows the sandbox level with its honest boundary, not "fully isolated"', asy
   expect(line).toContain(zh['isolation.sandbox'])
   expect(line).not.toContain(zh['isolation.none'])
   expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('ongoing')
-  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('title')).toContain('自由命令')
+  expect(document.querySelector('.dt-status-line .dt-lv-value .dt-info')?.getAttribute('aria-label')).toContain('自由命令')
 })
 
 it('sends one stop for a double click on Confirm', async () => {

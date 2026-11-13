@@ -272,10 +272,12 @@ it('treats an empty ticket_ref as missing and fills it from the decision', async
   const items = [
     { id: 'r7', role: 'agent', reply_to: 'm6', ticket_ref: '', text: '改好了', at: '2026-11-11T00:00:10.000Z' },
     { id: 'r8', role: 'agent', reply_to: 'm6', ticket_ref: 'tk-gateway-wins', text: '另一个回执', at: '2026-11-11T00:00:11.000Z' },
+    { id: 'r9', role: 'agent', reply_to: 'm6', ticket_ref: '   ', text: '空白票号', at: '2026-11-11T00:00:12.000Z' },
   ]
   const decisions = [{ kind: 'accept', threadKey: 'team:main:6', ticketId: 'tk-1', at: '2026-11-11T00:00:05.000Z' }]
   const refs = ticketRefs(items as never, decisions as never)
   expect(refs.get('r7')).toBe('tk-1')
+  expect(refs.get('r9')).toBe('tk-1') // 纯空白同样算缺失，结果条不该被挡住。
   expect(refs.has('r8')).toBe(false) // 网关给的真值仍然优先。
   const out = withTicketRefs(items as never, refs) as Record<string, unknown>[]
   expect(out[0]).toMatchObject({ id: 'r7', ticket_ref: 'tk-1' })

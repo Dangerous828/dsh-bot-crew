@@ -90,13 +90,16 @@ class MainActivity : ComponentActivity() {
                         // 判据只认 crew 指纹，认不出就不动；没授权附近设备或网络无组播时
                         // 这条流安静结束，配对保持原样，不假装刷新过。
                         launch {
+                            // 「当前已应用的配对」独立记录：它是 refresh 的比较基准，但**不能**
+                            // 用 Compose 的 paired 状态存 —— 改那个会重启本 effect、重建 tailcat
+                            // 句柄，把正在跑的 P2P 隧道打断。也不能一直拿最初的 current 比：
+                            // A→B→A 时第三条与旧 A 相等会被判「无变化」，磁盘和入口表永久停在 B。
+                            var applied: PairedCrew = checkNotNull(current)
                             CrewDiscovery.find(this@MainActivity).collect { sighting ->
                                 val found = sighting as? CrewSighting.Found ?: return@collect
-                                val here = paired ?: return@collect
-                                val refreshed = CrewNearby.refresh(here, found.beacon) ?: return@collect
+                                val refreshed = CrewNearby.refresh(applied, found.beacon) ?: return@collect
                                 pairing.save(refreshed)
-                                // 只就地换入口表，不改 paired：改它会重启本 effect、重建
-                                // tailcat 句柄，把正在跑的 P2P 隧道打断。下次启动自然读到新值。
+                                applied = refreshed
                                 opened.replaceEntries(CrewRoute.entries(refreshed, proxyPort))
                             }
                         }

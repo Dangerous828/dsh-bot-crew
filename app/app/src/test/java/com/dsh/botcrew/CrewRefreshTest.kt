@@ -107,4 +107,18 @@ class CrewRefreshTest {
         org.junit.Assert.assertNotEquals(first, CrewNearby.signature(beacon(p2pAddr = "tcpNEW")))
         org.junit.Assert.assertNotEquals(first, CrewNearby.signature(beacon(crew = "other")))
     }
+
+    // A→B→A：调用方必须拿「上一次已应用的配对」当比较基准，不能一直拿最初的 A。
+    // 否则第三条与旧 A 相等会被判「无变化」，磁盘与入口表永久停在 B。
+    @Test
+    fun aReturnToTheOriginalAddressIsStillAChange() {
+        val a = beacon(base = "http://192.168.31.127:43499")
+        val b = beacon(base = "http://10.0.0.9:43499")
+        val toB = CrewNearby.refresh(paired, b)!!
+        assertEquals("http://10.0.0.9:43499", toB.base)
+        val backToA = CrewNearby.refresh(toB, a)
+        assertEquals("http://192.168.31.127:43499", backToA?.base)
+        // 重复广播同一条：已应用过就是无变化，不写盘、不换表。
+        assertNull(CrewNearby.refresh(toB, b))
+    }
 }

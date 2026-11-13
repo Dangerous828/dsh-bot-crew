@@ -31,9 +31,12 @@ export function ExecutionStatus({ filter: current, state, reload }: {
       {!state.setup.problem && <>
         <LabelValue label={t('executingLabel')}
           value={`${state.load.running} / ${maxWorkers}`} /><LabelValue label={t('queuedLabel')} value={state.load.queued} />
-        {/* 隔离档位紧跟状态：翻默认到 sandbox 之前，这一行必须让人一眼看见现在是哪一档（#11）。 */}
-        <LabelValue label={t('isolationLabel')} value={<span data-state={state.isolation === 'none' ? 'warning' : 'ongoing'}
-          title={t('isolationHint')}>{t(`isolation.${state.isolation}`)}</span>} />
+        {/* 隔离档位紧跟状态：翻默认到 sandbox 之前，这一行必须让人一眼看见现在是哪一档（#11）。
+            与全站一致的 (?) tooltip 承载说明，不用裸 title（005-panel.md「Consistent controls」）。 */}
+        <LabelValue label={t('isolationLabel')} value={<span className="dt-inline-tip">
+          <span data-state={state.isolation === 'none' ? 'warning' : 'ongoing'}>{t(`isolation.${state.isolation}`)}</span>
+          <InfoTip text={t('isolationHint')} />
+        </span>} />
       </>}
       <ConfirmButton variant="outline" icon={paused ? 'play' : 'pause'} label={t(action)} title={t(action)} message={t(paused
         ? 'resumeProcessingConfirm' : 'pauseProcessingConfirm')}

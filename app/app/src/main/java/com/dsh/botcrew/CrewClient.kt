@@ -78,8 +78,12 @@ class CrewClient(
         val clean = entries.map(CrewPairing::normalize).filter(String::isNotBlank).distinct()
         if (clean.isEmpty()) return
         synchronized(this) {
-            order = clean
-            if (current !in clean) current = clean.first()
+            // 本地回环代理是 P2P 主路。它在 probe 成功时才被 promote 进来，而广播可能
+            // 在那之前到：那时 CrewRoute.entries(proxyPort = null) 里没有它，直接换表会把
+            // 正在用的主路踢掉、降级到 LAN。所以只要当前入口还是本地代理，就留在新表里。
+            val keep = current.takeIf { it.startsWith(CrewRoute.LOCAL_PROXY_PREFIX) }
+            order = if (keep != null && keep !in clean) listOf(keep) + clean else clean
+            if (current !in order) current = order.first()
         }
     }
 

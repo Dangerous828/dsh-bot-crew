@@ -48,8 +48,11 @@ object CrewRoute {
     /** 失败探测按 1/2/4/8/16/30 秒退避，前台恢复会重新从第一档开始。 */
     fun retryDelay(failures: Int): Long = (1_000L shl failures.coerceIn(0, 5)).coerceAtMost(30_000L)
 
+    /** 本地回环代理的前缀。`CrewClient.replaceEntries` 靠它认出「这条是 P2P 主路，别踢掉」。 */
+    const val LOCAL_PROXY_PREFIX = "http://127.0.0.1:"
+
     /** 手机这一侧的入口。绑在回环上，所以换 Wi-Fi、开热点都不会变。 */
-    fun proxyBase(port: Int): String = "http://127.0.0.1:$port"
+    fun proxyBase(port: Int): String = "$LOCAL_PROXY_PREFIX$port"
 
     /**
      * 按优先级拼出要试的入口。

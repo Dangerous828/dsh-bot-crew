@@ -853,12 +853,18 @@ it('echoes the session capability bits and keeps a legacy timeline unchanged', a
   const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
   const legacy = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Record<string, unknown>
   expect(legacy).toMatchObject({ session_id: 'main', session_api: 1, sessions: ['main'], default_session_id: 'main' })
-  // 除这四个能力位字段外，老响应逐字不变。
-  const { session_id: _sid, session_api: _api, sessions: _list, default_session_id: _def, ...rest } = legacy
+  // 除这四个能力位字段外，老响应逐字不变。groups 是 S4 加的只读投影（增量字段，
+  // 与会话无关），同样按白名单剔除后单独断言形状。
+  const { session_id: _sid, session_api: _api, sessions: _list, default_session_id: _def,
+    groups, ...rest } = legacy
   expect(rest).toEqual({ items: [], tasks: [], queued: [], declined: [], bots: [], default_bot_id: '',
     unread: { count: 0, state: 'live' },
     unread_replies: { count: null, state: 'unknown', reason: expect.any(String) },
     status: { runtime: 'ready', mobile: 'ready', paused: false } })
+  // 群组只读投影：main 恒在首位（契约 §10「组集合只由会话名单 + main 兜底决定」），
+  // 所以即使没有别的会话也是 live，不是 empty。
+  expect(groups).toMatchObject({ state: 'live' })
+  expect((groups as { groups: { id: string }[] }).groups[0]).toMatchObject({ id: 'main', sessions: ['main'], bots: [], ticket_count: 0 })
   // 老调用的转发 URL 逐字不变：网关自己缺省 main。
   expect(seen[0]).toBe('http://gw/timeline')
   // 显式 session 才追加 query；有 ticket 时用 & 接在已有 query 后面。

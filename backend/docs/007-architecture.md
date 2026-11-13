@@ -456,6 +456,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/outputs.spec.ts` | The 产出 list: which tool calls count as a written file, one row per path with its write count, images counted apart, and "nothing yet" kept apart from "could not read" |
 | `tests/groups.spec.ts` | 群组只读投影：按会话归属分组、无归属落 main、三态不混、只读与纯函数、timeline 现成源形状的类型证据 |
 | `tests/source-session-admission.spec.ts` | 未登记会话的四条断言：落队列、可按 session_id 读到、不派单且有可观测的 conversation_not_listed、注册后立刻可派单 |
+| `tests/index-forward-headers.spec.ts` | 宿主入口 ask() 重建请求时透传 x-crew-session：单值、多值不猜、空值不带、凭据头不透传，以及「删掉透传即红」的回归守门 |
 | `tests/crew-memory.spec.ts` | 记忆格式层：frontmatter 的渲染与转义、多行 description 与空正文被拒、命名空间与文件名、注入规则与上行日限额 |
 | `tests/crew-memory-recall.spec.ts` | recall 与 settle 的纯函数：二元组相关度、Bot 命名空间过滤、新鲜度压过旧条目、预算整条取舍、哪句话算「定下来的规矩」、哪种工单收尾值得记 |
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |

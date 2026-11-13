@@ -22,6 +22,7 @@ import type { SpeakOutcome } from './speech.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
+import { groupsOf } from './groups.ts'
 
 // Structural contract keeps compatibility with the bundle's alpha development
 // peers; installed rc.2 Connection supplies this authenticated exact-route API.
@@ -1047,6 +1048,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
           session_id: sessionId, session_api: SESSION_API,
           sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID,
+          // 群组只读投影（#10 第 4 项 / 契约 §10）：从已有 sessions/bots/tickets 派生，
+          // 不写任何状态、不新增 Ticket 账。三态诚实：读不到就是 unavailable，绝不当成空。
+          groups: groupsOf({ sessions: sessionIds(runtime.store), bots: roster.bots, tickets }),
           // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
           items,
           tasks: tickets.map(ticket => {

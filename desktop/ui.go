@@ -1202,6 +1202,119 @@ func (s *app) drain(c *ui.Context) {
 	}
 }
 
+// ── 群组只读栏（契约 §10 / GLOSSARY「群组只读投影」） ───────────────────────
+//
+// 这一栏只是把后端 groupsOf() 从 sessions / bots / tickets 派生出来的投影画出来：
+// 不发请求、不落状态、不建工单。三态与产出 / 常规任务 / 记忆同口径，读不到绝不
+// 借空态那句「还没有」的壳。
+
+// GroupView 是一个群组的只读投影。sessions / bots 存 id，名字由花名册自己查。
+type GroupView struct {
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Sessions    []string `json:"sessions"`
+	Bots        []string `json:"bots"`
+	TicketCount int      `json:"ticket_count"`
+}
+
+// GroupsView 是整份投影。state 只有 live / empty / unavailable 三种；
+// reason 只在非 live 时出现。没有 state 就是「读不到」，绝不落成「确实没有」。
+type GroupsView struct {
+	Groups []GroupView `json:"groups"`
+	State  string      `json:"state"`
+	Reason string      `json:"reason,omitempty"`
+}
+
+// groupsProjection 是「从一次时间线里取群组只读投影」的唯一入口。
+//
+// client.go 的 Conversation.Groups 由 lead 合并时补上（本片不碰 client.go）。
+// 这里走 JSON 往返，是为了让 ui.go 在那个字段尚未补上时也能独立编译、独立跑测试：
+// 没有 groups 字段就是「读不到」= unavailable，绝不当成空态。字段补上后同一段
+// 代码会自动读到投影，不必再改 ui.go。测试把这个 seam 换成替身，不依赖 client.go。
+var groupsProjection = groupsOfConversation
+
+func groupsOfConversation(conv *Conversation) GroupsView {
+	if conv == nil {
+		return GroupsView{State: "unavailable", Reason: "还没读到队伍"}
+	}
+	// 字段已由 client.go 的 Conversation.Groups 提供。三态判据在 State 上：
+	// 老后端不下发 groups 时是零值（State 为空串），必须说「读不到」——
+	// 空串绝不是 empty，「读不到」与「确实没有」不能混。
+	view := conv.Groups
+	switch view.State {
+	case "live", "empty":
+		return view
+	case "unavailable":
+		if view.Reason == "" {
+			view.Reason = "后端说群组投影暂不可用"
+		}
+		return view
+	default:
+		return GroupsView{State: "unavailable", Reason: "后端还没有下发群组投影"}
+	}
+}
+
+// groupBarLine 是群组只读栏里的一行。warn 的那几行用赭色，和空态的灰分开。
+type groupBarLine struct {
+	text string
+	warn bool
+}
+
+// groupBarLines 把一份群组只读投影变成左栏要画的几行字。纯函数，可直接测。
+//
+// 三态在这里分开说：live 逐组一行；empty 是「读得到、确实没有」；
+// unavailable（含 state 缺席、以及认不出的值）只说读不到，绝不说「还没有」。
+func groupBarLines(view GroupsView) []groupBarLine {
+	switch view.State {
+	case "live":
+		if len(view.Groups) == 0 {
+			// 报了 live 却一组都没列：说清读到的形状不对，别替它说「没有群组」。
+			return []groupBarLine{{text: "群组投影没列出组", warn: true}}
+		}
+		lines := make([]groupBarLine, 0, len(view.Groups))
+		for _, group := range view.Groups {
+			title := group.Title
+			if title == "" {
+				title = group.ID
+			}
+			lines = append(lines, groupBarLine{text: fmt.Sprintf("%s · %d 会话 · %d 位 · %d 张",
+				title, len(group.Sessions), len(group.Bots), group.TicketCount)})
+		}
+		return lines
+	case "empty":
+		return []groupBarLine{{text: "读得到，还没有群组"}}
+	default:
+		line := "读不到群组"
+		if view.Reason != "" {
+			line += "：" + view.Reason
+		}
+		return []groupBarLine{{text: line, warn: true}}
+	}
+}
+
+// groupsPane 是左栏的群组只读栏。只读：不发请求、不落状态、不建工单。
+func (s *app) groupsPane(c *ui.Context, p Palette) {
+	view := groupsProjection(s.conversation)
+	ui.Column(c).FillWidth().MinWidth(0).ClipX().Gap(5).Children(func() {
+		ui.Row(c).FillWidth().MinWidth(0).ClipX().AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "群组").FontSize(FontTiny).FontWeight(WeightName).
+				LetterSpacing(0.55).TextColor(p.Faint)
+			ui.Row(c).Grow(1)
+			if view.State == "live" {
+				ui.Text(c, fmt.Sprintf("%d 组", len(view.Groups))).FontSize(FontTiny).TextColor(p.Faint)
+			}
+		})
+		for _, line := range groupBarLines(view) {
+			tint := p.Muted
+			if line.warn {
+				tint = p.Warn
+			}
+			ui.Text(c, line.text).FontSize(FontTiny).TextColor(tint).
+				MaxLines(1).Ellipsis("…").MinWidth(0)
+		}
+	})
+}
+
 // roster 是左栏：谁在这个队伍里，他此刻在干什么。
 func (s *app) roster(c *ui.Context, p Palette) {
 	if s.sidebarClosed {
@@ -1244,6 +1357,9 @@ func (s *app) roster(c *ui.Context, p Palette) {
 
 			// 会话列表：能力位没先验过时整块不画，老后端只留一句实话。
 			s.sessionPane(c, p)
+
+			// 群组只读栏：与会话列表同一份时间线派生，只读（契约 §10）。
+			s.groupsPane(c, p)
 
 			ui.Column(c).FillWidth().Gap(2).Children(func() {
 				if s.conversation == nil || len(s.conversation.Bots) == 0 {

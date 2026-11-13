@@ -72,6 +72,11 @@ RID_DEFAULT=s2s3-default
 RID_EXPLICIT=s2s3-explicit-main
 RID_BODY_ONLY=s2s3-body-only
 RID_HEADER_ONLY=s2s3-header-only
+RID_HDR_WORK=s2s3-hdr-work
+RID_HDR_SAME=s2s3-hdr-same
+RID_HDR_CONFLICT=s2s3-hdr-conflict
+RID_HDR_BAD=s2s3-hdr-bad
+RID_HDR_LEGACY=s2s3-hdr-legacy
 RID_STRAIGHT=s2s3-straight-send
 RID_CLAIM_OK=s2s3-claim-ok
 RID_WITHDRAW_OK=s2s3-withdraw-ok
@@ -282,18 +287,23 @@ def source_evidence(source_path, spec_path):
     spec = open(spec_path, encoding='utf-8').read().splitlines()
     guard = [i + 1 for i, line in enumerate(src) if 'data.session_api !== SESSION_API' in line]
     conflict = [i + 1 for i, line in enumerate(src) if "response(409, { error: 'unsupported_session' })" in line]
+    # 证据必须是**成对**的：某个 session_api 守卫行，紧跟其后的几行里就有 409 unsupported_session。
+    # 不能要求「文件里第一个 409 在守卫之后」—— 源码现在有两处 409（steer 内联分支 + 统一先验），
+    # 位置先后会随重构变动，那种写法会把「有守卫的 409」误判成缺失。按邻近成对匹配才是
+    # 真正想断言的东西：这个 409 是由能力位守卫触发的，而不是别处顺手回的。
+    pairs = [(g, c) for g in guard for c in conflict if 0 < c - g <= 6]
     # 只认「409 + unsupported_session」那一对断言，别把文件里别的 409 用例当证据。
     tests_409 = [i + 1 for i, line in enumerate(spec)
                  if 'toBe(409)' in line
                  and any('unsupported_session' in spec[j]
                          for j in range(max(0, i - 2), min(len(spec), i + 3)))]
     tests_code = [i + 1 for i, line in enumerate(spec) if "error: 'unsupported_session'" in line]
-    if not guard or not conflict or conflict[0] <= guard[0]:
-        fail('409 guard/branch missing in %s' % source_path)
+    if not pairs:
+        fail('409 guard/branch pair missing in %s (guards=%r, 409s=%r)' % (source_path, guard, conflict))
     if len(tests_409) < 2 or len(tests_code) < 2:
         fail('409 spec coverage missing in %s' % spec_path)
-    print('evidence: mobile-http.ts:%s guard, :%s 409; mobile-http.spec.ts:%s,%s 409 tests'
-          % (guard[0], conflict[0], tests_409[0], tests_409[1]))
+    print('evidence: mobile-http.ts:%s guard -> :%s 409; mobile-http.spec.ts:%s,%s 409 tests'
+          % (pairs[0][0], pairs[0][1], tests_409[0], tests_409[1]))
 
 
 def choose_port(excludes):
@@ -897,27 +907,93 @@ g7_old_gateway_simulation() {
     python3 "$HELPER" no_nonmain "$OLDGW_REQUESTS"
 }
 
-# ---- 组 8：session_id 只走 query，body / header 一律不认 ----
+# ---- 组 8：session_id 只走 query 或约定头 x-crew-session；body 与非约定头名不认 ----
+# 注意语义：S4 起 `x-crew-session` 是**正式**会话头（组 9 正向验证）。
+# 这里钉的是另外两件事：(a) body 里的 session_id 不被读；(b) `X-Session-Id` 这类
+# **非约定头名**不被识别 —— 保留这条是因为它证明网关按白名单读头，而不是「见到像
+# session 的头就猜」，不是说所有 header 都不认。
 g8_query_only() {
   request 'body 带 session_id=work' POST /send \
     "{\"text\":\"body-only\",\"request_id\":\"$RID_BODY_ONLY\",\"session_id\":\"work\"}"
   expect 'body 形态被忽略 -> 200 且无能力字段' 200 python3 "$HELPER" no_capability "$LAST_BODY"
   EXTRA_HEADER='X-Session-Id: work'
-  request 'header 带 X-Session-Id: work' POST /send \
+  request '非约定头名 X-Session-Id: work（不是 x-crew-session）' POST /send \
     "{\"text\":\"header-only\",\"request_id\":\"$RID_HEADER_ONLY\"}"
-  expect 'header 形态被忽略 -> 200 且无能力字段' 200 python3 "$HELPER" no_capability "$LAST_BODY"
+  expect '非约定头名不被识别 -> 200 且无能力字段' 200 python3 "$HELPER" no_capability "$LAST_BODY"
   request 'query 显式 work（正向对照）' POST '/send?session_id=work' \
     "{\"text\":\"query-work\",\"request_id\":\"s2s3-query-work\"}"
   expect 'query 形态生效 -> 200 + 能力位' 200 python3 "$HELPER" capability "$LAST_BODY" work
   cap work
 
-  request 'body/header 的 send 落在 main' GET '/timeline?session_id=main'
-  expect 'main 见到 body/header 两条' 200 python3 "$HELPER" contains_rids "$LAST_BODY" "$RID_BODY_ONLY,$RID_HEADER_ONLY"
-  request 'body/header 的 send 不在 work' GET '/timeline?session_id=work'
-  expect 'work 不含 body/header 两条' 200 python3 "$HELPER" excludes "$LAST_BODY" "$RID_BODY_ONLY,$RID_HEADER_ONLY" 'body-only,header-only'
+  request 'body/非约定头的 send 落在 main' GET '/timeline?session_id=main'
+  expect 'main 见到 body/非约定头两条' 200 python3 "$HELPER" contains_rids "$LAST_BODY" "$RID_BODY_ONLY,$RID_HEADER_ONLY"
+  request 'body/非约定头的 send 不在 work' GET '/timeline?session_id=work'
+  expect 'work 不含 body/非约定头两条' 200 python3 "$HELPER" excludes "$LAST_BODY" "$RID_BODY_ONLY,$RID_HEADER_ONLY" 'body-only,header-only'
 }
 
-# ---- 组 9：夹具隔离与自清理（不留残留进程/端口）----
+# ---- 组 9：约定头 x-crew-session 正向语义（S4 开放后的正式形态）----
+# 这组存在的理由：组 8 只证明「非约定头名不认」，单看那组会让人误以为 header 一律无效。
+# 这里把 S4 真正开放的能力逐条钉住：header-only 落 header 会话、query+header 同值通过、
+# 冲突 400、非法 header 400、header 响应带能力位、老调用（两种载体都不带）逐字不变。
+g9_session_header_positive() {
+  EXTRA_HEADER='x-crew-session: work'
+  request 'header-only /send（x-crew-session: work）' POST /send \
+    "{\"text\":\"hdr-only\",\"request_id\":\"$RID_HDR_WORK\"}"
+  expect 'header-only /send 200' 200 python3 "$HELPER" send_ok "$LAST_BODY" "$RID_HDR_WORK"
+  expect 'header-only /send 带 work 能力位' 200 python3 "$HELPER" capability "$LAST_BODY" work
+  expect 'header-only /send 精确五键（老三键 + 能力位两键）' 200 python3 "$HELPER" exact_keys \
+    "$LAST_BODY" ok,id,request_id,session_id,session_api
+
+  request 'header 消息确实落进 work' GET '/timeline?session_id=work'
+  expect 'work timeline 见到 header-only 消息' 200 python3 "$HELPER" contains_rids "$LAST_BODY" "$RID_HDR_WORK"
+  request 'header 消息没落 main' GET '/timeline?session_id=main'
+  expect 'main timeline 不含 header-only 消息' 200 python3 "$HELPER" excludes "$LAST_BODY" "$RID_HDR_WORK" 'hdr-only'
+
+  EXTRA_HEADER='x-crew-session: work'
+  request 'query+header 同值' POST '/send?session_id=work' \
+    "{\"text\":\"hdr-same\",\"request_id\":\"$RID_HDR_SAME\"}"
+  expect 'query+header 同值 200' 200 python3 "$HELPER" send_ok "$LAST_BODY" "$RID_HDR_SAME"
+  expect 'query+header 同值带 work 能力位' 200 python3 "$HELPER" capability "$LAST_BODY" work
+  request 'query+header 同值的消息落在 work' GET '/timeline?session_id=work'
+  expect 'work timeline 见到 query+header 同值消息' 200 python3 "$HELPER" contains_rids "$LAST_BODY" "$RID_HDR_SAME"
+
+  EXTRA_HEADER='x-crew-session: ops'
+  request 'query work + header ops 冲突' POST '/send?session_id=work' \
+    "{\"text\":\"hdr-conflict\",\"request_id\":\"$RID_HDR_CONFLICT\"}"
+  expect 'query/header 冲突 -> 400 invalid_session' 400 python3 "$HELPER" exact_error "$LAST_BODY" invalid_session
+  request '冲突请求未落 work' GET '/timeline?session_id=work'
+  expect 'work timeline 不含冲突请求' 200 python3 "$HELPER" excludes "$LAST_BODY" "$RID_HDR_CONFLICT" 'hdr-conflict'
+  request '冲突请求未落 ops' GET '/timeline?session_id=ops'
+  expect 'ops timeline 不含冲突请求' 200 python3 "$HELPER" excludes "$LAST_BODY" "$RID_HDR_CONFLICT" 'hdr-conflict'
+
+  EXTRA_HEADER='x-crew-session: Work'
+  request '非法 header 值（大写）' GET /timeline
+  expect '非法 header -> 400 invalid_session' 400 python3 "$HELPER" exact_error "$LAST_BODY" invalid_session
+  EXTRA_HEADER='x-crew-session: a b'
+  request '非法 header 值（含空格）' POST /send \
+    "{\"text\":\"hdr-bad\",\"request_id\":\"$RID_HDR_BAD\"}"
+  expect '非法 header（含空格）-> 400 invalid_session' 400 python3 "$HELPER" exact_error "$LAST_BODY" invalid_session
+
+  EXTRA_HEADER='x-crew-session: work'
+  request 'header /claim 不存在的消息' POST /claim '{"request_id":"s2s3-no-such-row"}'
+  expect 'header /claim 404 状态' 404 python3 "$HELPER" has_error "$LAST_BODY" 'no such message'
+  expect 'header 错误响应也带 work 能力位' 404 python3 "$HELPER" capability "$LAST_BODY" work
+  EXTRA_HEADER='x-crew-session: work'
+  request 'header timeline' GET /timeline
+  expect 'header timeline 200 + work 能力位' 200 python3 "$HELPER" capability "$LAST_BODY" work
+
+  request '老调用 /send（无 query 无 header）' POST /send \
+    "{\"text\":\"hdr-legacy\",\"request_id\":\"$RID_HDR_LEGACY\"}"
+  expect '老调用 /send 200' 200 python3 "$HELPER" send_ok "$LAST_BODY" "$RID_HDR_LEGACY"
+  expect '老调用 /send 逐字三键不变' 200 python3 "$HELPER" exact_keys "$LAST_BODY" ok,id,request_id
+  expect '老调用 /send 一个能力字段都不加' 200 python3 "$HELPER" no_capability "$LAST_BODY"
+  request '老调用 timeline（无 query 无 header）' GET /timeline
+  expect '老调用 timeline 顶层三键不变' 200 python3 "$HELPER" exact_keys "$LAST_BODY" items,session_id,session_api
+  expect '老调用 timeline 仍是 main' 200 python3 "$HELPER" capability "$LAST_BODY" main
+  expect '老调用 timeline item 形状精确（7 键）' 200 python3 "$HELPER" item_shapes "$LAST_BODY"
+}
+
+# ---- 组 10：夹具隔离与自清理（不留残留进程/端口）----
 port_released() {
   port=$1
   deadline=$(( $(date +%s) + 5 ))
@@ -928,7 +1004,7 @@ port_released() {
   done
 }
 
-g9_isolation_and_cleanup() {
+g10_isolation_and_cleanup() {
   check '端口避开 8788 / 18787 / 18799 且互异' \
     python3 "$HELPER" assert_ports "$MOBILEGW_PORT" "$OLDGW_PORT"
   check '临时库/token 全在 DSH_HOME 下，生产库未被本脚本写入' \
@@ -974,12 +1050,13 @@ run_group 4 '非 timeline 响应（send/withdraw/claim/200/409/400）全带能�
 run_group 5 '非法 id 400 invalid_session 与合法形状边界' g5_invalid_session_id
 run_group 6 '缺省回落 main、老调用逐字不变' g6_default_main
 run_group 7 '老网关模拟：先验能力位、停发非 main 锁 main、409 证据' g7_old_gateway_simulation
-run_group 8 'session_id 只走 query，body/header 不认' g8_query_only
-run_group 9 '夹具隔离与自清理（不留进程/端口）' g9_isolation_and_cleanup
+run_group 8 'session_id 不走 body，非约定头名 X-Session-Id 不被识别' g8_query_only
+run_group 9 '约定头 x-crew-session 正向：落会话/同值/冲突 400/非法 400/能力位/老调用不变' g9_session_header_positive
+run_group 10 '夹具隔离与自清理（不留进程/端口）' g10_isolation_and_cleanup
 
 if [ "$FAILURES" -ne 0 ]; then
-  printf 'FAIL %s assertion(s) across %s of 9 groups\n' "$FAILURES" "$GROUP_FAILURES" >&2
+  printf 'FAIL %s assertion(s) across %s of 10 groups\n' "$FAILURES" "$GROUP_FAILURES" >&2
   exit 1
 fi
-printf 'PASS all 9 groups (%s assertions)\n' "$CHECK_NO"
+printf 'PASS all 10 groups (%s assertions)\n' "$CHECK_NO"
 exit 0

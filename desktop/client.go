@@ -735,6 +735,9 @@ type Conversation struct {
 	SessionAPI       int
 	Sessions         []string
 	DefaultSessionID string
+	// Groups 是群组只读投影（#10 第 4 项 / 契约 §10）。老后端没有这个字段时是零值，
+	// 界面按「读不到」画，绝不当成「还没有群组」。
+	Groups GroupsView
 }
 
 // Unread 是「未读」这一格的全部内容：数，以及这个数算不算得出来。
@@ -1041,6 +1044,8 @@ func (c *Client) Timeline(ctx context.Context, session ...string) (*Conversation
 		SessionAPI       int      `json:"session_api"`
 		Sessions         []string `json:"sessions"`
 		DefaultSessionID string   `json:"default_session_id"`
+		// 群组只读投影：缺字段时零值，界面据此画「读不到」而不是「没有」。
+		Groups GroupsView `json:"groups"`
 	}
 	if err := c.do(ctx, http.MethodGet, path, nil, &payload); err != nil {
 		return nil, err
@@ -1057,7 +1062,7 @@ func (c *Client) Timeline(ctx context.Context, session ...string) (*Conversation
 		Tasks: payload.Tasks, Status: payload.Status, Queued: payload.Queued, Declined: payload.Declined,
 		Unread: payload.Unread, UnreadReplies: payload.UnreadReplies, Model: payload.Model,
 		SessionID: sessionID, SessionAPI: payload.SessionAPI, Sessions: payload.Sessions,
-		DefaultSessionID: payload.DefaultSessionID}, nil
+		DefaultSessionID: payload.DefaultSessionID, Groups: payload.Groups}, nil
 }
 
 // ReportRead 把主人读到的最后一条回话 id 报给后端，记成会话级已读水位（契约 §5.6）。

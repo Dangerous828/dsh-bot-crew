@@ -1088,7 +1088,9 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
 ```
 
 - **结构**：每项 `{ id, title, sessions: [...], bots: [...], ticket_count }`；按会话归属为主，
-  bot 按归属会话归组，无归属的落 `main` 组。`groups` 恒为数组，缺省按 `empty` 处理但不许
+  bot 按归属会话归组，无归属的落 `main` 组。归属来自 team Source 的 bot 配置
+  `session_id`（可选，形状同会话 id；只影响呈现分组，不参与路由与授权；不给就落 `main`，
+  老配置因此完全不受影响）。`groups` 恒为数组，缺省按 `empty` 处理但不许
   把「读不到」说成「没有」。
 - **三态不许合并**：`live` = 有归组数据；`empty` = 读得到、确实没有；`unavailable` = 读不到
   （宿主没接这项能力 / 会话树打不开），客户端只说「读不出来」，不得说「还没有群组」。

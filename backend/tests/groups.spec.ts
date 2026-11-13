@@ -142,6 +142,18 @@ describe('groupsOf — 接入形状', () => {
     // 花名册行不带 session_id：无归属落 main，不猜它属于哪一段。
     expect(view.groups.find(group => group.id === MAIN_GROUP)?.bots).toEqual(['coder'])
   })
+
+  // 「bot 按归属会话归组」这条以前在真实链路上不可达（crewRoster 不带 session_id），
+  // 现在 BotSchema / BotCard 支持可选 session_id 并透传，这里钉住它真的生效。
+  it('把声明了归属会话的 bot 放进那个组', () => {
+    const view = groupsOf({
+      sessions: ['main', 'work'],
+      bots: [{ id: 'lead' }, { id: 'coder', session_id: 'work' }],
+      tickets: [],
+    })
+    expect(view.groups.find(group => group.id === 'work')?.bots).toEqual(['coder'])
+    expect(view.groups.find(group => group.id === MAIN_GROUP)?.bots).toEqual(['lead'])
+  })
 })
 
 describe('groupsOf — 三态诚实', () => {

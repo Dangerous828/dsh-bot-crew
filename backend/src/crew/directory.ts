@@ -13,6 +13,13 @@ export interface BotCard {
   avatar?: string
   color?: string
   memory_namespace: string
+  /**
+   * 这位 Bot 归属哪一段会话（契约 §10「bot 按归属会话归组」）。
+   *
+   * 可选：不给就落 `main` 组 —— 那是老配置的现状，也是「没声明就按缺省」的诚实做法。
+   * 注意它只影响**呈现分组**，不参与路由与授权：谁接话仍由 mentions / default 决定。
+   */
+  session_id?: string
 }
 
 export interface BotDirectory {

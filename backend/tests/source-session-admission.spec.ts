@@ -189,18 +189,20 @@ describe('断言 1 / 2：未登记会话落队列且可读', () => {
     expect(mainBody.items.some(item => item.request_id === RID)).toBe(false)
   })
 
-  it('消息面 /api/mobile/timeline 按 session_id 转发并回显（items 内容以网关层断言为准）', async () => {
-    // 契约 §2 断言 2 的本体在网关层（上一条用例）。消息面还会按会话过滤 items（S1 §4），
-    // 未登记会话的 items 不在这层承诺里，所以这里只钉住 200、session_id 回显与转发 URL。
+  it('消息面 /api/mobile/timeline 把未登记会话的 items 原样带回来', async () => {
+    // 契约 §2 断言 2 的本体在网关层（上一条用例），但消息面这一层也得钉住：
+    // S1 §4 的 items 过滤只在「有外会话 decision 的行号」时才剔（itemsForSession），
+    // 未登记会话没有 decision，所以它的条目必须原样出现在 items 里 —— 不凭空消失。
     const real = await fetch(`${origin}/timeline?session_id=${UNREG}`, { headers: { 'X-GW-Token': token } })
     const data = await real.json() as Record<string, unknown>
     const upstream = vi.fn(async () => Response.json({ ...data, session_api: 1 }))
     const handler = phoneHandler(phoneHost(new Map(), stateDir), 'http://gw', upstream as never)
     const result = await handler(new Request(`http://dsh/api/mobile/timeline?session_id=${UNREG}`))
     expect(result.status).toBe(200)
-    const body = await result.json() as { session_id: string; items: unknown }
+    const body = await result.json() as { session_id: string; items: { request_id?: string; text?: string }[] }
     expect(body.session_id).toBe(UNREG)
-    expect(Array.isArray(body.items)).toBe(true)
+    // 本体：那条消息真的被读回来了，不是空数组。
+    expect(body.items.filter(item => item.request_id === RID).map(item => item.text)).toEqual([TEXT])
     expect(upstream).toHaveBeenCalledWith(`http://gw/timeline?session_id=${UNREG}`,
       expect.objectContaining({ method: 'GET' }))
   })

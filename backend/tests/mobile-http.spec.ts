@@ -774,14 +774,14 @@ it('writes a routine through POST and refuses a bad action or missing field', as
 // S1 多会话消息面（契约 §1 / §2 / §4）：老调用逐字不变、能力位回显、显式非 main 绝不静默回落。
 // ─────────────────────────────────────────────────────────────────────────────
 /** 会话测试用的假宿主：KV 用内存 Map 顶替，get / set / keys 与真 Store 同形。 */
-function sessionHost(options: { decisions?: unknown[]; tickets?: unknown[] } = {}) {
+function sessionHost(options: { decisions?: unknown[]; tickets?: unknown[]; settings?: unknown } = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'phone-session-')); directories.push(stateDir)
   writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
   const kv = new Map<string, unknown>()
   const runtime = { ready: Promise.resolve(), machine: { stateDir },
     health: { runtime: { state: 'ready' }, mobile: { state: 'ready' } },
     store: {
-      settings: () => ({ paused: false }),
+      settings: () => options.settings ?? { paused: false },
       tickets: { list: () => options.tickets ?? [] },
       read: { recentDecisions: () => options.decisions ?? [] },
       get: (key: string) => kv.get(key),
@@ -939,6 +939,25 @@ it('counts every session’s tickets in the group projection, not just the one b
   // 传过滤后（且被 slice(0,30) 截断）的 tickets 会让别的组恒显示 0 张 —— 那是向人显示错事实。
   expect(byId.get('main')).toBe(1)
   expect(byId.get('work')).toBe(1)
+})
+
+it('puts a bot into the group its config declares, end to end', async () => {
+  const { runtime } = sessionHost({ settings: { paused: false, sources: { team: { config: {
+    default_bot_id: 'lead',
+    bots: [
+      { bot_id: 'lead', name: '大哥', role: 'default', memory_namespace: 'bot/lead' },
+      { bot_id: 'coder', name: '码农', role: 'member', memory_namespace: 'bot/coder', session_id: 'work' },
+    ],
+  } } } } })
+  const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: '{"id":"work"}' }))
+  const body = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as {
+    groups: { groups: { id: string; bots: string[] }[] } }
+  const byId = new Map(body.groups.groups.map(group => [group.id, group.bots]))
+  // 契约 §10「bot 按归属会话归组」：声明了 session_id 就进那个组，没声明落 main。
+  expect(byId.get('work')).toEqual(['coder'])
+  expect(byId.get('main')).toEqual(['lead'])
 })
 
 it('says the group projection is unavailable instead of failing the whole timeline', async () => {

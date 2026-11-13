@@ -280,22 +280,24 @@ function ticketBot(ticket: { channels: readonly { address?: Record<string, strin
 
 /** The Bot roster the phone offers as mention targets; unreadable settings fall back to no roster. */
 function crewRoster(settings: Settings, since: (botId: string) => string = () => ''): {
-  bots: { id: string; name: string; role: string; persona?: string; since?: string }[]
+  bots: { id: string; name: string; role: string; persona?: string; since?: string; session_id?: string }[]
   default_bot_id: string
 } {
   const config = settings.sources?.team?.config
   const bots = Array.isArray(config?.bots) ? config.bots : []
   const roster = bots.flatMap(bot => {
-    const row = bot as { bot_id?: unknown; name?: unknown; role?: unknown; persona?: unknown }
+    const row = bot as { bot_id?: unknown; name?: unknown; role?: unknown; persona?: unknown; session_id?: unknown }
     if (typeof row.bot_id !== 'string' || !row.bot_id) return []
     // The persona is what the chip can explain on a long press; it is presentation text, never authority.
     const persona = typeof row.persona === 'string' ? row.persona.trim() : ''
     // 「认识多久」要说得出出处。这个值只从真实工单里最早的那一张取，
     // 取不到就整个字段不出现 —— 名片上宁可少一行，也不编一个日期。
     const known = since(row.bot_id)
+    // 归属会话透传给群组投影（契约 §10）。只影响分组，不参与路由与授权。
+    const home = typeof row.session_id === 'string' && row.session_id ? row.session_id : ''
     return [{ id: row.bot_id, name: typeof row.name === 'string' ? row.name : row.bot_id,
       role: typeof row.role === 'string' ? row.role : 'member', ...(persona ? { persona } : {}),
-      ...(known ? { since: known } : {}) }]
+      ...(known ? { since: known } : {}), ...(home ? { session_id: home } : {}) }]
   })
   const fallback = roster.find(bot => bot.role === 'default')?.id ?? roster[0]?.id ?? ''
   const named = config?.default_bot_id

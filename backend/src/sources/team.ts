@@ -37,6 +37,9 @@ const BotSchema = z.object({
   role: z.enum(['default', 'member']),
   persona: z.string().optional(),
   memory_namespace: z.string().regex(/^bot\/[a-z0-9_-]+$/),
+  // 归属会话（契约 §10「bot 按归属会话归组」）。可选：不给就落 main 组。
+  // 只影响呈现分组，不参与路由与授权。
+  session_id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/).optional(),
 }).strict()
 
 /**
@@ -92,6 +95,7 @@ export function directoryOf(config: TeamConfig): BotDirectory {
       role: bot.role,
       ...(bot.persona ? { persona: bot.persona } : {}),
       memory_namespace: bot.memory_namespace,
+      ...(bot.session_id ? { session_id: bot.session_id } : {}),
     })),
   }
   validateDirectory(dir)

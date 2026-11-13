@@ -92,6 +92,11 @@ func (m Message) Code() *CodeBlock {
 			continue
 		}
 		if block.Path != "" || len(block.Lines) > 0 {
+			// 上游历史上把 diff 前缀也塞进过 text（"+ gap: 16px;"）。前缀列由 Kind
+			// 决定，text 只该是代码正文：在解析层按同一条严格规则还原，渲染层不猜。
+			for i := range block.Lines {
+				block.Lines[i].Text = codeLineText(block.Lines[i].Text, block.Lines[i].Kind)
+			}
 			if block.TicketRef == "" {
 				block.TicketRef = m.ticketRef()
 			}
@@ -104,6 +109,28 @@ func (m Message) Code() *CodeBlock {
 		}
 	}
 	return nil
+}
+
+// codeLineText 把历史那种自带 diff 前缀的行还原成契约形状（docs/00-contract.md §4）。
+//
+// text 是代码正文（行首空白是缩进），`+ ` / `- ` 是画板那列前缀，由 Kind 决定、
+// 渲染时自己生成。只在「符号紧贴行首 + 后跟一个空格 + 与 Kind 对得上」时剥掉
+// 这两格；`--gap`、`-1`、`- item` 都是合法代码，不能误伤。与手机端
+// CrewWire.kt 的 codeLineText 是同一条规则，由 check-parity.sh 逐字比对判据。
+func codeLineText(text, kind string) string {
+	var sign byte
+	switch kind {
+	case "added":
+		sign = '+'
+	case "removed":
+		sign = '-'
+	default:
+		return text
+	}
+	if len(text) >= 2 && text[0] == sign && text[1] == ' ' {
+		return text[2:]
+	}
+	return text
 }
 
 // ticketRef 是消息上那个只读的票号引用。它只用来展示，不据此维护任何任务账。

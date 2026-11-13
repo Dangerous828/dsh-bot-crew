@@ -50,6 +50,24 @@ data class CodeBlock(
 data class CodeLine(val text: String, val kind: String)
 
 /**
+ * 把历史那种自带 diff 前缀的行还原成契约形状（docs/00-contract.md §4）：
+ * text 是代码正文，行首空白是缩进；`+` / `-` 是画板那列前缀，由 kind 决定、客户端自己生成。
+ *
+ * 只在「符号紧贴行首 + 后跟一个空格 + 与 kind 对得上」时剥掉那两格。
+ * `--gap`、`-1`、`- item` 都是合法代码，不许在这里被猜成前缀 —— 剥错了就是把代码改给人看。
+ * 与桌面端 `desktop/client.go` 的 codeLineText 是同一条规则，由 check-parity.sh 逐字比对判据。
+ */
+internal fun codeLineText(text: String, kind: String): String {
+    val sign = when (kind) {
+        "added" -> '+'
+        "removed" -> '-'
+        else -> return text
+    }
+    if (text.length >= 2 && text[0] == sign && text[1] == ' ') return text.substring(2)
+    return text
+}
+
+/**
  * 名片上能看到的那些字。它是呈现，不持有任何任务状态。
  *
  * since 是这个 Bot 最早那张工单的时间，回答「认识多久」。后台取不到时不返回这个字段，
@@ -124,7 +142,8 @@ object CrewWire {
         val lines = mutableListOf<CodeLine>()
         for (i in 0 until raw.length()) {
             val line = raw.optJSONObject(i) ?: continue
-            lines.add(CodeLine(line.optString("text"), line.optString("kind")))
+            val kind = line.optString("kind")
+            lines.add(CodeLine(codeLineText(line.optString("text"), kind), kind))
         }
         val path = block.optString("path")
         // 没有行内容就只有个文件名，画出来是张空卡 —— 不如不画。
@@ -796,11 +815,13 @@ internal object CodeSyntax {
      * 改动行整行一段、不拆词 —— 桌面端 highlight=false 就是这条：画板里改动的
      * 是**整行**，行内再分色反而看不出哪一行变了。上下文行才分词着色。
      *
-     * 正文可能自带 + / - 前缀（后端两种写法都给过），先剥掉再按类别加，
-     * 否则画出来是 `+ + gap: 16px;`。这一条是手机端原来就有的，保留。
+     * text 一律逐字保留：行首空白是缩进（Python / YAML / 嵌套 CSS 靠它分层），
+     * 前导 `+` / `-` 也可能是代码本身（`--gap`、`-1`、`- item`）。历史那种自带
+     * diff 前缀的写法由 [codeLineText] 在解析层还原，渲染层不再猜，也不再 trim。
+     * 与桌面端 `codeSegments(prefix, line.Text, …)` 一致：同一批输入两端同一结果。
      */
     fun segments(line: CodeLine): List<Token> {
-        val body = line.text.trimStart().trimStart('+', '-').trimStart()
+        val body = line.text
         val prefix = when (line.kind) {
             "added" -> "+ "
             "removed" -> "- "

@@ -236,3 +236,59 @@ func TestCodeCardButtonsReachTheExistingChannels(t *testing.T) {
 		t.Errorf("看不了写进了全局 problem（那是断连横幅的位置）：%q", s.problem)
 	}
 }
+
+// 代码行两端逐字保留：这一组输入与手机端 CrewWireTest 的 parity-fixture 一一对应。
+// 前缀列单独一段，text 里行首空白与前导 +/- 都属于代码本身，不许被 trim 掉。
+func TestCodeSegmentsKeepTheLinesOwnWhitespaceAndSigns(t *testing.T) {
+	p := PaletteFor(false)
+	for _, line := range []string{
+		"gap: 12px;",
+		`color: "#FFF";`,
+		// parity-fixture: "  gap: 12px;" -> "    gap: 12px;"
+		// parity-fixture: "  --gap: 12px;" -> "    --gap: 12px;"
+		// parity-fixture: "    # 缩进后的注释" -> "      # 缩进后的注释"
+		// parity-fixture: "+ gap: 16px;" -> "  + gap: 16px;"
+		"  gap: 12px;",
+		"  --gap: 12px;",
+		"    # 缩进后的注释",
+		"+ gap: 16px;",
+	} {
+		if got, want := join(codeSegments("  ", line, p.Faint, p.Warn, true)), "  "+line; got != want {
+			t.Errorf("拼回去是 %q，原文是 %q —— 行首空白/符号被吃掉了", got, want)
+		}
+	}
+	// 改动行：前缀与正文之间也不剥字。
+	if got, want := join(codeSegments("+ ", "  gap: 16px;", p.Accent, p.Warn, false)), "+   gap: 16px;"; got != want {
+		t.Errorf("改动行拼回去是 %q，应该是 %q", got, want)
+	}
+}
+
+// 历史那种自带前缀的行只在解析层还原，且只有「符号 + 空格 + Kind 对得上」才剥。
+func TestCodeLineTextOnlyStripsAMatchingDiffPrefix(t *testing.T) {
+	cases := []struct{ text, kind, want string }{
+		{"+ gap: 16px;", "added", "gap: 16px;"},
+		{"- gap: 16px;", "removed", "gap: 16px;"},
+		{"+ gap: 16px;", "removed", "+ gap: 16px;"},
+		{"-1", "removed", "-1"},
+		{"--gap: 12px;", "added", "--gap: 12px;"},
+		{"  gap: 12px;", "", "  gap: 12px;"},
+	}
+	for _, c := range cases {
+		if got := codeLineText(c.text, c.kind); got != c.want {
+			t.Errorf("codeLineText(%q, %q) = %q，应该是 %q", c.text, c.kind, got, c.want)
+		}
+	}
+	// 真实解析链：带 "- " 前缀的 removed 行落到 CodeLine 里已是正文。
+	raw := `{"id":"m6","role":"agent","text":"x","code":{"path":"a.ts","lines":[{"text":"- gap: 16px;","kind":"removed"},{"text":"  --gap: 12px;","kind":""}]}}`
+	var message Message
+	if err := json.Unmarshal([]byte(raw), &message); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	block := message.Code()
+	if block == nil || len(block.Lines) != 2 {
+		t.Fatalf("代码行没解出来: %+v", block)
+	}
+	if block.Lines[0].Text != "gap: 16px;" || block.Lines[1].Text != "  --gap: 12px;" {
+		t.Errorf("解析层没按同一规则还原: %+v", block.Lines)
+	}
+}

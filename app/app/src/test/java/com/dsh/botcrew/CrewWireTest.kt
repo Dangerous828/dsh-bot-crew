@@ -219,7 +219,7 @@ class TicketAndStatusTest {
     }
 
     // 分词着色，与桌面端 syntax_test.go 是同一组断言。
-    // 这一层唯一不能错的地方：拼回去必须与原文逐字相同 ——
+    // 这一层唯一不能错的地方：拼回去必须与原文逐字相同 —— 行首空白与前导 +/- 也算字。
     // 高亮是装饰，吃掉一个字符就是把代码改错了给人看。
     @Test
     fun tokenizingNeverDropsCharacters() {
@@ -234,16 +234,18 @@ class TicketAndStatusTest {
             "/* 块注释 */",
             "SELECT * FROM t -- SQL 注释",
             """不配对的引号 " 后面还有字""",
+            // parity-fixture: "  gap: 12px;" -> "    gap: 12px;"
+            // parity-fixture: "  --gap: 12px;" -> "    --gap: 12px;"
+            // parity-fixture: "    # 缩进后的注释" -> "      # 缩进后的注释"
+            // parity-fixture: "+ gap: 16px;" -> "  + gap: 16px;"
+            "  gap: 12px;",
+            "  --gap: 12px;",
+            "    # 缩进后的注释",
+            "+ gap: 16px;",
         )) {
             val joined = CodeSyntax.segments(CodeLine(line, "")).joinToString("") { it.text }
             assertEquals("  $line", joined)
         }
-        // 行首空白会被剥掉：segments 里 trimStart，与旧渲染同一行为（那一格缩进由行首
-        // 那两格前缀代表，正文不再重复带自己的缩进）。除了这两格前缀，一个字都不能少。
-        assertEquals(
-            "  # 井号开头",
-            CodeSyntax.segments(CodeLine("  # 井号开头", "")).joinToString("") { it.text },
-        )
     }
 
     // 画板 Desktop.dc.html:133 那一行：上下文整行暖灰，只有值 `12px` 是赭色。
@@ -285,12 +287,43 @@ class TicketAndStatusTest {
     // 改动行整行一段、不拆词：画板里改动的就是整行，行内再分色看不出哪一行变了。
     @Test
     fun aChangedLineStaysOnePieces() {
+        // 契约形状的 text 带自己的缩进：前缀列另加，正文一个字不动（与桌面端同）。
         val added = CodeSyntax.segments(CodeLine("  gap: 16px;", "added"))
         assertEquals(1, added.size)
-        assertEquals("+ gap: 16px;", added[0].text)
-        val removed = CodeSyntax.segments(CodeLine("- gap: 16px;", "removed"))
+        assertEquals("+   gap: 16px;", added[0].text)
+        val removed = CodeSyntax.segments(CodeLine("  gap: 16px;", "removed"))
         assertEquals(1, removed.size)
-        assertEquals("- gap: 16px;", removed[0].text)
+        assertEquals("-   gap: 16px;", removed[0].text)
+        // 历史那种自带前缀的行在解析层已还原，渲染层看到的永远是正文。
+        assertEquals("gap: 16px;", codeLineText("- gap: 16px;", "removed"))
+        assertEquals(
+            "- gap: 16px;",
+            CodeSyntax.segments(CodeLine(codeLineText("- gap: 16px;", "removed"), "removed"))[0].text,
+        )
+    }
+
+    // 只在解析层认 diff 前缀：符号 + 空格 + kind 对得上才剥，别把代码吃了。
+    @Test
+    fun codeLineTextOnlyStripsAMatchingDiffPrefix() {
+        assertEquals("gap: 16px;", codeLineText("+ gap: 16px;", "added"))
+        assertEquals("gap: 16px;", codeLineText("- gap: 16px;", "removed"))
+        assertEquals("+ gap: 16px;", codeLineText("+ gap: 16px;", "removed"))
+        assertEquals("-1", codeLineText("-1", "removed"))
+        assertEquals("--gap: 12px;", codeLineText("--gap: 12px;", "added"))
+        assertEquals("  gap: 12px;", codeLineText("  gap: 12px;", ""))
+    }
+
+    // 走真实解析链：上游两种写法都给过时，两端拿到的 CodeLine 形状相同。
+    @Test
+    fun aHistoricalPrefixedLineIsNormalizedWhileParsing() {
+        val message = CrewWire.parseTimeline(
+            """{"items":[{"id":"r1","role":"agent","text":"改好了",
+               "code":{"path":"a.ts","lines":[{"text":"- gap: 16px;","kind":"removed"},
+               {"text":"  --gap: 12px;","kind":""}]}}],
+               "bots":[],"default_bot_id":""}""".trimIndent(),
+        ).messages.single()
+        assertEquals("gap: 16px;", message.code!!.lines[0].text)
+        assertEquals("  --gap: 12px;", message.code!!.lines[1].text)
     }
 
     // 配对走的是和消息面不同的一条路：还没有凭据时也得能到达，所以它单独一组方法。

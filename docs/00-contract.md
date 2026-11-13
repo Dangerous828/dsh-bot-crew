@@ -820,42 +820,51 @@
 
 一次请求选哪一段消息流，由 `session_id` 决定。本节只定义线上字节；状态仍以队列与后台为准。
 切片划分与 seam 取舍见 [ADR 0007](adr/0007-multi-session-seam.md)，三个词的分工见 [GLOSSARY.md](../GLOSSARY.md)。
+header 形态与能力位裁决见 §9.7，Source 准入见 §9.8，群组只读投影见 §10。
 
 **S1 是后端闭环**：网关与消息面按会话分片，S1 阶段手机 / 桌面客户端不改，老调用逐字不变。
 ~~要开会话、切会话的客户端行为与准入收口是 S2 / S3 / S4 的事，一律按顶部的书写约定标为欠账，
 按日期核对；后续切片在本节逐条记为欠账。~~（2026-11-13 原记）
-**S2 / S3 已落地，S4 待做**：手机端（S2）与桌面端（S3）的列出 / 新建 / 切换会话已落地，
-事实描述见 §9.4、客户端能力位先验与缓存隔离见 §9.6；Source 准入收口与真机 / 人工验收窗口
-（S4）仍是欠账，按本文件顶部的书写约定标出。
+**S2 / S3 已落地，S4 机制已落地**：手机端（S2）与桌面端（S3）的列出 / 新建 / 切换会话已落地；
+S4 落下 header 双载体（§9.7）、Source 准入收口（§9.8）与群组只读投影（§10）。
+事实描述见 §9.4，客户端能力位先验与缓存隔离见 §9.6。
+真机 / 人工验收窗口与 issue #15 七项仍属未做，按本文件顶部的书写约定在 §9.4 留一条欠账；
+真机证据缺位时如实标注未做，不作覆盖性结论。
 
 ### 9.1 字段形状
 
 | 项 | 约定 |
 | --- | --- |
-| 名称 | `session_id` |
-| 位置 | **只走 query 参数**（relay 把 `url.search` 原样拼回下游路径，`relay/src/server.ts:644`）；不用 body、不用 header |
-| 形状 | `^[a-z0-9][a-z0-9-]{0,31}$` |
-| 缺省 | 不带即 `main`；`session_id=main` 与不带等价 |
+| 名称 | `session_id`（query）／`x-crew-session`（header） |
+| 位置 | **两种载体**：URL query 参数 `session_id`，或请求头 `x-crew-session`。**query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`（§9.7）。body 不认。relay 把 `url.search` 原样拼回下游路径（`relay/src/server.ts:644`），请求头也原样下送（`relay/src/server.ts:633-642`） |
+| 形状 | `^[a-z0-9][a-z0-9-]{0,31}$`，两种载体同形 |
+| 缺省 | 两种载体都不给即 `main`；`session_id=main`、只给 `x-crew-session: main`、两者都不给，等价 |
 | 映射 | 与队列 `messages.conversation` 列一一映射：`session_id` 是该列在线上消息面的字段名 |
 
 - `session_id` 是**传输层的字段**，不是 DSH 的 Session；DSH 总路由 `masterId` 仍是单值，不随会话增减。
 - ~~（原 `desktop` 欠账，2026-11-13）header 形态的 `session_id` 未开放：留给 S3 桌面端，本阶段只认 query 参数。
-  S1 的 body 与 header 都不读 `session_id`。~~ → **2026-11-13 订正**：header 形态不开放；
-  桌面端与手机端一致走 query，理由：网关只在 query 读 —— `session_of()` 只取
-  `urlsplit(path).query`，body / header 一律不认（`test_session_id_is_a_query_only_field` 已钉死）。
-  桌面端没有另一套 header 通道可开；上面带删除线的原话按 2026-11-13 留作历史。
+  S1 的 body 与 header 都不读 `session_id`。~~ → **2026-11-13 第一次订正**：header 形态不开放；
+  桌面端与手机端一致走 query，理由：S1 网关只在 query 读 —— `session_of()` 只取
+  `urlsplit(path).query`，body / header 一律不认（`test_session_id_is_a_query_only_field` 曾把它钉死）。
+  ~~桌面端没有另一套 header 通道可开。~~
+  → **2026-11-13 S4 第二次订正**：#14 第 2 项要求的 header 形态已落地，头名 `x-crew-session`；
+  网关与消息面都识别它，query 优先、header 兜底，冲突与非法值一律 400 `invalid_session`。
+  桌面端非 `main` 请求同时带 query 与 header 且值相同，默认 `main` 不带任何会话字段。
+  两段带删除线的原话按 2026-11-13 留作历史，裁决与理由见 §9.7。
 
 ### 9.2 能力位（expand 的那一半）
 
-- 网关对**显式带 `session_id` 的每个响应**（不只是 `GET /timeline`）回显 `session_id: X` 与
-  `session_api: 1`，包括 `/send`、`/withdraw`、`/claim` 及各自的错误响应。
+- 网关对**显式带会话的每个响应**（query 带 `session_id`，或请求带 `x-crew-session`；不只是
+  `GET /timeline`）回显 `session_id: X` 与 `session_api: 1`，包括 `/send`、`/withdraw`、`/claim`
+  及各自的错误响应。能力位注入判据在 `_send` 一处，随 header 识别同步扩到 header（§9.7）。
   理由：客户端可能不先取 timeline 就直发 `send?session_id=work`，若只有 timeline 带能力位，
-  这条路径在老网关上会被静默按 `main` 落库且无从发现。
+  这条路径在老网关上会被静默按 `main` 落库且无从发现；header 直发同理。
 - 消息面 `GET /api/mobile/timeline` 响应回显 `session_id`、`session_api: 1`、
   `sessions: ["main", ...]`、`default_session_id: "main"`。
-- 老调用（不带 `session_id`）的**请求与响应**都逐字不变：网关一个字段都不加（能力位只在显式
-  带参数时注入）；`/timeline` 老调用仍回显 `session_id: "main"`，响应其余部分逐字不变。
-  消息面老调用的转发 URL 也不带 `session_id`，由网关缺省 `main`。
+- 老调用（既不带 `session_id` query，也不带 `x-crew-session` header）的**请求与响应**都逐字不变：
+  网关一个字段都不加（能力位只在显式带会话时注入）；`/timeline` 老调用仍回显
+  `session_id: "main"`，响应其余部分逐字不变。消息面老调用的转发 URL 也不带 `session_id`、
+  不转发会话头，由网关缺省 `main`。
 - `GET /api/mobile/sessions` → `{ sessions, default_session_id: "main", session_api: 1 }`，
   `main` 恒在首位；`POST /api/mobile/sessions` body `{ "id": "work" }` 按 §9.1 校验形状、登记进名单，
   返回 `{ id, sessions, session_api: 1 }`；重复 id 幂等返回 200。
@@ -866,14 +875,16 @@
 
 | `error` | HTTP | 何时 |
 | --- | --- | --- |
-| `invalid_session` | 400 | `session_id` 不符合 §9.1 形状（大写 / 空格 / 超长 / 非法字符） |
-| `unsupported_session` | 409 | 显式 `session_id != main` 而对端未升级（网关响应缺 `session_api`） |
+| `invalid_session` | 400 | 任一载体的值不符合 §9.1 形状（大写 / 空格 / 超长 / 非法字符），或 query 与 header 都给且**不一致**（不许猜哪个算数） |
+| `unsupported_session` | 409 | 显式会话 != `main` 而对端未升级（网关响应缺 `session_api`）；header 形态同样适用 |
 
 - 两条都回 `{ "error": "<code>" }`，与 §6 的错误体同形；`error` 的值就是上表的码，客户端按 §6 只展示文本。
 - **`unsupported_session` 绝不静默当 `main`**：这是本阶段最重要的防串线约束。
 - 消息面对**任何转发 operation**（timeline / send / withdraw / claim 等）一视同仁：网关响应缺
-  `session_api` 且请求显式 `session_id != main`，回 409 `unsupported_session`。
+  `session_api` 且请求显式会话 != `main`，回 409 `unsupported_session`。
   因此直发 `send` 到老网关也会被挡，不依赖客户端「先取 timeline 探测」的约定。
+- header 形态的「对端未升级」不另立错误码：新客户端发了 `x-crew-session` 而老网关不认时，
+  由能力位先验（非 `main` 零发出）与消息面的 409 兜住，**不按缺省 `main` 落库**；裁决见 §9.7。
 
 ### 9.4 老客户端兼容
 
@@ -892,10 +903,21 @@
   `do()` / `auth()` 老路径零改动；timeline 缓存按每会话一份组织
   （`map[string]*Conversation` + `currentSession`），左栏会话列表；当前会话持久化到凭据文件，
   缺键回落 `main`。细则见 §9.6。
-- `TODO(backend, 2026-11-13)` S4：Source 准入判定（`scope()` / `channel.allowed`）与会话名单的收口未做；
-  S1 只写这份契约与「未登记会话不静默丢消息」的说明，`team.ts` / `mobile.ts` 只加说明性注释，不改判定逻辑。
-- `TODO(gw, 2026-11-13)` S4：真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、真机配对与
-  `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state` 与归档守卫）尚未做。
+- ~~（原 `backend` 欠账，2026-11-13）S4：Source 准入判定（`scope()` / `channel.allowed`）与会话名单的收口未做；
+  S1 只写这份契约与「未登记会话不静默丢消息」的说明，`team.ts` / `mobile.ts` 只加说明性注释，不改判定逻辑。~~
+  → **2026-11-13 S4 已落地**：`scope()` / `channel.allowed` 在手配 `conversations` 之外合并
+  `KV.mobile.sessions` 注册名单，手配清单保留作向后兼容；未登记会话的消息照原 `conversation`
+  落 `mobileq.db`、可按 `session_id` 读回，并给出可观测的 `conversation_not_listed` 准入结果，
+  不静默吞掉；登记后立刻可派单，不手改 Source 配置、不重启。四条断言与证据见 §9.8。
+- ~~（原 `gw` 欠账，2026-11-13）S4：真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、真机配对与
+  `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state` 与归档守卫）尚未做。~~
+  → **2026-11-13 订正**：S4 真机 / 人工窗口与 issue #15 七项（Step 0 四期收尾）仍属未做，
+  需要设备与人工窗口、每项要有截图 / 录屏 / 日志证据；本轮只有独立临时网关的 HTTP 断言，
+  不代替真机。欠账按顶部书写约定继续标出：
+- `TODO(gw, 2026-11-13)` 真机验收：S4 真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、
+  真机配对与 `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state`
+  与归档守卫），以及 issue #15 七项（桌面端、手机端、远程恢复、运行中 profile 加载新构建、
+  真机 APK 安装、真实额度数据源、relay 重新部署）均未做，缺真机证据；每项有证据才勾。
 
 ### 9.5 四种组合与静默串线
 
@@ -917,12 +939,14 @@ timeline 全量下发、`READ_CURSOR` 全局单键。S1 逐一对上：query 原
 `session_api: 1` 就停发并报错；滚动升级时（新消息面 + 老网关）再由消息面把「网关响应缺
 `session_api` 且显式非 `main`」翻成 409 `unsupported_session`。两道都指向同一条规矩：
 **显式非 `main` 遇未升级对端，宁可报错，也不静默当 `main`。**
+header 形态会把同一个 C4 再开一次口子（老网关不读 `x-crew-session`，客户端以为在 X、
+消息实际写进 `main`，全程 200）；裁决与两道兜底见 §9.7。
 
 ### 9.6 客户端能力位先验与缓存隔离
 
-S2（手机端）/ S3（桌面端）已落地，S4 待做。本节是两端共同遵守的客户端规矩：实现语言与存储
-不同（Kotlin / Go），判定一致。传输形态按 §9.1 —— 会话相关请求统一在 query 带 `session_id`，
-header 不开放。
+S2（手机端）/ S3（桌面端）已落地，S4 补上 header 形态与准入收口。本节是两端共同遵守的客户端
+规矩：实现语言与存储不同（Kotlin / Go），判定一致。传输形态按 §9.1 —— 手机端会话相关请求在
+query 带 `session_id`；桌面端非 `main` 请求 query 与 `x-crew-session` **双写且值相同**（§9.7）。
 
 **能力位先验**：启动 / 首次进入先取 `GET /api/mobile/sessions`，三种响应分开处理，禁止静默降级：
 
@@ -939,10 +963,11 @@ header 不开放。
   不新增本地条目。
 - 会话 id 形状按 §9.1（`^[a-z0-9][a-z0-9-]{0,31}$`）：提交前本地校验（`trail-` 合法、
   32 位上限，大写 / 空格 / 下划线非法），非法 id 不发往后端。
-- 默认 `main` 的请求不带参数（网关缺省 `main`，老路径零改动），只有非 `main` 才追加
-  `?session_id=<id>`。与会话无关的宿主侧接口（models / efforts / model / routines / memory /
-  spend / audit / voice / speak / screen / outputs / work / agents / bots / pair / pause /
-  resume / retry / takeover / reply-spend）不带 `session_id`。
+- 默认 `main` 的请求不带 query 参数、也不带 `x-crew-session`（网关缺省 `main`，老路径零改动）；
+  只有非 `main` 才追加 `?session_id=<id>`，桌面端同时带同名 header。与会话无关的宿主侧接口
+  （models / efforts / model / routines / memory / spend / audit / voice / speak / screen /
+  outputs / work / agents / bots / pair / pause / resume / retry / takeover / reply-spend）
+  不带 `session_id`，也不带 `x-crew-session`。
 
 **每会话独立缓存**：手机 `Map<String, Conversation>`、桌面 `map[string]*Conversation` +
 `currentSession`，键就是 `session_id`。切回 A 时显示 A 的缓存，**绝不显示 B 的消息**。切换会话时
@@ -959,3 +984,102 @@ header 不开放。
 本节与 §9.2 的能力位、§9.3 的错误码、§9.5 的 C4 是同一套规矩，不另立字段；`session_id` /
 `conversation` / `masterId` 的分工见 [GLOSSARY.md](../GLOSSARY.md)，切片与传输形态裁决见
 [ADR 0007](adr/0007-multi-session-seam.md)。
+
+### 9.7 header 形态 `x-crew-session`（#14 第 2 项）与字面要求的差异
+
+#14 第 2 项原文：「另加 header 形态的 session_id 在本片开放（S1 只认 query；header 未被识别时
+按缺省 main，不得报错）」。前半句按原样落地；**后半句按下面的裁决收窄**，理由是它会把 §9.5
+判定过的危险组合重新放进来。
+
+**线上字节**
+
+| 项 | 约定 |
+| --- | --- |
+| 头名 | `x-crew-session`（小写，与 `x-crew-device` / `x-crew-credential` 同族） |
+| 值形状 | 与 §9.1 同形：`^[a-z0-9][a-z0-9-]{0,31}$` |
+| 取值 | **query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`，不许猜哪个算数；两者都不给 → 缺省 `main` |
+| 能力位 | 显式带 header 的请求，**所有响应**同样回显 `session_id: X` 与 `session_api: 1`（复用 `_send` 一处判据，含 `/send` / `/withdraw` / `/claim` 及错误响应）；老调用一个字段不加 |
+| 客户端 | 桌面端默认 `main` 不带任何会话字段；非 `main` 时 query 与 header **双写且值相同**（滚动升级中任一版对端都读得到）。手机端（S2）不改，继续走 query。现有精确路径断言一条都不改 |
+| 两道门 | relay 原样下送请求头（`relay/src/server.ts:633-642`；逐跳头集合见 `:883`，不含本头），query 由 `:644` 原样拼回；`phone-gate` 的 401 只认设备凭据两枚头（`backend/src/app/phone-gate.ts:22-29`、`42-49`），新增本头不改判定；`lan-server` 把 `request.headers` 整体交给 `forward`（`backend/src/app/lan-server.ts:108`） |
+
+**与 #14 字面要求的差异及理由（防串线）**
+
+按字面做「header 未被识别时按缺省 `main`，不得报错」会重新引入 §9.5 的 **C4 静默串线**：
+S1 网关 `session_of()` 只读 query、不读 header；客户端以为自己在 `work` 会话，消息实际写进
+`main`，响应也不回显 `session_api`，**全程 200 无报错**。客户端既拿不到「会话被并进 main」的信号，
+也没法在 `work` 的 timeline 上找回这条消息。§9.5 与 [ADR 0007](adr/0007-multi-session-seam.md)
+正是把这一组合判为唯一危险组合。
+
+裁决：
+
+1. 「header 未被识别时按缺省 `main`，不得报错」**只在「老客户端压根不发这个 header」这一意义上
+   成立**：两种载体都不带的老调用逐字不变、缺省 `main`、全程 200（§9.2 / §9.4）。
+2. 「新客户端发了 header 但对端不认」**必须报错，不许降级**：网关与消息面都识别
+   `x-crew-session`；老网关不认 header 时，由**能力位先验**（先验没过，非 `main` 请求零发出）
+   与**消息面 409 `unsupported_session`**（网关响应缺 `session_api`）两道兜住，
+   **绝不静默按 `main` 落库**。
+3. query 与 header 都给且不一致一律 400 `invalid_session`：宁可让调用方改对，也不替它挑一段会话。
+
+**验收边界**：`scripts/test-s4-e2e.sh` 用独立临时网关按两道只读能力位探测自动启用 header
+断言组（header 形态、query 优先、冲突 400、非法 400、header 响应能力位、老调用逐字不变）；
+网关未识别 `x-crew-session` 时逐条标 deferred，由 lead 以
+`S4_REQUIRE_HEADER=1 sh scripts/test-s4-e2e.sh` 跑绿。消息面把 header 交给 `phoneHandler`、
+向下转发到网关，以及桌面端 query / header 双写，由 lead 集成时合并并另验；本脚本只验独立
+临时网关的线上字节，不替代消息面与真机证据。
+
+### 9.8 Source 准入：会话名单是唯一真源
+
+「未登记会话不静默丢消息」在 S1 只是文档说明，S4 落成机制：手配的
+`ConfigSchema.conversations` 保留（老配置照旧），`scope()` / `channel.allowed` 在它之外合并
+`KV.mobile.sessions` 注册名单；会话名单是准入的唯一真源，`masterId` 与 DSH 上游不动。
+Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局可变状态。
+
+四条断言与各自的证据口径：
+
+| # | 断言 | 可观测证据 |
+| --- | --- | --- |
+| 1 | 落队列 | 未登记会话发的消息进 `mobileq.db` 的 `messages` 行，`conversation` 就是那段会话 id |
+| 2 | 可读 | `timeline?session_id=<未登记>` 读回它，不凭空消失 |
+| 3 | 不派单 | `scope()` 明确给出 `conversation_not_listed`，并在 health/detail 或日志 / 计数里留一条**可观测记录**；不产生 Trigger / Ticket，禁止「什么都没发生」 |
+| 4 | 注册即生效 | `POST /api/mobile/sessions` 登记后，该会话消息立刻可派单，不手改 Source 配置、不重启 |
+
+`scripts/test-s4-e2e.sh` 用独立临时网关覆盖 1 / 2 与 3 的队列层证据（`read_at` 为空、无回复行）；
+3 的 `scope()` 记录与 4 的注册即生效由 `backend/tests/source-session-admission.spec.ts` 表达，
+脚本在该文件存在时调用它。真机里「第二个 conversation 真派单后 `/state` 与归档守卫仍正常」
+仍属 §9.4 的真机欠账，本轮没有真机证据。
+
+## 10. 群组只读投影（groups）
+
+群组是**只读投影**，不是第二本账。`backend/src/app/groups.ts` 的纯函数
+`groupsOf({ sessions, bots, tickets })` 从已有 sessions / bots / tickets 派生 `groups[]`；
+`GET /api/mobile/timeline` 顶层加只读字段 `groups`（与 `items` / `tasks` 同级），不新开路由、
+不改路由语义。
+
+```jsonc
+{
+  "groups": [
+    {
+      "id": "main",                 // 按会话归属为主；无归属的 bot 落 main 组
+      "title": "主会话",
+      "sessions": ["main"],
+      "bots": ["lead"],
+      "ticket_count": 2            // 从已有 tickets 数出来的只读计数，不是新增 Ticket 账
+    }
+  ],
+  "groups_state": "live",          // live | empty | unavailable
+  "groups_reason": "…"            // 只在 groups_state != live 时出现，一句给人看的中文
+}
+```
+
+- **结构**：每项 `{ id, title, sessions: [...], bots: [...], ticket_count }`；按会话归属为主，
+  bot 按归属会话归组，无归属的落 `main` 组。`groups` 恒为数组，缺省按 `empty` 处理但不许
+  把「读不到」说成「没有」。
+- **三态不许合并**：`live` = 有归组数据；`empty` = 读得到、确实没有；`unavailable` = 读不到
+  （宿主没接这项能力 / 会话树打不开），客户端只说「读不出来」，不得说「还没有群组」。
+  `groups_reason` 只在非 `live` 时出现，可直接显示。
+- **只读**：零新增 Ticket 账、零新增持久化状态、不改路由语义；`ticket_count` 只数不写。
+  没有群组写路由（不存在 `POST /api/mobile/groups`），客户端不得本地改完 `groups` 当落盘。
+- 桌面端 `desktop/ui.go` 用 `Conversation.Groups` 画只读栏，手机端不改（#14 只要求桌面或真机
+  二选一）。`groups` 的接入字段位置、import 与断言由 lead 在集成时与本节对齐。
+- **验收边界**：三态与结构由 `backend/tests/groups.spec.ts` 覆盖，脚本在该文件存在时调用它；
+  群组投影在真机或桌面端实际打开看过（#10 第 4 项）仍属 §9.4 的真机欠账。

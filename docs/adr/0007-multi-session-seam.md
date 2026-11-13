@@ -1,7 +1,8 @@
 # 多会话的 seam 放在网关 / 消息面：masterId 保持单值
 
 对应 #10 多会话大阶段 S1（2026-11-13）。状态：accepted（决策已定；~~S2–S4 为后续切片，本阶段不实现~~ →
-2026-11-13 更新：S2 / S3 已落地，S4 待做；Source 准入与真机验收仍是欠账）。
+2026-11-13 更新：S2 / S3 / S4 机制已落地；header 形态见下方「传输形态裁决」，真机验收
+（S4 真机窗口与 issue #15 七项）仍是欠账）。
 
 ## 背景
 
@@ -19,9 +20,10 @@ relay 也把 `url.search` 原样透传（`relay/src/server.ts:644`）。缺的�
 ## 决策
 
 **seam 选在网关 / 消息面，不动 DSH 上游。** `masterId` 保持单值，`runtime.ts` /
-`sessions.ts` / `http.ts` 零改动；给 `session_id` 做线上消息面字段（只走 query，默认 `main`），
-与队列 `conversation` 列一一映射，网关把进程常量换成请求级选择。DSH 那边仍只有一支队伍、
-一个总路由；多出来的是「消息流」的维度，不是 Session 的维度。
+`sessions.ts` / `http.ts` 零改动；给 `session_id` 做线上消息面字段（query 为首选载体，S4 起另有
+`x-crew-session` header 兜底，query 优先，默认 `main`），与队列 `conversation` 列一一映射，
+网关把进程常量换成请求级选择。DSH 那边仍只有一支队伍、一个总路由；多出来的是「消息流」的
+维度，不是 Session 的维度。
 
 考虑过并否掉的两条：
 
@@ -36,7 +38,8 @@ relay 也把 `url.search` 原样透传（`relay/src/server.ts:644`）。缺的�
    **能力位覆盖显式会话请求的所有响应**（含 send / withdraw / claim 及错误响应），
    不只 timeline —— 客户端可能不先探测就直发 `send?session_id=work`，那条路径也必须能被认出来。
 2. 迁移（S2 / S3）：客户端先验 `session_api: 1` 再启用显式非 `main`；在此之前一律只发 `main`。
-3. contract（S4 及以后）：各层都升级后，才收紧准入、去掉单会话兜底一类老假设。S1 不做任何删除或收紧。
+3. contract（S4）：各层都升级后收紧准入、去掉单会话兜底一类老假设；S4 已落 Source 准入收口与
+   群组只读投影。S1 不做任何删除或收紧。
 
 ## 四个垂直切片（S1–S4）
 
@@ -44,36 +47,67 @@ relay 也把 `url.search` 原样透传（`relay/src/server.ts:644`）。缺的�
 | --- | --- | --- | --- |
 | **S1 协议 expand（本阶段）** | 网关请求级 `session_of`、SQL 全链路按会话、消息面 `/api/mobile/sessions` 与 timeline 能力位、READ_CURSOR / timeline 按会话分键、`invalid_session` / `unsupported_session`、后端测试与独立验收脚本。**后端闭环** | — | 停发 `session_id` 即全量回落 `main`；改动只在网关 + 消息面两处，回退这两处即可，无需数据迁移（队列仍是同一份 `mobileq.db`，`conversation` 列本就存在） |
 | **S2 手机端切换 / 新建** | app 端读会话名单、切会话、先验能力位 | S1 | 客户端不发 `session_id` 即回落 S1 的 `main`；整批灰度可关停，后端零改动 |
-| **S3 桌面端切换 / 新建** | desktop 端同上；~~header 形态的 `session_id` 在此开放~~ → 2026-11-13 订正：header 不开放，与 S2 一样只走 query（见下方「传输形态裁决」） | S1（与 S2 并行） | 同 S2；~~header 未被识别时按 S1 只认 query / 缺省 `main`~~ → 只有 query 一种形态，缺省 `main` |
-| **S4 隔离不变量收口 + 群组只读投影** | 把 Source 准入判定（`scope()` / `channel.allowed`）与会话名单对齐，「未登记会话不静默丢消息」落成机制；真机 / 人工验收窗口 | S2 / S3 | 准入是配置项：保持 `conversations` 名单为 `main` 全域即回到 S1 行为，不涉及数据 |
+| **S3 桌面端切换 / 新建** | desktop 端同上；~~header 形态的 `session_id` 在此开放~~ → 2026-11-13 订正：S2/S3 阶段 header 不开放，与 S2 一样只走 query；**2026-11-13 S4 再订正**：header 在 S4 以 `x-crew-session` 落地，桌面端非 `main` 双写且值相同（见下方「传输形态裁决」） | S1（与 S2 并行） | 同 S2；~~header 未被识别时按 S1 只认 query / 缺省 `main`~~ → S2/S3 只有 query 一种形态，缺省 `main`；S4 起老网关不认 header 由能力位先验 / 409 兜住 |
+| **S4 隔离不变量收口 + 群组只读投影** | **机制已落地**：把 Source 准入判定（`scope()` / `channel.allowed`）与会话名单对齐，「未登记会话不静默丢消息」落成机制；header 形态与能力位同步；群组只读投影。真机 / 人工验收窗口仍属欠账 | S2 / S3 | 准入是配置项：保持 `conversations` 名单为 `main` 全域即回到 S1 行为，不涉及数据 |
 
 每片可独立验证、单独回退；expand 阶段没删老行为，所以四片的回退都不需要回滚数据。
 
-**切片结果（2026-11-13）**：S1 已交付（`2f623c1`）；**S2 / S3 已落地，S4 待做**。S2 / S3 各按上表的
+**切片结果（2026-11-13）**：S1 已交付（`2f623c1`）；**S2 / S3 / S4 机制已落地**。S2 / S3 各按上表的
 「先验 `session_api: 1` 再启用显式非 `main`」接入，并把能力位先验三态、每会话独立缓存、
-当前会话持久化写进契约 §9.4 / §9.6；两端都走 query，上表 S3 行原先「header 在此开放」的说法
-按下面的裁决作废（原行以删除线保留）。S4 的 Source 准入收口与真机 / 人工验收窗口仍是欠账，
-仍标在契约 §9.4 的两条 `TODO(backend/gw)` 里。
+当前会话持久化写进契约 §9.4 / §9.6；S2/S3 阶段两端都走 query，上表 S3 行原先「header 在此开放」
+的说法按当时的裁决作废（原行以删除线保留）。S4 按 #14 第 2 项把 header 形态落地（见下方
+「传输形态裁决」），并落 Source 准入收口（契约 §9.8）与群组只读投影（契约 §10）；契约 §9.4 的
+两条原 `TODO(backend/gw)` 已用删除线保留历史并追加已落地事实。真机验收（S4 真机窗口与
+issue #15 七项）仍属欠账，留在契约 §9.4 的一条 `TODO(gw)` 里。
 
-## 传输形态裁决：两端统一 query，header 不开放
+## 传输形态裁决（2026-11-13 更新）：query 优先 + `x-crew-session` 兜底
 
-补记 2026-11-13：契约 §9.1 曾写「header 形态的 `session_id` 未开放：留给 S3 桌面端」，切片表 S3 行
-也写「header 形态在此开放」。这两处都把 header 当成桌面端将来可开的第二条通道，**与 S1 网关的
-实现约束相反，一并订正**：`session_id` 只有一种载体 —— URL query 参数，手机端（S2）与桌面端（S3）
-一致；header 形态不开放，body 也不认。
+~~补记 2026-11-13：契约 §9.1 曾写「header 形态的 `session_id` 未开放：留给 S3 桌面端」，切片表
+S3 行也写「header 形态在此开放」。这两处都按「header 不开放」订正：`session_id` 只有一种载体 ——
+URL query 参数，手机端（S2）与桌面端（S3）一致；header 形态不开放，body 也不认。~~
+（S2 / S3 阶段裁决，按 2026-11-13 时点保留）
 
-理由（网关 S1 的实现约束，不是客户端偏好）：网关 `session_of()` 只从 `urlsplit(path).query`
-取 `session_id`，body / header 一律不读，`test_session_id_is_a_query_only_field` 已把这件事钉成测试；
-relay 也只把 `url.search` 原样拼回下游路径（`relay/src/server.ts:644`）。query 是唯一端到端可达的形态。
+S2/S3 阶段的理由（网关 S1 的实现约束，不是客户端偏好）：网关 `session_of()` 只从
+`urlsplit(path).query` 取 `session_id`，body / header 一律不读，
+`test_session_id_is_a_query_only_field` 曾把它钉成测试；relay 把 `url.search` 原样拼回下游路径
+（`relay/src/server.ts:644`）。~~当时否掉的替代是「桌面端走 header」：网关读不到 header，请求会按
+缺省 `main` 落库，客户端以为在会话 X、实际读写 `main`，且响应不带 `session_api: 1`，能力位先验
+也拦不住 —— 正好是 §9.5 的 C4 静默串线。桌面端没有另一套通道可开。~~
 
-否掉的替代是「桌面端走 header」：网关读不到 header，请求会按缺省 `main` 落库，客户端以为在会话 X、
-实际读写 `main`，且响应不带 `session_api: 1`，能力位先验也拦不住 —— 正好是 §9.5 的 C4 静默串线。
-桌面端没有另一套通道可开，因此不存在「留给 S3」的欠账。
+**S4 裁决（2026-11-13，#14 第 2 项）**：header 形态落地，头名 `x-crew-session`（小写，与
+`x-crew-device` / `x-crew-credential` 同族）。网关与消息面都识别它，`session_id` 取
+**query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`（不许猜哪个算数），
+形状仍是 `^[a-z0-9][a-z0-9-]{0,31}$`。能力位 `session_api: 1` 的注入判据同步扩到 header：
+显式带 header 的请求所有响应同样回显（复用网关 `_send` 一处逻辑），老调用（两种载体都不带）
+逐字不变。桌面端默认 `main` 不带任何会话字段；非 `main` 时 query 与 header **双写且值相同**；
+手机端不改，继续走 query；现有精确路径断言一条都不改。上面那条「否掉」理由随网关 / 消息面
+一起识别 header 而消除 —— 不是客户端单方面换通道。
 
-后果：默认 `main` 的请求不带参数（老路径逐字不变），只有非 `main` 才追加 `?session_id=<id>`；
-与会话无关的宿主侧接口不带 `session_id`。两端的能力位先验、每会话缓存与当前会话持久化见
-[契约 §9.4 / §9.6](../00-contract.md)；术语裁决见 [GLOSSARY.md](../../GLOSSARY.md)。
-S2 / S3 已落地，S4 待做。
+### 与 #14 字面要求的差异及理由（决策记录）
+
+#14 第 2 项还写了「header 未被识别时按缺省 `main`，不得报错」。**按字面做会重新引入 C4
+静默串线**：S1 网关不读 header，客户端以为在 `work` 会话、消息实际写进 `main`，响应不回显
+`session_api`，**全程 200 无报错** —— 正是本 ADR 判定为唯一危险组合的那条。裁决：
+
+- 「按缺省 `main`，不得报错」只在**老客户端压根不发这个 header** 的意义上成立（两种载体都不带的
+  老调用逐字不变、全程 200）。
+- 「新客户端发了 header 但对端不认」**必须报错，不许降级**：老网关不认 header 由**能力位先验**
+  （先验没过，非 `main` 请求零发出）与**消息面 409 `unsupported_session`**（网关响应缺
+  `session_api`）两道兜住，**绝不静默按 `main` 落库**。
+- 记录理由：这是 hard-to-reverse 的线上字节裁决；「按 #14 字面实现」看起来更省事，却会把已收口的
+  C4 重新放进来。单独留档，避免后来者「顺手修回去」。
+
+**两道门的落点**：relay 原样下送请求头（`relay/src/server.ts:633-642`，逐跳头集合见 `:883`，不含
+本头），query 由 `:644` 原样拼回；`phone-gate.ts:22-29` 的 401 只认设备凭据两枚头，新增本头不改
+判定；`lan-server.ts:108` 把 `request.headers` 整体交给 `forward`。消息面必须把 header 交给
+`phoneHandler` 并向下转发到网关：当前 `backend/src/index.ts:59-64` 的 `ask()` 重建 `Request` 时
+未带 headers，是 lead 集成时要补的一处（不在 4 个 agent 的文件分工内）。
+
+后果：默认 `main` 的请求不带参数也不带头（老路径逐字不变），只有非 `main` 才追加
+`?session_id=<id>`，桌面端同时带同名 header；与会话无关的宿主侧接口不带会话字段。两端的能力位
+先验、每会话缓存与当前会话持久化见 [契约 §9.4 / §9.6](../00-contract.md)；线上字节、Source 准入
+与群组三态见 [契约 §9.7 / §9.8 / §10](../00-contract.md)；术语裁决见
+[GLOSSARY.md](../../GLOSSARY.md)。S2 / S3 / S4 机制已落地，真机验收（issue #15 七项）仍属欠账。
 
 ## 静默串线的四种组合与能力位防串
 
@@ -95,21 +129,26 @@ send body 重构丢未知字段、`CONV` 仍写 `main`、timeline 全量下发�
 
 - **客户端侧**：新客户端只在确认 `session_api: 1` 后才发显式非 `main`；缺位即停止发送并明确报错，禁止静默降级。这是 C4 在后端全老时唯一的防线（老后端一路 200，拦不住自己）。
 - **消息面侧**：显式 `session_id != main` 而网关**任一**响应缺 `session_api` → 409 `unsupported_session`；非法形状 → 400 `invalid_session`。滚动升级时（新消息面 + 老网关）由这一道把 C4 从「静默 200」翻成「响亮的 409」，且覆盖直发 send 的路径，不依赖客户端先取 timeline。
-- **为什么 S1 先做能力位**：S1 交付时客户端还没接（下节），能力位是提前埋给 S2 / S3 的；等客户端真开始发显式非 `main`，后端已是新版本，C4 不再成立。（2026-11-13 补：S2 / S3 已按此落地，S4 待做。）
+- **为什么 S1 先做能力位**：S1 交付时客户端还没接（下节），能力位是提前埋给 S2 / S3 的；等客户端真开始发显式非 `main`，后端已是新版本，C4 不再成立。（2026-11-13 补：S2 / S3 已按此落地；S4 把 header 形态纳进同一套防线。）
+- **header 形态再开的那一次 C4**：老网关不读 `x-crew-session` 时，客户端以为在 X、消息写进 `main`、
+  全程 200。裁决不是「按缺省 main 不报错」，而是能力位先验 + 消息面 409 两道兜住，见上方
+  「传输形态裁决」的决策记录。
 
 ## 本阶段（S1）的边界
 
 - **S1 是后端闭环**：手机 / 桌面客户端本阶段不改，老调用逐字不变（不带 `session_id` 的请求形状、状态码、响应其余内容；新增字段是增量的，按契约 §5「未知字段必须保留、不得丢弃」处理）。
 - **不动 DSH 上游**：`runtime.ts` / `sessions.ts` / `http.ts` / `mobile-http.ts` 的 masterId 相关零改动，`masterId` 单值不动；不动运行中服务、不动生产 `<stateDir>/mobileq.db`。
-- **不动 Source 准入判定**：`team.ts` / `mobile.ts` 的 `ConfigSchema.conversations` 名单、`scope()` / `channel.allowed` 本阶段只加说明性注释，不改判定逻辑。S1 只写文档契约与「未登记会话不静默丢消息」的说明 —— 消息仍按其 conversation 落队列、可在 `timeline?session_id=X` 读到，只是未列入名单就不派单，不凭空消失。**准入与会话名单的收口留给 S4**，见上表。
+- **不动 Source 准入判定**：`team.ts` / `mobile.ts` 的 `ConfigSchema.conversations` 名单、`scope()` / `channel.allowed` 本阶段只加说明性注释，不改判定逻辑。S1 只写文档契约与「未登记会话不静默丢消息」的说明 —— 消息仍按其 conversation 落队列、可在 `timeline?session_id=X` 读到，只是未列入名单就不派单，不凭空消失。~~准入与会话名单的收口留给 S4。~~ → 2026-11-13 更新：S4 已落该收口（契约 §9.8）。
 - ~~S2 / S3 客户端接入、S4 准入收口与真机验收窗口都标在 `docs/00-contract.md` §9 的 `TODO(owner, 日期)` 里，本阶段未实现。~~
-  → 2026-11-13 更新：S2 / S3 已落地（契约 §9.4 / §9.6）；S4 准入收口与真机验收窗口仍是欠账，
-  留在契约 §9.4 的两条 `TODO(backend/gw)` 里。上面三条「本阶段」约束仍指 S1 阶段本身。
+  → 2026-11-13 更新：S2 / S3 已落地（契约 §9.4 / §9.6），S4 的 header 形态、准入收口与群组
+  只读投影已落地（契约 §9.7 / §9.8 / §10）；契约 §9.4 的两条原 `TODO(backend/gw)` 已用删除线
+  保留历史并追加已落地事实。真机验收（S4 真机窗口与 issue #15 七项）仍是欠账，留在契约 §9.4
+  的一条 `TODO(gw)` 里。上面三条「本阶段」约束仍指 S1 阶段本身。
 
 ## 依据
 
 - `开发进度.md` §十（#10 方案：expand–contract、四切片、`session_api:1` / 409 的由来）。
-- `docs/00-contract.md` §9「会话」（字段形状、能力位、错误码、四种组合、§9.6 客户端能力位先验与缓存隔离）、`GLOSSARY.md`（`masterId` / `conversation` / `session_id` 三词分工与「只走 query」的术语裁决）。
-- `test_session_id_is_a_query_only_field`（S1 网关：`session_of()` 只从 query 读，body / header 一律不认）。
-- `relay/src/server.ts:644`（`rest + url.search` 原样透传）；`backend/src/kv.ts` / `runtime.ts`（`master-id` 单值）。
+- `docs/00-contract.md` §9「会话」（字段形状、能力位、错误码、四种组合、§9.6 客户端能力位先验与缓存隔离、§9.7 header 裁决、§9.8 Source 准入）与 §10（群组只读投影三态）；`GLOSSARY.md`（`masterId` / `conversation` / `session_id` 三词分工，以及「query 与 `x-crew-session` 双载体、query 优先」的术语裁决）。
+- `test_session_id_is_a_query_only_field`（S1 网关曾钉死 `session_of()` 只从 query 读）；S4 网关与消息面都识别 `x-crew-session`，该断言随实现同步扩展。
+- `relay/src/server.ts:633-642`（请求头原样下送）、`:644`（`rest + url.search` 原样透传）；`backend/src/app/phone-gate.ts:22-29`（401 只认设备凭据两枚头）、`backend/src/app/lan-server.ts:108`（`request.headers` 整体交给 `forward`）；`backend/src/kv.ts` / `runtime.ts`（`master-id` 单值）。
 - ADR 0001（后端留在 dsh 进程）、ADR 0002（客户端只走消息面）、ADR 0005（主 Session 不归档）。

@@ -44,15 +44,19 @@ _Avoid_: 会话 id、session_id、crew 指纹、instanceId
 _Avoid_: Session、masterId、session_id（线上字段名）
 
 **session_id**
-线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身；载体只有 URL query 参数：网关只从 query 读，body 与 header 都不认，手机端与桌面端一致。不存在「header 形态的 `session_id`」这种变体；取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与客户端规矩见 [契约 §9](docs/00-contract.md)。
-_Avoid_: masterId、Session id、conversation_id、header 形态 session_id、X-Session-Id 之类的 header 名
+线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身。载体有 URL query 参数 `session_id` 与请求头 `x-crew-session` 两种，**query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`。手机端只用 query，桌面端非 `main` 双写且值相同；两种载体都不带即老调用，缺省 `main`。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与裁决见 [契约 §9.7](docs/00-contract.md)。
+_Avoid_: masterId、Session id、conversation_id、X-Session-Id（头名是 `x-crew-session`）
+
+**x-crew-session（header 形态 session_id）**
+`session_id` 的 header 载体，与 `x-crew-device` / `x-crew-credential` 同族。query 优先、它兜底；能力位判据同步覆盖带它的请求。老网关不认它由能力位先验 / 409 兜住，**不静默按 `main` 落库**（[ADR 0007](docs/adr/0007-multi-session-seam.md) 的裁决）。
+_Avoid_: X-Session-Id、X-Crew-Session-Id、`session_id`（那是 query 参数名）
 
 **能力位（session_api）**
-后端在显式会话响应里回显的标记，`1` 表示这台后端按会话分片、认得 `session_id`。客户端先验它再启用显式非 `main`；缺位即视为老后端，锁 `main` 并如实提示，不静默降级。
+后端在显式会话响应里回显的标记，`1` 表示这台后端按会话分片、认得 `session_id`；判据同时覆盖 query 与 `x-crew-session` 两种载体。客户端先验它再启用显式非 `main`；缺位即视为老后端，锁 `main` 并如实提示，不静默降级。
 _Avoid_: feature flag、版本号、能力协商（它不是一次协商，只是响应里的一个回显字段）
 
 **会话名单（sessions）**
-后端持有的会话 id 列表，`main` 恒在首位，配一个 `default_session_id`。唯一真源在后端，客户端每次启动重新拉，不落盘。
+后端持有的会话 id 列表，`main` 恒在首位，配一个 `default_session_id`。唯一真源在后端，客户端每次启动重新拉，不落盘；它也是 Source 准入的唯一真源（S4）：`scope()` / `channel.allowed` 合并手配 `conversations` 与注册名单。
 _Avoid_: 本地名单、缓存名单、花名册（那是 Bot 目录）
 
 **当前会话（current session）**
@@ -124,4 +128,18 @@ mDNS TXT 的 `crew` 字段（`backend/src/app/discovery.ts` 的 `crewFingerprint
 **未读（unread）**
 人发出去、队伍还没读走的条数，就是从 `read_at` 空着的那些消息数出来的（契约 `00` §5.6）。
 `unknown` 表示网关没报这一列，此时**不画徽标**：算不出来不等于 0 条。
+
+## 群组与准入
+
+**Source 准入（conversation_not_listed）**
+Source 判一段 conversation 能否派单的结果。未登记会话明确给 `conversation_not_listed` 并留可观测记录；消息仍照原会话落队列、可按 `session_id` 读回，只是不派单、不凭空消失。名单见 **会话名单（sessions）**，见 [契约 §9.8](docs/00-contract.md)。
+_Avoid_: 静默丢消息、默认会话（那是 `default_session_id`）、会话切换
+
+**群组只读投影（groups）**
+从已有 sessions / bots / tickets 派生出的 `groups[]`，每项 `{ id, title, sessions, bots, ticket_count }`。只读：零新增 Ticket 账、零新增持久化状态、不新开写路由；`ticket_count` 只数不写。见 [契约 §10](docs/00-contract.md)。
+_Avoid_: 群组账本、第二份 Ticket 账、可编辑群组
+
+**群组三态（groups_state）**
+`live`（有归组数据）/ `empty`（读得到、确实没有）/ `unavailable`（读不到）。读不到不许说成没有；`reason` 只在非 `live` 时出现，口径与产出、常规任务、记忆三态一致。
+_Avoid_: 把 unavailable 画成空、把空画成 live、布尔开关
 

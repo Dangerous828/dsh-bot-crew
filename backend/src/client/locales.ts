@@ -91,6 +91,12 @@ const TEXT = {
   statusTitle: ['状态', 'Status'],
   executingLabel: ['执行中', 'Executing'],
   queuedLabel: ['排队', 'Queued'],
+  // 隔离档位（#11 第 3 项）。文案按 ADR 0004 如实说边界，不许把 sandbox 说成「已全覆盖」：
+  // 它只包住本仓 runAsWorker 调用，agent 自由命令仍依赖 DSH provider。
+  isolationLabel: ['隔离', 'Isolation'],
+  'isolation.none': ['未隔离 · 沿用本机账号', 'None · runs as your OS user'],
+  'isolation.sandbox': ['平台沙箱 · 仅 worker 执行面', 'Platform sandbox · worker commands only'],
+  isolationHint: ['当前只隔离 worker 执行面（写本工单目录、读不到你的凭据）；agent 自由命令仍依赖 DSH 宿主。接真账号前先确认这条边界。', 'Only the worker execution face is sandboxed (writes its ticket directory, cannot read your credentials); an agent\u2019s free-form commands still depend on the DSH host. Confirm this boundary before connecting real accounts.'],
   resumeProcessing: ['恢复处理', 'Resume processing'],
   resumeProcessingConfirm: ['恢复后继续评估、派工和发送回复。', 'Resuming starts Evals, Assignments and replies again.'],
   restartInterrupts: ['保存会重启 dsh-superagent：{count} 个进行中的派工会中断，并带恢复说明重新开始。', 'Saving restarts dsh-superagent: {count} running Assignments stop and start again with a recovery note.'],

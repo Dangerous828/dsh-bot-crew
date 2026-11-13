@@ -41,6 +41,22 @@
 - worker 在 agent 会话里**实际跑的每一条命令**由 DSH 的 subprocess provider 起，不在本仓 `runAsWorker` 这条缝上——要连那些也关进沙箱，需要在 DSH provider 层支持 uid/gid 或 per-session 沙箱包装，超出本仓能控范围。这是 A 方案「完整落地」的下一步：向 DSH 提 provider 能力，或在 provider 外包一层。
 - 因此当前隔离强度：**ticket 准备阶段与 git/文件基线命令已隔开凭据**；agent 自由命令的隔离依赖 DSH。如实记录，不把「部分隔离」说成「全隔离」。
 
+## 档位可见（#11 第 3 项的前半，2026-11-13）
+
+翻默认到 `sandbox` 的**前置**是「面板上要让人一眼看出当前档位」。此前 `executor.isolation`
+只存在 settings schema 里，`/state`、面板、手机、桌面都不显示，读的人无从判断现在裸没裸跑。
+现在：
+
+- `stateView`（`GET /orchestrator/api/state`）多一个 `isolation: 'none' | 'sandbox'`，报的是
+  **配置值**，不是「已隔离」的结论。
+- 管理面板执行页状态行显示档位；`none` 用警示色，两档都带 `title` 提示说清上面的边界
+  （只包住 `runAsWorker`，agent 自由命令仍依赖 DSH provider）。文案里**不许**出现
+  「已全覆盖」「完全隔离」这类话。
+- 手机 / 桌面暂不显示：#11 说的是「面板」，且两端状态行改动要跟真机一起验，别先铺开。
+
+**没做的**：默认仍是 `none`，没有翻到 `sandbox` —— issue #11 的收口线要求真机一条活验收
+通过后才翻。这里只把「现在是哪一档」变成看得见的事实，不替人做那个决定。
+
 ## 落地顺序（对应 #9 五项）
 
 1. 本 ADR（定方案）。

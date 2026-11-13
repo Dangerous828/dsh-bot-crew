@@ -31,6 +31,9 @@ export function ExecutionStatus({ filter: current, state, reload }: {
       {!state.setup.problem && <>
         <LabelValue label={t('executingLabel')}
           value={`${state.load.running} / ${maxWorkers}`} /><LabelValue label={t('queuedLabel')} value={state.load.queued} />
+        {/* 隔离档位紧跟状态：翻默认到 sandbox 之前，这一行必须让人一眼看见现在是哪一档（#11）。 */}
+        <LabelValue label={t('isolationLabel')} value={<span data-state={state.isolation === 'none' ? 'warning' : 'ongoing'}
+          title={t('isolationHint')}>{t(`isolation.${state.isolation}`)}</span>} />
       </>}
       <ConfirmButton variant="outline" icon={paused ? 'play' : 'pause'} label={t(action)} title={t(action)} message={t(paused
         ? 'resumeProcessingConfirm' : 'pauseProcessingConfirm')}

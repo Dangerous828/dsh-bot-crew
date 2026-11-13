@@ -23,7 +23,8 @@ it('lists Tickets under Execution by who they wait on, with the Executor state a
   await click(zh['ticket.ended'])
   expect(text()).toContain('旧工单')
   expect(text()).toContain(zh['outcome.stopped'])
-  expect(all('.dt-status-line .dt-lv').map(item => item.textContent)).toEqual(['执行中 2 / 3', '排队 0'])
+  expect(all('.dt-status-line .dt-lv').map(item => item.textContent)).toEqual([
+    '执行中 2 / 3', '排队 0', `${zh.isolationLabel} ${zh['isolation.none']}`])
   // The pause is its own action: an Execution settings draft started before it still saves.
   await click(find(zh['tab.settings'], '.dt-status-head button'))
   expect(tab(zh['tab.settings']).getAttribute('aria-selected')).toBe('true')
@@ -212,6 +213,31 @@ it('words an ended Ticket by its outcome, on its row and its page, with a person
     reason: '不需要了' } }
   await remount(en)
   expect(all('.dt-hint').map(hint => hint.textContent).find(line => line?.includes(en['outcome.stopped']))).toMatch(/Stopped by a person: 不需要了$/)
+})
+
+// #11 第 3 项：翻默认到 sandbox 之前，执行页得让人一眼看见现在是哪一档。
+// 文案按 ADR 0004 如实说边界，不许拿 sandbox 冒充「已全覆盖」。
+it('shows the current isolation level on the Execution status line', async () => {
+  await mount()
+  await click(zh['tab.execution'])
+  const line = document.querySelector('.dt-status-line')?.textContent ?? ''
+  expect(line).toContain(zh.isolationLabel)
+  expect(line).toContain(zh['isolation.none'])
+  // 未隔离那档用警示色，别让人一眼扫过去以为是开着的。
+  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('warning')
+  // 提示里要说清 agent 自由命令仍不在隔离范围内。
+  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('title')).toContain('自由命令')
+})
+
+it('shows the sandbox level with its honest boundary, not "fully isolated"', async () => {
+  server.settings.executor = { ...server.settings.executor, isolation: 'sandbox' }
+  await mount()
+  await click(zh['tab.execution'])
+  const line = document.querySelector('.dt-status-line')?.textContent ?? ''
+  expect(line).toContain(zh['isolation.sandbox'])
+  expect(line).not.toContain(zh['isolation.none'])
+  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('ongoing')
+  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('title')).toContain('自由命令')
 })
 
 it('sends one stop for a double click on Confirm', async () => {

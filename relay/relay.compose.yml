@@ -39,7 +39,10 @@ services:
       RELAY_HEARTBEAT_MS: "15000"
       RELAY_PONG_TIMEOUT_MS: "60000"
       RELAY_RESPONSE_TIMEOUT_MS: "120000"
-      RELAY_MAX_BODY_BYTES: "262144"
+      # 不设 RELAY_MAX_BODY_BYTES：显式配了它就一律以它为准，会把语音的媒体上限
+      # （8MiB）一起压到 256KiB —— 实测 500KB WAV 直接被 413 拒掉。
+      # 缺省不传，server 才分得清「没配」与「显式配成某个值」，语音吃媒体默认上限，
+      # 普通 JSON 请求仍受代码里的 256KiB 默认约束。
       RELAY_MAX_INFLIGHT: "64"
       RELAY_AUTH_FAILURE_LIMIT: "20"
     # 日志上限：公网暴露面的日志会被试探填满。

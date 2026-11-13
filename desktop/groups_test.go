@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -246,5 +249,42 @@ func TestGroupsViewMatchesTheTimelineJSONShape(t *testing.T) {
 	}
 	if bad.Reason != "读不出来" || !strings.Contains(groupBarLines(bad)[0].text, "读不出来") {
 		t.Errorf("unavailable 的 reason 没透出来：%+v", bad)
+	}
+}
+
+// 上面所有用例都替换了 groupsProjection 这个 seam，所以「client.go 的 json 标签对不对」
+// 「groupsOfConversation 的 live 分支对不对」「groupsPane 还挂在左栏上吗」这三处
+// 谁也守不住 —— 独立审查实测：改 json 标签、改 live 分支、删调用点，go test 三刀全绿。
+// 这一条走真链路：httptest → Client.Timeline() → groupsOfConversation() → groupBarLines()，
+// 一次把三处都钉住。
+func TestGroupsComeThroughTheRealTimeline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[],"session_id":"main","session_api":1,
+			"groups":{"state":"live","groups":[
+				{"id":"main","title":"main","sessions":["main"],"bots":["lead"],"ticket_count":2},
+				{"id":"work","title":"work","sessions":["work"],"bots":[],"ticket_count":1}]}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := &Client{base: server.URL, token: "token", deviceID: "device", http: server.Client()}
+	conv, err := client.Timeline(context.Background())
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	// 1) json 标签对不对：字段没解析进来就是零值，这里会红。
+	if conv.Groups.State != "live" || len(conv.Groups.Groups) != 2 {
+		t.Fatalf("client.go 没把 groups 解进来：%+v", conv.Groups)
+	}
+	// 2) groupsOfConversation 的 live 分支对不对：它必须原样交出投影，不能改判 unavailable。
+	view := groupsOfConversation(conv)
+	if view.State != "live" || len(view.Groups) != 2 {
+		t.Fatalf("groupsOfConversation 把 live 改判了：%+v", view)
+	}
+	// 3) 画出来的是真数字。
+	lines := groupBarLines(view)
+	if len(lines) != 2 {
+		t.Fatalf("群组栏应有 2 行，实际 %d：%+v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0].text, "main") || !strings.Contains(lines[0].text, "2 张") {
+		t.Errorf("第一行应显示 main 与 2 张票：%q", lines[0].text)
 	}
 }

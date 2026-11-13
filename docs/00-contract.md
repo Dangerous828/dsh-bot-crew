@@ -1048,6 +1048,19 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
 脚本在该文件存在时调用它。真机里「第二个 conversation 真派单后 `/state` 与归档守卫仍正常」
 仍属 §9.4 的真机欠账，本轮没有真机证据。
 
+**两处边界（实现如此，按字面验收会以为漏了）**：
+
+- **不补派历史**：游标在拒收后照样前进，所以登记**之前**已经越过游标的旧消息不会被补派。
+  断言 4 的「立刻可派单」指登记后新到的消息。这是刻意的：否则一次登记会把整个历史队列
+  倒进 Engine。需要补历史就手动 `mobileq inject`，别指望登记回溯。
+- **`main` 不在注册名单里**：`main` 是缺省会话，恒在名单首位但**不落键**
+  （`POST /api/mobile/sessions {id:"main"}` 返回 200 但什么都不写）。它的准入仍靠手配
+  `conversations`，所以 `runtime.ts` 里 routine 派单与 handOff 造的 `conversation: 'main'`
+  Trigger 不受 S4 影响 —— 那是既有行为，不是回归。
+- **快照不回溯**：名单快照随 Trigger 落库，旧 Mandate 的 `revalidate` 按**当时**的快照判。
+  会话后来从名单移除，历史票据不会因此失效。要改这条就得在 revalidate 时重读名单，
+  属于独立决策，见 ADR 0007。
+
 ## 10. 群组只读投影（groups）
 
 群组是**只读投影**，不是第二本账。`backend/src/app/groups.ts` 的纯函数
@@ -1057,17 +1070,20 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
 
 ```jsonc
 {
-  "groups": [
-    {
-      "id": "main",                 // 按会话归属为主；无归属的 bot 落 main 组
-      "title": "主会话",
-      "sessions": ["main"],
-      "bots": ["lead"],
-      "ticket_count": 2            // 从已有 tickets 数出来的只读计数，不是新增 Ticket 账
-    }
-  ],
-  "groups_state": "live",          // live | empty | unavailable
-  "groups_reason": "…"            // 只在 groups_state != live 时出现，一句给人看的中文
+  // 整份投影是一个对象（groups / state / reason 同层），不是三个并列的顶层字段。
+  "groups": {
+    "state": "live",              // live | empty | unavailable
+    "reason": "…",                // 只在 state != live 时出现，一句给人看的中文
+    "groups": [
+      {
+        "id": "main",             // 按会话归属为主；无归属的 bot 落 main 组
+        "title": "主会话",
+        "sessions": ["main"],
+        "bots": ["lead"],
+        "ticket_count": 2         // 从已有 tickets 数出来的只读计数，不是新增 Ticket 账
+      }
+    ]
+  }
 }
 ```
 
@@ -1076,7 +1092,11 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
   把「读不到」说成「没有」。
 - **三态不许合并**：`live` = 有归组数据；`empty` = 读得到、确实没有；`unavailable` = 读不到
   （宿主没接这项能力 / 会话树打不开），客户端只说「读不出来」，不得说「还没有群组」。
-  `groups_reason` 只在非 `live` 时出现，可直接显示。
+  `reason` 只在非 `live` 时出现，可直接显示。
+- **`empty` 在实际链路上几乎不可达**，这是刻意的：`sessions` 恒含 `main`，而 `main` 组
+  确实存在（只是可能没有 bot 与票），所以「只有 main、无 bot、无票」判 `live` 而不是 `empty`。
+  真正会说 `unavailable` 的是读票 / 读名单失败 —— 那时整条时间线照常 200，只把这一格标成
+  「读不到」，绝不因此让整个时间线失败。
 - **只读**：零新增 Ticket 账、零新增持久化状态、不改路由语义；`ticket_count` 只数不写。
   没有群组写路由（不存在 `POST /api/mobile/groups`），客户端不得本地改完 `groups` 当落盘。
 - 桌面端 `desktop/ui.go` 用 `Conversation.Groups` 画只读栏，手机端不改（#14 只要求桌面或真机

@@ -41,6 +41,25 @@ relay 也把 `url.search` 原样透传（`relay/src/server.ts:644`）。缺的�
 3. contract（S4）：各层都升级后收紧准入、去掉单会话兜底一类老假设；S4 已落 Source 准入收口与
    群组只读投影。S1 不做任何删除或收紧。
 
+### 名单快照随 Trigger 走，不随名单回溯（S4 决策记录）
+
+S4 的准入判定需要「这条消息属于哪个会话、那个会话在册吗」，但 `scope()` 的签名只有
+`(meta, config)`，拿不到 `store`（`kind.ts:100` / `registry.ts:131`）。两条路：
+
+- **改 `scope()` 签名把 store 传进去**：要动 `kind.ts` + `registry.ts` + 全部 Source 实现，
+  为一个只读判定扩大接口面。
+- **在 Trigger 生成时把名单快照写进 `meta`**（选这条）：`withRoster()` 把当时注册的会话
+  写进 `trigger.meta` 与 `channel.address`，`scope()` / `channel.allowed` 只读这份快照。
+  快照是不可变副本，不引入全局可变状态，真 `Store` 上验过（`state.keys(family)`）。
+
+**代价（如实记下）**：快照会随 Trigger 落库，旧 Mandate 的 `revalidate` 按**当时**的快照判。
+所以「会话后来从注册名单移除」不会让历史票据失效。这是刻意的：准入判定的是「这条消息
+当时该不该被接」，不是「现在还能不能碰」。要让历史也跟随，就得在 revalidate 时重读名单，
+那是一次独立的语义变更（会把在跑的历史票据突然判成不准入），不在 S4 范围。
+
+同理，「登记之前已越过游标的旧消息不补派」也是刻意的：否则一次登记会把整个历史队列
+倒进 Engine。需要补历史就手动 `mobileq inject`。
+
 ## 四个垂直切片（S1–S4）
 
 | 切片 | 内容 | 依赖 | 回退点 |

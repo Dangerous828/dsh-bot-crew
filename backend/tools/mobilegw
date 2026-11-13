@@ -21,6 +21,9 @@ BIND = os.environ.get('MOBILEGW_HOST', '127.0.0.1')
 # 会话必须是请求级的：进程级常量会把两个会话静默并进同一条时间线。`main` 是唯一缺省值（契约 §1）。
 DEFAULT_SESSION = 'main'
 SESSION_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
+# header 形态（契约 §1 / #14 第 2 项）：与 x-crew-device / x-crew-credential 同族的小写头名。
+# query 优先、header 兜底；两者都给且不一致一律 400 invalid_session，不许猜哪个算数。
+SESSION_HEADER = 'x-crew-session'
 MAX_BODY = 64 * 1024
 
 
@@ -78,19 +81,48 @@ def tie_key(value):
     return '' if value is None else str(value)
 
 
-def session_of(handler):
-    """The conversation for THIS request, from ?session_id= (contract §1).
+def resolve_session(handler):
+    """Pure read of THIS request's session field: (session, explicit). No I/O.
 
-    Query-only on purpose: body and header are not transports for this field. Missing -> `main`,
-    so a legacy caller keeps seeing exactly the old rows. Malformed -> 400 invalid_session and
-    None, which tells the caller to stop before it touches the database. `fullmatch` (not `$`)
-    also rejects a trailing newline that a naive anchored regex would let through.
+    query 优先、header 兜底（契约 §1 的 header 形态）。两者都给且值不一致 -> (None, True)：
+    **绝不猜哪个算数**, 调用方一律回 400 invalid_session。两者都没给 -> (main, False)：
+    老调用，响应一个字段都不加、逐字不变。形状非法 / 同名 header 给了两个不同值 ->
+    (None, True)，同样是 400 而不是回落 main。`fullmatch`（不是 `$`）连带挡住尾部换行。
+
+    #14 字面写「header 未被识别时按缺省 main，不得报错」。按字面做会重新引入 C4 静默串线：
+    老网关不读 header，客户端以为在 work 会话、消息却 200 写进 main，全程无报错 —— 契约
+    §9.5 / ADR 0007 判定的「唯一危险组合」。裁决：那句只对「老客户端压根不发这个 header」
+    成立（下面的 session is None 分支）；「新客户端发了 header 但对端不认」必须由消息面 /
+    客户端的能力位先验挡成 409 unsupported_session 或零发出，绝不降级成 200。所以这里
+    header 一旦出现就必须被识别、必须校验、必须冲突报错，绝不静默吞掉按 main 落库。
     """
     values = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get('session_id')
-    if not values:
-        return DEFAULT_SESSION
-    session = values[0]
+    query = values[0] if values else None
+    # get_all 而不是 get：同名 header 出现两次且值不同也是「两者不一致」，不许取第一个猜。
+    raw_headers = handler.headers.get_all(SESSION_HEADER) or []
+    header_values = list(dict.fromkeys(raw_headers))
+    if len(header_values) > 1:
+        return None, True
+    header = header_values[0] if header_values else None
+    if query is not None and header is not None and query != header:
+        return None, True
+    session = query if query is not None else header
+    if session is None:
+        return DEFAULT_SESSION, False
     if not SESSION_RE.fullmatch(session):
+        return None, True
+    return session, True
+
+
+def session_of(handler):
+    """The conversation for THIS request. Invalid/conflicting -> 400 invalid_session + None.
+
+    Missing -> `main`, so a legacy caller keeps seeing exactly the old rows. None tells the
+    caller to stop before it touches the database; no row is ever written under `main` for a
+    request that explicitly named a session (C4 串线的入口).
+    """
+    session, _explicit = resolve_session(handler)
+    if session is None:
         handler._send(400, {'error': 'invalid_session'})
         return None
     return session
@@ -107,13 +139,17 @@ class H(BaseHTTPRequestHandler):
         # 能力位覆盖**所有**响应，而不只是 timeline：消息面据此在任何 operation 上判断
         # 对端是不是老网关。否则客户端不先取 timeline 就直发 send?session_id=work 时，
         # 老网关会把消息静默按 main 落库，消息面也无从发现（S1 契约最在意的串线）。
-        # 老调用（query 不带 session_id）一个字段都不加，响应逐字不变；非法值已被
-        # session_of 回过 400，这里 fullmatch 不通过同样不加。timeline 自带这两个字段，
-        # setdefault 不覆盖它。
+        #
+        # 判据与 session_of 共用 resolve_session 一处逻辑：query 或 header 任一形态显式
+        # 带了会话，所有响应都回显 session_id + session_api:1（契约 §1 header 形态）。
+        # 老调用（既无 query 也无 header）一个字段都不加，逐字不变；冲突 / 非法值已被
+        # session_of 回过 400，这里 resolve 返回 None 同样不加 —— 那个 400 响应必须逐字
+        # 是 {'error': 'invalid_session'}，不能被消息面误读成一次成功的能力协商。
+        # timeline 自带这两个字段，setdefault 不覆盖它。
         if isinstance(obj, dict):
-            values = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get('session_id')
-            if values and SESSION_RE.fullmatch(values[0]):
-                obj.setdefault('session_id', values[0])
+            session, explicit = resolve_session(self)
+            if explicit and session is not None:
+                obj.setdefault('session_id', session)
                 obj.setdefault('session_api', 1)
         data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
         self.send_response(code)

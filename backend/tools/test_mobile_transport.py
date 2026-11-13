@@ -1,4 +1,5 @@
 """Exercise the real gateway and queue in a temporary DSH home (no running agent)."""
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -13,6 +14,8 @@ import urllib.error
 import urllib.request
 
 TOOLS = Path(__file__).resolve().parent
+# #14 第 2 项的 header 形态；与网关 SESSION_HEADER、契约 §1 同一字面值。
+SESSION_HEADER = 'x-crew-session'
 
 
 class MobileTransportTest(unittest.TestCase):
@@ -35,10 +38,12 @@ class MobileTransportTest(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def request(self, path, body=None, token=True):
+    def request(self, path, body=None, token=True, extra_headers=None):
         headers = {'Content-Type': 'application/json'}
         if token:
             headers['X-GW-Token'] = self.gateway.TOKEN
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(self.url + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
         try:
             response = urllib.request.urlopen(req, timeout=3)
@@ -161,8 +166,13 @@ class MobileTransportTest(unittest.TestCase):
         self.assertEqual(self.request('/timeline-unrelated')[0], 404)
         self.assertEqual(self.request('/send-unrelated', {'text': 'hello'})[0], 404)
     # --- S1: one request, one session; the queue column is never a process constant ---
-    # Contract §1/§2/§3: session_id is query-only, defaults to main, ^[a-z0-9][a-z0-9-]{0,31}$,
+    # Contract §1/§2/§3: session_id defaults to main, shape ^[a-z0-9][a-z0-9-]{0,31}$,
     # malformed -> 400 invalid_session, and GET /timeline echoes session_id + session_api: 1.
+    # #14 第 2 项：query 优先、x-crew-session header 兜底；两者都给且不一致 -> 400，
+    # 不许猜哪个算数。能力位判据（_send 一处）同步扩到 header：显式带 header 的
+    # 请求，所有响应都回显 session_id + session_api:1。老调用（既无 query 也无
+    # header）一个字段不加。绝不按 #14 字面「header 未识别就静默按 main 落库」——
+    # 那会重新引入 C4 串线；下面的 header 用例就是这条裁决的可执行证据。
 
     def test_two_sessions_can_reuse_one_request_id_and_stay_apart(self):
         # UNIQUE(conversation, request_id) is per session: the same phone retry key in two
@@ -250,17 +260,23 @@ class MobileTransportTest(unittest.TestCase):
             with self.subTest(session=session):
                 self.assertEqual(self.request('/timeline?session_id=' + session)[1]['session_id'], session)
 
-    def test_session_id_is_a_query_only_field(self):
+    def test_body_and_unrelated_headers_are_not_session_transports(self):
         self.request('/send', {'text': 'body 里的会话名不算数', 'session_id': 'work'})
         self.assertEqual([i['text'] for i in self.request('/timeline?session_id=main')[1]['items']],
                          ['body 里的会话名不算数'])
         self.assertEqual(self.request('/timeline?session_id=work')[1]['items'], [])
-        # A header must not become a second transport for this field (headers belong to S3).
+        # 只有约定的 x-crew-session 是会话头：随便一个近义头名（X-Session-Id）绝不能
+        # 变成第二条传输，否则「客户端以为在 work、网关读成 main」又会静默发生。
         req = urllib.request.Request(self.url + '/timeline',
                                      headers={'X-GW-Token': self.gateway.TOKEN,
                                               'X-Session-Id': 'work'})
         with urllib.request.urlopen(req, timeout=3) as response:
             self.assertEqual(json.load(response)['session_id'], 'main')
+        # 约定头名则必须生效：header 兜底把这条读请求放进 work，而不是 main。
+        code, body = self.request('/timeline', extra_headers={SESSION_HEADER: 'work'})
+        self.assertEqual(code, 200)
+        self.assertEqual((body['session_id'], body['session_api']), ('work', 1))
+        self.assertEqual(body['items'], [])
 
     def test_missing_session_id_falls_back_to_main(self):
         sent = self.request('/send', {'text': '老调用', 'request_id': 'legacy-1'})[1]
@@ -269,6 +285,155 @@ class MobileTransportTest(unittest.TestCase):
         self.assertEqual(self.request('/timeline?session_id=work')[1]['items'], [])
         self.assertEqual(self.request('/claim', {'request_id': 'legacy-1'})[1]['id'], sent['id'])
         self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'legacy-1'})[0], 404)
+
+    # --- #14 第 2 项：header 形态 session_id（契约 §1 裁决） ---
+    # 反向验证目标：去掉 resolve_session 里的 header 读取，或去掉「query 与 header
+    # 不一致 -> (None, True)」的冲突判定，下面这整块用例应当成片变红。
+
+    def raw(self, path, header_pairs, body=None):
+        """手写一个请求（可带重复 header 名），返回 (status, 解析后的 JSON)。"""
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=3)
+        try:
+            conn.putrequest('POST' if body is not None else 'GET', path)
+            for name, value in header_pairs:
+                conn.putheader(name, value)
+            payload = None if body is None else json.dumps(body)
+            if payload is not None:
+                conn.putheader('Content-Type', 'application/json')
+                conn.putheader('Content-Length', str(len(payload.encode())))
+            conn.endheaders()
+            if payload is not None:
+                conn.send(payload.encode())
+            response = conn.getresponse()
+            with response:
+                return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def test_header_is_a_fallback_for_every_endpoint(self):
+        """header 兜底：query 缺省时，所有 operation 都从 x-crew-session 读会话。"""
+        hdr = {SESSION_HEADER: 'work'}
+        endpoints = (
+            ('/timeline', None), ('/health', None),
+            ('/send', {'text': 'header 侧', 'request_id': 'hdr-every-1'}),
+            ('/withdraw', {'request_id': 'hdr-every-1'}),
+            ('/claim', {'request_id': 'hdr-every-1'}),
+        )
+        for path, body in endpoints:
+            with self.subTest(path=path):
+                code, payload = self.request(path, body, extra_headers=hdr)
+                self.assertIn(code, (200, 404, 409), path)
+                # 所有响应都回显能力位（_send 一处逻辑，判据已扩到 header）。
+                self.assertEqual((payload.get('session_id'), payload.get('session_api')), ('work', 1), path)
+
+    def test_header_only_send_lands_in_its_session_and_never_silently_in_main(self):
+        """C4 裁决的核心证据：#14 字面「header 未识别时按缺省 main，不得报错」按字面做，
+        客户端以为在 work、消息却静默写进 main 且全程 200 —— 契约 §9.5 / ADR 0007
+        判定的唯一危险组合。这里 header 必须被识别：消息只落在 work，main 一个字都没有。
+        老网关不认 header 时的兜底不在本网关（见消息面 409 与桌面端能力位先验）。
+        """
+        code, sent = self.request('/send', {'text': '只给 header', 'request_id': 'hdr-c4'},
+                                  extra_headers={SESSION_HEADER: 'work'})
+        self.assertEqual(code, 200)
+        self.assertEqual((sent['session_id'], sent['session_api']), ('work', 1))
+        work = self.request('/timeline', extra_headers={SESSION_HEADER: 'work'})[1]
+        self.assertEqual([i['text'] for i in work['items']], ['只给 header'])
+        self.assertEqual(self.request('/timeline')[1]['items'], [], 'header 请求绝不静默按 main 落库')
+        self.assertEqual(self.request('/timeline?session_id=main')[1]['items'], [])
+        # query 与 header 指同一个会话时，读到的也是同一条。
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=work')[1]['items']],
+                         ['只给 header'])
+
+    def test_query_takes_priority_when_both_are_present_and_equal(self):
+        hdr = {SESSION_HEADER: 'work'}
+        for path, body in (('/timeline?session_id=work', None), ('/health?session_id=work', None),
+                           ('/send?session_id=work', {'text': '双写', 'request_id': 'hdr-both'}),
+                           ('/claim?session_id=work', {'request_id': 'hdr-both'})):
+            with self.subTest(path=path):
+                code, payload = self.request(path, body, extra_headers=hdr)
+                self.assertIn(code, (200, 409), path)
+                self.assertEqual((payload['session_id'], payload['session_api']), ('work', 1), path)
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=work')[1]['items']], ['双写'])
+
+    def test_conflicting_query_and_header_is_400_and_writes_nothing(self):
+        """两者都给且值不一致 -> 400 invalid_session：不许猜哪个算数，也不许落库。"""
+        hdr = {SESSION_HEADER: 'other'}
+        paths = (('/timeline?session_id=work', None), ('/health?session_id=work', None),
+                 ('/send?session_id=work', {'text': '猜一个算数', 'request_id': 'hdr-conflict'}),
+                 ('/withdraw?session_id=work', {'request_id': 'hdr-conflict'}),
+                 ('/claim?session_id=work', {'request_id': 'hdr-conflict'}))
+        for path, body in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path, body, extra_headers=hdr),
+                                 (400, {'error': 'invalid_session'}), path)
+        # 「不许猜」= 任何一边都没有落到库里：work / other / main 全空。
+        for query in ('/timeline?session_id=work', '/timeline?session_id=other', '/timeline'):
+            self.assertEqual(self.request(query)[1]['items'], [], query)
+        self.assertEqual(self.request('/timeline', extra_headers=hdr)[1]['items'], [])
+        # main 作为 query 也一样冲突，不存在「缺省值优先」的偷偷放行。
+        self.assertEqual(self.request('/timeline?session_id=main', extra_headers={SESSION_HEADER: 'work'}),
+                         (400, {'error': 'invalid_session'}))
+
+    def test_invalid_header_session_is_400_for_every_endpoint(self):
+        """header 形状与 query 同一正则；非法 header 绝不按 main 静默放行。"""
+        bad = ['WORK', 'work x', 'w' * 33, '-lead', 'under_score', 'main%0A', '']
+        for value in bad:
+            with self.subTest(value=value):
+                hdr = {SESSION_HEADER: value}
+                for path, body in (('/timeline', None), ('/health', None),
+                                   ('/send', {'text': 'x', 'request_id': 'hdr-bad'}),
+                                   ('/withdraw', {'request_id': 'x'}),
+                                   ('/claim', {'request_id': 'x'})):
+                    self.assertEqual(self.request(path, body, extra_headers=hdr),
+                                     (400, {'error': 'invalid_session'}), (value, path))
+        self.assertEqual(self.request('/timeline')[1]['items'], [], '非法 header 不许按 main 落库')
+        # 合法形状与 query 完全一致：尾部连字符、32 位上限都放行。
+        for session in ('work-2', 'trail-', 'a' * 32):
+            with self.subTest(session=session):
+                code, payload = self.request('/timeline', extra_headers={SESSION_HEADER: session})
+                self.assertEqual(code, 200)
+                self.assertEqual(payload['session_id'], session)
+
+    def test_every_explicit_header_response_carries_the_capability_bit(self):
+        """能力位覆盖所有响应：业务 200、409、404、400 都得让消息面认出对端版本。"""
+        hdr = {SESSION_HEADER: 'work'}
+        self.request('/send', {'text': 'B 侧', 'request_id': 'hdr-cap'}, extra_headers=hdr)
+        cases = (
+            ('/claim', {'request_id': 'hdr-cap'}),      # 200
+            ('/claim', {'request_id': 'hdr-cap'}),      # 409 已读走
+            ('/send', []),                              # 400 非法 body
+            ('/withdraw', {'request_id': 'missing'}),   # 404
+        )
+        for path, body in cases:
+            with self.subTest(path=path, body=body):
+                code, payload = self.request(path, body, extra_headers=hdr)
+                self.assertIn(code, (200, 400, 404, 409))
+                self.assertEqual((payload['session_id'], payload['session_api']), ('work', 1))
+        code, payload = self.request('/timeline-unrelated', extra_headers=hdr)
+        self.assertEqual(code, 404)
+        self.assertEqual((payload['session_id'], payload['session_api']), ('work', 1))
+
+    def test_legacy_call_without_any_session_field_is_byte_for_byte_unchanged(self):
+        """老调用（既无 query 也无 header）：响应一个字段都不加，逐字不变。"""
+        self.assertEqual(self.request('/health'), (200, {'ok': True}))
+        self.assertEqual(self.request('/timeline-unrelated'), (404, {'error': 'not found'}))
+        self.assertEqual(self.request('/timeline', token=False), (401, {'error': 'unauthorized'}))
+        code, legacy = self.request('/send', {'text': 'A 侧', 'request_id': 'hdr-legacy'})
+        self.assertEqual(code, 200)
+        self.assertEqual(set(legacy), {'ok', 'id', 'request_id'})
+        code, missing = self.request('/withdraw', {'request_id': 'never-sent'})
+        self.assertEqual(code, 404)
+        self.assertEqual(missing, {'error': 'no such message'})
+
+    def test_duplicate_conflicting_headers_are_400_not_a_guess(self):
+        """同名 header 给了两个不同值也是「两者不一致」，不许取第一个猜。"""
+        token = [('X-GW-Token', self.gateway.TOKEN)]
+        self.assertEqual(self.raw('/timeline', token + [(SESSION_HEADER, 'work'), (SESSION_HEADER, 'other')]),
+                         (400, {'error': 'invalid_session'}))
+        # 两个相同值不是冲突，仍是那一个会话。
+        code, payload = self.raw('/timeline', token + [(SESSION_HEADER, 'work'), (SESSION_HEADER, 'work')])
+        self.assertEqual(code, 200)
+        self.assertEqual((payload['session_id'], payload['session_api']), ('work', 1))
 
 
 if __name__ == '__main__':

@@ -787,10 +787,37 @@ func New(base, token, deviceID string) *Client {
 	return &Client{base: base, token: token, deviceID: deviceID, http: &http.Client{Timeout: 15 * time.Second}}
 }
 
-// ── 会话（契约 §1 / §2：session_id 只走 query，默认 main 不带参数） ──────────
+// ── 会话（契约 §1 / §2：默认 main 不带参数；非 main 时 query 与 header 双写） ──
 
 // defaultSessionID 与网关的 DEFAULT_SESSION_ID 是同一个值。
 const defaultSessionID = "main"
+
+// sessionHeader 是 header 形态的会话字段（#14 第 2 项 / 契约 §1 裁决），与
+// x-crew-device / x-crew-credential 同族；头名与网关 SESSION_HEADER、消息面
+// SESSION_HEADER 逐字一致。
+//
+// 桌面端非 main 时 query 与 header 同时带、且值相同：滚动升级中只认 query 的
+// S1 对端与认 header 的新对端都能读到，任一端都不会把 work 的消息按 main 落库。
+// 默认 main 一个会话字段都不带，老路径逐字不变。
+//
+// #14 字面写「header 未被识别时按缺省 main，不得报错」。按字面做会重新引入 C4
+// 静默串线：新客户端在 work 发了 header、老网关不认，消息却 200 写进 main。裁决：
+// 那句只对「老客户端压根不发这个 header」成立；「新客户端发了 header 但对端不认」
+// 由消息面/网关的能力位先验挡成 409 unsupported_session，桌面端则由
+// sessionCapable 先验保证非 main 请求零发出，绝不降级成 200 静默落库。
+const sessionHeader = "x-crew-session"
+
+// applySessionHeader 从请求 URL 上已有的 session_id 派生**同值** header。
+// 值只有一个来源（query），所以两者不可能不一致，也就不存在「猜哪个算数」；
+// sessionQuery 对默认 main 根本不追加参数，于是一个会话字段都不加。
+// 所有消息面请求都在 auth() 这一个点上经过它，新增会话请求不会漏掉双写。
+func applySessionHeader(request *http.Request) {
+	id := request.URL.Query().Get("session_id")
+	if id == "" || id == defaultSessionID {
+		return
+	}
+	request.Header.Set(sessionHeader, id)
+}
 
 // sessionAPIBit 是能力位的值（GLOSSARY 里叫「能力位」，不是版本号）。
 // 缺它或不是 1，就当老后端：锁 main，不发非 main 请求。
@@ -1488,6 +1515,9 @@ const defaultDeviceID = "crew-desktop"
 // 以前是「设备号为空就凭据也不发」，于是每个请求都缺 x-crew-device，必然 401。
 // 反过来说，没有 token 时一个都不发：空串凭据只会让对端分不清「没配」和「配错了」。
 func (c *Client) auth(request *http.Request) {
+	// 会话头与凭据无关，必须挂在所有消息面请求共用的这一个收口点上，
+	// 且要放在 token 判空之前：没有 token 时 header 形态也得照样生效。
+	applySessionHeader(request)
 	token := strings.TrimSpace(c.token)
 	if token == "" {
 		return

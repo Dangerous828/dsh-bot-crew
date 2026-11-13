@@ -56,9 +56,20 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   // 两条路（局域网直连、中转隧道）通向的是同一个处理器，所以请求的拼法只写一份：
   // 「`http://dsh` + 路径」只是为了给 Request 一个合法的绝对 URL，处理器只读 pathname。
   // 隧道那边还要把取消信号传下去（手机放弃了要能停掉宿主这边的活），所以它单独传一个 signal。
-  const ask = (request: { method: string; url: string }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<Response> =>
+  // 两条入口的 headers 形状不同（LAN 是 IncomingMessage['headers']，隧道是 Record<string,string>），
+  // 这里只把会话头透传下去：凭据头归各自入口的 phoneGate，逐跳头更不该进重建的 Request。
+  // 不带这一句，phoneHandler 读不到 x-crew-session，header 形态的会话会静默退回 main。
+  const sessionHeader = (headers?: Record<string, string | string[] | undefined>): Record<string, string> => {
+    const raw = headers?.['x-crew-session']
+    // 同名多值不许猜第一个（网关 get_all 的口径）：拼成一个肯定过不了形状校验的值，
+    // 交给消息面回 400 invalid_session，绝不静默按 main 落库。
+    const value = Array.isArray(raw) ? raw.join(', ') : raw
+    return typeof value === 'string' && value ? { 'x-crew-session': value } : {}
+  }
+  const ask = (request: { method: string; url: string; headers?: Record<string, string | string[] | undefined> }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<Response> =>
     answer(new Request(`http://dsh${request.url}`, {
       method: request.method,
+      headers: sessionHeader(request.headers),
       ...(body.length ? { body } : {}),
       ...(signal ? { signal } : {}),
     }))

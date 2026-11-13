@@ -326,11 +326,16 @@ function gatewayOrigin(stateDir?: string): string {
 }
 
 /**
- * 会话字段（S1 契约第 1、2 节）。只走 query —— relay 会原样透传 `url.search`，header 留给 S3 桌面端。
+ * 会话字段（S1 契约第 1、2 节 + #14 第 2 项的 header 形态）。
+ * query 优先、header 兜底；两者都给且不一致 -> 400 invalid_session，不许猜哪个算数。
+ * relay / lan-server 原样透传 headers，phone-gate 只看凭据头，所以 header 能到这一层；
+ * 转发到网关时除拼 query 外也把 header 透传下去，滚动升级中任一版对端都读得到。
  * `invalid_session` / `unsupported_session` 是契约钉死的错误码字面值（能力协商用），
  * 故意不进 PHONE_ERRORS：翻成中文，400 / 409 的码就对不上了。
  */
 const DEFAULT_SESSION_ID = 'main'
+/** header 形态的会话字段，与网关 SESSION_HEADER、桌面端 sessionHeader 同一字面值。 */
+const SESSION_HEADER = 'x-crew-session'
 /** 会话名形状（S1 契约第 1 节）。消息面校验与 threadKey 共用这一段，改形状只改一处。 */
 const SESSION_NAME = '[a-z0-9][a-z0-9-]{0,31}'
 const SESSION_ID = new RegExp(`^${SESSION_NAME}$`)
@@ -463,12 +468,27 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     if (!operation || !(OPERATIONS[operation].methods as readonly string[]).includes(incoming.method)) {
       return response(404, { error: 'Unknown operation' })
     }
-    // session_id 只走 query，缺省 main。非法值一律在这里挡住：不落到网关、不静默当 main —— 那是
-    // 本阶段最重要的防串线约束（S1 契约第 1 节）。显式非 main 遇未升级网关还有下面的 409 能力位检查。
+    // session_id：query 优先、header 兜底（#14 第 2 项）。两者都给且不一致 -> 400
+    // invalid_session，不许猜哪个算数；形状非法同样在这里挡住，不落到网关、不静默当 main。
+    //
+    // #14 字面写「header 未被识别时按缺省 main，不得报错」。按字面做会重新引入 C4 串线：
+    // 老网关不读 header，客户端以为在 work 会话、消息却 200 写进 main，全程无报错 —— 契约
+    // §9.5 / ADR 0007 判定的唯一危险组合。裁决：「按缺省 main」只对老调用（既无 query 也
+    // 无 header）成立；新客户端发了 header 而对端不认，必须由下面的 409 能力位先验挡住
+    // （桌面端则由能力位先验保证零发出），绝不降级成 200 静默落库。
     const askedSession = url.searchParams.get('session_id')
-    if (askedSession !== null && !SESSION_ID.test(askedSession)) return response(400, { error: 'invalid_session' })
-    const sessionId = askedSession ?? DEFAULT_SESSION_ID
-    const explicitSession = askedSession !== null
+    const headerSession = incoming.headers.get(SESSION_HEADER)
+    if (askedSession !== null && headerSession !== null && askedSession !== headerSession) {
+      return response(400, { error: 'invalid_session' })
+    }
+    // Headers.get 对「头存在但值为空」返回 ''（不是 null），与网关 get_all 一样视为显式非法值；
+    // 多个同名头会被拼成带 ', ' 的值，同样过不了形状校验 —— 两种都不许猜。
+    const declaredSession = askedSession ?? headerSession
+    if (declaredSession !== null && !SESSION_ID.test(declaredSession)) return response(400, { error: 'invalid_session' })
+    const sessionId = declaredSession ?? DEFAULT_SESSION_ID
+    const explicitSession = declaredSession !== null
+    // 只有客户端真的带了 header 才透传，值用校验后的 sessionId（与 query 同一个值，绝不制造冲突）。
+    const forwardHeader = headerSession !== null
     // 会话名单与登记都在宿主侧答，不经过网关；`sessions` 是唯一不转发的新增 operation。
     if (operation === 'sessions') {
       await runtime.ready
@@ -732,20 +752,34 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         if (!ticket || ticket.ended) return response(409, { error: 'Ticket is not running' })
         const token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim()
         if (!token) return response(503, { error: 'Mobile transport is not configured' })
+        // steer 在宿主侧直答，不走下面统一的那道 409 先验，但它内部要往网关写/认领消息。
+        // 两条内部请求必须同样带会话字段并验能力位：否则 header 形态的非 main steer 会
+        // 绕过先验、把消息静默按 main 落库（审查发现的真串线口子）。
+        const steerQuery = explicitSession ? `?session_id=${encodeURIComponent(sessionId)}` : ''
+        const steerHeaders: Record<string, string> = { 'X-GW-Token': token, 'Content-Type': 'application/json',
+          ...(forwardHeader ? { [SESSION_HEADER]: sessionId } : {}) }
+        const steerCapability = async (upstream: Response): Promise<Response | undefined> => {
+          if (!explicitSession || sessionId === DEFAULT_SESSION_ID) return undefined
+          const data = await upstream.clone().json().catch(() => undefined) as { session_api?: unknown } | undefined
+          if (data?.session_api !== SESSION_API) return response(409, { error: 'unsupported_session' })
+          return undefined
+        }
         const authored = typeof asked.text === 'string' ? asked.text.trim() : ''
         let text = ''
         if (authored) {
           // 发送即插队：消息以「已读」写进网关，路由不会再把它当新活接一遍。
-          const sent = await request(`${gateway}/send`, { method: 'POST',
-            headers: { 'X-GW-Token': token, 'Content-Type': 'application/json' },
+          const sent = await request(`${gateway}/send${steerQuery}`, { method: 'POST',
+            headers: steerHeaders,
             body: JSON.stringify({ text: authored, request_id: requestId, mentions: [], steer: true }),
             signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error' })
           if (!sent.ok) return response(sent.status === 401 ? 503 : sent.status, { error: 'Mobile request was rejected' })
+          const denied = await steerCapability(sent)
+          if (denied) return denied
           text = authored
         } else {
           // 对已经在队列里的消息：先认领（标记读走）。成功才说明它还没被路由读过，不会送两遍。
-          const claimed = await request(`${gateway}/claim`, { method: 'POST',
-            headers: { 'X-GW-Token': token, 'Content-Type': 'application/json' },
+          const claimed = await request(`${gateway}/claim${steerQuery}`, { method: 'POST',
+            headers: steerHeaders,
             body: JSON.stringify({ request_id: requestId }),
             signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error' })
           if (!claimed.ok) {
@@ -755,7 +789,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             }
             return response(claimed.status === 401 ? 503 : claimed.status, { error: 'Mobile request was rejected' })
           }
-          const message = await claimed.json() as { text?: unknown }
+          const message = await claimed.clone().json() as { text?: unknown }
+          const denied = await steerCapability(claimed)
+          if (denied) return denied
           text = typeof message.text === 'string' ? message.text : ''
         }
         if (!text) return response(409, { error: 'no such message' })
@@ -953,11 +989,15 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       const token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim()
       if (!token) return response(503, { error: 'Mobile transport is not configured' })
       const query = ticketId ? `?ticket=${encodeURIComponent(ticketId)}` : ''
-      // 只在显式带了 session_id 时追加：老调用的转发 URL 逐字不变，网关自己缺省 main（S1 契约第 1 节）。
+      // 只在显式带了会话字段时追加：老调用的转发 URL 逐字不变，网关自己缺省 main（S1 契约第 1 节）。
       // 有 ticket 时接 `&`，没有时接 `?`，两种形状都让网关从 url.search 取到同一个字段。
+      // header-only 请求在这里「等价地转成 query」（只认 query 的 S1 网关也读得到），同时把
+      // header 原样透传下去（认 header 的新网关也读得到）；两者值恒相同，网关不会判成冲突。
       const target = `${gateway}/${operation}${query}${explicitSession ? `${query ? '&' : '?'}session_id=${encodeURIComponent(sessionId)}` : ''}`
+      const forwardedHeaders: Record<string, string> = { 'X-GW-Token': token, 'Content-Type': 'application/json' }
+      if (forwardHeader) forwardedHeaders[SESSION_HEADER] = sessionId
       const upstream = await request(target, {
-        method: incoming.method, headers: { 'X-GW-Token': token, 'Content-Type': 'application/json' },
+        method: incoming.method, headers: forwardedHeaders,
         ...(body ? { body } : {}), signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error',
       })
       if (!upstream.ok) {
@@ -972,11 +1012,16 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           { error: upstream.status === 401 ? 'Mobile transport credential mismatch' : 'Mobile request was rejected' })
       }
       const data = await upstream.json() as Record<string, unknown>
-      // 能力位（S1 契约第 2 节）：网关对显式带 session_id 的**每个**响应都回显
-      // session_api: 1（老调用不带参数 → 响应逐字不变）。所以对任何转发 operation，
-      // 显式非 main 却没拿到 1，就是对端未升级、会把这段会话当 main 读写：直接 409，
-      // 绝不静默回落。这样即使客户端不先取 timeline 就直发 send，也不会被老网关
-      // 悄悄按 main 落库。老调用与显式 main 不受影响（老网关照常服务）。
+      // 能力位（S1 契约第 2 节 + #14 第 2 项）：网关对显式声明了会话的**每个**响应都回显
+      // session_api: 1（query 或 header 任一形态；老调用两者都不带 → 响应逐字不变）。
+      // 所以对任何转发 operation，显式非 main 却没拿到 1，就是对端未升级、会把这段会话
+      // 当 main 读写：直接 409，绝不静默回落。
+      //
+      // 这正是「老网关不认 header」的唯一兜底：#14 字面要求「header 未被识别时按缺省 main，
+      // 不得报错」，按字面做会让新客户端在 work 发的话 200 写进 main（C4 串线）。这里必须
+      // 报错。判据用的是**上游原始 data**，绝不能在下面注入兜底能力位之后再判，否则老网关
+      // 会被自己补的字段伪装成已升级。桌面端另有一道能力位先验，先验没过就零发出。
+      // 老调用与显式 main 不受影响（main 本来就是 main，老网关照常服务）。
       if (explicitSession && sessionId !== DEFAULT_SESSION_ID && data.session_api !== SESSION_API) {
         return response(409, { error: 'unsupported_session' })
       }

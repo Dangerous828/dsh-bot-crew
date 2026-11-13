@@ -457,6 +457,51 @@ it('sends a fresh message straight into the running worker without queueing it',
   expect(sentBody).toMatchObject({ text: '先看这一条', steer: true })
 })
 
+// steer 在宿主侧直答，不走统一转发那道 409 先验。它内部往网关写/认领的两条请求
+// 必须同样带会话字段并验能力位，否则 header 形态的非 main steer 会静默按 main 落库。
+it('steer carries the declared session into both internal gateway calls', async () => {
+  const steer = vi.fn(async () => true)
+  const gateway = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (new URL(String(input)).pathname.endsWith('/claim')) {
+      return Response.json({ ok: true, id: 3, text: '排队的这条', session_api: 1 })
+    }
+    return Response.json({ ok: true, id: 9, session_api: 1 })
+  })
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1', open: true } }, steer }), 'http://gw',
+    gateway as unknown as typeof fetch)
+  const headers = { 'x-crew-session': 'work' }
+  const queued = await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST', headers,
+    body: JSON.stringify({ ticket: 't1', request_id: 'r1' }) }))
+  expect(queued.status).toBe(200)
+  const fresh = await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST', headers,
+    body: JSON.stringify({ ticket: 't1', request_id: 's1', text: '先看这一条' }) }))
+  expect(fresh.status).toBe(200)
+  // 两条内部请求都带 query 与 header，值同为 work。
+  expect(gateway.mock.calls.map(call => String(call[0]))).toEqual([
+    'http://gw/claim?session_id=work', 'http://gw/send?session_id=work',
+  ])
+  for (const call of gateway.mock.calls) {
+    expect((call[1]?.headers as Record<string, string>)['x-crew-session']).toBe('work')
+  }
+})
+
+it('steer refuses a legacy gateway for a non-main session instead of writing into main', async () => {
+  const steer = vi.fn(async () => true)
+  // 老网关：任何响应都不带 session_api。
+  const gateway = vi.fn(async () => Response.json({ ok: true, id: 9 }))
+  const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1', open: true } }, steer }), 'http://gw',
+    gateway as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST',
+    headers: { 'x-crew-session': 'work' },
+    body: JSON.stringify({ ticket: 't1', request_id: 's1', text: '先看这一条' }) }))
+  expect(result.status).toBe(409)
+  expect(await result.json()).toEqual({ error: 'unsupported_session' })
+  expect(steer).not.toHaveBeenCalled()
+  // 老调用（不带会话字段）不受影响，照常插队。
+  expect((await handler(new Request('http://dsh/api/mobile/steer', { method: 'POST',
+    body: JSON.stringify({ ticket: 't1', request_id: 's2', text: '老调用' }) }))).status).toBe(200)
+})
+
 it('takes over exactly the ticket it names, and refuses an unknown one', async () => {
   const engine = { stopTicket: vi.fn() }
   const handler = phoneHandler(controlHost({ tickets: { t1: { id: 't1' } }, engine }), undefined,
@@ -993,4 +1038,142 @@ it('does not let a decision from another conversation leak into main', async () 
   const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
   const main = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as { declined: unknown[] }
   expect(main.declined).toEqual([])
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #14 第 2 项：header 形态 session_id（契约 §1 裁决）。
+// query 优先 / header 兜底 / 冲突 400 不许猜 / 非法 400 / 老调用逐字不变 /
+// header 请求转发时 query 与 header 双写且值相同 / 老网关不认 header 时 409 不静默。
+// 反向验证目标：去掉 incoming.headers.get(SESSION_HEADER) 或去掉冲突判定，
+// 下面这一整块用例应当成片变红。
+// ─────────────────────────────────────────────────────────────────────────────
+const SESSION_HEADER = 'x-crew-session'
+
+/** 带 header 形态会话的请求；init.headers 仍是普通对象，避免测试自己造出歧义。 */
+function withHeader(url: string, session: string, init: RequestInit = {}): Request {
+  return new Request(url, { ...init,
+    headers: { ...(init.headers as Record<string, string> | undefined ?? {}), [SESSION_HEADER]: session } })
+}
+
+/** 记下转发给网关的 URL 与 headers，用来验证双写与老调用逐字不变。 */
+function recordingUpstream(body: unknown = { items: [], session_id: 'work', session_api: 1 }) {
+  const seen: { url: string; headers: Record<string, string> }[] = []
+  const upstream = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    seen.push({ url: String(input), headers: { ...(init?.headers as Record<string, string> | undefined ?? {}) } })
+    return Response.json(body)
+  })
+  return { seen, upstream }
+}
+
+it('accepts a session from the header and forwards query + header with the same value', async () => {
+  const { runtime } = sessionHost()
+  const { seen, upstream } = recordingUpstream()
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(withHeader('http://dsh/api/mobile/timeline', 'work'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toMatchObject({ session_id: 'work', session_api: 1 })
+  // 等价转成 query（只认 query 的 S1 网关读得到）+ 原样透传 header（认 header 的新网关
+  // 也读得到），两者值恒相同，网关绝不会判成冲突。
+  expect(seen[0]?.url).toBe('http://gw/timeline?session_id=work')
+  expect(seen[0]?.headers[SESSION_HEADER]).toBe('work')
+})
+
+it('takes the query over an equal header, and refuses a conflicting pair with 400', async () => {
+  const { runtime } = sessionHost()
+  const { seen, upstream } = recordingUpstream()
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  // 两者都给且值相同：query 优先，正常服务。
+  const agreed = await handler(withHeader('http://dsh/api/mobile/timeline?session_id=work', 'work'))
+  expect(agreed.status).toBe(200)
+  expect(seen[0]?.url).toBe('http://gw/timeline?session_id=work')
+  expect(seen[0]?.headers[SESSION_HEADER]).toBe('work')
+  // 两者都给且值不一致 -> 400 invalid_session，不许猜哪个算数，一个请求都不转发。
+  upstream.mockClear()
+  const conflict = await handler(withHeader('http://dsh/api/mobile/timeline?session_id=work', 'other'))
+  expect(conflict.status).toBe(400)
+  expect(await conflict.json()).toEqual({ error: 'invalid_session' })
+  expect(upstream).not.toHaveBeenCalled()
+  // main 也不是「缺省值优先」的偷偷放行口。
+  expect((await handler(withHeader('http://dsh/api/mobile/timeline?session_id=main', 'work'))).status).toBe(400)
+})
+
+it('rejects an invalid or ambiguous header session before it reaches the gateway', async () => {
+  const { runtime } = sessionHost()
+  const { upstream } = recordingUpstream()
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  for (const bad of ['Work', 'a b', '', 'x'.repeat(33), '-bad', 'a_b', 'bad!', 'main%0A']) {
+    const result = await handler(withHeader('http://dsh/api/mobile/timeline', bad))
+    expect(result.status).toBe(400)
+    expect(await result.json()).toEqual({ error: 'invalid_session' })
+  }
+  // 头存在但值为空同样不是「老调用」：显式的空值必须报错，不能静默按 main。
+  const empty = new Request('http://dsh/api/mobile/timeline', { headers: { [SESSION_HEADER]: '' } })
+  expect((await handler(empty)).status).toBe(400)
+  // 多个同名 header 拼成带 ', ' 的值，也不许猜取第一个。
+  const doubled = new Request('http://dsh/api/mobile/timeline')
+  doubled.headers.append(SESSION_HEADER, 'work')
+  doubled.headers.append(SESSION_HEADER, 'other')
+  expect((await handler(doubled)).status).toBe(400)
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('keeps a legacy call with neither query nor header byte-for-byte unchanged', async () => {
+  const { runtime } = sessionHost()
+  const { seen, upstream } = recordingUpstream({ ok: true, id: 1, request_id: 'r1' })
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/send', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+  expect(result.status).toBe(200)
+  // 老调用一个会话字段都不加：转发 URL 无 query、转发 headers 无 x-crew-session，
+  // 响应也原样透传（能力位是网关 _send 才注入，老调用连它都不加）。
+  expect(seen[0]?.url).toBe('http://gw/send')
+  expect(seen[0]?.headers).toEqual({ 'X-GW-Token': 'server-only-test-token', 'Content-Type': 'application/json' })
+  expect(await result.json()).toEqual({ ok: true, id: 1, request_id: 'r1' })
+})
+
+it('refuses a header-only non-main session against a gateway without session_api (409, no silent main)', async () => {
+  const { runtime } = sessionHost()
+  // 老网关：不认 x-crew-session，也不回能力位，会把 work 的消息静默按 main 落库。
+  // #14 字面「header 未被识别时按缺省 main，不得报错」按字面做就是这个 C4 串线组合。
+  const { seen, upstream } = recordingUpstream({ ok: true, id: 1, request_id: 'r1' })
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(withHeader('http://dsh/api/mobile/send', 'work', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+  expect(result.status).toBe(409)
+  expect(await result.json()).toEqual({ error: 'unsupported_session' })
+  // 被问的仍然是 work，不是 main：绝不静默回落。header 也透传下去了。
+  expect(seen[0]?.url).toBe('http://gw/send?session_id=work')
+  expect(seen[0]?.headers[SESSION_HEADER]).toBe('work')
+  // 老调用与显式 main 照常服务（main 本来就是 main，老网关能服务）。
+  expect((await handler(new Request('http://dsh/api/mobile/send', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r2' }) }))).status).toBe(200)
+  expect((await handler(withHeader('http://dsh/api/mobile/send', 'main', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r3' }) }))).status).toBe(200)
+})
+
+it('serves a header-only session once the gateway echoes session_api', async () => {
+  const { runtime } = sessionHost()
+  const { upstream } = recordingUpstream()
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: '{"id":"work"}' }))
+  const result = await handler(withHeader('http://dsh/api/mobile/timeline', 'work'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toMatchObject({ session_id: 'work', session_api: 1,
+    sessions: ['main', 'work'], default_session_id: 'main' })
+})
+
+it('echoes session_id + session_api on every response of a header-declared request', async () => {
+  const { runtime } = sessionHost()
+  // 网关 _send 一处逻辑：显式带 header 的请求，所有响应都回显能力位。消息面把
+  // 转发 operation 的 data 原样交回，timeline 自己算的会话也以 header 为准。
+  const { upstream } = recordingUpstream({ ok: true, id: 1, request_id: 'r1', session_id: 'work', session_api: 1 })
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  for (const path of ['/api/mobile/send', '/api/mobile/withdraw']) {
+    const result = await handler(withHeader(`http://dsh${path}`, 'work', { method: 'POST',
+      body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+    expect(result.status).toBe(200)
+    expect(await result.json()).toMatchObject({ session_id: 'work', session_api: 1 })
+  }
+  const timeline = await handler(withHeader('http://dsh/api/mobile/timeline', 'work'))
+  expect(await timeline.json()).toMatchObject({ session_id: 'work', session_api: 1 })
 })

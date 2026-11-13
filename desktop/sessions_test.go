@@ -16,8 +16,9 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// 多会话（S3 桌面端）。这些用例盯住四件事：session_id 只走 query 且默认 main 不带参数、
-// 能力位先验的三态、每会话一份缓存、以及「老后端锁 main、非法 id 本地拒绝」。
+// 多会话（S3 桌面端 + S4 header 形态）。盯住：session_id 走 query、非 main 同值双写
+// x-crew-session、默认 main 一个会话字段都不带、能力位先验三态、每会话一份缓存、
+// 「老后端锁 main、非法 id 本地拒绝」。
 // 会话相关的测试都从客户端的公开方法与 app 的公共状态入口进去，不看内部实现。
 
 type sessionCall struct {
@@ -125,8 +126,9 @@ func TestSessionNamesAreCheckedLocally(t *testing.T) {
 	}
 }
 
-// 会话 id 只走 query：header 与 body 都不认（S1 网关 session_of() 只读 urlsplit(path).query）。
-func TestNonMainSessionUsesQueryOnly(t *testing.T) {
+// 会话 id 走 query，非 main 时另加同值 x-crew-session header（#14 第 2 项 / 契约 §1）。
+// body 不认；header 的值只从 query 派生，所以两者不可能不一致。
+func TestNonMainSessionUsesQueryAndSameValueHeader(t *testing.T) {
 	_, log, client := sessionCapableFixture(t)
 	client = client.WithSession("work")
 	ctx := context.Background()
@@ -168,12 +170,33 @@ func TestNonMainSessionUsesQueryOnly(t *testing.T) {
 		if got.url != tc.want {
 			t.Errorf("%s 打到了 %q，契约是 %q", tc.name, got.url, tc.want)
 		}
+		// 旧形态的头名一概不认；S4 只认 x-crew-session，且值必须与 query 同值。
 		if got.headers.Get("session_id") != "" || got.headers.Get("X-Session-Id") != "" {
-			t.Errorf("%s 把会话放进了 header：%v", tc.name, got.headers)
+			t.Errorf("%s 用了旧形态的会话头：%v", tc.name, got.headers)
+		}
+		if got := got.headers.Get(sessionHeader); got != "work" {
+			t.Errorf("%s 的 x-crew-session = %q，应与 query 同为 work", tc.name, got)
 		}
 		if strings.Contains(got.body, "session_id") {
 			t.Errorf("%s 把会话放进了 body：%s", tc.name, got.body)
 		}
+	}
+}
+
+// 默认 main 一个会话字段都不带（query 与 header 都不加），老路径逐字不变。
+func TestDefaultMainCarriesNoSessionField(t *testing.T) {
+	_, log, client := sessionCapableFixture(t)
+	ctx := context.Background()
+	log.reset()
+	if _, err := client.Timeline(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := log.last()
+	if strings.Contains(got.url, "session_id") {
+		t.Errorf("默认 main 的 URL 带了会话参数：%q", got.url)
+	}
+	if got.headers.Get(sessionHeader) != "" {
+		t.Errorf("默认 main 带了 x-crew-session：%v", got.headers)
 	}
 }
 

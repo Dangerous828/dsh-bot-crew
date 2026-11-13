@@ -265,6 +265,23 @@ it('points a code reply at its own ticket, and leaves it blank when it cannot te
   expect(out[0]).toEqual(items[0])
 })
 
+// 老网关把「没有票号」写成空串而不是干脆不给字段。空串不是已有值，
+// 否则那条回话永远补不上票号、结果条也永远不画（code-card 批留下的 nit）。
+it('treats an empty ticket_ref as missing and fills it from the decision', async () => {
+  const { ticketRefs, withTicketRefs } = await import('../src/app/mobile-http.ts')
+  const items = [
+    { id: 'r7', role: 'agent', reply_to: 'm6', ticket_ref: '', text: '改好了', at: '2026-11-11T00:00:10.000Z' },
+    { id: 'r8', role: 'agent', reply_to: 'm6', ticket_ref: 'tk-gateway-wins', text: '另一个回执', at: '2026-11-11T00:00:11.000Z' },
+  ]
+  const decisions = [{ kind: 'accept', threadKey: 'team:main:6', ticketId: 'tk-1', at: '2026-11-11T00:00:05.000Z' }]
+  const refs = ticketRefs(items as never, decisions as never)
+  expect(refs.get('r7')).toBe('tk-1')
+  expect(refs.has('r8')).toBe(false) // 网关给的真值仍然优先。
+  const out = withTicketRefs(items as never, refs) as Record<string, unknown>[]
+  expect(out[0]).toMatchObject({ id: 'r7', ticket_ref: 'tk-1' })
+  expect(out[1]).toMatchObject({ id: 'r8', ticket_ref: 'tk-gateway-wins' })
+})
+
 // 工作区三个控件与花名册。假宿主只给这一条会用到的那部分能力：真 Runtime 上它们都在，
 // 但测试不必为了一个 stopTicket 把整个引擎搭起来。
 function controlHost(options: { tickets?: Record<string, unknown>; engine?: unknown; settingsControl?: unknown

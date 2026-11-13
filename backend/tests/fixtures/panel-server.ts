@@ -159,7 +159,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused,
+  masterId: 'master', paused: server.settings.paused, isolation: server.settings.executor.isolation,
   // The panel does not read health; the service script does.
   health: {},
   // 看门狗快照：这份 fixture 不驱动它，给 null（没有告警）。

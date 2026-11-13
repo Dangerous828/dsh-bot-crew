@@ -80,6 +80,32 @@ it('reclaims a resumed Session whose existing selection points at a gone provide
   // 真正用 selectModel 切换（不是 append），这样老会话之后的请求也换模型，重启不再回旧状态。
   expect(selectModel).toHaveBeenCalledWith(expect.objectContaining({ provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' }))
 })
+
+// #13 的收口线：「光 selection 写对不算，request 走对才算」。
+// 宿主里 sessionController.selectModel 走 selectForNextRequest：它 append 一条 durable
+// model/selection，并把 selection.current 置为新选择；installModelSelection 在
+// system-prompt/assemble 时把 current 快照成 assembled，agent/request 再用 assembled
+// 覆盖 provider/model。所以切换必须走 selectModel 这个正规接口——只 append 事件、
+// 或把旧 requestHeader 留在那儿，下一次真实 request 就会继续用死 provider。
+it('routes the actual request through the configured provider after reclaiming a dead selection (#13)', async () => {
+  const { ctx, agent, host, listModels, selectModel, request } = await fixture()
+  const dead = { provider: 'deepseek-account', model: 'deepseek-flash' }
+  // 老会话：既发过请求（落盘 header 指向死 provider），也有过时的 selection。
+  agent.session.append('request/header', { header: { config: dead }, reason: 'initial' })
+  const event = agent.session.append('model/selection', dead); ctx.emit('session/event', agent.session, event)
+  listModels.mockImplementation(async () => [{ id: 'workbuddy/deepseek-v4.1-flash-500k' }])
+  // mock 只模拟宿主 selectForNextRequest 的那一半：把新选择写成 selection.current。
+  // 关键是不调 selectModel 就不会更新——若实现退回 append 老路，request 仍走死 provider，此例变红。
+  selectModel.mockImplementation(async (r: { provider: string; model: string }) => {
+    Object.defineProperty(host, 'current', { value: { provider: r.provider, model: r.model }, configurable: true, writable: true })
+    return { selected: { provider: r.provider, model: r.model } }
+  })
+  await initializeRoleModel(ctx, agent, { provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' })
+  expect(selectModel).toHaveBeenCalledWith(expect.objectContaining({ provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' }))
+  // 下一次真正组装 prompt 并发请求：provider/model 必须是新路由，不是 deepseek-account。
+  await ctx.systemPrompt.assemble()
+  expect(await request()).toMatchObject({ provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' })
+})
 it('inherits the host when unset and fails unavailable routes before recording a selection', async () => {
   const { ctx, agent, resolve, request } = await fixture()
   await initializeRoleModel(ctx, agent, null)

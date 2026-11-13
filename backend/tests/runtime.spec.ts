@@ -562,6 +562,11 @@ it('projects read models for the management page and removes thread subscription
   expect((await api('GET', 'state')).body).not.toHaveProperty('tickets')
   // scripts/dsh-superagent and agents read health from GET state (docs/006, Management API); settings and their revisions have their own route.
   expect((await api('GET', 'state')).body).toMatchObject({ health: { runtime: { state: expect.any(String) } }, paused: false, load: { maxWorkers: 3 } })
+  // 隔离档位必须随 /state 出去：翻默认到 sandbox 之前，面板与 doctor 都得读得到现在是哪一档（#11）。
+  // 这里报的是配置值，不是「已隔离」的结论 —— ADR 0004 的边界由客户端文案负责说清。
+  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'none' })
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, isolation: 'sandbox' } })
+  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'sandbox' })
   expect((await api('GET', 'settings')).body).toMatchObject({ sources: expect.arrayContaining([expect.objectContaining({ id: 'github',
     revision: expect.any(Number), value: expect.objectContaining({ enabled: true }) })]), blocks: { policy: { revision: expect.any(Number) } } })
   expect((await api('POST', `threads/${encodeURIComponent(threadKeyValue)}/unsubscribe`)).body).toMatchObject({ removed: true })
@@ -1898,6 +1903,61 @@ it('unarchives the main Session on startup when it was archived (root fix for bl
   await next.ready
   await vi.waitFor(() => expect(unarchive).toHaveBeenCalledWith(masterId))
   expect((services.workspaceRegistry as unknown as { archivedSessionIds: string[] }).archivedSessionIds).not.toContain(masterId)
+})
+
+// 启动检查只管得了一次。workspace.json 是一台机器一份、所有宿主共用、整文件覆写，
+// 别的宿主（另一个 profile / Electron）随时能把含主 Session 的旧集合写回来。两道机制：
+// 归档准入 waterfall 挡住走正规接口的请求，一分钟巡检兜住跨进程覆写，且复发要可见。
+it('refuses to archive the main Session at admission, and leaves other sessions alone', async () => {
+  const instance = await restart()
+  await instance.ready
+  const ctx = (instance as unknown as { ctx: Context & { waterfall: (...args: unknown[]) => Promise<unknown> } }).ctx
+  const guard = (sessionId: string) => ctx.waterfall('workspace/session-activity', { sessionId }, async () => [])
+  expect(await guard(instance.masterId)).toContainEqual({ kind: 'orchestrator' })
+  // 别的会话照旧：worker 归档不能被这条守卫误挡。
+  expect(await guard('worker-any-ticket')).toEqual([])
+})
+
+// 这一例钉的是「巡检真的挂在每拍上」：直接调 ensureMasterActive 会漏掉挂载点被删的情况。
+it('checks the main Session archive state on every routine tick', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  try {
+    const instance = await restart()
+    await instance.ready
+    const registry = services.workspaceRegistry as unknown as { archivedSessionIds: string[]; unarchiveSession: (id: string) => Promise<void> }
+    const unarchive = vi.fn(async () => { registry.archivedSessionIds = [] })
+    registry.unarchiveSession = unarchive
+    registry.archivedSessionIds = [instance.masterId]
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(unarchive).toHaveBeenCalledWith(instance.masterId)
+    expect(registry.archivedSessionIds).not.toContain(instance.masterId)
+  } finally {
+    await runtime?.stop()
+    vi.useRealTimers()
+  }
+})
+
+it('unarchives the main Session again when another host writes it back during the run', async () => {
+  const instance = await restart()
+  await instance.ready
+  const masterId = instance.masterId
+  const registry = services.workspaceRegistry as unknown as { archivedSessionIds: string[]; unarchiveSession: (id: string) => Promise<void> }
+  const unarchive = vi.fn(async (id: string) => {
+    registry.archivedSessionIds = registry.archivedSessionIds.filter(x => x !== id)
+  })
+  registry.unarchiveSession = unarchive
+  registry.archivedSessionIds = [masterId]
+  const guard = instance as unknown as { ensureMasterActive: (phase: 'watch') => Promise<boolean> }
+  expect(await guard.ensureMasterActive('watch')).toBe(true)
+  expect(unarchive).toHaveBeenCalledWith(masterId)
+  expect(registry.archivedSessionIds).not.toContain(masterId)
+  // 复发要让人看见：看门狗账本有一条，桌面右栏与管理面 /state 都读得到。
+  expect(instance.watchdogStatus().alerts.filter(alert => alert.kind === 'master_archived')).toHaveLength(1)
+  // 两个宿主来回覆写时不刷屏：一小时内只记一条，但每次都照样解出来。
+  registry.archivedSessionIds = [masterId]
+  expect(await guard.ensureMasterActive('watch')).toBe(true)
+  expect(registry.archivedSessionIds).not.toContain(masterId)
+  expect(instance.watchdogStatus().alerts.filter(alert => alert.kind === 'master_archived')).toHaveLength(1)
 })
 
 // 收尾那一下会丢：进程重启、崩溃、或同一份 workspace.json 被另一台宿主整文件覆写过之后，

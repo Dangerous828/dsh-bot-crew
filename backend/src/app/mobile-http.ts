@@ -214,8 +214,9 @@ export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: s
     // 对不上的仍然缺着 —— 这个字段是**来源**，不是猜出来的。
     const row = typeof item.reply_to === 'string' ? /^m(\d+)$/.exec(item.reply_to)?.[1] : undefined
     const found = row ? byRow.get(row) : undefined
-    // 网关自己已经给了 ticket_ref 就以它为准：这里只补缺，不改写已有的值。
-    if (!found || typeof item.ticket_ref === 'string') continue
+    // 网关自己给了非空 ticket_ref 就以它为准：这里只补缺，不改写已有的值。
+    // 空串不是「已有值」——老网关会把它写成 ''，那时结果条该照常补上真票号。
+    if (!found || (typeof item.ticket_ref === 'string' && item.ticket_ref.length > 0)) continue
     if (typeof item.id === 'string' && item.id) refs.set(item.id, found.ticket)
   }
   return refs

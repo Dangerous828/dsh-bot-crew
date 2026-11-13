@@ -110,6 +110,10 @@ export function stateView(runtime: HttpHost) {
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
     masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    // 隔离档位要让人一眼看见（#11 第 3 项：翻默认到 sandbox 之前，面板得先说清现在是哪一档）。
+    // 只报配置里的值，不把 sandbox 说成「已全覆盖」——ADR 0004 写明它只包住 runAsWorker，
+    // agent 自由命令仍依赖 DSH provider。文案的边界写在客户端本地化里。
+    isolation: settings.executor.isolation,
     // 看门狗快照：桌面右栏与管理面都从这里读「最近有没有卡住的事」，不依赖 App 系统推送（#8-2）。
     watchdog: runtime.watchdogStatus?.() ?? null }
 }

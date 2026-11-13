@@ -73,6 +73,8 @@ import { memoryView, type MemoryView } from './views/memory.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
+/** 主 Session 常驻：归档准入 waterfall 用这个 family 报「还在忙」，让任何归档请求在写盘前被拒。 */
+declare module '@deepseek-ai/dsh-workspace/types' { interface SessionActivityKindMap { orchestrator: true } }
 /**
  * Why a finished worker session is archived at once.
  *
@@ -174,6 +176,10 @@ export class Runtime extends Service implements SourceHost {
   // 看门狗告警账本：超时未决定这类「卡住」事件各记一条，桌面/管理面读它显示横幅。
   // 与 pushNotice 无关——即使 App 的独立系统推送停了，这条账本也一定写在 /state 上（#8-2）。
   private readonly watchdogAlerts: { at: string; kind: string; title: string; body: string; decisionId: string }[] = []
+  /** 归档准入守卫只装一次；装过时 ctx 事件已被 ctx 自行回收，无需手动解绑。 */
+  private masterArchiveGuardInstalled = false
+  /** 上次巡检看到「主 Session 被归档」的时刻，用来给重复告警去重，别每个 tick 刷一条。 */
+  private masterArchiveAlertedAt?: number
   private routineTimer?: ReturnType<typeof setInterval>
   // 上次 tick 的时刻。Mac 睡眠时 setInterval 也停摆，醒来后第一次 tick 会明显晚于 TICK_MS；
   // 用它判断「是不是睡过头了」，睡过就先补扫一次自愈，别让停机窗口里的卡死没人管（#8-4）。
@@ -344,7 +350,7 @@ export class Runtime extends Service implements SourceHost {
           const archiving = ctx.workspaceRegistry.archiveSession
           if (event.type === 'ticket.ended' && typeof archiving === 'function') {
             void archiving.call(ctx.workspaceRegistry, workerSessionId(event.data.ticketId) as SessionId, { stopActivity: true })
-              .catch(() => undefined)
+              .catch((error: unknown) => { ctx.logger.warn('dsh-superagent could not archive worker Session on ticket end: %s', String(error)) })
           }
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
@@ -1171,6 +1177,8 @@ export class Runtime extends Service implements SourceHost {
     }
     this.sessions.install()
     this.executor.install()
+    // 先装准入守卫，再补归档：补归档这一轮也要受「不许归档主 Session」约束。
+    this.installMasterArchiveGuard()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
     await this.archiveFinishedWorkers()
     await this.ensureMasterActive()
@@ -1196,31 +1204,72 @@ export class Runtime extends Service implements SourceHost {
    * 已经归档过的 id 会被 registry 直接跳过，重复调用是安全的。
    */
   /**
-   * 确保主 Session 没有被归档。
+   * 把「主 Session 不许被归档」从一条约定变成宿主自己的准入机制。
+   *
+   * `workspaceRegistry.archiveSession` 在写盘前会跑一遍 `workspace/session-activity`
+   * waterfall；任何非空结果都以 `WorkspaceActiveSessionError` 拒绝这次归档。我们对主 Session
+   * 报一条常驻活动，让面板误点、历史迁移、别的插件走正规接口发起的归档在**写入之前**就被挡下，
+   * 而不是等写进 `workspace.json` 之后再靠启动检查擦一遍。
+   *
+   * 这是机制层的第一道；跨进程整文件覆写不走这个 waterfall，由下面的定时巡检兜住。两道一起
+   * 才叫根治：只装启动检查，运行中复发仍然会静默瘫队。
+   */
+  private installMasterArchiveGuard(): void {
+    if (this.masterArchiveGuardInstalled) return
+    if (typeof this.ctx.waterfall !== 'function') return // 精简组合/测试替身没有事件总线就不装。
+    this.masterArchiveGuardInstalled = true
+    this.ctx.on('workspace/session-activity', async ({ sessionId }, next) => {
+      const activity = await next()
+      if (sessionId !== this.masterId) return activity
+      this.ctx.logger.warn('dsh-superagent: 拒绝归档主 Session %s（它是队伍总路由，归档会让所有 turn 在 pre-step 被拒）', this.masterId)
+      return [{ kind: 'orchestrator' }, ...activity]
+    })
+  }
+
+  /**
+   * 确保主 Session 没有被归档（启动一次 + 运行中每拍一次）。
    *
    * 根因（#4 那类「消息永远排队、Eval 一直 evaluating 到超时」的真正元凶）：DSH 的
    * `ArchivedSessionGate` 会在 `agent/pre-step` 里对「已归档会话」直接返回 `reject`，
-   * turn 于是以 `blocked` 收口、连一次模型请求都不发。主 Session 一旦被归档（面板误点、
-   * 或历史迁移把它写进归档集合），它收到的每张 candidate 卡都会在 pre-step 被拒，
-   * eval 永远等不到判定 → 超时 → 所有消息卡在「排队中」。这与模型、权限都无关，
-   * 只跟这条归档标记有关，所以重启也修不好、换模型也没用。
+   * turn 于是以 `blocked` 收口、连一次模型请求都不发。主 Session 一旦被归档，它收到的每张
+   * candidate 卡都会在 pre-step 被拒，eval 永远等不到判定 → 超时 → 所有消息卡在「排队中」。
+   * 这与模型、权限都无关，只跟这条归档标记有关。
    *
-   * 主 Session 是这台机器替主人干活的总路由，任何时候都不该被归档。每次启动收尾时主动
-   * 从归档集合里解出来（`unarchiveSession` 是正规接口，写回 workspace 状态），并记一条告警，
-   * 别让「主 Session 被归档」这种状态静默地把整支队伍瘫掉。
+   * 为什么不能只在启动时查一次：`~/.dsh/storages/workspace.json` 是**一台机器一份、所有宿主
+   * 共用**的状态文件，各宿主各持一份内存状态、整文件原子覆写，谁后写谁赢。另一台宿主（另一个
+   * profile / Electron）拿着旧的归档集合写回来，下次进程启动就会读到带着主 Session 的脏集合；
+   * 而本进程运行途中 registry 状态也可能被别的调用改回「已归档」。启动检查早就跑完了，队伍
+   * 就这样静默瘫掉。所以把同一份检查挂到已有的一分钟巡检上：状态不变量由机制持续保证，
+   * 复发最多一拍就解出来，并记一条看得见的告警，不再静默。
+   *
+   * 跨进程整文件覆写发生在 DSH 的 workspace 存储层，不在本仓能改的范围；这里不去猜别人的
+   * 文件路径或绕过正规接口读盘，只用 `workspaceRegistry` 保证本进程看到的状态不变量，并把
+   * 残留的脏状态在每次启动时清掉。边界与验收见 docs/adr/0005-*。
    */
-  private async ensureMasterActive(): Promise<void> {
+  private async ensureMasterActive(phase: 'startup' | 'watch' = 'startup'): Promise<boolean> {
     const registry = this.ctx.workspaceRegistry
     // 组合里可能没有归档能力（精简部署/测试替身）：没有就不管，别让启动因缺接口而崩。
     const archived = registry.archivedSessionIds
-    if (!Array.isArray(archived) || typeof registry.unarchiveSession !== 'function') return
-    if (!archived.includes(this.masterId as SessionId)) return
+    if (!Array.isArray(archived) || typeof registry.unarchiveSession !== 'function') return false
+    if (!archived.includes(this.masterId as SessionId)) return false
     try {
       await registry.unarchiveSession(this.masterId as SessionId)
-      this.ctx.logger.warn('dsh-superagent: 主 Session %s 曾被归档，已自动解除（归档会导致所有 turn 在 pre-step 被拒、消息永远排队）', this.masterId)
+      this.ctx.logger.warn('dsh-superagent: 主 Session %s 曾被归档（phase=%s），已自动解除（归档会导致所有 turn 在 pre-step 被拒、消息永远排队）', this.masterId, phase)
+      // 复发要让人看见：写进看门狗账本，桌面右栏与管理面 /state 都读得到。一小时内只记一条，
+      // 免得两个宿主来回覆写时每个 tick 刷一条。
+      const at = Date.now()
+      if (phase === 'watch' && (!this.masterArchiveAlertedAt || at - this.masterArchiveAlertedAt > 3_600_000)) {
+        this.masterArchiveAlertedAt = at
+        this.watchdogAlerts.unshift({ at: now(), kind: 'master_archived', title: '队伍刚刚被挡了一下',
+          body: '主 Session 又被归档了，已自动解除。通常是另一台 DSH 宿主把旧的 workspace 状态整份写回来；反复出现就来查一下有几台宿主在同时跑。',
+          decisionId: this.masterId })
+        if (this.watchdogAlerts.length > 50) this.watchdogAlerts.length = 50
+      }
+      return true
     } catch (error) {
       // 解除失败要让人看见，而不是又一次静默瘫队。
       this.runtimeHealth.set({ state: 'error', detail: `主 Session 处于归档状态且解除失败：${String(error)}`, at: now() })
+      return false
     }
   }
   private async archiveFinishedWorkers(): Promise<void> {
@@ -1312,6 +1361,9 @@ export class Runtime extends Service implements SourceHost {
         void this.runSelfHeal(now, { catchUpMs: gap })
           .catch(error => { console.log('[selfheal] catch-up failed: %s', String(error)) })
       }
+      // 主 Session 的归档状态是跨宿主共享的：别的宿主随时能把它写回去。每拍先确认一次，
+      // 复发就当场解出来，不用等重启。不 await —— 一拍里的其它活不该被它拖住。
+      void this.ensureMasterActive('watch').catch(error => { console.log('[guard] master archive check failed: %s', String(error)) })
       void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
       void this.runSelfHeal(now).catch(error => { console.log('[selfheal] tick failed: %s', String(error)) })
       void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })

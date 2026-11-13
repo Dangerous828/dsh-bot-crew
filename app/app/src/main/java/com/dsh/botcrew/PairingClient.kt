@@ -69,10 +69,12 @@ class PairingClient(private val base: String) {
  * - [base] 是配对那一刻的局域网地址（同一 Wi-Fi 下最快的一条）；
  * - [fallbackBase] 是电脑的出门地址（`https://...`，配对时由 mDNS 的 `pub` 一并带过来）；
  * - [p2pAddr] 是电脑的隧道地址（tc-addr，配对时由 `p2p` 带过来），它是直连，比中转快得多。
+ * - [crew] 是 stateDir 指纹（mDNS 的 `crew`），与网卡、网段都无关，用来在重新发现时认出同一台。
  *
- * 两条可空的都是空串而不是 null：空串就是「这台电脑没有那条路」，那不是错误，
+ * 后三格可空的都是空串而不是 null：空串就是「这台电脑没有这项」，那不是错误，
  * 只是那个场景下走不通。三格分开存是为了让选路顺序（P2P → 局域网 → 公网）永远成立 ——
  * 把「上次哪条通」写回 base 会让下一次启动先试公网，把更快的路排到后面。
+ * 网段相关的只有 base；重新发现同一台时按 crew 更新它，而不是记住旧网段的 IP。
  */
 data class PairedCrew(
     val deviceId: String,
@@ -80,4 +82,5 @@ data class PairedCrew(
     val base: String,
     val fallbackBase: String = "",
     val p2pAddr: String = "",
+    val crew: String = "",
 )

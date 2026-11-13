@@ -63,4 +63,49 @@ class CrewClientRouteTest {
     fun aHandWrittenEntryIsNormalisedBeforeItEntersTheTable() {
         assertEquals(listOf("http://10.0.0.9:43499"), client("10.0.0.9:43499/").routeOrder())
     }
+
+    // 重新发现换了地址：整张表换掉，归一化 + 去重。
+    @Test
+    fun replacingTheTableSwapsInTheFreshAddress() {
+        val crew = client("http://192.168.31.127:43499", "https://crew.example.top")
+        crew.replaceEntries(listOf("10.0.0.9:43499/", "https://crew.example.top", "https://crew.example.top"))
+        assertEquals(
+            listOf("http://10.0.0.9:43499", "https://crew.example.top"),
+            crew.routeOrder(),
+        )
+    }
+
+    // 当前在用的 P2P 代理若还在新表里，必须继续用它 —— 换表不许打断正在跑的隧道。
+    @Test
+    fun replacingTheTableKeepsTheCurrentP2pEntry() {
+        val crew = client("http://192.168.31.127:43499")
+        val proxy = "http://127.0.0.1:43001"
+        crew.promote(proxy)
+        assertEquals(proxy, crew.currentEntry())
+        crew.replaceEntries(listOf("http://10.0.0.9:43499", proxy, "https://crew.example.top"))
+        assertEquals(
+            listOf("http://10.0.0.9:43499", proxy, "https://crew.example.top"),
+            crew.routeOrder(),
+        )
+        // 表换了，但「当前入口」仍是 P2P 代理，没被强行拉回旧 LAN。
+        assertEquals(proxy, crew.currentEntry())
+    }
+
+    // 当前入口不在新表里时才回落到第一条。
+    @Test
+    fun aCurrentEntryMissingFromTheNewTableFallsBackToTheFirst() {
+        val crew = client("http://old:1", "http://keep:2")
+        crew.promote("http://old:1")
+        crew.replaceEntries(listOf("http://new:3", "http://keep:2"))
+        assertEquals("http://new:3", crew.currentEntry())
+    }
+
+    // 空表不许把入口清光：那样每条请求都会直接报「没有可用的入口」。
+    @Test
+    fun anEmptyReplacementNeverWipesTheTable() {
+        val crew = client("http://a:1")
+        crew.replaceEntries(emptyList())
+        crew.replaceEntries(listOf("", "  "))
+        assertEquals(listOf("http://a:1"), crew.routeOrder())
+    }
 }

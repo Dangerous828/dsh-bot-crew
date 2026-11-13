@@ -22,7 +22,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
@@ -82,6 +84,22 @@ class MainActivity : ComponentActivity() {
                     }
                     // 只在前台探测；退到后台取消等待，再回前台重置退避。句柄始终复用。
                     lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                        // 配好之后也继续听附近的广播，但只作**兜底**：P2P 是网域无关的主路，
+                        // 换 Wi-Fi / 出门根本不需要重新发现。这里只在 P2P 没起来时，让 LAN
+                        // 那条重试能命中电脑当次的地址（同网段内 IP 变了）。
+                        // 判据只认 crew 指纹，认不出就不动；没授权附近设备或网络无组播时
+                        // 这条流安静结束，配对保持原样，不假装刷新过。
+                        launch {
+                            CrewDiscovery.find(this@MainActivity).collect { sighting ->
+                                val found = sighting as? CrewSighting.Found ?: return@collect
+                                val here = paired ?: return@collect
+                                val refreshed = CrewNearby.refresh(here, found.beacon) ?: return@collect
+                                pairing.save(refreshed)
+                                // 只就地换入口表，不改 paired：改它会重启本 effect、重建
+                                // tailcat 句柄，把正在跑的 P2P 隧道打断。下次启动自然读到新值。
+                                opened.replaceEntries(CrewRoute.entries(refreshed, proxyPort))
+                            }
+                        }
                         var failures = 0
                         while (isActive) {
                             val probed = withContext(Dispatchers.IO) {

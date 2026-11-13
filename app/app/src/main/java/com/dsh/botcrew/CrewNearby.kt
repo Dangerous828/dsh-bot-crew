@@ -18,6 +18,8 @@ object CrewNearby {
         val base: String,
         val publicBase: String = "",
         val p2pAddr: String = "",
+        /** 与网卡无关的队伍指纹；配对时一起存下，重新发现时按它认同一台。 */
+        val crew: String = "",
     )
 
     /**
@@ -27,7 +29,7 @@ object CrewNearby {
      * 手指正好按在上面就会点错人。
      */
     fun add(spots: List<Spot>, beacon: CrewBeacon): List<Spot> {
-        val spot = Spot(beacon.name, beacon.base, beacon.publicBase, beacon.p2pAddr)
+        val spot = Spot(beacon.name, beacon.base, beacon.publicBase, beacon.p2pAddr, beacon.crew)
         val at = spots.indexOfFirst { it.name == beacon.name }
         return if (at < 0) spots + spot else spots.toMutableList().also { it[at] = spot }
     }
@@ -39,6 +41,40 @@ object CrewNearby {
     fun merge(spots: List<Spot>, sighting: CrewSighting): List<Spot> = when (sighting) {
         is CrewSighting.Found -> add(spots, sighting.beacon)
         is CrewSighting.Lost -> remove(spots, sighting.name)
+    }
+
+    /**
+     * 一条广播的「内容签名」：服务名 + 地址 + 两条出门路 + 指纹。
+     *
+     * 发现流用它去重：完全相同的重复上报只发一次，但**地址或任一路由变了就必须是新的一条**。
+     * 只按服务名去重会漏掉「同一台换了 IP 重新广播」，那正是地址要跟着寻址走的关键一拍。
+     */
+    fun signature(beacon: CrewBeacon): String = listOf(
+        beacon.name, beacon.base, beacon.publicBase, beacon.p2pAddr, beacon.crew,
+    ).joinToString("\u0000")
+
+    /**
+     * 重新发现到一台队伍时，把**网段相关**的那格地址更新成当次广播的地址。
+     *
+     * 配好之后电脑可能换 Wi-Fi、IP 全变，或者重启后 `pub` / `p2p` 换了。这些都不该靠
+     * 「记住上一次哪条通」——网段一换，记住的地址就是另一台机器甚至不存在。认同一台
+     * 只用 mDNS 的 `crew` 指纹（stateDir 派生，与网卡无关），地址一律取当次广播。
+     *
+     * 认不出就返回 null：没存指纹、广播里没有、或者指纹对不上，一律不猜，配好的是什么
+     * 就保持什么。同一网段里有好几台时也不会把别人的地址写进来。
+     *
+     * `pub` / `p2p` 只在广播给了非空值时更新：一次短暂的广播缺项不该把已经存好的、能跨网
+     * 用的那条路抹掉（那是手机出了门唯一能走的路）。地址这格则每次都取广播的现值。
+     * 没有任何变化时返回 null，调用方据此不写盘、不重建连接。
+     */
+    fun refresh(paired: PairedCrew, beacon: CrewBeacon): PairedCrew? {
+        if (paired.crew.isEmpty() || beacon.crew.isEmpty() || paired.crew != beacon.crew) return null
+        val fresh = paired.copy(
+            base = CrewPairing.normalize(beacon.base),
+            fallbackBase = beacon.publicBase.ifEmpty { paired.fallbackBase },
+            p2pAddr = beacon.p2pAddr.ifEmpty { paired.p2pAddr },
+        )
+        return if (fresh == paired) null else fresh
     }
 
     /**

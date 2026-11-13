@@ -51,8 +51,9 @@ object PairingRecord {
     const val BASE = "base"
     const val FALLBACK = "fallbackBase"
     const val P2P = "p2pAddr"
+    const val CREW = "crew"
 
-    /** 缺前三格就不算一份配对；其余两格缺了读成空串，那是「这台电脑没有那条路」。 */
+    /** 缺前三格就不算一份配对；其余几格缺了读成空串，那是「这台电脑没有这项」。 */
     fun read(values: Map<String, Any?>): PairedCrew? {
         val device = values[DEVICE] as? String ?: return null
         val token = values[TOKEN] as? String ?: return null
@@ -63,6 +64,7 @@ object PairingRecord {
             base = base,
             fallbackBase = values[FALLBACK] as? String ?: "",
             p2pAddr = values[P2P] as? String ?: "",
+            crew = values[CREW] as? String ?: "",
         )
     }
 
@@ -72,6 +74,7 @@ object PairingRecord {
         BASE to paired.base,
         FALLBACK to paired.fallbackBase,
         P2P to paired.p2pAddr,
+        CREW to paired.crew,
     )
 }
 

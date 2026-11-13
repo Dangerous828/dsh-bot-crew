@@ -32,7 +32,11 @@ object CrewDiscovery {
         val manager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
         if (manager == null) { close(); return@callbackFlow }
 
-        val seen = mutableSetOf<String>()
+        // 按「服务名 → 上次那条广播的签名」去重，而不是只记服务名。
+        // 只记名字的话，同一台电脑换 Wi-Fi、IP 变了重新广播时服务名不变，这一条就被吞掉，
+        // 已配对那边永远收不到新地址，「跟着寻址走」也就无从谈起。签名把地址与路由都算进去：
+        // 完全相同的重复上报仍然只发一次，内容变了就必须再发一条。
+        val seen = mutableMapOf<String, String>()
 
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
@@ -40,9 +44,12 @@ object CrewDiscovery {
             override fun onServiceFound(info: NsdServiceInfo) {
                 // 只认自己的类型；系统有时会把同一网段的别的服务也递过来。
                 if (!info.serviceType.startsWith("_dsh-crew")) return
-                // 同一个实例系统会重复上报，解析也慢；同名的只发一次，界面那边才是一台一行。
                 resolve(manager, info) { beacon ->
-                    if (seen.add(beacon.name)) trySend(CrewSighting.Found(beacon))
+                    val signature = CrewNearby.signature(beacon)
+                    if (seen[beacon.name] != signature) {
+                        seen[beacon.name] = signature
+                        trySend(CrewSighting.Found(beacon))
+                    }
                 }
             }
 
@@ -87,11 +94,15 @@ object CrewDiscovery {
                 // `p2p` 是同一台电脑的隧道地址（tc-addr，内嵌密钥）。它比 `pub` 更值钱也更容易
                 // 过期：电脑换了密钥或没起 serve 时这里就是空的，那时退回上面那两条路。
                 val p2p = serviceInfo.attributes?.get("p2p")?.toString(Charsets.UTF_8)?.trim()
+                // `crew` 是 stateDir 的短指纹，与网卡、网段无关：电脑换个 Wi-Fi、IP 全变了，
+                // 它还是同一台。地址只能用来「这一次连谁」，指纹才是「还是上次那台」的判据。
+                val crew = serviceInfo.attributes?.get("crew")?.toString(Charsets.UTF_8)?.trim()
                 onFound(CrewBeacon(
                     name = serviceInfo.serviceName,
                     base = "http://$shaped:$port",
                     publicBase = public?.takeIf { it.isNotEmpty() }.orEmpty(),
                     p2pAddr = p2p?.takeIf { it.isNotEmpty() }.orEmpty(),
+                    crew = crew?.takeIf { it.isNotEmpty() }.orEmpty(),
                 ))
             }
         })
@@ -112,6 +123,8 @@ data class CrewBeacon(
     val base: String,
     val publicBase: String = "",
     val p2pAddr: String = "",
+    /** stateDir 短指纹（mDNS TXT 的 `crew`）：换网段、换 IP 都不变，用来认「还是同一台」。空串表示这台没公布。 */
+    val crew: String = "",
 )
 
 /**

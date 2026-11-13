@@ -21,6 +21,7 @@ class PairingRecordTest {
         base = "http://192.168.31.127:43499",
         fallbackBase = "https://crew.example.top",
         p2pAddr = "tcpAAAA",
+        crew = "fingerprint-7",
     )
 
     // 存一次读回来必须一模一样，三条路一格不少。
@@ -39,6 +40,14 @@ class PairingRecordTest {
         assertEquals("http://192.168.31.127:43499", values[PairingRecord.BASE])
         assertEquals("https://crew.example.top", values[PairingRecord.FALLBACK])
         assertEquals("tcpAAAA", values[PairingRecord.P2P])
+        assertEquals("fingerprint-7", values[PairingRecord.CREW])
+    }
+
+    // 指纹必须真的落盘：少这一格不会报错，只会表现为「重新发现时永远认不出同一台」，
+    // 于是换网段后地址一直停在旧 IP 上 —— 正是这次要根治的毛病。
+    @Test
+    fun theCrewFingerprintSurvivesTheRoundTrip() {
+        assertEquals("fingerprint-7", PairingRecord.read(PairingRecord.write(saved))?.crew)
     }
 
     // 老装机存下来的只有前三格：后两格读成空串（= 那台电脑没有那条路），不是读失败。
@@ -52,6 +61,8 @@ class PairingRecordTest {
         assertEquals(PairedCrew("dev-1", "tok-1", "http://192.168.31.127:43499"), PairingRecord.read(old))
         assertEquals("", PairingRecord.read(old)?.fallbackBase)
         assertEquals("", PairingRecord.read(old)?.p2pAddr)
+        // 老记录没有指纹：读成空串，刷新那层据此不做任何推断，行为与旧版一致。
+        assertEquals("", PairingRecord.read(old)?.crew)
     }
 
     // 前三格少一格就不算一份配对：宁可回到配对屏，也不要拿着半份凭据去连。

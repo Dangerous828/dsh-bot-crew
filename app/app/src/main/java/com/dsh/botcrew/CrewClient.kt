@@ -46,6 +46,9 @@ class CrewClient(
     /** 现在会按什么顺序试。给测试和日志看。 */
     fun routeOrder(): List<String> = order
 
+    /** 现在在用的入口。给测试和日志看：换表之后它是否还留在原处，是「有没有打断隧道」的判据。 */
+    fun currentEntry(): String = current
+
     /**
      * 把一条**已经确认可用**的入口提到队首。
      *
@@ -58,6 +61,25 @@ class CrewClient(
         synchronized(this) {
             order = listOf(clean) + order.filter { it != clean }
             current = clean
+        }
+    }
+
+    /**
+     * 重新发现到同一台、地址变了时整体换掉入口表，**不重启连接**。
+     *
+     * P2P 是网域无关的主路（127.0.0.1 本地代理 + 固定密钥的 tc-addr），换 Wi-Fi
+     * 根本不靠这张表；这里只让 P2P 没起来时 LAN 那条重试能命中当次广播的地址。
+     *
+     * 特别不能靠改 `paired` 状态来刷新：那会重启整个 LaunchedEffect、连带重建
+     * tailcat 句柄，把本来正在跑的隧道打断。所以只就地换表，正在用的入口
+     * （多半是 P2P 代理）只要还在新表里就继续用它。
+     */
+    fun replaceEntries(entries: List<String>) {
+        val clean = entries.map(CrewPairing::normalize).filter(String::isNotBlank).distinct()
+        if (clean.isEmpty()) return
+        synchronized(this) {
+            order = clean
+            if (current !in clean) current = clean.first()
         }
     }
 

@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { key, threadKey, type OutboundMessage, type Trigger } from '../core/index.ts'
 import { CliError } from '../infra/commands.ts'
-import { record, type Key } from '../kv.ts'
+import { KV, record, type Key } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { SourceKind } from './kind.ts'
 
@@ -12,19 +12,16 @@ const SOURCE = 'mobile'
 const CURSOR: Key<number> = record<number>('mobile-cursor')
 
 /**
- * 多会话 seam 的文档契约（S1，见 `docs/adr/0007-multi-session-seam.md`、`docs/00-contract.md` §9）：
+ * 多会话 seam（S1 文档契约 + S4 落地，见 `docs/adr/0007-multi-session-seam.md`、`docs/00-contract.md` §9）：
  *
  * - `conversation` 是队列 `mobileq.db` 的列 / 领域词；线上消息面以 query 参数 `session_id`
  *   与它一一映射，缺省 `main`。网关/消息面按 `session_id` 分片后，这里读到的
  *   `message.conversation` 已是那次请求选中的会话，不再是单一常量。
- * - 下面这份 `conversations` 名单是 **Source 准入** 的允许清单，不是会话名单：
- *   `scope()` 与 `channel.allowed` 据此判断一条消息的 conversation 是否登记在册。
- * - **S1 不改这里的准入判定**：本阶段只落文档契约。「未登记会话不静默丢消息」——
- *   不在这层丢消息，也不把未知会话静默改写成 `main`；消息按其 conversation 原样入队、
- *   可在 `timeline?session_id=X` 读到，派单与否仍由既有名单判据决定。
- * - 让 `conversations` 跟随会话注册名单、给未登记会话一个明确的准入结果，是 **S4** 的范围
- *   （隔离不变量收口）。在 S4 之前，本文件的 `scope()` / `channel.allowed` 保持不动，
- *   `masterId` 与 DSH 上游也不动（ADR 0007）。
+ * - S4 起，**会话准入的唯一真源是 S1 的 `KV.mobile.sessions` 注册名单**（family 前缀只由 kv.ts 定义），
+ *   `ConfigSchema.conversations` 只保留作向后兼容的手配清单，两者叠加。未登记会话的消息
+ *   原样留在队列里（可按 `timeline?session_id=X` 读回），不生成 Trigger、不派单，但会留下
+ *   明确的可观测记录（`conversation_not_listed` + 计数 KV + health detail），绝不静默吞掉。
+ * - `masterId` 与 DSH 上游不动（ADR 0007）。
  */
 const ConfigSchema = z.object({
   conversations: z.array(z.object({
@@ -34,6 +31,69 @@ const ConfigSchema = z.object({
   pollSeconds: z.number().int().min(2).max(3600).default(5),
 }).strict()
 export type MobileConfig = z.infer<typeof ConfigSchema>
+
+/**
+ * S4 Source 准入机制（issue #14 第 3 项 / #10 第 4 项）。
+ *
+ * `kind.ts:100` 的 `scope?(input: { meta }, config)` 与 `channel.allowed(address, config)` 签名里
+ * 没有 context / store，`registry.ts:131` 也只把 `meta` 与 `config` 传进来。因此名单由
+ * `pollQueue()`（拿得到 `SourceContext.state.keys`）在生成 Trigger 时算一次，以**快照**形式
+ * 写进 `Trigger.meta` 与 `Trigger.channel.address`，两个判定点只读这份随 Trigger 走的快照：
+ * 不改 kind.ts / registry.ts 签名，不用全局可变状态，登记后下一次 poll 重读 KV 即生效。
+ *
+ * `main` 是缺省会话：S1 读侧恒补首位、不落键，它的准入仍由手配清单负责；只有真正登记过的
+ * 非 main 会话才由注册名单放行。
+ */
+const SESSION_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
+/** `Trigger.meta` / `Trigger.channel.address` 上携带「生成时注册名单快照」的字段名。 */
+export const SESSION_ROSTER = 'registeredSessions'
+/** 未登记消息被本 Source 拒收的累计次数（Source 私有 KV；可观测，不是全局可变状态）。 */
+export const UNLISTED: Key<number> = record<number>('mobile-unlisted')
+
+/** 从 `KV.mobile.sessions` 读出 S1 注册名单。每次 poll 重读，所以登记后无需配置变更或重启。 */
+export function sessionRoster(state: Pick<SourceContext['state'], 'keys'>): string[] {
+  const keys = typeof state.keys === 'function' ? state.keys(KV.mobile.sessions) : []
+  const extra = keys
+    .map(name => name.slice(KV.mobile.sessions.prefix.length))
+    .filter(id => id !== 'main' && SESSION_ID.test(id))
+  return [...new Set(extra)].sort()
+}
+
+/** 读出注入的名单快照：`meta` 里是数组，`channel.address` 里是 JSON 字符串；读不到一律当空名单。 */
+export function rosterOf(value: unknown): string[] {
+  let parsed: unknown = value
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) as unknown } catch { return [] }
+  }
+  return Array.isArray(parsed)
+    ? [...new Set(parsed.filter((id): id is string => typeof id === 'string' && SESSION_ID.test(id)))].sort()
+    : []
+}
+
+/** 会话是否入册：手配清单（向后兼容）**或** S1 注册名单。去掉 `roster.includes` 这一支，断言 4 立刻变红。 */
+export function isAdmitted(conversations: readonly { id: string }[], conversation: unknown, roster: readonly string[]): boolean {
+  return typeof conversation === 'string'
+    && (conversations.some(item => item.id === conversation) || roster.includes(conversation))
+}
+
+/** 把「生成时的注册名单」快照写进 Trigger，供 `scope()` 与 `channel.allowed` 判定。 */
+export function withRoster(trigger: Trigger, roster: readonly string[]): Trigger {
+  const sessions = [...new Set(roster)].sort()
+  return {
+    ...trigger,
+    meta: { ...trigger.meta, [SESSION_ROSTER]: sessions },
+    ...(trigger.channel ? { channel: { ...trigger.channel,
+      address: { ...trigger.channel.address, [SESSION_ROSTER]: JSON.stringify(sessions) } } } : {}),
+  }
+}
+
+/** health detail 里的可观测记录：拒收条数与会话名，把 `conversation_not_listed` 摆到台面上。 */
+export function pollDetail(read: number, unreadable: number, refused: number, refusedSessions: readonly string[]): string {
+  const base = `${read} messages, ${unreadable} unreadable`
+  return refused > 0
+    ? `${base}, ${refused} conversation_not_listed: ${[...new Set(refusedSessions)].sort().join(', ')}`
+    : base
+}
 
 const MessageSchema = z.looseObject({
   id: z.union([z.string(), z.number()]).transform(v => String(v)),
@@ -84,14 +144,19 @@ export const mobileKind: SourceKind<MobileConfig> = {
     { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
   ],
   health: ['mobile'],
-  // 准入判定：S1 保持不动，会话名单收口留给 S4（说明见上方 ConfigSchema 注释、ADR 0007）。
+  // S4：名单 = 手配清单（向后兼容）+ Trigger 里随行的 S1 注册名单快照。
   scope({ meta }, config) {
     const conv = config.conversations.find(item => item.id === meta.conversation)
-    if (!conv) return { listened: false, reason: 'conversation_not_listed' }
-    return { listened: true, observed: conv.listen === 'all', row: conv.id }
+    if (conv) return { listened: true, observed: conv.listen === 'all', row: conv.id }
+    if (isAdmitted([], meta.conversation, rosterOf(meta[SESSION_ROSTER]))) {
+      // 注册会话按「仅 @」处理：不主动观察未点名的消息，也不占 Policy 表的手配行。
+      return { listened: true, observed: false }
+    }
+    return { listened: false, reason: 'conversation_not_listed' }
   },
   channel: {
-    allowed: (address, config) => config.conversations.some(item => item.id === address.conversation),
+    // 回话目标同样合并注册名单，否则登记会话派单成功、回话却被 channelIgnored 丢掉。
+    allowed: (address, config) => isAdmitted(config.conversations, address.conversation, rosterOf(address[SESSION_ROSTER])),
     send: sendMobile,
     link: address => ({ url: address.url ?? '', label: { zh: `手机对话 ${address.conversation}`, en: `Mobile conversation ${address.conversation}` } }),
   },
@@ -166,9 +231,9 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     else {
       const at = new Date().toISOString()
       try {
-        const { read, unreadable } = await pollQueue(ctx, signal)
+        const { read, unreadable, refused, refusedSessions } = await pollQueue(ctx, signal)
         failures = 0
-        ctx.report('mobile', { state: 'ready', detail: `${read} messages, ${unreadable} unreadable`, at })
+        ctx.report('mobile', { state: 'ready', detail: pollDetail(read, unreadable, refused, refusedSessions), at })
       } catch (error) {
         failures += 1
         if (!signal.aborted && failures >= 3) {
@@ -181,21 +246,35 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 }
 
 /** Read the queue after the cursor, take in each message, then move the cursor past them. */
-export async function pollQueue(ctx: SourceContext, signal: AbortSignal): Promise<{ read: number; unreadable: number }> {
+export async function pollQueue(ctx: SourceContext, signal: AbortSignal): Promise<{
+  read: number; unreadable: number; refused: number; refusedSessions: string[]
+}> {
   const after = ctx.state.get(CURSOR) ?? 0
   const output = await ctx.commands.withSignal(signal).run('mobileq', ['pull', '--after', String(after), '--json'])
   const page = PageSchema.parse(JSON.parse(output))
-  let unreadable = 0
+  const config = ctx.config<MobileConfig>(SOURCE)
+  // 每次 poll 重读 S1 注册名单：登记会话不用改 Source 配置、不用重启。
+  const roster = sessionRoster(ctx.state)
+  let unreadable = 0, refused = 0
+  const refusedSessions: string[] = []
   for (const item of page.items) {
     if (signal.aborted) throw new Error('The mobile Source stopped during the read')
     const message = MessageSchema.safeParse(item)
     if (!message.success) { unreadable++; continue }
+    if (!isAdmitted(config?.conversations ?? [], message.data.conversation, roster)) {
+      // 未登记会话：不生成 Trigger、不派单；消息原样留在队列里，可按 session_id 读回。
+      // 计数与会话名落到 KV / health detail，绝不「什么都没发生」。
+      refused++
+      refusedSessions.push(message.data.conversation)
+      ctx.state.set(UNLISTED, (ctx.state.get(UNLISTED) ?? 0) + 1)
+      continue
+    }
     const trigger = mobileTrigger(message.data, page.me)
     if (!trigger) continue
-    await ctx.receive(trigger)
+    await ctx.receive(withRoster(trigger, roster))
     const conversation = { label: { zh: '对话', en: 'Conversation' }, value: message.data.conversation }
     for (const ref of trigger.threads) ctx.threads.describe(threadKey(ref), { facts: { conversation } })
   }
   ctx.state.set(CURSOR, Number(page.next))
-  return { read: page.items.length, unreadable }
+  return { read: page.items.length, unreadable, refused, refusedSessions }
 }

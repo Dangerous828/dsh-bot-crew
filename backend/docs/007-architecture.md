@@ -346,6 +346,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/mobile-http.ts` | Authenticated owner-only Connection Fetch routes for phone timeline, idempotent sends and the withdrawal of a still-queued message; also the work, agent-tree, model, pairing, outputs and routines routes; server-side gateway credentials |
 | `src/app/screen.ts` | The phone's "看画面" snapshot: the worker session's recent commands, output, speech and status, trimmed and secret-masked; a pure function over session events, not a screenshot |
 | `src/app/outputs.ts` | The phone's 产出 list: the files a worker wrote (the `write` / `edit` calls in its session events), one row per path with its write count; a pure function that keeps "nothing yet" apart from "could not read" |
+| `src/app/groups.ts` | 群组只读投影 groupsOf：从已有 sessions / bots / tickets 按会话归属派生 groups，ticket_count 只数不写；三态 live / empty / unavailable，读不到绝不落成空 |
 | `src/app/routines.ts` | The phone's 常规任务 ledger: one row per task the owner wrote down (title, cycle, bot, switch, last and next run), read from the `routines:task:` KV records; `next_run` is counted from the cycle and never rolled forward, and `runner: none` says there is no scheduler yet |
 | `src/app/work.ts` | How one ticket was worked, the agent tree under it, and the worker model switch |
 | `src/memory/adapter.ts` | 记忆的格式层：`MemoryRecord` 的形状、按插件 1.3.0 frontmatter 渲染（拒多行 description）、命名空间与落盘路径；不碰数据库，也不内置 Hub 地址 |
@@ -453,6 +454,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/outputs.spec.ts` | The 产出 list: which tool calls count as a written file, one row per path with its write count, images counted apart, and "nothing yet" kept apart from "could not read" |
+| `tests/groups.spec.ts` | 群组只读投影：按会话归属分组、无归属落 main、三态不混、只读与纯函数、timeline 现成源形状的类型证据 |
+| `tests/source-session-admission.spec.ts` | 未登记会话的四条断言：落队列、可按 session_id 读到、不派单且有可观测的 conversation_not_listed、注册后立刻可派单 |
 | `tests/crew-memory.spec.ts` | 记忆格式层：frontmatter 的渲染与转义、多行 description 与空正文被拒、命名空间与文件名、注入规则与上行日限额 |
 | `tests/crew-memory-recall.spec.ts` | recall 与 settle 的纯函数：二元组相关度、Bot 命名空间过滤、新鲜度压过旧条目、预算整条取舍、哪句话算「定下来的规矩」、哪种工单收尾值得记 |
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |

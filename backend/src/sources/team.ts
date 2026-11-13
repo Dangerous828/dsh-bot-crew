@@ -22,6 +22,8 @@ import { CliError } from '../infra/commands.ts'
 import { record, type Key } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks, SourceKind } from './kind.ts'
+// S4 准入核心与 mobile Source 共用一份实现（会话名单是唯一真源，不各写一套判定）。
+import { isAdmitted, pollDetail, rosterOf, sessionRoster, withRoster, SESSION_ROSTER } from './mobile.ts'
 import { defaultBot, validateDirectory, type BotDirectory } from '../crew/directory.ts'
 import { routeBot, threadOf } from '../crew/route.ts'
 
@@ -38,19 +40,16 @@ const BotSchema = z.object({
 }).strict()
 
 /**
- * 多会话 seam 的文档契约（S1，见 `docs/adr/0007-multi-session-seam.md`、`docs/00-contract.md` §9）：
+ * 多会话 seam（S1 文档契约 + S4 落地，见 `docs/adr/0007-multi-session-seam.md`、`docs/00-contract.md` §9）：
  *
  * - `conversation` 是队列 `mobileq.db` 的列 / 领域词；线上消息面以 query 参数 `session_id`
  *   与它一一映射，缺省 `main`。网关/消息面按 `session_id` 分片后，这里读到的
  *   `message.conversation` 已是那次请求选中的会话，不再是单一常量。
- * - 下面这份 `conversations` 名单是 **Source 准入** 的允许清单，不是会话名单：
- *   `scope()` 与 `channel.allowed` 据此判断一条消息的 conversation 是否登记在册。
- * - **S1 不改这里的准入判定**：本阶段只落文档契约。「未登记会话不静默丢消息」——
- *   不在这层丢消息，也不把未知会话静默改写成 `main`；消息按其 conversation 原样入队、
- *   可在 `timeline?session_id=X` 读到，派单与否仍由既有名单判据决定。
- * - 让 `conversations` 跟随会话注册名单、给未登记会话一个明确的准入结果，是 **S4** 的范围
- *   （隔离不变量收口）。在 S4 之前，本文件的 `scope()` / `channel.allowed` 保持不动，
- *   `masterId` 与 DSH 上游也不动（ADR 0007）。
+ * - S4 起，**会话准入的唯一真源是 S1 的 `KV.mobile.sessions` 注册名单**（family 前缀只由 kv.ts 定义），
+ *   下面这份 `conversations` 只保留作向后兼容的手配清单，两者叠加。未登记会话的消息原样
+ *   留在队列里（可按 `timeline?session_id=X` 读回），不生成 Trigger、不派单，但会留下
+ *   明确的可观测记录（`conversation_not_listed` + 计数 KV + health detail），绝不静默吞掉。
+ * - `masterId` 与 DSH 上游不动（ADR 0007）。
  */
 const ConfigSchema = z.object({
   bots: z.array(BotSchema).default([]),
@@ -63,6 +62,9 @@ const ConfigSchema = z.object({
   pollSeconds: z.number().int().min(2).max(3600).default(5),
 }).strict()
 export type TeamConfig = z.infer<typeof ConfigSchema>
+
+/** S4：未登记消息被本 Source 拒收的累计次数（与 mobile 分键，避免两个 Source 共用一份账）。 */
+export const UNLISTED: Key<number> = record<number>('team-unlisted')
 
 const MessageSchema = z.looseObject({
   id: z.union([z.string(), z.number()]).transform(v => String(v)),
@@ -194,15 +196,20 @@ export const teamKind: SourceKind<TeamConfig> = {
     { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
   ],
   health: ['team'],
-  // 准入判定：S1 保持不动，会话名单收口留给 S4（说明见上方 ConfigSchema 注释、ADR 0007）。
+  // S4：名单 = 手配清单（向后兼容）+ Trigger 里随行的 S1 注册名单快照。
   scope({ meta }, config) {
     const conversation = config.conversations.find(item => item.id === meta.conversation)
-    if (!conversation) return { listened: false, reason: 'conversation_not_listed' }
     // 名单里成员被 @ 也算听见；名单里没有的人 @ 谁都不算。
-    return { listened: true, observed: conversation.listen === 'all', row: conversation.id }
+    if (conversation) return { listened: true, observed: conversation.listen === 'all', row: conversation.id }
+    if (isAdmitted([], meta.conversation, rosterOf(meta[SESSION_ROSTER]))) {
+      // 注册会话按「仅 @」处理：不主动观察未点名的消息，也不占 Policy 表的手配行。
+      return { listened: true, observed: false }
+    }
+    return { listened: false, reason: 'conversation_not_listed' }
   },
   channel: {
-    allowed: (address, config) => config.conversations.some(item => item.id === address.conversation),
+    // 回话目标同样合并注册名单，否则登记会话派单成功、回话却被 channelIgnored 丢掉。
+    allowed: (address, config) => isAdmitted(config.conversations, address.conversation, rosterOf(address[SESSION_ROSTER])),
     send: sendTeam,
     link: teamLink,
   },
@@ -342,9 +349,9 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     else {
       const at = new Date().toISOString()
       try {
-        const { read, unreadable } = await pollQueue(ctx, signal)
+        const { read, unreadable, refused, refusedSessions } = await pollQueue(ctx, signal)
         failures = 0
-        ctx.report('team', { state: 'ready', detail: `${read} messages, ${unreadable} unreadable`, at })
+        ctx.report('team', { state: 'ready', detail: pollDetail(read, unreadable, refused, refusedSessions), at })
       } catch (error) {
         failures += 1
         if (!signal.aborted && failures >= 3) {
@@ -357,31 +364,43 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 }
 
 /** 读过游标之后的消息，逐条收进 Engine，然后把游标推过去。 */
-export async function pollQueue(ctx: SourceContext, signal: AbortSignal): Promise<{ read: number; unreadable: number }> {
+export async function pollQueue(ctx: SourceContext, signal: AbortSignal): Promise<{
+  read: number; unreadable: number; refused: number; refusedSessions: string[]
+}> {
   const after = ctx.state.get(CURSOR) ?? 0
   const output = await ctx.commands.withSignal(signal).run('mobileq', ['pull', '--after', String(after), '--json',
       ...queueFile(ctx.deployment)])
   const page = PageSchema.parse(JSON.parse(output))
-  let unreadable = 0
+  // 每次 poll 重读 S1 注册名单：登记会话不用改 Source 配置、不用重启。
+  const roster = sessionRoster(ctx.state)
+  let unreadable = 0, refused = 0
+  const refusedSessions: string[] = []
   for (const item of page.items) {
     if (signal.aborted) throw new Error('The team Source stopped during the read')
     const message = MessageSchema.safeParse(item)
     if (!message.success) { unreadable++; continue }
     const config = ctx.config<TeamConfig>(SOURCE)
     if (!config) break
+    if (!isAdmitted(config.conversations, message.data.conversation, roster)) {
+      // 未登记会话：不生成 Trigger、不派单；消息原样留在队列里，可按 session_id 读回。
+      refused++
+      refusedSessions.push(message.data.conversation)
+      ctx.state.set(UNLISTED, (ctx.state.get(UNLISTED) ?? 0) + 1)
+      continue
+    }
     let trigger: Trigger | undefined
     try {
       trigger = teamTrigger(message.data, page.me, config)
-    } catch (error) {
+    } catch {
       // 名单配错不该拖住整个来源：记成不可读，其余照常。
       unreadable++
       continue
     }
     if (!trigger) continue
-    await ctx.receive(trigger)
+    await ctx.receive(withRoster(trigger, roster))
     const conversation = { label: { zh: '对话', en: 'Conversation' }, value: message.data.conversation }
     for (const ref of trigger.threads) ctx.threads.describe(threadKey(ref), { facts: { conversation } })
   }
   ctx.state.set(CURSOR, Number(page.next))
-  return { read: page.items.length, unreadable }
+  return { read: page.items.length, unreadable, refused, refusedSessions }
 }

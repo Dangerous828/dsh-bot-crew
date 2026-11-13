@@ -205,7 +205,7 @@ beforeEach(async () => {
     inspect: vi.fn(async () => ({ events: [] })),
   }
   jobs = jobRegistry()
-  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }), list: () => [] }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }), list: () => [], archivedSessionIds: [] as string[], unarchiveSession: vi.fn(async () => {}) }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
@@ -1880,6 +1880,24 @@ it('archives a finished worker Session so the DSH chat list holds only the perso
   const { ticket, sessionId } = await acceptedTicket()
   await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done' })
   await vi.waitFor(() => expect(archived).toContain(sessionId))
+})
+
+// 主 Session 永远不该被归档：ArchivedSessionGate 会在 agent/pre-step 里对已归档会话直接 reject，
+// turn 以 blocked 收口、连模型请求都不发，于是每张 candidate 卡都被拒、eval 一直等到超时、消息永远排队。
+// 启动收尾必须把被归档的主 Session 解出来并告警，而不是让整支队伍静默瘫掉。
+it('unarchives the main Session on startup when it was archived (root fix for blocked/eval-timeout)', async () => {
+  const masterId = runtime.masterId
+  // 模拟主 Session 被归档：归档集合里有它。
+  ;(services.workspaceRegistry as unknown as { archivedSessionIds: string[] }).archivedSessionIds = [masterId]
+  const unarchive = vi.fn(async (id: string) => {
+    const set = (services.workspaceRegistry as unknown as { archivedSessionIds: string[] }).archivedSessionIds
+    ;(services.workspaceRegistry as unknown as { archivedSessionIds: string[] }).archivedSessionIds = set.filter(x => x !== id)
+  })
+  ;(services.workspaceRegistry as Record<string, unknown>).unarchiveSession = unarchive
+  const next = await restart()
+  await next.ready
+  await vi.waitFor(() => expect(unarchive).toHaveBeenCalledWith(masterId))
+  expect((services.workspaceRegistry as unknown as { archivedSessionIds: string[] }).archivedSessionIds).not.toContain(masterId)
 })
 
 // 收尾那一下会丢：进程重启、崩溃、或同一份 workspace.json 被另一台宿主整文件覆写过之后，

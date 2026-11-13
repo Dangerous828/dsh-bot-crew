@@ -263,7 +263,10 @@ export class Runtime extends Service implements SourceHost {
         recall: (ticket, query) => this.memory.recall(ticket, query) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
-        deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
+        // 候选卡片是主 Session 的普通输入（它要靠 orchestrator_route/eval 去判定），必须用 'queue'(followup)
+        // 排成自己的一轮；用 'steer' 会被当成插话、在空闲会话上起一个没有 ordinary message 的空 turn 而 blocked，
+        // 导致 eval 永远等不到判定、消息一直排队。
+        deliver: (id, text) => sessions.prompt(masterId, id, text, 'queue'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         // A worker cannot open a ticket, so when it names a teammate in its reply the host opens one here, on the
         // same request, addressed to that bot. Reading the roster at call time keeps a settings change immediate.
@@ -1170,6 +1173,7 @@ export class Runtime extends Service implements SourceHost {
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
     await this.archiveFinishedWorkers()
+    await this.ensureMasterActive()
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -1191,6 +1195,34 @@ export class Runtime extends Service implements SourceHost {
    *   `worker-*` 会话。只认本队执行根目录，别处的一概不碰。
    * 已经归档过的 id 会被 registry 直接跳过，重复调用是安全的。
    */
+  /**
+   * 确保主 Session 没有被归档。
+   *
+   * 根因（#4 那类「消息永远排队、Eval 一直 evaluating 到超时」的真正元凶）：DSH 的
+   * `ArchivedSessionGate` 会在 `agent/pre-step` 里对「已归档会话」直接返回 `reject`，
+   * turn 于是以 `blocked` 收口、连一次模型请求都不发。主 Session 一旦被归档（面板误点、
+   * 或历史迁移把它写进归档集合），它收到的每张 candidate 卡都会在 pre-step 被拒，
+   * eval 永远等不到判定 → 超时 → 所有消息卡在「排队中」。这与模型、权限都无关，
+   * 只跟这条归档标记有关，所以重启也修不好、换模型也没用。
+   *
+   * 主 Session 是这台机器替主人干活的总路由，任何时候都不该被归档。每次启动收尾时主动
+   * 从归档集合里解出来（`unarchiveSession` 是正规接口，写回 workspace 状态），并记一条告警，
+   * 别让「主 Session 被归档」这种状态静默地把整支队伍瘫掉。
+   */
+  private async ensureMasterActive(): Promise<void> {
+    const registry = this.ctx.workspaceRegistry
+    // 组合里可能没有归档能力（精简部署/测试替身）：没有就不管，别让启动因缺接口而崩。
+    const archived = registry.archivedSessionIds
+    if (!Array.isArray(archived) || typeof registry.unarchiveSession !== 'function') return
+    if (!archived.includes(this.masterId as SessionId)) return
+    try {
+      await registry.unarchiveSession(this.masterId as SessionId)
+      this.ctx.logger.warn('dsh-superagent: 主 Session %s 曾被归档，已自动解除（归档会导致所有 turn 在 pre-step 被拒、消息永远排队）', this.masterId)
+    } catch (error) {
+      // 解除失败要让人看见，而不是又一次静默瘫队。
+      this.runtimeHealth.set({ state: 'error', detail: `主 Session 处于归档状态且解除失败：${String(error)}`, at: now() })
+    }
+  }
   private async archiveFinishedWorkers(): Promise<void> {
     const archiving = this.ctx.workspaceRegistry.archiveSession
     if (typeof archiving !== 'function') return

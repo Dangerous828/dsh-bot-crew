@@ -45,6 +45,8 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/pause', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/resume', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/sessions', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/sessions', methods: ['POST'], requestBody: 'buffered' },
   ])
 })
 it('injects only the server credential and refuses malformed sends before enqueue', async () => {
@@ -155,8 +157,17 @@ it('leaves authentication to Connection instead of inventing a second door', () 
     logger: { warn: () => {} },
   }
   registerMobileHttp(ctx as never, host() as never)
-  expect(registered.length).toBe(25)
-  expect(registered).toContain('/api/mobile/resume')
+  // 逐项断言，别硬编码注册条数：以后每加一条路由都应该由它自己的用例说出来，而不是改一个数字。
+  for (const path of ['/api/mobile/timeline', '/api/mobile/send', '/api/mobile/withdraw', '/api/mobile/read',
+    '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models', '/api/mobile/efforts', '/api/mobile/model',
+    '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/outputs', '/api/mobile/routines', '/api/mobile/memory',
+    '/api/mobile/spend', '/api/mobile/audit', '/api/mobile/voice', '/api/mobile/reply-spend', '/api/mobile/speak',
+    '/api/mobile/takeover', '/api/mobile/retry', '/api/mobile/steer', '/api/mobile/pause', '/api/mobile/resume',
+    '/api/mobile/bots', '/api/mobile/sessions']) {
+    expect(registered).toContain(path)
+  }
+  // sessions 是两条 exact route（GET 与 POST 各一条），不是一条带两个方法。
+  expect(registered.filter(path => path === '/api/mobile/sessions')).toHaveLength(2)
   // 只注册到 Connection，不额外挂到原始 web 路由上。
   expect(registered.every(path => path.startsWith('/api/mobile/'))).toBe(true)
 })
@@ -712,4 +723,274 @@ it('writes a routine through POST and refuses a bad action or missing field', as
   const bare = await phoneHandler(host(), undefined, fetchless)(new Request('http://dsh/api/mobile/routines',
     { method: 'POST', body: JSON.stringify({ action: 'create', title: 'x', cycle: 'daily' }) }))
   expect(bare.status).toBe(503)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S1 多会话消息面（契约 §1 / §2 / §4）：老调用逐字不变、能力位回显、显式非 main 绝不静默回落。
+// ─────────────────────────────────────────────────────────────────────────────
+/** 会话测试用的假宿主：KV 用内存 Map 顶替，get / set / keys 与真 Store 同形。 */
+function sessionHost(options: { decisions?: unknown[]; tickets?: unknown[] } = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-session-')); directories.push(stateDir)
+  writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
+  const kv = new Map<string, unknown>()
+  const runtime = { ready: Promise.resolve(), machine: { stateDir },
+    health: { runtime: { state: 'ready' }, mobile: { state: 'ready' } },
+    store: {
+      settings: () => ({ paused: false }),
+      tickets: { list: () => options.tickets ?? [] },
+      read: { recentDecisions: () => options.decisions ?? [] },
+      get: (key: string) => kv.get(key),
+      set: (key: string, value: unknown) => { kv.set(key, value) },
+      keys: (target: string | { prefix: string }) => {
+        const prefix = typeof target === 'string' ? target : target.prefix
+        return [...kv.keys()].filter(key => key.startsWith(prefix))
+      },
+    } } as unknown as HttpHost
+  return { runtime, kv }
+}
+
+it('lists sessions from the host KV family without forwarding to the gateway', async () => {
+  const { runtime } = sessionHost()
+  const upstream = vi.fn() as unknown as typeof fetch
+  const result = await phoneHandler(runtime, 'http://gw', upstream)(new Request('http://dsh/api/mobile/sessions'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toEqual({ sessions: ['main'], default_session_id: 'main', session_api: 1 })
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('registers a session id, keeps main first, and is idempotent', async () => {
+  const { runtime } = sessionHost()
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn() as unknown as typeof fetch)
+  const post = (id: unknown) => new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: JSON.stringify({ id }) })
+  // 与网关的 fullmatch 同一形状：首字符限 [a-z0-9]、尾部连字符合法、最多 32 位。
+  for (const bad of ['Work', 'has space', '', 'x'.repeat(33), '-lead', 'a_b', 'work\n', 7, undefined]) {
+    expect((await handler(post(bad))).status).toBe(400)
+  }
+  const first = await handler(post('work'))
+  expect(first.status).toBe(200)
+  expect(await first.json()).toEqual({ id: 'work', sessions: ['main', 'work'], session_api: 1 })
+  // 重复 id 幂等：还是 200、同一份名单。登记效果一律通过公开接口 GET 验证，不锁内部键名。
+  const again = await handler(post('work'))
+  expect(again.status).toBe(200)
+  expect(await again.json()).toEqual({ id: 'work', sessions: ['main', 'work'], session_api: 1 })
+  expect(await (await handler(new Request('http://dsh/api/mobile/sessions'))).json())
+    .toEqual({ sessions: ['main', 'work'], default_session_id: 'main', session_api: 1 })
+  // 尾部连字符与 32 位上限都是合法 id；main 恒在首位、不重复，登记它也只是幂等返回。
+  expect((await handler(post('trail-'))).status).toBe(200)
+  expect((await handler(post('x'.repeat(32)))).status).toBe(200)
+  expect((await handler(post('main'))).status).toBe(200)
+  const listed = await (await handler(new Request('http://dsh/api/mobile/sessions'))).json() as { sessions: string[] }
+  expect(listed.sessions[0]).toBe('main')
+  expect(new Set(listed.sessions).size).toBe(listed.sessions.length)
+  expect(listed.sessions).toEqual(expect.arrayContaining(['work', 'trail-', 'x'.repeat(32)]))
+})
+
+it('refuses an invalid session_id before it reaches the gateway', async () => {
+  const { runtime } = sessionHost()
+  const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 })) as unknown as typeof fetch
+  const handler = phoneHandler(runtime, 'http://gw', upstream)
+  for (const bad of ['Work', 'a b', '', 'x'.repeat(33), '-bad', 'a_b', 'bad!']) {
+    const result = await handler(new Request(`http://dsh/api/mobile/timeline?session_id=${encodeURIComponent(bad)}`))
+    expect(result.status).toBe(400)
+    expect(await result.json()).toEqual({ error: 'invalid_session' })
+  }
+  expect(upstream).not.toHaveBeenCalled()
+})
+
+it('echoes the session capability bits and keeps a legacy timeline unchanged', async () => {
+  const { runtime } = sessionHost()
+  const seen: string[] = []
+  // 老网关：响应里没有 session_id / session_api，能力位由消息面补齐（expand 的那一半）。
+  const upstream = vi.fn(async (input: string | URL | Request) => {
+    seen.push(String(input))
+    return Response.json({ items: [] })
+  })
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const legacy = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Record<string, unknown>
+  expect(legacy).toMatchObject({ session_id: 'main', session_api: 1, sessions: ['main'], default_session_id: 'main' })
+  // 除这四个能力位字段外，老响应逐字不变。
+  const { session_id: _sid, session_api: _api, sessions: _list, default_session_id: _def, ...rest } = legacy
+  expect(rest).toEqual({ items: [], tasks: [], queued: [], declined: [], bots: [], default_bot_id: '',
+    unread: { count: 0, state: 'live' },
+    unread_replies: { count: null, state: 'unknown', reason: expect.any(String) },
+    status: { runtime: 'ready', mobile: 'ready', paused: false } })
+  // 老调用的转发 URL 逐字不变：网关自己缺省 main。
+  expect(seen[0]).toBe('http://gw/timeline')
+  // 显式 session 才追加 query；有 ticket 时用 & 接在已有 query 后面。
+  const shown = await handler(new Request('http://dsh/api/mobile/timeline?session_id=main'))
+  expect((await shown.json() as { session_id: string }).session_id).toBe('main')
+  expect(seen[1]).toBe('http://gw/timeline?session_id=main')
+  await handler(new Request('http://dsh/api/mobile/send?ticket=t1&session_id=work', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+  expect(seen.at(-1)).toBe('http://gw/send?ticket=t1&session_id=work')
+})
+
+it('refuses a non-main session against a gateway without session_api', async () => {
+  const { runtime } = sessionHost()
+  const upstream = vi.fn(async (_input: string | URL | Request) => Response.json({ items: [{ id: 'm1', role: 'user', text: 'main only' }] }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))
+  expect(result.status).toBe(409)
+  expect(await result.json()).toEqual({ error: 'unsupported_session' })
+  // 老网关被问的是 work，不是 main：绝不静默回落。
+  expect(String(upstream.mock.calls[0]?.[0])).toBe('http://gw/timeline?session_id=work')
+  // 老调用与显式 main 遇老网关照常工作（老调用兼容）。
+  expect((await handler(new Request('http://dsh/api/mobile/timeline'))).status).toBe(200)
+  expect((await handler(new Request('http://dsh/api/mobile/timeline?session_id=main'))).status).toBe(200)
+})
+
+it('refuses a straight send to a non-main session when the gateway has no session_api', async () => {
+  const { runtime } = sessionHost()
+  // 老网关：任何 operation 的响应都不带能力位，且会按 main 落库。客户端没先取 timeline
+  // 就直发 send 时，消息面也必须挡住 —— 否则这条 work 消息被静默写进 main。
+  const upstream = vi.fn(async (_input: string | URL | Request) => Response.json({ ok: true, id: 1, request_id: 'r1' }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/send?session_id=work', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+  expect(result.status).toBe(409)
+  expect(await result.json()).toEqual({ error: 'unsupported_session' })
+  expect(String(upstream.mock.calls[0]?.[0])).toBe('http://gw/send?session_id=work')
+  // 老调用（不带 session_id）与显式 main 照常放行。
+  expect((await handler(new Request('http://dsh/api/mobile/send', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r2' }) }))).status).toBe(200)
+  expect((await handler(new Request('http://dsh/api/mobile/send?session_id=main', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r3' }) }))).status).toBe(200)
+})
+
+it('accepts a straight send once the gateway echoes session_api', async () => {
+  const { runtime } = sessionHost()
+  const upstream = vi.fn(async (_input: string | URL | Request) =>
+    Response.json({ ok: true, id: 1, request_id: 'r1', session_id: 'work', session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: '{"id":"work"}' }))
+  const result = await handler(new Request('http://dsh/api/mobile/send?session_id=work', { method: 'POST',
+    body: JSON.stringify({ text: 'hi', request_id: 'r1' }) }))
+  expect(result.status).toBe(200)
+})
+
+it('serves an explicit non-main session once the gateway echoes session_api', async () => {
+  const { runtime } = sessionHost()
+  const upstream = vi.fn(async (_input: string | URL | Request) => Response.json({ items: [], session_id: 'work', session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: '{"id":"work"}' }))
+  const result = await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))
+  expect(result.status).toBe(200)
+  expect(await result.json()).toMatchObject({ session_id: 'work', session_api: 1,
+    sessions: ['main', 'work'], default_session_id: 'main' })
+  expect(String(upstream.mock.calls[0]?.[0])).toBe('http://gw/timeline?session_id=work')
+})
+
+it('keeps the read cursor per session, with the legacy key as main', async () => {
+  const { runtime, kv } = sessionHost()
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn() as unknown as typeof fetch)
+  const read = (url: string, last: string) => new Request(url, { method: 'POST', body: JSON.stringify({ last_read_id: last }) })
+  expect((await handler(read('http://dsh/api/mobile/read', 'r1'))).status).toBe(200)
+  expect(kv.get('mobile-read-cursor')).toBe('r1')          // 老键就是 main 那一份
+  expect((await handler(read('http://dsh/api/mobile/read?session_id=work', 'r9'))).status).toBe(200)
+  expect(kv.get('mobile-read-cursor:work')).toBe('r9')
+  expect(kv.get('mobile-read-cursor')).toBe('r1')          // 写 work 不动 main
+  const upstream = vi.fn(async () => Response.json({ items: [
+    { id: 'r1', role: 'agent', at: '2026-11-11T10:01:00+0800' },
+    { id: 'r2', role: 'agent', at: '2026-11-11T10:02:00+0800' } ], session_api: 1 }))
+  const timeline = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const main = await (await timeline(new Request('http://dsh/api/mobile/timeline'))).json() as { unread_replies: { count: number | null } }
+  expect(main.unread_replies.count).toBe(1)
+  const work = await (await timeline(new Request('http://dsh/api/mobile/timeline?session_id=work'))).json() as { unread_replies: { count: number | null; state: string } }
+  // work 的水位 r9 不在这份时间线里 → unknown，绝不拿 main 的 r1 顶替。
+  expect(work.unread_replies).toMatchObject({ count: null, state: 'unknown' })
+})
+
+it('keeps tasks, queued, unread and declined scoped to the requested session', async () => {
+  const at = new Date().toISOString()
+  const { runtime } = sessionHost({
+    tickets: [
+      { id: 't-main', title: 'main work', channels: [{ source: 'team', address: { conversation: 'main' } }], createdAt: at, updatedAt: at, assignments: [], inputs: [] },
+      { id: 't-work', title: 'work work', channels: [{ source: 'team', address: { conversation: 'work' } }], createdAt: at, updatedAt: at, assignments: [], inputs: [] },
+      // 老工单没有 address.conversation：只在 main 显示。
+      { id: 't-legacy', title: 'old', channels: [{ source: 'team' }], createdAt: at, updatedAt: at, assignments: [], inputs: [] },
+    ],
+    decisions: [
+      { kind: 'ignore', threadKey: 'team:main:1', at, reason: [{ code: 'said', values: { text: 'main 的寒暄' } }] },
+      { kind: 'ignore', threadKey: 'team:work:2', at, reason: [{ code: 'said', values: { text: 'work 的寒暄' } }] },
+    ],
+  })
+  // 上游给了一份混合时间线（模拟未按会话分片），消息面必须按行号把外会话条目剔掉。
+  const items = [
+    { id: 'm1', role: 'user', request_id: 'r1', at, read_at: '' },
+    { id: 'm2', role: 'user', request_id: 'r2', at, read_at: '' },
+  ]
+  const upstream = vi.fn(async () => Response.json({ items, session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  type Body = { tasks: { id: string }[]; queued: string[]; unread: { count: number | null; state: string }
+    declined: { request_id: string; reason: string }[]; items: { id: string }[] }
+  const main = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Body
+  expect(main.tasks.map(task => task.id)).toEqual(['t-main', 't-legacy'])
+  expect(main.queued).toEqual(['r1'])
+  expect(main.unread).toEqual({ count: 1, state: 'live' })
+  expect(main.declined).toEqual([{ request_id: 'r1', reason: 'main 的寒暄' }])
+  expect(main.items.map(item => item.id)).toEqual(['m1'])
+
+  const work = await (await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))).json() as Body & Record<string, unknown>
+  expect(work.tasks.map(task => task.id)).toEqual(['t-work'])
+  expect(work.queued).toEqual(['r2'])
+  expect(work.unread).toEqual({ count: 1, state: 'live' })
+  expect(work.declined).toEqual([{ request_id: 'r2', reason: 'work 的寒暄' }])
+  expect(work.items.map(item => item.id)).toEqual(['m2'])
+  // status / bots / default_bot_id 与会话无关，全量下发。
+  expect(work).toMatchObject({ bots: [], default_bot_id: '', status: { runtime: 'ready', mobile: 'ready' } })
+})
+
+it('does not attach another session ticket id to this session replies', async () => {
+  const at = new Date().toISOString()
+  const { runtime } = sessionHost({ decisions: [
+    { kind: 'accept', threadKey: 'team:main:1', ticketId: 'tk-main', at },
+    { kind: 'accept', threadKey: 'team:work:2', ticketId: 'tk-work', at },
+  ] })
+  const items = [
+    { id: 'm1', role: 'user', request_id: 'r1', at, read_at: '' },
+    { id: 'r1', role: 'agent', reply_to: 'm1', at },
+    { id: 'm2', role: 'user', request_id: 'r2', at, read_at: '' },
+    { id: 'r2', role: 'agent', reply_to: 'm2', at },
+  ]
+  const upstream = vi.fn(async () => Response.json({ items, session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  type Body = { items: { id: string; ticket_ref?: string }[] }
+  const main = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Body
+  expect(main.items.map(item => item.id)).toEqual(['m1', 'r1'])
+  expect(main.items.find(item => item.id === 'r1')?.ticket_ref).toBe('tk-main')
+  const work = await (await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))).json() as Body
+  expect(work.items.map(item => item.id)).toEqual(['m2', 'r2'])
+  expect(work.items.find(item => item.id === 'r2')?.ticket_ref).toBe('tk-work')
+})
+
+it('attributes a multi-channel ticket by any channel that names the session', async () => {
+  const at = new Date().toISOString()
+  const { runtime } = sessionHost({ tickets: [
+    // 两个 channel 分别标了 main 与 work：只取首个会把这张票从 work 里弄丢。
+    { id: 't-multi', title: 'multi', channels: [
+      { source: 'team', address: { conversation: 'main' } },
+      { source: 'team', address: { conversation: 'work' } }],
+      createdAt: at, updatedAt: at, assignments: [], inputs: [] },
+  ] })
+  const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const main = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as { tasks: { id: string }[] }
+  expect(main.tasks.map(task => task.id)).toEqual(['t-multi'])
+  // 任一 channel 命中即可：旧实现只认首个 channel，会把这张票从 work 里漏掉。
+  const work = await (await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))).json() as { tasks: { id: string }[] }
+  expect(work.tasks.map(task => task.id)).toEqual(['t-multi'])
+})
+
+it('does not let a decision from another conversation leak into main', async () => {
+  const at = new Date().toISOString()
+  const { runtime } = sessionHost({ decisions: [
+    // 历史 conversation 未必落在 session_id 形状内，但尾号是数字、会被 declined 消费：
+    // 若把这种 threadKey 当「认不出会话的老形态」放回 main，外会话的理由就串进来了。
+    { kind: 'ignore', threadKey: 'team:oc_x:1', at, reason: [{ code: 'said', values: { text: '别的会话的寒暄' } }] },
+  ] })
+  const items = [{ id: 'm1', role: 'user', request_id: 'r1', at, read_at: '' }]
+  const upstream = vi.fn(async () => Response.json({ items, session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const main = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as { declined: unknown[] }
+  expect(main.declined).toEqual([])
 })

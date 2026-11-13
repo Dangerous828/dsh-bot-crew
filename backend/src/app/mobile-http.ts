@@ -8,7 +8,7 @@ import { canRetry, ticketStage } from '../core/index.ts'
 import { SettingsConflict } from './settings.ts'
 import type { Settings } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
-import { KV, record } from '../kv.ts'
+import { KV } from '../kv.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
@@ -106,6 +106,7 @@ const PHONE_ERRORS: Readonly<Record<string, string>> = {
   'request_id is required': '缺 request_id',
   'last_read_id is required': '缺 last_read_id：没说读到哪一条回话',
   'Read cursor is unavailable': '这个后端记不下已读位置',
+  'Session registry is unavailable': '这个后端记不下会话名单',
 }
 /** 把一条错误换成人话；没有对应条目就原样交回，不吞掉后端的原因。 */
 const say = (error: string): string => PHONE_ERRORS[error] ?? error
@@ -325,15 +326,86 @@ function gatewayOrigin(stateDir?: string): string {
 }
 
 /**
- * 「回话已读到哪」的会话级水位。存在 Store 的 KV 里：不开新表、不给网关的 `replies` 表加
- * 阅读回执（契约 §5.6 明确说那上面不该有）。值和 `GET /timeline` 的回话 id 同源，都是网关给的 `r<n>`。
+ * 会话字段（S1 契约第 1、2 节）。只走 query —— relay 会原样透传 `url.search`，header 留给 S3 桌面端。
+ * `invalid_session` / `unsupported_session` 是契约钉死的错误码字面值（能力协商用），
+ * 故意不进 PHONE_ERRORS：翻成中文，400 / 409 的码就对不上了。
  */
-const READ_CURSOR = record<string>('mobile-read-cursor')
+const DEFAULT_SESSION_ID = 'main'
+/** 会话名形状（S1 契约第 1 节）。消息面校验与 threadKey 共用这一段，改形状只改一处。 */
+const SESSION_NAME = '[a-z0-9][a-z0-9-]{0,31}'
+const SESSION_ID = new RegExp(`^${SESSION_NAME}$`)
+const SESSION_API = 1
+/** threadKey 形如 `team:<会话>:<队列行号>` / `mobile:<会话>:<队列行号>`（core 的 `${source}:${id}`）。 */
+const SESSION_THREAD = new RegExp(`^(?:team|mobile):(${SESSION_NAME}):(\\d+)$`)
+/** 只要带 `team:<会话>:` / `mobile:<会话>:` 前缀就属于那个会话；尾号未必是数字，别用窄正则放行。 */
+const ANY_SESSION_THREAD = /^(?:team|mobile):[^:]+:/
 
-/** 读水位；宿主没接 KV（老版本或假宿主）时是「没报过」，不是 0 条。 */
-function replyReadCursor(store: PhoneHost['store']): string | undefined {
-  const value = typeof store.get === 'function' ? store.get(READ_CURSOR) : undefined
+/**
+ * 「回话已读到哪」按会话分键。存在 Store 的 KV 里：不开新表、不给网关的 `replies` 表加
+ * 阅读回执（契约 §5.6 明确说那上面不该有）。值和 `GET /timeline` 的回话 id 同源，都是网关给的 `r<n>`。
+ * `main` 复用升级前那一个单键（键名只由 KV.mobile.readCursor 定义），老的无参调用仍读写原来那一份。
+ */
+const READ_CURSOR = KV.mobile.readCursor
+
+/** 读某个会话的水位；宿主没接 KV（老版本或假宿主）时是「没报过」，不是 0 条。 */
+function replyReadCursor(store: PhoneHost['store'], sessionId: string): string | undefined {
+  const value = typeof store.get === 'function' ? store.get(READ_CURSOR(sessionId)) : undefined
   return typeof value === 'string' && value ? value : undefined
+}
+
+/** KV family 里登记过的会话；`main` 恒首位且不重复，读不到 KV 时只有它。 */
+function sessionIds(store: PhoneHost['store']): string[] {
+  const keys = typeof store.keys === 'function' ? store.keys(KV.mobile.sessions) : []
+  const extra = keys.map(key => key.slice(KV.mobile.sessions.prefix.length))
+    .filter(id => id !== DEFAULT_SESSION_ID && SESSION_ID.test(id))
+  return [DEFAULT_SESSION_ID, ...Array.from(new Set(extra)).sort()]
+}
+
+/**
+ * 本会话的决定（S1 契约第 4 节）：threadKey 前缀 `team:<session_id>:` / `mobile:<session_id>:`。
+ * 认不出会话前缀的老形态只在 `main` 显示 —— 老调用才逐字不变；带别的会话前缀的一律排除，
+ * 哪怕尾号不是数字（窄正则会把 `team:work:abc` 误当成老形态放回 main，那正是静默串线的口子）。
+ */
+function decisionsForSession<T extends { threadKey?: string }>(decisions: readonly T[], sessionId: string): T[] {
+  const prefixes = [`team:${sessionId}:`, `mobile:${sessionId}:`]
+  return decisions.filter(decision => {
+    const key = decision.threadKey
+    if (typeof key !== 'string' || !key) return false
+    if (prefixes.some(prefix => key.startsWith(prefix))) return true
+    return sessionId === DEFAULT_SESSION_ID && !ANY_SESSION_THREAD.test(key)
+  })
+}
+
+/**
+ * 明确属于**其他**会话的队列行号（threadKey 尾号）。网关按 `session_id` 分片返回 items 时这份是空的；
+ * 万一上游给了混合时间线，这些行号就是把外会话条目剔出去的依据（`m<row>` 与 threadKey 尾号同源）。
+ */
+function otherSessionRows(decisions: readonly { threadKey?: string }[], sessionId: string): Set<string> {
+  const rows = new Set<string>()
+  for (const decision of decisions) {
+    const match = typeof decision.threadKey === 'string' ? SESSION_THREAD.exec(decision.threadKey) : null
+    if (match && match[1] !== sessionId) rows.add(match[2]!)
+  }
+  return rows
+}
+
+/** 时间线条目按队列行号归会话；没有行号可判的条目保留，绝不靠猜把它丢掉。 */
+function itemsForSession(items: readonly TimelineItem[], otherRows: ReadonlySet<string>): TimelineItem[] {
+  if (otherRows.size === 0) return items.slice()
+  const rowOf = (value: unknown) => typeof value === 'string' ? /^m(\d+)$/.exec(value)?.[1] : undefined
+  return items.filter(item => {
+    const row = rowOf(item.id) ?? rowOf(item.reply_to)
+    return !row || !otherRows.has(row)
+  })
+}
+
+/** 工单按 `channels[].address.conversation` 归会话；任一 channel 命中即可，没标会话的老工单只在 `main` 显示。 */
+function ticketsForSession<T extends { channels: readonly { address?: Record<string, string> }[] }>(tickets: readonly T[], sessionId: string): T[] {
+  return tickets.filter(ticket => {
+    const tagged = ticket.channels.some(channel => typeof channel.address?.conversation === 'string' && channel.address.conversation)
+    if (!tagged) return sessionId === DEFAULT_SESSION_ID
+    return ticket.channels.some(channel => channel.address?.conversation === sessionId)
+  })
 }
 
 /** Which operations exist, how they are called, and whether they need a query the surface checks itself. */
@@ -378,6 +450,8 @@ const OPERATIONS = {
   resume: { methods: ['POST'] },
   // 花名册的读写：空态「加第一位 Bot」与手机上要显示的名字。
   bots: { methods: ['GET', 'POST'] },
+  // 会话名单：GET 列出、POST 登记。两条 exact route 都在宿主侧直接答，不转发到网关。
+  sessions: { methods: ['GET', 'POST'] },
 } as const
 type Operation = keyof typeof OPERATIONS
 
@@ -388,6 +462,28 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     const operation = name && name in OPERATIONS ? name : undefined
     if (!operation || !(OPERATIONS[operation].methods as readonly string[]).includes(incoming.method)) {
       return response(404, { error: 'Unknown operation' })
+    }
+    // session_id 只走 query，缺省 main。非法值一律在这里挡住：不落到网关、不静默当 main —— 那是
+    // 本阶段最重要的防串线约束（S1 契约第 1 节）。显式非 main 遇未升级网关还有下面的 409 能力位检查。
+    const askedSession = url.searchParams.get('session_id')
+    if (askedSession !== null && !SESSION_ID.test(askedSession)) return response(400, { error: 'invalid_session' })
+    const sessionId = askedSession ?? DEFAULT_SESSION_ID
+    const explicitSession = askedSession !== null
+    // 会话名单与登记都在宿主侧答，不经过网关；`sessions` 是唯一不转发的新增 operation。
+    if (operation === 'sessions') {
+      await runtime.ready
+      if (incoming.method === 'GET') {
+        return response(200, { sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
+      }
+      const raw = await incoming.text()
+      if (Buffer.byteLength(raw) > 8 * 1024) return response(413, { error: 'Request too large' })
+      const asked = askedBody(raw)
+      const id = typeof asked?.id === 'string' ? asked.id : ''
+      if (!SESSION_ID.test(id)) return response(400, { error: 'invalid_session' })
+      if (typeof runtime.store.set !== 'function') return response(503, { error: 'Session registry is unavailable' })
+      // 重复 id 幂等：写同一个键、回同一份名单，不报错。`main` 恒在首位，不必落键。
+      if (id !== DEFAULT_SESSION_ID) runtime.store.set(KV.mobile.sessions(id), true)
+      return response(200, { id, sessions: sessionIds(runtime.store), session_api: SESSION_API })
     }
     // A work or agent lookup without a ticket would ask the gateway to guess; refuse it here instead.
     const ticketId = url.searchParams.get('ticket') ?? ''
@@ -719,7 +815,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const lastReadId = typeof asked.last_read_id === 'string' ? asked.last_read_id.trim() : ''
         if (!lastReadId || lastReadId.length > 128) return response(400, { error: 'last_read_id is required' })
         if (typeof runtime.store.set !== 'function') return response(503, { error: 'Read cursor is unavailable' })
-        runtime.store.set(READ_CURSOR, lastReadId)
+        // 按会话分键；老的无参调用落到 main 那一份（升级前的那个单键），已存过的水位不丢。
+        runtime.store.set(READ_CURSOR(sessionId), lastReadId)
         return response(200, { ok: true, last_read_id: lastReadId })
       }
       if (operation === 'bots') {
@@ -855,7 +952,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       await runtime.ready
       const token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim()
       if (!token) return response(503, { error: 'Mobile transport is not configured' })
-      const target = ticketId ? `${gateway}/${operation}?ticket=${encodeURIComponent(ticketId)}` : `${gateway}/${operation}`
+      const query = ticketId ? `?ticket=${encodeURIComponent(ticketId)}` : ''
+      // 只在显式带了 session_id 时追加：老调用的转发 URL 逐字不变，网关自己缺省 main（S1 契约第 1 节）。
+      // 有 ticket 时接 `&`，没有时接 `?`，两种形状都让网关从 url.search 取到同一个字段。
+      const target = `${gateway}/${operation}${query}${explicitSession ? `${query ? '&' : '?'}session_id=${encodeURIComponent(sessionId)}` : ''}`
       const upstream = await request(target, {
         method: incoming.method, headers: { 'X-GW-Token': token, 'Content-Type': 'application/json' },
         ...(body ? { body } : {}), signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error',
@@ -872,18 +972,36 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           { error: upstream.status === 401 ? 'Mobile transport credential mismatch' : 'Mobile request was rejected' })
       }
       const data = await upstream.json() as Record<string, unknown>
+      // 能力位（S1 契约第 2 节）：网关对显式带 session_id 的**每个**响应都回显
+      // session_api: 1（老调用不带参数 → 响应逐字不变）。所以对任何转发 operation，
+      // 显式非 main 却没拿到 1，就是对端未升级、会把这段会话当 main 读写：直接 409，
+      // 绝不静默回落。这样即使客户端不先取 timeline 就直发 send，也不会被老网关
+      // 悄悄按 main 落库。老调用与显式 main 不受影响（老网关照常服务）。
+      if (explicitSession && sessionId !== DEFAULT_SESSION_ID && data.session_api !== SESSION_API) {
+        return response(409, { error: 'unsupported_session' })
+      }
       if (operation === 'timeline') {
         const settings = runtime.store.settings()
         const decisions = runtime.store.read?.recentDecisions?.(0, 200) ?? []
+        // 会话过滤（S1 契约第 4 节）：宿主侧的决定、工单、时间线都先按 session_id 收窄，
+        // 别把别的会话的数据算进这一格的 tasks / queued / declined / unread / unread_replies。
+        // 老调用是 main，且老数据没有会话标记，所以这层过滤对它是恒等的 —— 内容其余部分逐字不变。
+        const sessionDecisions = decisionsForSession(decisions, sessionId)
         const gatewayItems = Array.isArray(data.items) ? data.items as TimelineItem[] : []
+        const sessionItems = itemsForSession(gatewayItems, otherSessionRows(decisions, sessionId))
         // 代码卡上「看看改完的样子」要知道看哪张票：网关只记「回哪条消息」，
         // 工单号在这一侧对齐一次再下发。对不上就让它缺着，客户端会如实说。
-        const items = withTicketRefs(gatewayItems, ticketRefs(gatewayItems, decisions))
+        const items = withTicketRefs(sessionItems, ticketRefs(sessionItems, sessionDecisions))
         // The crew Source answers on the same queue as mobile, so its tickets belong on the phone too.
-        const tickets = runtime.store.tickets.list().filter(ticket => ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team')).slice(0, 30)
+        const tickets = ticketsForSession(runtime.store.tickets.list().filter(ticket =>
+          ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team')), sessionId).slice(0, 30)
         // The phone names a Bot on send; the roster tells it who exists and who answers by default.
         const roster = crewRoster(runtime.store.settings(), bot => earliestTicketAt(data, bot))
         return response(200, { ...data, ...roster,
+          // 能力位（S1 契约第 2 节）：老调用也回显 session_id: "main"，内容其余部分逐字不变。
+          // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
+          session_id: sessionId, session_api: SESSION_API,
+          sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID,
           // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
           items,
           tasks: tickets.map(ticket => {
@@ -921,19 +1039,18 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         }),
         // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
         // Withdrawing it means the crew has not read it, which is what the phone needs to offer.
-        queued: queuedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : []),
+        queued: queuedRequests(sessionItems),
         // 「未读」：人发出去、队伍还没读走的有几条（契约 §5.6）。和 `queued` 读的是同一份时间线，
         // 但判据不同：`queued` 是「还没回复、还能撤回」，未读是「还没被读走」。一条消息可以先被读走
         // 再慢慢回，那时它已经不算未读了。
         unread: unreadOf(items),
         // 「未读回话」：队伍回了、主人还没看的有几条（契约 §5.6 新增的一格）。
         // 和 `unread` 方向相反、判据不同，两个数谁也不冒充谁；没报过水位就是 unknown，不是 0。
-        unread_replies: unreadRepliesOf(items, replyReadCursor(runtime.store)),
+        unread_replies: unreadRepliesOf(items, replyReadCursor(runtime.store, sessionId)),
         // The messages read and left on purpose. Without these the phone cannot tell a thought in progress from
         // one that will never be answered.
         // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
-        declined: declinedRequests(Array.isArray(data.items) ? data.items as TimelineItem[] : [],
-          decisions),
+        declined: declinedRequests(sessionItems, sessionDecisions),
         // 手机消息由已安装的那个 Source 承载：独立部署是 `mobile`，Bot 队伍里是 `team`。
         // 两个都不在时如实说 missing；兜底写 starting 会让人以为服务一直没起来。
         status: { runtime: runtime.health.runtime?.state ?? 'starting',
@@ -1077,6 +1194,10 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/resume', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 花名册：GET 读，POST 加一位。
       connection.fetch.register({ path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered', fetch: handler }),
+      // 会话名单：两条 exact route（GET 列出 / POST 登记），都指向同一个处理器，由 incoming.method 区分。
+      // 宿主侧直接答，不转发到网关。
+      connection.fetch.register({ path: '/api/mobile/sessions', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/sessions', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
     ]
     child.effect(() => async () => { await Promise.all(disposers.map(dispose => dispose())) })
   })

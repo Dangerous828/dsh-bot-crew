@@ -4,10 +4,11 @@ import base64
 import hmac
 import json
 import os
+import re
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # MOBILEGW_STATE 让一个后端把 gateway 指到它自己的状态目录：两套队伍（例如 desktop 与 web）各自持有队列和 token，
 # 而不是抢同一份。不设时仍落到历史默认位置，老部署的行为一字不变。
@@ -17,7 +18,9 @@ DB = os.path.join(STATE, 'mobileq.db')
 TOKEN_FILE = os.path.join(STATE, 'mobilegw.token')
 PORT = int(os.environ.get('MOBILEGW_PORT', '8788'))
 BIND = os.environ.get('MOBILEGW_HOST', '127.0.0.1')
-CONV = os.environ.get('MOBILEGW_CONV', 'main')
+# 会话必须是请求级的：进程级常量会把两个会话静默并进同一条时间线。`main` 是唯一缺省值（契约 §1）。
+DEFAULT_SESSION = 'main'
+SESSION_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 MAX_BODY = 64 * 1024
 
 
@@ -75,6 +78,24 @@ def tie_key(value):
     return '' if value is None else str(value)
 
 
+def session_of(handler):
+    """The conversation for THIS request, from ?session_id= (contract §1).
+
+    Query-only on purpose: body and header are not transports for this field. Missing -> `main`,
+    so a legacy caller keeps seeing exactly the old rows. Malformed -> 400 invalid_session and
+    None, which tells the caller to stop before it touches the database. `fullmatch` (not `$`)
+    also rejects a trailing newline that a naive anchored regex would let through.
+    """
+    values = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get('session_id')
+    if not values:
+        return DEFAULT_SESSION
+    session = values[0]
+    if not SESSION_RE.fullmatch(session):
+        handler._send(400, {'error': 'invalid_session'})
+        return None
+    return session
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -83,6 +104,17 @@ class H(BaseHTTPRequestHandler):
         return hmac.compare_digest(self.headers.get('X-GW-Token', '').encode(), TOKEN.encode())
 
     def _send(self, code, obj):
+        # 能力位覆盖**所有**响应，而不只是 timeline：消息面据此在任何 operation 上判断
+        # 对端是不是老网关。否则客户端不先取 timeline 就直发 send?session_id=work 时，
+        # 老网关会把消息静默按 main 落库，消息面也无从发现（S1 契约最在意的串线）。
+        # 老调用（query 不带 session_id）一个字段都不加，响应逐字不变；非法值已被
+        # session_of 回过 400，这里 fullmatch 不通过同样不加。timeline 自带这两个字段，
+        # setdefault 不覆盖它。
+        if isinstance(obj, dict):
+            values = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get('session_id')
+            if values and SESSION_RE.fullmatch(values[0]):
+                obj.setdefault('session_id', values[0])
+                obj.setdefault('session_api', 1)
         data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -110,9 +142,15 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
+            # 探针不消费会话，但非法值仍按契约 §1 拒绝，不留一个静默放行口。
+            if session_of(self) is None:
+                return
             return self._send(200, {'ok': True})
         if not self._auth():
             return self._send(401, {'error': 'unauthorized'})
+        session = session_of(self)
+        if session is None:
+            return
         if path != '/timeline':
             return self._send(404, {'error': 'not found'})
         c = db()
@@ -121,8 +159,8 @@ class H(BaseHTTPRequestHandler):
             # phone must neither show it nor keep offering it in `queued`.
             # `read_at` 一起读出来：它是「队伍已经读走」的唯一持久记录。手机面靠它算
             # 「发出去还没被读走」的条数（契约 §5.6）。撤回只看它有没有值，这里不改那套判定。
-            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions,read_at FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (CONV,)).fetchall()
-            reps = c.execute('SELECT id,to_msg,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id', (CONV,)).fetchall()
+            msgs = c.execute('SELECT id,text,sender,at,request_id,mentions,read_at FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (session,)).fetchall()
+            reps = c.execute('SELECT id,to_msg,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id', (session,)).fetchall()
         finally:
             c.close()
         entries = [(m['id'], 0, m['id'], {'role': 'user', 'text': m['text'], 'at': m['at'],
@@ -143,9 +181,10 @@ class H(BaseHTTPRequestHandler):
         # 排到 23:54 的消息之前，屏幕上就成了「回答和消息对不上」。
         # at 是同一格式的带偏移时间串，可直接比较；同一秒内用户消息在前、回复在后。
         entries.sort(key=lambda item: (item[3]['at'], item[1], tie_key(item[2])))
-        return self._send(200, {'items': [item[3] for item in entries]})
+        return self._send(200, {'items': [item[3] for item in entries],
+                                'session_id': session, 'session_api': 1})
 
-    def _claim(self):
+    def _claim(self, session):
         """Take a message out of the queue for a steer without answering it.
 
         A steer is the owner jumping the line: the text goes straight to the running worker's next
@@ -162,10 +201,10 @@ class H(BaseHTTPRequestHandler):
         c = db()
         try:
             row = c.execute('SELECT id,text,read_at,withdrawn_at FROM messages WHERE conversation=? AND request_id=?',
-                            (CONV, request_id)).fetchone()
+                            (session, request_id)).fetchone()
             if not row or row['withdrawn_at']:
                 return self._send(404, {'error': 'no such message'})
-            answered = c.execute('SELECT 1 FROM replies WHERE conversation=? AND to_msg=? LIMIT 1', (CONV, row['id'])).fetchone()
+            answered = c.execute('SELECT 1 FROM replies WHERE conversation=? AND to_msg=? LIMIT 1', (session, row['id'])).fetchone()
             if answered:
                 return self._send(409, {'error': 'message was already answered'})
             if row['read_at']:
@@ -181,10 +220,13 @@ class H(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if not self._auth():
             return self._send(401, {'error': 'unauthorized'})
+        session = session_of(self)
+        if session is None:
+            return
         if path == '/withdraw':
-            return self._withdraw()
+            return self._withdraw(session)
         if path == '/claim':
-            return self._claim()
+            return self._claim(session)
         if path != '/send':
             return self._send(404, {'error': 'not found'})
         ok, body = self._body()
@@ -205,7 +247,7 @@ class H(BaseHTTPRequestHandler):
         c = db()
         try:
             c.execute('BEGIN IMMEDIATE')
-            existing = c.execute('SELECT id,text FROM messages WHERE conversation=? AND request_id=?', (CONV, request_id)).fetchone() if request_id else None
+            existing = c.execute('SELECT id,text FROM messages WHERE conversation=? AND request_id=?', (session, request_id)).fetchone() if request_id else None
             if existing:
                 if existing['text'] != text:
                     return self._send(409, {'error': 'request_id already used for a different message'})
@@ -218,14 +260,14 @@ class H(BaseHTTPRequestHandler):
                 # already read, so `pull` never routes the same text a second time.
                 stamp = now() if body.get('steer') is True else None
                 cursor = c.execute('INSERT INTO messages(conversation,thread,sender,bot,mentions_me,mentions,text,at,request_id,read_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                                   (CONV, None, 'owner', 0, 1, ','.join(mentions), text, now(), request_id, stamp))
+                                   (session, None, 'owner', 0, 1, ','.join(mentions), text, now(), request_id, stamp))
                 mid = cursor.lastrowid
             c.commit()
         finally:
             c.close()
         return self._send(200, {'ok': True, 'id': mid, 'request_id': request_id})
 
-    def _withdraw(self):
+    def _withdraw(self, session):
         """Take back a message nobody has consumed yet.
 
         A message is still withdrawable only while both things are true: no reply hangs under it
@@ -245,7 +287,7 @@ class H(BaseHTTPRequestHandler):
             # could be withdrawn after the worker has already been handed it.
             c.execute('BEGIN IMMEDIATE')
             row = c.execute('SELECT id,read_at,withdrawn_at FROM messages WHERE conversation=? AND request_id=?',
-                            (CONV, request_id)).fetchone()
+                            (session, request_id)).fetchone()
             if row is None:
                 c.rollback()
                 return self._send(404, {'error': 'no such message'})
@@ -253,7 +295,7 @@ class H(BaseHTTPRequestHandler):
                 c.rollback()
                 return self._send(409, {'error': 'message already withdrawn'})
             if c.execute('SELECT 1 FROM replies WHERE conversation=? AND to_msg=? LIMIT 1',
-                         (CONV, row['id'])).fetchone():
+                         (session, row['id'])).fetchone():
                 c.rollback()
                 return self._send(409, {'error': 'message was already answered'})
             if row['read_at']:
@@ -272,5 +314,5 @@ class H(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     # Initialize/migrate before accepting concurrent HTTP requests. Never log credentials.
     db().close()
-    print('mobilegw on %s:%d conv=%s' % (BIND, PORT, CONV), flush=True)
+    print('mobilegw on %s:%d conv=%s session_api=1' % (BIND, PORT, DEFAULT_SESSION), flush=True)
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()

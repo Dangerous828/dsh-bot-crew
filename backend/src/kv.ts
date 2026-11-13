@@ -76,4 +76,11 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /**
+   * 消息面（手机）按会话分的账（S1 契约第 4 节）。名单一条一个键，`main` 恒在读侧补在首位、不落键。
+   * 「回话已读到哪」按会话分键：`main` 复用升级前的单键 `mobile-read-cursor`，
+   * 这样老的无参调用仍读写原来那一份、已经存过的水位不丢；其余会话各占一个 `mobile-read-cursor:<id>`。
+   */
+  mobile: { sessions: family<true, [id: string]>('mobile-session:'),
+    readCursor: family<string, [session: string]>('mobile-read-cursor', session => session === 'main' ? '' : `:${session}`) },
 }

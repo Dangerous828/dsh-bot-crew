@@ -160,6 +160,115 @@ class MobileTransportTest(unittest.TestCase):
         self.assertEqual(self.request('/timeline', token=False)[0], 401)
         self.assertEqual(self.request('/timeline-unrelated')[0], 404)
         self.assertEqual(self.request('/send-unrelated', {'text': 'hello'})[0], 404)
+    # --- S1: one request, one session; the queue column is never a process constant ---
+    # Contract §1/§2/§3: session_id is query-only, defaults to main, ^[a-z0-9][a-z0-9-]{0,31}$,
+    # malformed -> 400 invalid_session, and GET /timeline echoes session_id + session_api: 1.
+
+    def test_two_sessions_can_reuse_one_request_id_and_stay_apart(self):
+        # UNIQUE(conversation, request_id) is per session: the same phone retry key in two
+        # sessions must insert two rows, not be deduplicated across the wire.
+        main_sent = self.request('/send?session_id=main', {'text': 'A 侧', 'request_id': 'shared-1'})[1]
+        work_sent = self.request('/send?session_id=work', {'text': 'B 侧', 'request_id': 'shared-1'})[1]
+        self.assertNotEqual(main_sent['id'], work_sent['id'])
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=main')[1]['items']], ['A 侧'])
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=work')[1]['items']], ['B 侧'])
+        # Same key, same text, same session stays idempotent (the old contract).
+        self.assertEqual(self.request('/send?session_id=work', {'text': 'B 侧', 'request_id': 'shared-1'})[1]['id'], work_sent['id'])
+        self.assertEqual(len(self.request('/timeline?session_id=work')[1]['items']), 1)
+
+    def test_withdraw_and_claim_stay_inside_their_session(self):
+        self.request('/send?session_id=work', {'text': '只在 work', 'request_id': 'cross-1'})
+        # Neither endpoint may find a row that belongs to another conversation.
+        self.assertEqual(self.request('/withdraw?session_id=main', {'request_id': 'cross-1'})[0], 404)
+        self.assertEqual(self.request('/claim?session_id=main', {'request_id': 'cross-1'})[0], 404)
+        # A cross-session miss must not consume the row; work can still claim/withdraw it.
+        self.assertEqual(self.request('/claim?session_id=work', {'request_id': 'cross-1'})[0], 200)
+        self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'cross-1'})[0], 409)
+
+    def test_answered_check_does_not_borrow_another_sessions_reply(self):
+        # mobileq writes replies with an explicit --conversation. Plant a reply under main
+        # pointing at work's message id: work's answered-checks must not see it. If either
+        # SELECT still uses a process-level conversation, these two succeed-by-accident.
+        work_id = self.request('/send?session_id=work', {'text': 'B 侧', 'request_id': 'reply-1'})[1]['id']
+        self.queue('reply', '--conversation', 'main', '--to', str(work_id), '--key', 'main-reply-1', '--text', '别串')
+        self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'reply-1'})[0], 200)
+        work_id2 = self.request('/send?session_id=work', {'text': 'B 侧 2', 'request_id': 'reply-2'})[1]['id']
+        self.queue('reply', '--conversation', 'main', '--to', str(work_id2), '--key', 'main-reply-2', '--text', '别串 2')
+        status, body = self.request('/claim?session_id=work', {'request_id': 'reply-2'})
+        self.assertEqual((status, body.get('text')), (200, 'B 侧 2'))
+
+    def test_timeline_replies_are_scoped_to_the_requested_session(self):
+        main_id = self.request('/send?session_id=main', {'text': 'A 侧', 'request_id': 'scope-1'})[1]['id']
+        self.queue('reply', '--conversation', 'main', '--to', str(main_id), '--key', 'scope-reply', '--text', 'A 的答')
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=work')[1]['items']], [])
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=main')[1]['items']], ['A 侧', 'A 的答'])
+
+    def test_timeline_echoes_session_and_capability_bit(self):
+        self.request('/send?session_id=main', {'text': 'A 侧', 'request_id': 'echo-1'})
+        work = self.request('/timeline?session_id=work')[1]
+        self.assertEqual((work['session_id'], work['session_api']), ('work', 1))
+        main = self.request('/timeline?session_id=main')[1]
+        self.assertEqual((main['session_id'], main['session_api']), ('main', 1))
+        # Legacy call: byte-for-byte the old body, plus exactly the two new fields.
+        legacy = self.request('/timeline')[1]
+        self.assertEqual(set(legacy), {'items', 'session_id', 'session_api'})
+        self.assertEqual((legacy['session_id'], legacy['session_api']), ('main', 1))
+        self.assertEqual(legacy['items'], main['items'])
+
+    def test_every_explicit_session_response_carries_the_capability_bit(self):
+        """能力位不只属于 timeline：直发 send / withdraw / claim 到老网关也必须能被认出来。
+
+        老调用（query 不带 session_id）一个字段都不加，响应逐字不变。
+        """
+        code, sent = self.request('/send?session_id=work', {'text': 'B 侧', 'request_id': 'cap-1'})
+        self.assertEqual(code, 200)
+        self.assertEqual((sent['session_id'], sent['session_api']), ('work', 1))
+        code, claimed = self.request('/claim?session_id=work', {'request_id': 'cap-1'})
+        self.assertEqual(code, 200)
+        self.assertEqual((claimed['session_id'], claimed['session_api']), ('work', 1))
+        code, withdrawn = self.request('/withdraw?session_id=work', {'request_id': 'cap-1'})
+        # 已被 claim 的消息撤不回来，但 409 也一样带能力位：任何响应都不能让消息面误判。
+        self.assertEqual((withdrawn['session_id'], withdrawn['session_api']), ('work', 1))
+        # 老调用逐字不变：send 响应仍是原来那三个键。
+        code, legacy = self.request('/send', {'text': 'A 侧', 'request_id': 'cap-legacy'})
+        self.assertEqual(code, 200)
+        self.assertEqual(set(legacy), {'ok', 'id', 'request_id'})
+
+    def test_invalid_session_id_is_rejected_with_400(self):
+        bad = ['WORK', 'work%20x', 'w' * 33, '-lead', 'under_score', 'main%0A', '']
+        for value in bad:
+            with self.subTest(value=value):
+                for path, body in (('/timeline?session_id=' + value, None),
+                                   ('/health?session_id=' + value, None),
+                                   ('/send?session_id=' + value, {'text': 'x'}),
+                                   ('/withdraw?session_id=' + value, {'request_id': 'x'}),
+                                   ('/claim?session_id=' + value, {'request_id': 'x'})):
+                    self.assertEqual(self.request(path, body), (400, {'error': 'invalid_session'}), path)
+        # A legal non-default session is accepted and never silently folded into main.
+        # The shape only constrains the FIRST character, so a trailing '-' is legal too.
+        for session in ('work-2', 'trail-', 'a' * 32):
+            with self.subTest(session=session):
+                self.assertEqual(self.request('/timeline?session_id=' + session)[1]['session_id'], session)
+
+    def test_session_id_is_a_query_only_field(self):
+        self.request('/send', {'text': 'body 里的会话名不算数', 'session_id': 'work'})
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=main')[1]['items']],
+                         ['body 里的会话名不算数'])
+        self.assertEqual(self.request('/timeline?session_id=work')[1]['items'], [])
+        # A header must not become a second transport for this field (headers belong to S3).
+        req = urllib.request.Request(self.url + '/timeline',
+                                     headers={'X-GW-Token': self.gateway.TOKEN,
+                                              'X-Session-Id': 'work'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            self.assertEqual(json.load(response)['session_id'], 'main')
+
+    def test_missing_session_id_falls_back_to_main(self):
+        sent = self.request('/send', {'text': '老调用', 'request_id': 'legacy-1'})[1]
+        self.assertEqual([i['text'] for i in self.request('/timeline')[1]['items']], ['老调用'])
+        self.assertEqual([i['text'] for i in self.request('/timeline?session_id=main')[1]['items']], ['老调用'])
+        self.assertEqual(self.request('/timeline?session_id=work')[1]['items'], [])
+        self.assertEqual(self.request('/claim', {'request_id': 'legacy-1'})[1]['id'], sent['id'])
+        self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'legacy-1'})[0], 404)
 
 
 if __name__ == '__main__':

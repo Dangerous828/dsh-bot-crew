@@ -815,3 +815,88 @@
 ## 8. 表层来源
 
 上述 timeline/send 形状、`request_id` 幂等与错误码，参照 BotHarness/DeepSeekBot（MIT）的消息面表层，以及本机既有的同源 `/api/mobile/*` 契约；只取字段形状，不取其 Assignment / Inbox / humanAttention 等状态字段。详见 `THIRD_PARTY_NOTICES.md`。
+
+## 9. 会话（session_id）
+
+一次请求选哪一段消息流，由 `session_id` 决定。本节只定义线上字节；状态仍以队列与后台为准。
+切片划分与 seam 取舍见 [ADR 0007](adr/0007-multi-session-seam.md)，三个词的分工见 `GLOSSARY.md`。
+
+**S1 是后端闭环**：网关与消息面按会话分片，手机 / 桌面客户端本阶段不改，老调用逐字不变。
+要开会话、切会话的客户端行为与准入收口是 S2 / S3 / S4 的事，一律用 `TODO(owner, 日期)` 标出，
+用 `grep -n 'TODO(' docs/00-contract.md` 可一次捞出，按日期核对。后续切片在本节逐条记为欠账。
+
+### 9.1 字段形状
+
+| 项 | 约定 |
+| --- | --- |
+| 名称 | `session_id` |
+| 位置 | **只走 query 参数**（relay 把 `url.search` 原样拼回下游路径，`relay/src/server.ts:644`）；不用 body、不用 header |
+| 形状 | `^[a-z0-9][a-z0-9-]{0,31}$` |
+| 缺省 | 不带即 `main`；`session_id=main` 与不带等价 |
+| 映射 | 与队列 `messages.conversation` 列一一映射：`session_id` 是该列在线上消息面的字段名 |
+
+- `session_id` 是**传输层的字段**，不是 DSH 的 Session；DSH 总路由 `masterId` 仍是单值，不随会话增减。
+- `TODO(desktop, 2026-11-13)` header 形态的 `session_id` 未开放：留给 S3 桌面端，本阶段只认 query 参数。
+  S1 的 body 与 header 都不读 `session_id`。
+
+### 9.2 能力位（expand 的那一半）
+
+- 网关对**显式带 `session_id` 的每个响应**（不只是 `GET /timeline`）回显 `session_id: X` 与
+  `session_api: 1`，包括 `/send`、`/withdraw`、`/claim` 及各自的错误响应。
+  理由：客户端可能不先取 timeline 就直发 `send?session_id=work`，若只有 timeline 带能力位，
+  这条路径在老网关上会被静默按 `main` 落库且无从发现。
+- 消息面 `GET /api/mobile/timeline` 响应回显 `session_id`、`session_api: 1`、
+  `sessions: ["main", ...]`、`default_session_id: "main"`。
+- 老调用（不带 `session_id`）的**请求与响应**都逐字不变：网关一个字段都不加（能力位只在显式
+  带参数时注入）；`/timeline` 老调用仍回显 `session_id: "main"`，响应其余部分逐字不变。
+  消息面老调用的转发 URL 也不带 `session_id`，由网关缺省 `main`。
+- `GET /api/mobile/sessions` → `{ sessions, default_session_id: "main", session_api: 1 }`，
+  `main` 恒在首位；`POST /api/mobile/sessions` body `{ "id": "work" }` 按 §9.1 校验形状、登记进名单，
+  返回 `{ id, sessions, session_api: 1 }`；重复 id 幂等返回 200。
+- 能力位是**增量字段**：老客户端按 §5「未知字段必须保留、不得丢弃」照旧处理，不因多出字段报错或改状态。
+  新客户端只在确认 `session_api: 1` 之后才发显式非 `main`；缺位即停止发送并明确报错，**禁止静默降级**。
+
+### 9.3 错误码
+
+| `error` | HTTP | 何时 |
+| --- | --- | --- |
+| `invalid_session` | 400 | `session_id` 不符合 §9.1 形状（大写 / 空格 / 超长 / 非法字符） |
+| `unsupported_session` | 409 | 显式 `session_id != main` 而对端未升级（网关响应缺 `session_api`） |
+
+- 两条都回 `{ "error": "<code>" }`，与 §6 的错误体同形；`error` 的值就是上表的码，客户端按 §6 只展示文本。
+- **`unsupported_session` 绝不静默当 `main`**：这是本阶段最重要的防串线约束。
+- 消息面对**任何转发 operation**（timeline / send / withdraw / claim 等）一视同仁：网关响应缺
+  `session_api` 且请求显式 `session_id != main`，回 409 `unsupported_session`。
+  因此直发 `send` 到老网关也会被挡，不依赖客户端「先取 timeline 探测」的约定。
+
+### 9.4 老客户端兼容
+
+- 不带 `session_id` 的请求形状、状态码、响应其余内容与本阶段之前一致，全程 200；新增字段是增量的，按 §5 处理。
+- 会话名单、READ_CURSOR、timeline 过滤在后端按 `session_id` 分开；老调用只落在 `main` 那一份。
+- `TODO(app, 2026-11-13)` S2：手机端切换 / 新建会话未接，本阶段不改 `app/`。
+- `TODO(desktop, 2026-11-13)` S3：桌面端切换 / 新建会话未接，本阶段不改 `desktop/`。
+- `TODO(backend, 2026-11-13)` S4：Source 准入判定（`scope()` / `channel.allowed`）与会话名单的收口未做；
+  S1 只写这份契约与「未登记会话不静默丢消息」的说明，`team.ts` / `mobile.ts` 只加说明性注释，不改判定逻辑。
+- `TODO(gw, 2026-11-13)` S4：真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、真机配对与
+  `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state` 与归档守卫）尚未做。
+
+### 9.5 四种组合与静默串线
+
+两个维度：**客户端**（老 = 不带 `session_id` / 只认 `main`；新 = 会发显式非 `main`）×
+**后端**（老 = 网关 + 消息面未升级、不回显 `session_api`；新 = 按会话分片、回显 `session_api: 1`）。
+
+| 组合 | 客户端 | 后端 | 结果 |
+| --- | --- | --- | --- |
+| C1 | 老 | 老 | 全落 `main`，200，逐字兼容，无串线（双方都只认一段） |
+| C2 | 老 | 新 | 缺省回落 `main`，200 + 回显 `session_id: "main"` / `session_api: 1`，老客户端忽略能力位，无串线 |
+| C3 | 新 | 新 | 显式非 `main` 被正确分片，200 + 回显 `session_id: X` / `session_api: 1`，无串线 |
+| C4 | 新 | **老** | **全程 200 静默串线**：客户端以为在 X，后端仍读写 `main`，不报错、不回显、不拒绝 |
+
+C4 是唯一危险组合，四个口子让它「全程 200」：send body 重构时丢掉未知字段、`CONV` 仍写 `main`、
+timeline 全量下发、`READ_CURSOR` 全局单键。S1 逐一对上：query 原样透传（§9.1）、网关请求级
+`session_of`、timeline 按会话过滤、READ_CURSOR 按会话分键。
+
+能力位防串：C4 里后端一路 200，靠**客户端先验能力位**兜底 —— 新客户端发现响应没有
+`session_api: 1` 就停发并报错；滚动升级时（新消息面 + 老网关）再由消息面把「网关响应缺
+`session_api` 且显式非 `main`」翻成 409 `unsupported_session`。两道都指向同一条规矩：
+**显式非 `main` 遇未升级对端，宁可报错，也不静默当 `main`。**

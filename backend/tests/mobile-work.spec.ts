@@ -39,11 +39,17 @@ it('registers the work routes on the same authenticated carrier as the rest', ()
   const child = { get: () => ({ fetch: { register: (route: unknown) => { registered.push(route as never); return vi.fn(async () => {}) } } }), effect: vi.fn() }
   const ctx = { inject: (_deps: string[], action: (scope: unknown) => void) => action(child) }
   registerMobileHttp(ctx as never, host())
-  expect(registered.map(route => route.path)).toEqual([
+  const paths = registered.map(route => route.path)
+  // 逐项断言而不是硬编码整张表：新增一条路由不该让这条例行测试整片变红。
+  // 这里的意图是「工单那几条和其它接口仍走同一道已鉴权的 carrier」，不是「路由总数恰好 N」。
+  for (const expected of [
     '/api/mobile/timeline', '/api/mobile/send', '/api/mobile/withdraw', '/api/mobile/read', '/api/mobile/work', '/api/mobile/agents', '/api/mobile/models', '/api/mobile/efforts',
     '/api/mobile/model', '/api/mobile/pair', '/api/mobile/screen', '/api/mobile/outputs', '/api/mobile/routines', '/api/mobile/memory', '/api/mobile/spend', '/api/mobile/audit', '/api/mobile/voice', '/api/mobile/reply-spend', '/api/mobile/speak', '/api/mobile/takeover', '/api/mobile/retry', '/api/mobile/steer',
     '/api/mobile/pause', '/api/mobile/resume', '/api/mobile/bots',
-  ])
+  ]) expect(paths).toContain(expected)
+  // 会话列表/新建：GET 与 POST 各注册一条 exact route（同一 path 出现两次），S1 新增。
+  expect(paths.filter(path => path === '/api/mobile/sessions')).toHaveLength(2)
+  expect(registered.filter(route => route.path === '/api/mobile/sessions').map(route => route.methods)).toEqual([['GET'], ['POST']])
 })
 
 it('retries a ticket through the phone surface', async () => {

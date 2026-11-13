@@ -33,11 +33,22 @@ Android 客户端。Kotlin + Compose 原生重写。旧仓 `~/Code/dsh-mobile-ap
 
 ## 对话
 
+三者分层，别混用：`masterId` 是 DSH 会话层、`conversation` 是队列 / 领域层、`session_id` 是线上消息面层。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)。
+
+**masterId**
+DSH 总路由 Session 的 id，全队伍**单值**，不随人开的「会话」增减。多会话只落在 `conversation` / `session_id` 那一层，不动它；worker 各自的 Session 与它也不是一回事。
+_Avoid_: 会话 id、session_id、crew 指纹、instanceId
+
 **conversation**
-一段人与人、Bot 之间的消息流。当前只有一段，id 恒为 `main`。
+一段消息流的稳定标识，领域词：队列按它分列、按 thread 分组。它切的是**消息**，不是 DSH 的 Session。id 缺省 `main`，可有多段；与线上消息面的 `session_id` 一一映射。
+_Avoid_: Session、masterId、session_id（线上字段名）
+
+**session_id**
+线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身。
+_Avoid_: masterId、Session id、conversation_id
 
 **Bot 队伍（crew）**
-一组 Bot 在同一段 conversation 里接话。Bot 靠 `@bot_id` 被点名；没人点名时由 default 那个接。
+一组 Bot 在 conversation 里接话。Bot 靠 `@bot_id` 被点名；没人点名时由 default 那个接。
 
 **BotCard**
 Bot 的名片：`bot_id`、`name`、`role`（default 或 member）、`persona`、`memory_namespace`。

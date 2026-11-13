@@ -37,6 +37,21 @@ const BotSchema = z.object({
   memory_namespace: z.string().regex(/^bot\/[a-z0-9_-]+$/),
 }).strict()
 
+/**
+ * 多会话 seam 的文档契约（S1，见 `docs/adr/0007-multi-session-seam.md`、`docs/00-contract.md` §9）：
+ *
+ * - `conversation` 是队列 `mobileq.db` 的列 / 领域词；线上消息面以 query 参数 `session_id`
+ *   与它一一映射，缺省 `main`。网关/消息面按 `session_id` 分片后，这里读到的
+ *   `message.conversation` 已是那次请求选中的会话，不再是单一常量。
+ * - 下面这份 `conversations` 名单是 **Source 准入** 的允许清单，不是会话名单：
+ *   `scope()` 与 `channel.allowed` 据此判断一条消息的 conversation 是否登记在册。
+ * - **S1 不改这里的准入判定**：本阶段只落文档契约。「未登记会话不静默丢消息」——
+ *   不在这层丢消息，也不把未知会话静默改写成 `main`；消息按其 conversation 原样入队、
+ *   可在 `timeline?session_id=X` 读到，派单与否仍由既有名单判据决定。
+ * - 让 `conversations` 跟随会话注册名单、给未登记会话一个明确的准入结果，是 **S4** 的范围
+ *   （隔离不变量收口）。在 S4 之前，本文件的 `scope()` / `channel.allowed` 保持不动，
+ *   `masterId` 与 DSH 上游也不动（ADR 0007）。
+ */
 const ConfigSchema = z.object({
   bots: z.array(BotSchema).default([]),
   default_bot_id: z.string().regex(/^[a-z0-9_-]+$/).default('lead'),
@@ -179,6 +194,7 @@ export const teamKind: SourceKind<TeamConfig> = {
     { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
   ],
   health: ['team'],
+  // 准入判定：S1 保持不动，会话名单收口留给 S4（说明见上方 ConfigSchema 注释、ADR 0007）。
   scope({ meta }, config) {
     const conversation = config.conversations.find(item => item.id === meta.conversation)
     if (!conversation) return { listened: false, reason: 'conversation_not_listed' }

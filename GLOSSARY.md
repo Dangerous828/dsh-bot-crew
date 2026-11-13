@@ -33,7 +33,7 @@ Android 客户端。Kotlin + Compose 原生重写。旧仓 `~/Code/dsh-mobile-ap
 
 ## 对话
 
-三者分层，别混用：`masterId` 是 DSH 会话层、`conversation` 是队列 / 领域层、`session_id` 是线上消息面层。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)。
+三者分层，别混用：`masterId` 是 DSH 会话层、`conversation` 是队列 / 领域层、`session_id` 是线上消息面层。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与客户端规矩见 [契约 §9](docs/00-contract.md)。
 
 **masterId**
 DSH 总路由 Session 的 id，全队伍**单值**，不随人开的「会话」增减。多会话只落在 `conversation` / `session_id` 那一层，不动它；worker 各自的 Session 与它也不是一回事。
@@ -44,8 +44,20 @@ _Avoid_: 会话 id、session_id、crew 指纹、instanceId
 _Avoid_: Session、masterId、session_id（线上字段名）
 
 **session_id**
-线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身。
-_Avoid_: masterId、Session id、conversation_id
+线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身；载体只有 URL query 参数：网关只从 query 读，body 与 header 都不认，手机端与桌面端一致。不存在「header 形态的 `session_id`」这种变体；取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与客户端规矩见 [契约 §9](docs/00-contract.md)。
+_Avoid_: masterId、Session id、conversation_id、header 形态 session_id、X-Session-Id 之类的 header 名
+
+**能力位（session_api）**
+后端在显式会话响应里回显的标记，`1` 表示这台后端按会话分片、认得 `session_id`。客户端先验它再启用显式非 `main`；缺位即视为老后端，锁 `main` 并如实提示，不静默降级。
+_Avoid_: feature flag、版本号、能力协商（它不是一次协商，只是响应里的一个回显字段）
+
+**会话名单（sessions）**
+后端持有的会话 id 列表，`main` 恒在首位，配一个 `default_session_id`。唯一真源在后端，客户端每次启动重新拉，不落盘。
+_Avoid_: 本地名单、缓存名单、花名册（那是 Bot 目录）
+
+**当前会话（current session）**
+客户端此刻选中的那一段 conversation 的 id。它落盘以便下次启动恢复，缺键回落 `main`；只是名单里被选中的一个值，不是名单本身。
+_Avoid_: 默认会话（那是 `default_session_id`）、masterId、会话名单
 
 **Bot 队伍（crew）**
 一组 Bot 在 conversation 里接话。Bot 靠 `@bot_id` 被点名；没人点名时由 default 那个接。

@@ -819,11 +819,14 @@
 ## 9. 会话（session_id）
 
 一次请求选哪一段消息流，由 `session_id` 决定。本节只定义线上字节；状态仍以队列与后台为准。
-切片划分与 seam 取舍见 [ADR 0007](adr/0007-multi-session-seam.md)，三个词的分工见 `GLOSSARY.md`。
+切片划分与 seam 取舍见 [ADR 0007](adr/0007-multi-session-seam.md)，三个词的分工见 [GLOSSARY.md](../GLOSSARY.md)。
 
-**S1 是后端闭环**：网关与消息面按会话分片，手机 / 桌面客户端本阶段不改，老调用逐字不变。
-要开会话、切会话的客户端行为与准入收口是 S2 / S3 / S4 的事，一律用 `TODO(owner, 日期)` 标出，
-用 `grep -n 'TODO(' docs/00-contract.md` 可一次捞出，按日期核对。后续切片在本节逐条记为欠账。
+**S1 是后端闭环**：网关与消息面按会话分片，S1 阶段手机 / 桌面客户端不改，老调用逐字不变。
+~~要开会话、切会话的客户端行为与准入收口是 S2 / S3 / S4 的事，一律按顶部的书写约定标为欠账，
+按日期核对；后续切片在本节逐条记为欠账。~~（2026-11-13 原记）
+**S2 / S3 已落地，S4 待做**：手机端（S2）与桌面端（S3）的列出 / 新建 / 切换会话已落地，
+事实描述见 §9.4、客户端能力位先验与缓存隔离见 §9.6；Source 准入收口与真机 / 人工验收窗口
+（S4）仍是欠账，按本文件顶部的书写约定标出。
 
 ### 9.1 字段形状
 
@@ -836,8 +839,11 @@
 | 映射 | 与队列 `messages.conversation` 列一一映射：`session_id` 是该列在线上消息面的字段名 |
 
 - `session_id` 是**传输层的字段**，不是 DSH 的 Session；DSH 总路由 `masterId` 仍是单值，不随会话增减。
-- `TODO(desktop, 2026-11-13)` header 形态的 `session_id` 未开放：留给 S3 桌面端，本阶段只认 query 参数。
-  S1 的 body 与 header 都不读 `session_id`。
+- ~~（原 `desktop` 欠账，2026-11-13）header 形态的 `session_id` 未开放：留给 S3 桌面端，本阶段只认 query 参数。
+  S1 的 body 与 header 都不读 `session_id`。~~ → **2026-11-13 订正**：header 形态不开放；
+  桌面端与手机端一致走 query，理由：网关只在 query 读 —— `session_of()` 只取
+  `urlsplit(path).query`，body / header 一律不认（`test_session_id_is_a_query_only_field` 已钉死）。
+  桌面端没有另一套 header 通道可开；上面带删除线的原话按 2026-11-13 留作历史。
 
 ### 9.2 能力位（expand 的那一半）
 
@@ -873,8 +879,19 @@
 
 - 不带 `session_id` 的请求形状、状态码、响应其余内容与本阶段之前一致，全程 200；新增字段是增量的，按 §5 处理。
 - 会话名单、READ_CURSOR、timeline 过滤在后端按 `session_id` 分开；老调用只落在 `main` 那一份。
-- `TODO(app, 2026-11-13)` S2：手机端切换 / 新建会话未接，本阶段不改 `app/`。
-- `TODO(desktop, 2026-11-13)` S3：桌面端切换 / 新建会话未接，本阶段不改 `desktop/`。
+- ~~（原 `app` 欠账，2026-11-13）S2：手机端切换 / 新建会话未接，本阶段不改 `app/`。~~
+  → **2026-11-13 S2 已落地**：手机端（`app/`）启动 / 首次进入先取 `GET /api/mobile/sessions`
+  做能力位先验（`session_api: 1` 才启用会话切换）；老后端或读不到名单时锁 `main` 并如实提示
+  「这台后端还只支持一个会话」/「读不到会话列表」；timeline 缓存按每会话一份组织
+  （`Map<String, Conversation>`），切回 A 不显示 B；当前会话 id 持久化到 `PairingRecord.SESSION`，
+  缺键回落 `main`，会话名单每次启动从后端拉。会话相关请求走 query，细则见 §9.6。
+- ~~（原 `desktop` 欠账，2026-11-13）S3：桌面端切换 / 新建会话未接，本阶段不改 `desktop/`。~~
+  → **2026-11-13 S3 已落地**：桌面端（`desktop/`）同样先验能力位、缺位锁 `main` 并如实提示；
+  `Client` 的 `Sessions()` / `CreateSession(id)` 与 `Timeline/Send/ReportRead/Withdraw/SendAgain`
+  带可选 session，非 `main` 时在 path 追加 `?session_id=` / `&session_id=`（走 query，不开放 header），
+  `do()` / `auth()` 老路径零改动；timeline 缓存按每会话一份组织
+  （`map[string]*Conversation` + `currentSession`），左栏会话列表；当前会话持久化到凭据文件，
+  缺键回落 `main`。细则见 §9.6。
 - `TODO(backend, 2026-11-13)` S4：Source 准入判定（`scope()` / `channel.allowed`）与会话名单的收口未做；
   S1 只写这份契约与「未登记会话不静默丢消息」的说明，`team.ts` / `mobile.ts` 只加说明性注释，不改判定逻辑。
 - `TODO(gw, 2026-11-13)` S4：真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、真机配对与
@@ -900,3 +917,45 @@ timeline 全量下发、`READ_CURSOR` 全局单键。S1 逐一对上：query 原
 `session_api: 1` 就停发并报错；滚动升级时（新消息面 + 老网关）再由消息面把「网关响应缺
 `session_api` 且显式非 `main`」翻成 409 `unsupported_session`。两道都指向同一条规矩：
 **显式非 `main` 遇未升级对端，宁可报错，也不静默当 `main`。**
+
+### 9.6 客户端能力位先验与缓存隔离
+
+S2（手机端）/ S3（桌面端）已落地，S4 待做。本节是两端共同遵守的客户端规矩：实现语言与存储
+不同（Kotlin / Go），判定一致。传输形态按 §9.1 —— 会话相关请求统一在 query 带 `session_id`，
+header 不开放。
+
+**能力位先验**：启动 / 首次进入先取 `GET /api/mobile/sessions`，三种响应分开处理，禁止静默降级：
+
+| 状态 | 响应 | 判定 | 界面文案 | 后续请求 |
+| --- | --- | --- | --- | --- |
+| 可用 | `200` 且 `session_api: 1` | 新后端 | 用 `sessions[]` / `default_session_id` 画会话列表，启用切换 | 允许非 `main` |
+| 老后端 | `404` 或响应缺 `session_api: 1` | 未升级 | 「这台后端还只支持一个会话」，锁 `main`，不画切换条 | 不发任何非 `main` |
+| 读不到 | 网络错误 / 超时 | 说不清 | 「读不到会话列表」，锁 `main`，不假装成功 | 不发任何非 `main` |
+
+- 缺位与网络错误是两种「说不清」，文案不同，都锁 `main`；这是 §9.5 C4 防线在客户端的落点
+  （老后端一路 200，只有客户端先验能拦住）。
+- 新建会话 `POST /api/mobile/sessions` body `{"id":"work"}`：`200` 用返回的 `sessions[]`
+  刷新列表并切到新会话；`400 invalid_session` / `409 unsupported_session` / `503` 如实展示错误，
+  不新增本地条目。
+- 会话 id 形状按 §9.1（`^[a-z0-9][a-z0-9-]{0,31}$`）：提交前本地校验（`trail-` 合法、
+  32 位上限，大写 / 空格 / 下划线非法），非法 id 不发往后端。
+- 默认 `main` 的请求不带参数（网关缺省 `main`，老路径零改动），只有非 `main` 才追加
+  `?session_id=<id>`。与会话无关的宿主侧接口（models / efforts / model / routines / memory /
+  spend / audit / voice / speak / screen / outputs / work / agents / bots / pair / pause /
+  resume / retry / takeover / reply-spend）不带 `session_id`。
+
+**每会话独立缓存**：手机 `Map<String, Conversation>`、桌面 `map[string]*Conversation` +
+`currentSession`，键就是 `session_id`。切回 A 时显示 A 的缓存，**绝不显示 B 的消息**。切换会话时
+清掉 / 不复用上一个会话的 `messages`、`queued`、`declined`、`unread`、`unread_replies`、`tasks`；
+它们都来自各自会话的 timeline 响应，不跨会话拼接。老后端（锁 `main`）时缓存结构与 S1 之前
+一致：单份 `Conversation`。
+
+**当前会话持久化，名单不持久化**：当前会话 id 落盘（手机 `PairingRecord` 新键 `SESSION`、
+桌面凭据文件新键），下次启动恢复，缺键回落 `main`；会话名单本身不落盘，每次启动从
+`GET /api/mobile/sessions` 拉，唯一真源在后端，不以本地缓存的名单为准。老响应缺 `sessionId` /
+`name`（桌面 `SessionID`）字段时按 `main` 回落，兼容 S1 之前的时间线形状；缺字段不等于新会话，
+不凭空建一段缓存。
+
+本节与 §9.2 的能力位、§9.3 的错误码、§9.5 的 C4 是同一套规矩，不另立字段；`session_id` /
+`conversation` / `masterId` 的分工见 [GLOSSARY.md](../GLOSSARY.md)，切片与传输形态裁决见
+[ADR 0007](adr/0007-multi-session-seam.md)。

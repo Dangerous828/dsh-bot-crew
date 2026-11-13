@@ -1,6 +1,7 @@
 # 多会话的 seam 放在网关 / 消息面：masterId 保持单值
 
-对应 #10 多会话大阶段 S1（2026-11-13）。状态：accepted（决策已定；S2–S4 为后续切片，本阶段不实现）。
+对应 #10 多会话大阶段 S1（2026-11-13）。状态：accepted（决策已定；~~S2–S4 为后续切片，本阶段不实现~~ →
+2026-11-13 更新：S2 / S3 已落地，S4 待做；Source 准入与真机验收仍是欠账）。
 
 ## 背景
 
@@ -43,10 +44,36 @@ relay 也把 `url.search` 原样透传（`relay/src/server.ts:644`）。缺的�
 | --- | --- | --- | --- |
 | **S1 协议 expand（本阶段）** | 网关请求级 `session_of`、SQL 全链路按会话、消息面 `/api/mobile/sessions` 与 timeline 能力位、READ_CURSOR / timeline 按会话分键、`invalid_session` / `unsupported_session`、后端测试与独立验收脚本。**后端闭环** | — | 停发 `session_id` 即全量回落 `main`；改动只在网关 + 消息面两处，回退这两处即可，无需数据迁移（队列仍是同一份 `mobileq.db`，`conversation` 列本就存在） |
 | **S2 手机端切换 / 新建** | app 端读会话名单、切会话、先验能力位 | S1 | 客户端不发 `session_id` 即回落 S1 的 `main`；整批灰度可关停，后端零改动 |
-| **S3 桌面端切换 / 新建** | desktop 端同上；header 形态的 `session_id` 在此开放 | S1（与 S2 并行） | 同 S2；header 未被识别时按 S1 只认 query / 缺省 `main` |
+| **S3 桌面端切换 / 新建** | desktop 端同上；~~header 形态的 `session_id` 在此开放~~ → 2026-11-13 订正：header 不开放，与 S2 一样只走 query（见下方「传输形态裁决」） | S1（与 S2 并行） | 同 S2；~~header 未被识别时按 S1 只认 query / 缺省 `main`~~ → 只有 query 一种形态，缺省 `main` |
 | **S4 隔离不变量收口 + 群组只读投影** | 把 Source 准入判定（`scope()` / `channel.allowed`）与会话名单对齐，「未登记会话不静默丢消息」落成机制；真机 / 人工验收窗口 | S2 / S3 | 准入是配置项：保持 `conversations` 名单为 `main` 全域即回到 S1 行为，不涉及数据 |
 
 每片可独立验证、单独回退；expand 阶段没删老行为，所以四片的回退都不需要回滚数据。
+
+**切片结果（2026-11-13）**：S1 已交付（`2f623c1`）；**S2 / S3 已落地，S4 待做**。S2 / S3 各按上表的
+「先验 `session_api: 1` 再启用显式非 `main`」接入，并把能力位先验三态、每会话独立缓存、
+当前会话持久化写进契约 §9.4 / §9.6；两端都走 query，上表 S3 行原先「header 在此开放」的说法
+按下面的裁决作废（原行以删除线保留）。S4 的 Source 准入收口与真机 / 人工验收窗口仍是欠账，
+仍标在契约 §9.4 的两条 `TODO(backend/gw)` 里。
+
+## 传输形态裁决：两端统一 query，header 不开放
+
+补记 2026-11-13：契约 §9.1 曾写「header 形态的 `session_id` 未开放：留给 S3 桌面端」，切片表 S3 行
+也写「header 形态在此开放」。这两处都把 header 当成桌面端将来可开的第二条通道，**与 S1 网关的
+实现约束相反，一并订正**：`session_id` 只有一种载体 —— URL query 参数，手机端（S2）与桌面端（S3）
+一致；header 形态不开放，body 也不认。
+
+理由（网关 S1 的实现约束，不是客户端偏好）：网关 `session_of()` 只从 `urlsplit(path).query`
+取 `session_id`，body / header 一律不读，`test_session_id_is_a_query_only_field` 已把这件事钉成测试；
+relay 也只把 `url.search` 原样拼回下游路径（`relay/src/server.ts:644`）。query 是唯一端到端可达的形态。
+
+否掉的替代是「桌面端走 header」：网关读不到 header，请求会按缺省 `main` 落库，客户端以为在会话 X、
+实际读写 `main`，且响应不带 `session_api: 1`，能力位先验也拦不住 —— 正好是 §9.5 的 C4 静默串线。
+桌面端没有另一套通道可开，因此不存在「留给 S3」的欠账。
+
+后果：默认 `main` 的请求不带参数（老路径逐字不变），只有非 `main` 才追加 `?session_id=<id>`；
+与会话无关的宿主侧接口不带 `session_id`。两端的能力位先验、每会话缓存与当前会话持久化见
+[契约 §9.4 / §9.6](../00-contract.md)；术语裁决见 [GLOSSARY.md](../../GLOSSARY.md)。
+S2 / S3 已落地，S4 待做。
 
 ## 静默串线的四种组合与能力位防串
 
@@ -68,18 +95,21 @@ send body 重构丢未知字段、`CONV` 仍写 `main`、timeline 全量下发�
 
 - **客户端侧**：新客户端只在确认 `session_api: 1` 后才发显式非 `main`；缺位即停止发送并明确报错，禁止静默降级。这是 C4 在后端全老时唯一的防线（老后端一路 200，拦不住自己）。
 - **消息面侧**：显式 `session_id != main` 而网关**任一**响应缺 `session_api` → 409 `unsupported_session`；非法形状 → 400 `invalid_session`。滚动升级时（新消息面 + 老网关）由这一道把 C4 从「静默 200」翻成「响亮的 409」，且覆盖直发 send 的路径，不依赖客户端先取 timeline。
-- **为什么 S1 先做能力位**：S1 交付时客户端还没接（下节），能力位是提前埋给 S2 / S3 的；等客户端真开始发显式非 `main`，后端已是新版本，C4 不再成立。
+- **为什么 S1 先做能力位**：S1 交付时客户端还没接（下节），能力位是提前埋给 S2 / S3 的；等客户端真开始发显式非 `main`，后端已是新版本，C4 不再成立。（2026-11-13 补：S2 / S3 已按此落地，S4 待做。）
 
 ## 本阶段（S1）的边界
 
 - **S1 是后端闭环**：手机 / 桌面客户端本阶段不改，老调用逐字不变（不带 `session_id` 的请求形状、状态码、响应其余内容；新增字段是增量的，按契约 §5「未知字段必须保留、不得丢弃」处理）。
 - **不动 DSH 上游**：`runtime.ts` / `sessions.ts` / `http.ts` / `mobile-http.ts` 的 masterId 相关零改动，`masterId` 单值不动；不动运行中服务、不动生产 `<stateDir>/mobileq.db`。
 - **不动 Source 准入判定**：`team.ts` / `mobile.ts` 的 `ConfigSchema.conversations` 名单、`scope()` / `channel.allowed` 本阶段只加说明性注释，不改判定逻辑。S1 只写文档契约与「未登记会话不静默丢消息」的说明 —— 消息仍按其 conversation 落队列、可在 `timeline?session_id=X` 读到，只是未列入名单就不派单，不凭空消失。**准入与会话名单的收口留给 S4**，见上表。
-- S2 / S3 客户端接入、S4 准入收口与真机验收窗口都标在 `docs/00-contract.md` §9 的 `TODO(owner, 日期)` 里，本阶段未实现。
+- ~~S2 / S3 客户端接入、S4 准入收口与真机验收窗口都标在 `docs/00-contract.md` §9 的 `TODO(owner, 日期)` 里，本阶段未实现。~~
+  → 2026-11-13 更新：S2 / S3 已落地（契约 §9.4 / §9.6）；S4 准入收口与真机验收窗口仍是欠账，
+  留在契约 §9.4 的两条 `TODO(backend/gw)` 里。上面三条「本阶段」约束仍指 S1 阶段本身。
 
 ## 依据
 
 - `开发进度.md` §十（#10 方案：expand–contract、四切片、`session_api:1` / 409 的由来）。
-- `docs/00-contract.md` §9「会话」（字段形状、能力位、错误码、四种组合）、`GLOSSARY.md`（`masterId` / `conversation` / `session_id` 三词分工）。
+- `docs/00-contract.md` §9「会话」（字段形状、能力位、错误码、四种组合、§9.6 客户端能力位先验与缓存隔离）、`GLOSSARY.md`（`masterId` / `conversation` / `session_id` 三词分工与「只走 query」的术语裁决）。
+- `test_session_id_is_a_query_only_field`（S1 网关：`session_of()` 只从 query 读，body / header 一律不认）。
 - `relay/src/server.ts:644`（`rest + url.search` 原样透传）；`backend/src/kv.ts` / `runtime.ts`（`master-id` 单值）。
 - ADR 0001（后端留在 dsh 进程）、ADR 0002（客户端只走消息面）、ADR 0005（主 Session 不归档）。

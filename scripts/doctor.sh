@@ -31,11 +31,18 @@ running_profile() {
       | LC_ALL=C awk '{for (i = 1; i < NF; i++) if ($i == "--profile") {print $(i + 1); exit}}'
   done | head -1
 }
-PROFILE="${DSH_PROFILE:-$(running_profile)}"; PROFILE="${PROFILE:-superagent}"
+RUNNING_PROFILE="$(running_profile)"
+PROFILE="${DSH_PROFILE:-$RUNNING_PROFILE}"; PROFILE="${PROFILE:-superagent}"
 PATCH="$HOME/.dsh/profiles/$PROFILE/cordis.patch.yml"
 web_port() { awk '/^- id: webserver/{f=1} f && /^ +port:/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$PATCH" 2>/dev/null; }
 state_dir() { awk '/^- id: dsh-superagent/{f=1} f && /stateDir:/{print $2; exit}' "$PATCH" 2>/dev/null; }
 STATE="${DSH_STATE_DIR:-$(state_dir)}"
+# 宿主会话会注入 DSH_PROFILE（例如 desktop）。显式变量优先是脚本的承诺，但那会让
+# doctor 去检查一个没有桥的 profile：stateDir 读不到、端口全部推导为空，接着报一页
+# "not listening" 的假故障。把不一致明说出来，让人一眼知道该用哪个 profile 重跑。
+if [ -n "$RUNNING_PROFILE" ] && [ -n "${DSH_PROFILE:-}" ] && [ "$DSH_PROFILE" != "$RUNNING_PROFILE" ]; then
+  say "profile" "note: DSH_PROFILE=$PROFILE, but the running crew is '$RUNNING_PROFILE' — unset it or set DSH_PROFILE=$RUNNING_PROFILE"
+fi
 # A profile with no `webserver` block takes dsh's own default, and the only honest way to learn it is to look at
 # what the process bound. The patch file is the first choice because it is readable while the service is down.
 listening_web_port() {
@@ -65,17 +72,33 @@ orch=$(port_pid "$WEB_PORT")
 [ -n "$orch" ] && say "orchestrator :$WEB_PORT ($PROFILE)" "$orch" || bad "orchestrator :$WEB_PORT" "not listening — run scripts/dsh-superagent start --profile $PROFILE"
 
 # 2. The phone gateway, which the /api/mobile routes forward to.
-gw=$(port_pid "$GATEWAY_PORT")
-if [ -n "$gw" ]; then say "mobile gateway :$GATEWAY_PORT" "$gw"
-else bad "mobile gateway :$GATEWAY_PORT" "not listening — it starts with the service (state $STATE)"; fi
+# 端口是从 stateDir 推出来的。读不到 stateDir 时端口为空，此时拿空端口去 lsof 只会得到
+# "not listening" —— 那是输入不足，不是网关没起。如实说清是哪一步缺了，别把人引去查服务。
+if [ -z "$GATEWAY_PORT" ] || [ -z "$LAN_PORT" ]; then
+  bad "phone ports" "cannot derive them: no stateDir for profile '$PROFILE' (patch $PATCH). Set DSH_PROFILE to the running crew or DSH_STATE_DIR explicitly"
+else
+  gw=$(port_pid "$GATEWAY_PORT")
+  if [ -n "$gw" ]; then say "mobile gateway :$GATEWAY_PORT" "$gw"
+  else bad "mobile gateway :$GATEWAY_PORT" "not listening — it starts with the service (state $STATE)"; fi
 
-# The listener the phone actually dials. Its port is derived from the state directory, never chosen.
-phone=$(port_pid "$LAN_PORT")
-[ -n "$phone" ] && say "phone listener :$LAN_PORT" "$phone" || bad "phone listener :$LAN_PORT" "not listening — the Source binds it when it starts"
+  # The listener the phone actually dials. Its port is derived from the state directory, never chosen.
+  phone=$(port_pid "$LAN_PORT")
+  [ -n "$phone" ] && say "phone listener :$LAN_PORT" "$phone" || bad "phone listener :$LAN_PORT" "not listening — the Source binds it when it starts"
+fi
 
 # 3. Health of every orchestrator component, through the loopback Host the fence accepts.
 health=$(api "/state")
-if [ -z "$health" ]; then bad "orchestrator health" "no answer"
+if [ -z "$health" ]; then
+  bad "orchestrator health" "no answer"
+  # 管理面不答最常见的原因是机器换了网段、后端还绑在旧地址上。status 已经把这件事算成
+  # bind_stale；这里问同一处、说同一句话，别让人对着 "no answer" 去猜要不要重启服务。
+  # 只读且带超时：status 自己读进程表与管理面，不能让它把 doctor 拖住。
+  drift=$(python3 "$(dirname "$0")/../backend/scripts/dsh-superagent" status 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('bind_stale') or '')" 2>/dev/null)
+  if [ -n "$drift" ]; then
+    say "  likely cause" "IP changed to $drift but the running backend is bound to an older address — the phone cannot reach it"
+    say "  to fix" "restart the crew on the new address (scripts/dsh-superagent restart); doctor never restarts it"
+  fi
 else
   python3 - "$health" <<'PY'
 import json, sys

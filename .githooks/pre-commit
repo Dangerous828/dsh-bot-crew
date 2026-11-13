@@ -13,6 +13,8 @@ cd "$ROOT"
 
 # 只检查这次真的动到的块，没动的块跑一遍是白花时间。
 changed() { git diff --cached --name-only --diff-filter=ACMR | grep -q "^$1/"; }
+# 单个文件：路径要精确匹配，不能拿目录那套（尾部补 /）来比。
+changed_file() { git diff --cached --name-only --diff-filter=ACMR | grep -qx "$1"; }
 
 failed=""
 
@@ -39,6 +41,13 @@ if changed backend || changed scripts; then
   # 在 dsh 会话里 GIT_CONFIG_GLOBAL 是设着的，不摘掉会让这两项假失败。
   if ! ( cd backend && env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM pnpm check ); then
     failed="$failed backend"
+  fi
+fi
+
+if changed_file scripts/doctor.sh || changed_file scripts/test-doctor.sh; then
+  echo "pre-commit: doctor 自检回归"
+  if ! sh scripts/test-doctor.sh; then
+    failed="$failed doctor"
   fi
 fi
 

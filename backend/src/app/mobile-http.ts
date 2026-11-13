@@ -22,7 +22,7 @@ import type { SpeakOutcome } from './speech.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
-import { groupsOf } from './groups.ts'
+import { groupsOf, type GroupsView } from './groups.ts'
 
 // Structural contract keeps compatibility with the bundle's alpha development
 // peers; installed rc.2 Connection supplies this authenticated exact-route API.
@@ -1039,18 +1039,37 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 工单号在这一侧对齐一次再下发。对不上就让它缺着，客户端会如实说。
         const items = withTicketRefs(sessionItems, ticketRefs(sessionItems, sessionDecisions))
         // The crew Source answers on the same queue as mobile, so its tickets belong on the phone too.
-        const tickets = ticketsForSession(runtime.store.tickets.list().filter(ticket =>
-          ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team')), sessionId).slice(0, 30)
+        // 群组只读投影（#10 第 4 项 / 契约 §10）用未按会话过滤、未截断的全量票：
+        // 投影只数不写、不含工单对象；若传下面那份 `tickets`，别的会话的组会恒显示「0 张」
+        // —— 那是向人显示错事实。读票失败也在这里兜住，让三态里的「读不到」真的可达，
+        // 而不是被外层 catch 吞成 502（整个时间线失败比诚实说「读不到」更糟）。
+        const crewTickets = ((): { rows: ReturnType<typeof runtime.store.tickets.list> } | { reason: string } => {
+          try {
+            return { rows: runtime.store.tickets.list().filter(ticket =>
+              ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team')) }
+          } catch (error) {
+            return { reason: `工单读不出来：${String(error)}` }
+          }
+        })()
+        const tickets = 'rows' in crewTickets ? ticketsForSession(crewTickets.rows, sessionId).slice(0, 30) : []
         // The phone names a Bot on send; the roster tells it who exists and who answers by default.
         const roster = crewRoster(runtime.store.settings(), bot => earliestTicketAt(data, bot))
+        // sessions 恒含 main，所以「只有 main、无 bot、无票」是 live 而不是 empty：
+        // main 组确实存在，只是暂时没有内容。
+        const groups = ((): GroupsView => {
+          try {
+            if ('reason' in crewTickets) return { groups: [], state: 'unavailable', reason: crewTickets.reason }
+            return groupsOf({ sessions: sessionIds(runtime.store), bots: roster.bots, tickets: crewTickets.rows })
+          } catch (error) {
+            return { groups: [], state: 'unavailable', reason: `群组投影读不出来：${String(error)}` }
+          }
+        })()
         return response(200, { ...data, ...roster,
           // 能力位（S1 契约第 2 节）：老调用也回显 session_id: "main"，内容其余部分逐字不变。
           // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
           session_id: sessionId, session_api: SESSION_API,
           sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID,
-          // 群组只读投影（#10 第 4 项 / 契约 §10）：从已有 sessions/bots/tickets 派生，
-          // 不写任何状态、不新增 Ticket 账。三态诚实：读不到就是 unavailable，绝不当成空。
-          groups: groupsOf({ sessions: sessionIds(runtime.store), bots: roster.bots, tickets }),
+          groups,
           // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
           items,
           tasks: tickets.map(ticket => {

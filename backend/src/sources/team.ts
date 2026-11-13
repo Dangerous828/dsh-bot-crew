@@ -23,7 +23,7 @@ import { record, type Key } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks, SourceKind } from './kind.ts'
 // S4 准入核心与 mobile Source 共用一份实现（会话名单是唯一真源，不各写一套判定）。
-import { isAdmitted, pollDetail, rosterOf, sessionRoster, withRoster, SESSION_ROSTER } from './mobile.ts'
+import { isAdmitted, pollReport, rosterOf, sessionRoster, withRoster, SESSION_ROSTER } from './mobile.ts'
 import { defaultBot, validateDirectory, type BotDirectory } from '../crew/directory.ts'
 import { routeBot, threadOf } from '../crew/route.ts'
 
@@ -351,7 +351,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       try {
         const { read, unreadable, refused, refusedSessions } = await pollQueue(ctx, signal)
         failures = 0
-        ctx.report('team', { state: 'ready', detail: pollDetail(read, unreadable, refused, refusedSessions), at })
+        ctx.report('team', pollReport(read, unreadable, refused, refusedSessions))
       } catch (error) {
         failures += 1
         if (!signal.aborted && failures >= 3) {

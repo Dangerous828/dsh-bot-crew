@@ -26,7 +26,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { KV } from '../src/kv.ts'
 import {
-  mobileKind, mobileTrigger, pollQueue as pollMobile, pollDetail, isAdmitted, rosterOf,
+  mobileKind, mobileTrigger, pollQueue as pollMobile, pollDetail, pollReport, isAdmitted, rosterOf,
   sessionRoster, withRoster, SESSION_ROSTER, UNLISTED as MOBILE_UNLISTED,
 } from '../src/sources/mobile.ts'
 import { teamKind, pollQueue as pollTeam, UNLISTED as TEAM_UNLISTED } from '../src/sources/team.ts'
@@ -219,6 +219,12 @@ describe('断言 3：未登记会话不派单，且拒绝是可观测的', () =>
     expect(f.kv.get(MOBILE_UNLISTED)).toBe(1)                // 计数 KV：可观测
     expect(pollDetail(result.read, result.unreadable, result.refused, result.refusedSessions))
       .toContain('conversation_not_listed: s4-unreg')       // health detail：可观测
+    // 关键：watch() 上报的是 pollReport 的产物，不是它自己拼的字符串。
+    // 只断言 pollDetail 的话，把 watch 里那处调用换回旧字符串仍会全绿 —— 守门就落空了。
+    const report = pollReport(result.read, result.unreadable, result.refused, result.refusedSessions)
+    expect(report.state).toBe('ready')
+    expect(report.detail).toContain('conversation_not_listed: s4-unreg')
+    expect(Date.parse(report.at)).not.toBeNaN()
     expect(mobileKind.scope!({ meta: { conversation: UNREG, [SESSION_ROSTER]: [] } }, MOBILE_CONFIG))
       .toEqual({ listened: false, reason: 'conversation_not_listed' })
     expect(mobileKind.channel!.allowed!({ conversation: UNREG }, MOBILE_CONFIG)).toBe(false)

@@ -95,6 +95,17 @@ export function pollDetail(read: number, unreadable: number, refused: number, re
     : base
 }
 
+/**
+ * 一轮 poll 之后要报给 health 的那一条（`watch` 唯一的 ready 上报点）。
+ *
+ * 抽成导出函数是为了让它能被测试直接钉住：审查证明，只在纯函数 `pollDetail` 上断言时，
+ * 把 `watch` 里的这处调用换回旧字符串，全部用例仍然绿 —— 「可观测」就没有机制保障了。
+ * 现在测试断言的是这个函数本身，`watch` 只能调它。
+ */
+export function pollReport(read: number, unreadable: number, refused: number, refusedSessions: readonly string[]): { state: 'ready'; detail: string; at: string } {
+  return { state: 'ready', detail: pollDetail(read, unreadable, refused, refusedSessions), at: new Date().toISOString() }
+}
+
 const MessageSchema = z.looseObject({
   id: z.union([z.string(), z.number()]).transform(v => String(v)),
   conversation: z.string().min(1),
@@ -233,7 +244,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       try {
         const { read, unreadable, refused, refusedSessions } = await pollQueue(ctx, signal)
         failures = 0
-        ctx.report('mobile', { state: 'ready', detail: pollDetail(read, unreadable, refused, refusedSessions), at })
+        ctx.report('mobile', pollReport(read, unreadable, refused, refusedSessions))
       } catch (error) {
         failures += 1
         if (!signal.aborted && failures >= 3) {

@@ -919,6 +919,41 @@ it('accepts a straight send once the gateway echoes session_api', async () => {
   expect(result.status).toBe(200)
 })
 
+it('counts every session’s tickets in the group projection, not just the one being viewed', async () => {
+  const when = new Date().toISOString()
+  const { runtime } = sessionHost({ tickets: [
+    { id: 't-main', title: 'main work', channels: [{ source: 'team', address: { conversation: 'main' } }],
+      createdAt: when, updatedAt: when, assignments: [], inputs: [] },
+    { id: 't-work', title: 'work work', channels: [{ source: 'team', address: { conversation: 'work' } }],
+      createdAt: when, updatedAt: when, assignments: [], inputs: [] },
+  ] })
+  const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  // 先登记 work 会话：群组只由「已登记的会话 + main 兜底」决定，未登记的会话不成组
+  // （契约 §10）。登记之后 work 才是独立的组，才谈得上它的票数。
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: '{"id":"work"}' }))
+  const body = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as {
+    groups: { groups: { id: string; ticket_count: number }[] } }
+  const byId = new Map(body.groups.groups.map(group => [group.id, group.ticket_count]))
+  // 看 main 时 work 组的票数也必须是真数：投影是只读事实，不是「当前这段会话能看到的」。
+  // 传过滤后（且被 slice(0,30) 截断）的 tickets 会让别的组恒显示 0 张 —— 那是向人显示错事实。
+  expect(byId.get('main')).toBe(1)
+  expect(byId.get('work')).toBe(1)
+})
+
+it('says the group projection is unavailable instead of failing the whole timeline', async () => {
+  const { runtime } = sessionHost()
+  // 让 tickets.list() 抛错：群组投影该说「读不到」，而不是把整条时间线变成 502。
+  ;(runtime.store.tickets as unknown as { list: () => unknown }).list = () => { throw new Error('store offline') }
+  const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 }))
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  const result = await handler(new Request('http://dsh/api/mobile/timeline'))
+  expect(result.status).toBe(200)
+  const body = await result.json() as { groups: { state: string; reason?: string } }
+  expect(body.groups.state).toBe('unavailable')
+  expect(body.groups.reason).toContain('读不出来')
+})
+
 it('serves an explicit non-main session once the gateway echoes session_api', async () => {
   const { runtime } = sessionHost()
   const upstream = vi.fn(async (_input: string | URL | Request) => Response.json({ items: [], session_id: 'work', session_api: 1 }))

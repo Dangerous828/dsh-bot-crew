@@ -76,11 +76,36 @@ bug 会出现在最难复现的那个组合里（某一条路某一种时序）�
 
 ## 已知缺口
 
-- **降级链的「选路」这一半还没有接线。** `relay-chain.ts` 里有探测、记忆与整条阶梯的状态，
-  但宿主启动时走的是「把 `CREW_RELAY_URLS` 原样交给隧道，让隧道按失败轮转」——
-  没有先探一遍再选。实践上够用（失败即切换），代价是第一次连到死地址要等一个连接超时。
-  接上它需要把 `choose()` 放进 `start()` 之前，并让 `invalidate` 接在隧道的断开回调上。
-- **局域网与中转之间没有自动切换。** 两条路并存（同一个 `forward`），手机打哪个地址由手机决定。
-  真正「手机自动换路」要在 `app/` 里重试另一条地址，本轮没碰 `app/`。
+- ~~**降级链的「选路」这一半还没有接线**~~（历史记录，11-10 写的；11-12 `e42196b`
+  之后已过期，别照着它去重做）：原话是「`relay-chain.ts` 里有探测、记忆与整条阶梯的状态，
+  但宿主启动时把 `CREW_RELAY_URLS` 原样交给隧道、没有先探一遍再选；接上它需要把
+  `choose()` 放进 `start()` 之前，并让 `invalidate` 接在隧道的断开回调上」。
+- **这一半已落地**：`backend/src/index.ts:140` 先 `await orderRelays(relays)`，
+  `:189`–`:203` 用 `createChain(...).choose()`（`relay-chain.ts:85`，带 2s 超时的
+  WebSocket 握手 `index.ts:206`）逐条探一遍，选中的提到数组首位，`:144` 交给
+  `createTunnel`、`:177` 才 `void tunnel.start()` —— `choose()` 确实在 `start()` 之前；
+  全不通退回原顺序。`backend/tests/index.spec.ts` 3 例覆盖排序。
+- **剩余真实缺口**：
+  - `invalidate` 仍未接断开回调：`relay-chain.ts:55` / `:99` 只有接口声明与实现，
+    生产代码零调用点（唯一调用在单测 `tests/relay-chain.spec.ts:107`）；`tunnel.ts`
+    的 `TunnelOptions` 也没有断开回调，`close`（`tunnel.ts:264`）只清在途请求并推进
+    `cursor` 轮转，「某档坏了就从阶梯顶端重探」在运行态没有发生。
+  - `orderRelays` 里的 `createChain` 是选完即弃的局部对象（`index.ts:196`），链的
+    「记住选中档」没有跨请求复用：进程只在启动时选一次，之后全靠隧道自己的 `cursor` 轮转。
+  - `lan` 档不参与这一步：出站隧道只用 `relay` / `fallback` 两档（`index.ts:138`）。
+- ~~**局域网与中转之间没有自动切换**~~：手机侧 `CrewClient.read()` 已按
+  `CrewRoute.entries()`（P2P → 局域网 → 公网）逐条试，`IOException` 就绕到下一条、成功即记住
+  当前入口（401 不换，那是凭据问题）；`CrewClientRouteTest` / `CrewRouteTest` 有单测。这句是 11-10
+  写的，11-12 `065fe82` 之后已过期，别照着它去重做。
+- **跨网域的主答案是 P2P，不是重新发现**：`tailcat serve --key=default` 用固定密钥，tc-addr 重启
+  不变；手机侧 `TailcatP2p` 在 `127.0.0.1` 起本地代理、`promote()` 提到队首。换 Wi-Fi、开热点、
+  出门用蜂窝都不受影响，配对时存下的 `p2pAddr` 是网域无关的公钥身份，不是「记住旧网关」。
+  会随网段失效的只有 `base`（LAN IP），而它只在 P2P 没起来时当第二条路。
+- **P2P 没起来时的 LAN 兜底**：配对时把 mDNS TXT 的 `crew` 指纹连同 `pub` / `p2p` 一起落盘；
+  同网段重新发现时按指纹认出同一台，用 `CrewClient.replaceEntries()` **就地**换入口表——
+  特意不改 `paired` 状态，否则会重启 `LaunchedEffect`、重建 tailcat 句柄，把正在跑的隧道打断。
+  发现流去重改成按「地址 + 路由 + 指纹」签名：原来只按服务名去重会吞掉同一台换 IP 后的重新广播。
+  `CrewRefreshTest` 9 例 / `CrewClientRouteTest` 换表 4 例 + 三处反向验证。**真机未验**（无 adb 设备）：
+  P2P 换网不断线、LAN 兜底刷新、权限被拒的降级路径都还需一次实机走通。
 - 中转不支持 WebSocket 隧道（`wsUpgrade` 一族）：消息面全是请求-响应，用不到。
 

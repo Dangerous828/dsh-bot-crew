@@ -929,10 +929,27 @@ func fitPane(v, lo, hi, room float32) float32 {
 	return v
 }
 
+// repaint 请求一帧；c 为 nil 时什么也不做（只推进状态、不绘制）。
+func (s *app) repaint(c *ui.Context) {
+	if c != nil {
+		c.Invalidate()
+	}
+}
+
 // drain 把后台线程交回来的结果收进状态。
 //
 // 每帧调用一次，把**已经到达**的结果全收掉就返回。它不能一直等：
 // 它是从 view() 里调的，一帧里卡住就等于整个界面冻住。
+//
+// `c` 可以为 nil：那时只推进状态、不请求重绘。这不是给测试开的方便门 ——
+// 状态推进**不该依赖绘制**。原先它只能从 view() 里跑，于是窗口没在画（锁屏、被遮挡、
+// App Nap）时，后台结果早进了通道而状态永远不动：实测表现为 messages:-1、
+// memoryCount:-1，以及「重启后界面回到旧状态」这一类现象。
+//
+// **还没根治**：试过在 `wake()` 里也 `drain(nil)`，但那样会绕过 S3 的能力位先验门禁
+// （`TestRefreshWaitsForTheCapabilityProbe` 变红：先验未完成时就发出了 timeline 与
+// state 请求）。所以目前只有调试口用得上「c 为 nil」这条路径（`debug.go` 的
+// `pumpResults()`）。产品路径的根治需要让 drain 与「先验门禁」解耦，不是加一行能了事的。
 func (s *app) drain(c *ui.Context) {
 	for {
 		select {
@@ -940,23 +957,23 @@ func (s *app) drain(c *ui.Context) {
 			if conversation != nil {
 				s.applyConversation(conversation)
 				// 数据是后台线程送回来的：不主动要一帧，界面会停在「正在读对话」。
-				c.Invalidate()
+				s.repaint(c)
 			}
 		case result := <-s.sessionsCh:
 			// 启动 / 首次进入的能力位先验：三态都在这里落到状态上，不静默降级。
 			s.applySessions(result)
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.createdSessionCh:
 			// 新建回执：失败只写实话，成功才用后端名单刷新并切过去。
 			s.applyCreatedSession(result)
-			c.Invalidate()
+			s.repaint(c)
 		case tree := <-s.tree:
 			s.agents = tree
-			c.Invalidate()
+			s.repaint(c)
 		case message := <-s.pairFailed:
 			// 配对失败写在配对那一块，不冒充连接故障。
 			s.pairingNote = "配对没成功：" + message
-			c.Invalidate()
+			s.repaint(c)
 		case credential := <-s.paired:
 			// 配对成功：先把凭据落到本机，再换上新的 client。存不下来也要说清楚 ——
 			// 这一次能连、下次启动又要重配，是两件不同的事。
@@ -979,7 +996,7 @@ func (s *app) drain(c *ui.Context) {
 			s.sessions, s.sessionNote = nil, ""
 			s.conversations = map[string]*Conversation{}
 			s.conversation = nil
-			c.Invalidate()
+			s.repaint(c)
 			s.refresh()
 		case result := <-s.steps:
 			// 只有回来的正是当前打开的那张票才显示，否则写的是别人的经过。
@@ -988,35 +1005,35 @@ func (s *app) drain(c *ui.Context) {
 			}
 			if result.err != nil {
 				s.workError = actionErrorText(result.err)
-				c.Invalidate()
+				s.repaint(c)
 				continue
 			}
 			s.workSteps, s.workError = result.steps, ""
-			c.Invalidate()
+			s.repaint(c)
 		case catalog := <-s.modelList:
 			s.models, s.modelsError, s.modelNote = catalog, "", ""
 			s.loadEfforts()
-			c.Invalidate()
+			s.repaint(c)
 		case load := <-s.crewLoadCh:
 			// 槽位情况回来了：底部「队列 · 上限 N 并发」那一行据此画。
 			s.crewLoad = load
-			c.Invalidate()
+			s.repaint(c)
 		case wd := <-s.watchdogCh:
 			// 看门狗告警回来了：右栏顶部据此画横幅。
 			s.watchdog = wd
-			c.Invalidate()
+			s.repaint(c)
 		case view := <-s.effortsCh:
 			s.efforts = view
-			c.Invalidate()
+			s.repaint(c)
 		case message := <-s.modelError:
 			s.modelsError, s.modelNote = message, ""
-			c.Invalidate()
+			s.repaint(c)
 		case message := <-s.retryErrorCh:
 			s.retryError = message
-			c.Invalidate()
+			s.repaint(c)
 		case note := <-s.screenNoteCh:
 			s.screenNote = note
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.exportCh:
 			s.exporting = false
 			if result.err != nil {
@@ -1024,7 +1041,7 @@ func (s *app) drain(c *ui.Context) {
 			} else {
 				s.exportNote = "已备份到 " + result.path
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.devicesCh:
 			s.devicesTried = true
 			s.revoking = map[string]bool{}
@@ -1034,7 +1051,7 @@ func (s *app) drain(c *ui.Context) {
 				s.devices = result.list
 				s.devicesNote = ""
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.botSaved:
 			s.botSaving = false
 			if result.err != nil {
@@ -1045,7 +1062,7 @@ func (s *app) drain(c *ui.Context) {
 				s.botError = ""
 				go s.refresh()
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.pauseDone:
 			s.pausing = false
 			if result.err != nil {
@@ -1054,7 +1071,7 @@ func (s *app) drain(c *ui.Context) {
 				s.pauseNote = "已让它停一下（全局执行器，恢复要去面板）"
 				go s.refresh()
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.steerDone:
 			delete(s.steering, result.requestID)
 			if result.err != nil {
@@ -1066,21 +1083,21 @@ func (s *app) drain(c *ui.Context) {
 				s.steerNote = "已插话，队伍做完当前这一步会先处理这句"
 				go s.refresh()
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case view := <-s.screenCh:
 			s.screen = view
 			s.screenNote = ""
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.modelSwitched:
 			// 换成了：目录里记下新的这一个，左栏和右栏都跟着改，不用等人再点一次刷新。
 			s.applyModel(result)
-			c.Invalidate()
+			s.repaint(c)
 		case text := <-s.sent:
 			// 只清掉「刚发出去的那一句」；用户在这期间又打了字就留着。
 			if s.input == text {
 				s.input = ""
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.answered:
 			// 发出去就重读一次：问题被答掉之后，这张卡要么换成新的一组选项，要么整张消失。
 			delete(s.answers, result.key)
@@ -1096,7 +1113,7 @@ func (s *app) drain(c *ui.Context) {
 				}
 				go s.refresh()
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.withdrawn:
 			delete(s.withdrawing, result.requestID)
 			if result.err != nil {
@@ -1106,11 +1123,11 @@ func (s *app) drain(c *ui.Context) {
 				if errors.Is(result.err, ErrWithdrawalTooLate) {
 					go s.refresh()
 				}
-				c.Invalidate()
+				s.repaint(c)
 				continue
 			}
 			s.withdrawError = ""
-			c.Invalidate()
+			s.repaint(c)
 			// 撤掉了就重读一次，让那条从队列里消失；重读本身失败会走 failed，
 			// 那时才轮到全局横幅说话。
 			s.refresh()
@@ -1130,7 +1147,7 @@ func (s *app) drain(c *ui.Context) {
 				s.adoptNotes[result.key] = "已请它采用这段改动，下一步会按这个改"
 				go s.refresh()
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.previewed:
 			if result.view != nil {
 				// 有具体的活动快照就换中间栏：它和「看它的屏幕」是同一块画面。
@@ -1139,15 +1156,15 @@ func (s *app) drain(c *ui.Context) {
 				// 没有就说清楚为什么没有。这句话写在标题栏，不挂断连横幅。
 				s.previewNote = result.reason
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.outputsCh:
 			s.loadingOutputs = false
 			s.outputs, s.outputsNote = result.view, result.note
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.routinesCh:
 			s.loadingRoutine = false
 			s.routines, s.routinesNote = result.view, result.note
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.spendCh:
 			// 两种结果都记：读不到也记一笔，否则每一帧都会重发一次请求。
 			if s.spendOf == nil {
@@ -1171,16 +1188,16 @@ func (s *app) drain(c *ui.Context) {
 			if result.note != "" {
 				s.spendNote[result.ticket] = result.note
 			}
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.memoryCh:
 			s.loadingMemory = false
 			s.memory, s.memoryNote = result.view, result.note
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.actions.results:
 			// 四个动作入口的结果都在这里落到状态上；播报失败、接手回执、识别草稿
 			// 都不该挂到顶部那条全局断连横幅里。
 			s.applyAction(result)
-			c.Invalidate()
+			s.repaint(c)
 		case result := <-s.ticketOut:
 			delete(s.loadingTicket, result.ticket)
 			if s.perTicket == nil {
@@ -1189,11 +1206,11 @@ func (s *app) drain(c *ui.Context) {
 			// 读不到也记一笔（值是 nil），否则每一帧都会重发一次请求。
 			// 结果条据此不画：把「读不到」画成一条成果是最糟的一种假。
 			s.perTicket[result.ticket] = result.view
-			c.Invalidate()
+			s.repaint(c)
 		case message := <-s.failed:
 			s.problem = message
 			s.sending = false
-			c.Invalidate()
+			s.repaint(c)
 		default:
 			// 没有更多结果了：让这一帧画完，下一帧再收。
 			// 这里不能阻塞 —— 它是从 view() 里调的。

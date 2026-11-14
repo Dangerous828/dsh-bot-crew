@@ -328,10 +328,17 @@ func TestDesktopSessionPaneWaitsForTheCapabilityProbe(t *testing.T) {
 	}
 }
 
-// 调试口里没有任何 session.* 动作 —— 这条是**刻意**钉住的：
-// 它说明「桌面端切会话」不可能靠调一个动作来验，只能走 Client/app 这条真实路径
-// （本文件上面那条用例），也提醒后来人：要加就得改 desktop/debug.go，那是另一件事。
-func TestDebugBusHasNoSessionActions(t *testing.T) {
+// 调试口的会话动作是**按名字调界面同一个方法**，不是第二套行为。
+//
+// 这条钉住的是「有、且只有这三个」：session.list / session.set / session.reload。
+// 为什么只这三个：手机端 CrewDebug.kt 就是这三个（同名同语义），验收脚本两端能共用；
+// 而「新建会话」这类动作界面本来就有一条路（左栏输入框 + 新建），真 GUI 验收要的是
+// 「切过去、发一条、切回」，不需要再从调试口造一个 create。
+//
+// 历史：本文件原先钉的是「调试口零 session.*」，理由是切会话只能人手点像素。
+// issue #18 第 2 项要求把这条路变成可自动化的，于是 debug.go 加了这三个动作；
+// 具体行为由 debug_session_test.go 逐条验（含能力位门禁与缓存不串）。
+func TestDebugBusSessionActionsAreExactlyTheThreePhoneOnes(t *testing.T) {
 	s := newApp(New("http://127.0.0.1:1", "t", ""))
 	bus := newDebugBus(s)
 	raw, err := bus.invoke("actions.list", map[string]json.RawMessage{})
@@ -342,10 +349,14 @@ func TestDebugBusHasNoSessionActions(t *testing.T) {
 	if len(listed) == 0 {
 		t.Fatal("动作表是空的，读错了对象")
 	}
+	var found []string
 	for _, name := range listed {
-		if strings.HasPrefix(name, "session.") || strings.Contains(name, "Session") {
-			t.Errorf("调试口出现了会话动作 %q：说明 debug.go 已扩展，本文件的结论要重写", name)
+		if strings.HasPrefix(name, "session.") {
+			found = append(found, name)
 		}
+	}
+	if strings.Join(found, ",") != "session.list,session.reload,session.set" {
+		t.Errorf("会话动作应恰好是 session.list/reload/set（与手机端同名），实际 %v", found)
 	}
 	// 反证：动作表本身是能调通的，不是「什么都没注册」。
 	if _, err := bus.invoke("state.dump", map[string]json.RawMessage{}); err != nil {
@@ -690,12 +701,13 @@ func queueByConversation(t *testing.T, path string) map[string]int {
 	return counted
 }
 
-// 真实 unix socket 上的调试口：动作表里没有 session.*，也没有任何能切会话的动作。
+// 真实 unix socket 上的调试口：会话动作走的就是外部自动化看到的那一份 JSON。
 //
 // 这条走的是 serveDebug 那条真路径（CREW_DEBUG_SOCK 指到临时文件、一条 JSON 进一条 JSON 出），
 // 不是进程内 bus.invoke —— 但它**不起窗口**：mygo 窗口一建就会前置，而本轮要求不抢焦点。
-// 动作表本身与窗口无关（newDebugBus 只看 app），所以 socket 级验证就是等价证据。
-func TestDebugSocketHasNoSessionAction(t *testing.T) {
+// 动作表本身与窗口无关（newDebugBus 只看 app），所以 socket 级验证就是等价证据；
+// 真窗口那一遍另走一次手工取证（见 docs/PHASE_DESKTOP_SESSION_CHECK.md）。
+func TestDebugSocketExposesSessionActions(t *testing.T) {
 	// unix socket 路径有长度上限（macOS 104 字节），t.TempDir() 那条太深：改用 /tmp 下的短名。
 	socket := filepath.Join("/tmp", fmt.Sprintf("crew-debug-%d.sock", os.Getpid()))
 	t.Cleanup(func() { _ = os.Remove(socket) })
@@ -723,10 +735,14 @@ func TestDebugSocketHasNoSessionAction(t *testing.T) {
 	if len(listed) == 0 {
 		t.Fatalf("动作表是空的：%v", response)
 	}
+	seen := map[string]bool{}
 	for _, entry := range listed {
 		name, _ := entry.(string)
-		if strings.HasPrefix(name, "session.") || strings.Contains(strings.ToLower(name), "session") {
-			t.Errorf("调试口出现了会话动作 %q：debug.go 已扩展，本文件的结论要重写", name)
+		seen[name] = true
+	}
+	for _, want := range []string{"session.list", "session.set", "session.reload"} {
+		if !seen[want] {
+			t.Errorf("socket 上缺会话动作 %q", want)
 		}
 	}
 
@@ -738,9 +754,13 @@ func TestDebugSocketHasNoSessionAction(t *testing.T) {
 	if ok, _ := response["ok"].(bool); !ok {
 		t.Fatalf("state.dump 回了 %v", response)
 	}
-	// 未知动作明确报错，不静默成功 —— 会话动作走这里会立刻被拒。
-	if _, err := debugOverSocket(socket, "session.switch", map[string]any{"id": "work"}); err == nil {
-		t.Fatal("session.switch 竟然成功了：调试口已有会话动作")
+	// 未知动作仍明确报错，不静默成功。
+	if _, err := debugOverSocket(socket, "session.nope", map[string]any{"id": "work"}); err == nil {
+		t.Fatal("session.nope 竟然成功了：未知动作必须报错")
+	}
+	// 能力位没到 live（这个 app 没连后端）时，socket 上的 session.set 如实被拒。
+	if _, err := debugOverSocket(socket, "session.set", map[string]any{"session": "work"}); err == nil {
+		t.Fatal("没先验过能力位却切成功了")
 	}
 }
 

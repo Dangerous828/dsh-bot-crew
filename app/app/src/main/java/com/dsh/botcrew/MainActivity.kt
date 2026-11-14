@@ -64,6 +64,9 @@ class MainActivity : ComponentActivity() {
             // 隧道这条路上实测的一个来回。界面照实报出这个数，不拿它猜直连还是中继 ——
             // RTT 快慢证明不了请求有没有经 DERP，那是没有实际路径信号时的臆测。
             var tunnelMillis by remember { mutableStateOf<Long?>(null) }
+            // 配对记录里那条局域网地址还活着吗。走公网时它是「为什么没走直连」的唯一答案：
+            // 只写「公网中转」会让人以为本来就该这样，而死地址每次都在先白等一次连接超时。
+            var lanReport by remember { mutableStateOf(CrewLanHealth.Report()) }
 
             LaunchedEffect(paired) {
                 val current = paired
@@ -73,21 +76,46 @@ class MainActivity : ComponentActivity() {
                     way = null
                     p2pNote = ""
                     tunnelMillis = null
+                    lanReport = CrewLanHealth.Report()
                     return@LaunchedEffect
                 }
                 client = null
                 p2pNote = ""
                 tunnelMillis = null
+                lanReport = CrewLanHealth.Report()
 
                 // 先把不含 P2P 的连接交出去：建客户端不碰网络，启动不等隧道。
                 // proxyPort 在后台接上 P2P 之后才填，换路回调靠它认出「这一条是 P2P」。
                 var proxyPort: Int? = null
                 val entries = CrewRoute.entries(current, proxyPort = null)
-                val opened = CrewClient(entries, current.token, current.deviceId) { entry ->
-                    way = CrewRoute.kindOf(entry, current, proxyPort)
+                // 这一轮配对里「局域网那条」到底是哪个地址。重新发现换了地址时它会跟着变，
+                // 所以不能一直拿最初的 current.base —— 那会拿一条已经不存在的地址判失效。
+                var lanBase: String = current.base
+                // 判一次局域网那条的状态。做成闭包是因为它要在三处被调：换路成功时、
+                // 隧道探测每一轮、以及重新发现换了地址之后 —— 三处都可能有新证据。
+                fun judgeLan(opened: CrewClient): CrewLanHealth.Report {
+                    if (lanBase.isBlank()) return CrewLanHealth.Report()
+                    return CrewLanHealth.judge(
+                        lanBase = lanBase,
+                        failures = opened.failureCount(lanBase),
+                        localAddresses = LanAddresses.current(),
+                        inUse = CrewPairing.normalize(opened.currentEntry()) == CrewPairing.normalize(lanBase),
+                    )
                 }
-                client = opened
+                // 回调里要读「刚建好的那个 client」，而它还在初始化中：先留一个口子，
+                // 构造完立刻填上。回调只会在请求发生时被调，那时它一定已经填好了。
+                var opened: CrewClient? = null
+                val fresh = CrewClient(entries, current.token, current.deviceId) { entry ->
+                    way = CrewRoute.kindOf(entry, current, proxyPort)
+                    // 换路成功是一次新的证据：局域网那条刚被跳过，状态要跟着更新。
+                    opened?.let { lanReport = judgeLan(it) }
+                }
+                opened = fresh
+                client = fresh
                 way = CrewRoute.kindOf(entries.firstOrNull().orEmpty(), current, null)
+                // 建好就判一次：刚启动时局域网那条的失败计数是 0，这时结论必然是 OK，
+                // 但它让「有没有可判的地址」这件事在快照里一开始就有个明确的答案。
+                lanReport = judgeLan(fresh)
 
                 // 句柄只建一次：start 内部先 stop 再新建隧道客户端，反复 start 等于每次探测都重建句柄。
                 // 换网络后隧道在库内部自己重连，重试只复用这个端口去探，不再碰句柄。
@@ -98,6 +126,11 @@ class MainActivity : ComponentActivity() {
                     }
                     if (port == null) {
                         if (current.p2pAddr.isNotBlank()) p2pNote = P2P_DOWN
+                        // 隧道根本没起来：局域网那条是唯一能省下公网往返的路，
+                        // 而这一轮之后不会再有探测循环 —— 主动敲一次再退出，
+                        // 否则这条地址的状态永远是「不知道」。
+                        withContext(Dispatchers.IO) { fresh.probeEntry(lanBase) }
+                        lanReport = judgeLan(fresh)
                         return@LaunchedEffect
                     }
                     // 只在前台探测；退到后台取消等待，再回前台重置退避。句柄始终复用。
@@ -120,7 +153,11 @@ class MainActivity : ComponentActivity() {
                                 // saveSession），这里只管更新网段相关的入口表，不补任何字段。
                                 pairing.save(refreshed)
                                 applied = refreshed
-                                opened.replaceEntries(CrewRoute.entries(refreshed, proxyPort))
+                                // 地址换了就是换了另一条路：判失效的基准跟着走，
+                                // 旧地址的失败计数对新地址没有意义。
+                                lanBase = refreshed.base
+                                fresh.replaceEntries(CrewRoute.entries(refreshed, proxyPort))
+                                lanReport = judgeLan(fresh)
                             }
                         }
                         var failures = 0
@@ -130,15 +167,23 @@ class MainActivity : ComponentActivity() {
                             }
                             if (probed.ok) {
                                 proxyPort = port
-                                opened.promote(CrewRoute.proxyBase(port))
+                                fresh.promote(CrewRoute.proxyBase(port))
                                 way = CrewRoute.Way.P2P
                                 tunnelMillis = probed.millis
                                 p2pNote = ""
                                 failures = 0
+                                // 隧道通了，局域网那条失效在界面上不再是问题 —— 但仍要重判一次：
+                                // 快照里留着的是事实，界面上要不要说由 routeLine 决定。
+                                lanReport = judgeLan(fresh)
                                 delay(P2P_CHECK_INTERVAL_MS)
                             } else {
                                 p2pNote = P2P_DOWN
                                 tunnelMillis = null
+                                // 隧道没通，局域网那条就是唯一能省下公网往返的路。
+                                // 主动敲一次：`read()` 一旦落到公网就不会再试这条死地址，
+                                // 光靠它数不出失败，也就永远说不出「地址已失效」。
+                                withContext(Dispatchers.IO) { fresh.probeEntry(lanBase) }
+                                lanReport = judgeLan(fresh)
                                 delay(CrewRoute.retryDelay(failures))
                                 failures = (failures + 1).coerceAtMost(5)
                             }
@@ -163,6 +208,12 @@ class MainActivity : ComponentActivity() {
                         tunnelMillis = tunnelMillis,
                         p2pNote = p2pNote,
                         route = CrewRoute.label(way, tunnelMillis, p2pNote),
+                        // 局域网那条的状态也摊在这里：判据是「连续连不上 + 跨网段」，
+                        // 只读它的结论与那两个地址，脚本能直接断言，不必反推。
+                        lanVerdict = lanReport.verdict.name.lowercase(),
+                        lanHost = lanReport.host,
+                        lanSubnet = lanReport.subnet,
+                        lanFailures = lanReport.failures,
                         session = pairing.session(),
                     )
                 }
@@ -184,7 +235,13 @@ class MainActivity : ComponentActivity() {
                             palette = palette,
                             // 三条路哪条在用要说出来：出问题时「现在走的是公网中转」就是第一条线索。
                             // 隧道这条带上实测往返，只说连上了、多快，不凭快慢断言是直连还是中继。
-                            route = CrewRoute.label(way, tunnelMillis, p2pNote),
+                            // 走公网且局域网那条已判定失效时，这一行改成整句说明「为什么没走直连」——
+                            // 只写「公网中转」会让人以为本来就该这样。
+                            route = CrewLanHealth.routeLine(
+                                CrewRoute.label(way, tunnelMillis, p2pNote),
+                                lanReport,
+                                way,
+                            ),
                             onForget = {
                                 pairing.clear()
                                 paired = null

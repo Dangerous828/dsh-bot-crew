@@ -48,6 +48,17 @@ class CrewClient(
     private val base: String get() = current.ifEmpty { order.firstOrNull().orEmpty() }
 
     /**
+     * 每条入口**连续**失败了几次。成功一次就清零。
+     *
+     * 为什么要记：死掉的局域网地址不会被踢出表，它只是每次都先白等一次连接超时再退回公网。
+     * 界面要能说「局域网地址已失效」，就得有个「它已经连着不通几次」的事实可读 ——
+     * 猜不出来，只能数出来。
+     *
+     * 用并发 Map 而不是普通 map：read() 跑在 IO 线程上，而界面会在主线程读它。
+     */
+    private val failures = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
      * 会话相关的路径统一在这里拼；非会话接口一律不调它（契约 §1 的接口白名单）。
      *
      * **没有隐式默认值**：调用方不传 sessionId 就逐字走老路径。
@@ -62,6 +73,14 @@ class CrewClient(
 
     /** 现在在用的入口。给测试和日志看：换表之后它是否还留在原处，是「有没有打断隧道」的判据。 */
     fun currentEntry(): String = current
+
+    /**
+     * 这条入口连续失败了几次。给界面判断「局域网地址是不是已经失效」用。
+     *
+     * 只报事实（数到几次），不下结论 —— 结论要结合手机当前网段一起看，
+     * 那件事在 [CrewLanHealth] 里，是纯函数、能单测。
+     */
+    fun failureCount(entry: String): Int = failures[CrewPairing.normalize(entry)] ?: 0
 
     /**
      * 把一条**已经确认可用**的入口提到队首。
@@ -124,6 +143,8 @@ class CrewClient(
                 val entry = table[(start + step) % table.size]
                 try {
                     val text = attempt(entry, path, method, body)
+                    // 这一条通了：之前的失败计数作废，否则一次网络抖动会一直挂在界面上。
+                    failures.remove(entry)
                     // 表没被换过才把「现在用哪条」写回去。换过说明 P2P 刚升级上来，
                     // 这一次成功走的是旧路，不该把「当前入口」改回旧的那条。
                     if (entry != current && table === order) {
@@ -132,8 +153,13 @@ class CrewClient(
                     }
                     return@withContext text
                 } catch (error: CrewRejected) {
+                    // 凭据被拒说明这条地址**是通的**：能连上才可能被拒。不计失败。
+                    failures.remove(entry)
                     throw error
                 } catch (error: IOException) {
+                    // 只有「压根没连上」才算这条入口失败。带 HTTP 状态码的说明对端答了话，
+                    // 地址本身没错 —— 把 404/503 记成地址失效会让人白改一次配对。
+                    if (error is CrewHttpStatus) failures.remove(entry) else noteFailure(entry)
                     // 报出去的仍是第一条路的错：那才是人最先遇到的那个现象。
                     // 唯一例外：后续入口明确回了 HTTP 状态（例如老后端的 404）——
                     // 「对端明确拒绝」比「第一条路连不上」更能说明后端是什么，
@@ -146,8 +172,59 @@ class CrewClient(
             throw failure ?: IOException("队伍地址不对：没有可用的入口")
         }
 
-    private fun attempt(entry: String, path: String, method: String, body: String?): String {
-        val connection = open(entry, path, method, body)
+    /**
+     * 只探一条入口通不通，**不换路、不改「现在用哪条」**，只把结果记进失败计数。
+     *
+     * 为什么需要这一条：`read()` 是「从当前在用的那条开始绕一圈」，一旦落到公网，死掉的
+     * 局域网地址就再也不会被尝试 —— 那时它的失败计数永远停在 1（冷启动那一趟），
+     * 界面上也就永远说不出「地址已失效」。要判它失效，就得主动去敲它。
+     *
+     * 敲的是 [PROBE_PATH]：这个路径服务端只回一个 404，路由之外几乎不做事，
+     * 量到的主要是路本身。连接超时比正常请求短得多 —— 局域网里活的电脑 1ms 就答了，
+     * 3 秒还没握上手就是没人在听。
+     *
+     * 返回「这条路现在能不能连上」。401/404 都算**能连上**：对端答了话就说明地址是活的。
+     */
+    suspend fun probeEntry(entry: String, connectTimeoutMs: Int = 3_000): Boolean =
+        withContext(Dispatchers.IO) {
+            val clean = CrewPairing.normalize(entry)
+            if (clean.isEmpty()) return@withContext false
+            try {
+                attempt(clean, PROBE_PATH, "GET", null, connectTimeoutMs)
+                failures.remove(clean)
+                true
+            } catch (error: CrewRejected) {
+                // 凭据被拒：能连上才可能被拒，地址是活的。
+                failures.remove(clean)
+                true
+            } catch (error: CrewHttpStatus) {
+                // 对端明确回了一个状态码：地址是活的，只是这条路径不对。
+                failures.remove(clean)
+                true
+            } catch (error: IOException) {
+                noteFailure(clean)
+                false
+            }
+        }
+
+    /**
+     * 记一次「这条入口没连上」。
+     *
+     * 只累加到 [CrewLanHealth.FAILURES] 就停：再往上数没有意义（判定只看有没有到门槛），
+     * 而计数是给界面读的，别让它变成一个无界的数。
+     */
+    private fun noteFailure(entry: String) {
+        failures.merge(entry, 1) { old, one -> (old + one).coerceAtMost(CrewLanHealth.FAILURES) }
+    }
+
+    private fun attempt(
+        entry: String,
+        path: String,
+        method: String,
+        body: String?,
+        connectTimeoutMs: Int = 15_000,
+    ): String {
+        val connection = open(entry, path, method, body, connectTimeoutMs)
         return try {
             connection.inputStream.bufferedReader().use { it.readText() }
         } finally {
@@ -450,7 +527,13 @@ class CrewClient(
         read("/api/mobile/retry?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "POST")
     }
 
-    private fun open(entry: String, path: String, method: String, body: String?): HttpURLConnection {
+    private fun open(
+        entry: String,
+        path: String,
+        method: String,
+        body: String?,
+        connectTimeoutMs: Int = 15_000,
+    ): HttpURLConnection {
         val url = try {
             // 路径都带 /api/mobile 前缀：那是消息面的位置，独立监听与插件路由都只认它。
             URL(entry + path)
@@ -459,7 +542,7 @@ class CrewClient(
         }
         val connection = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = 15_000
+            connectTimeout = connectTimeoutMs
             readTimeout = 20_000
             setRequestProperty("X-GW-Token", token)
             // 走独立监听时，这道门要的是设备凭据；网关那套不认它，所以两样都带上，
@@ -495,6 +578,15 @@ class CrewClient(
 
 /** 对端明确拒绝了凭据：地址是通的，换一条路也一样进不去。 */
 private class CrewRejected(message: String) : IOException(message)
+
+/**
+ * 探一条入口通不通时敲的路径。
+ *
+ * 与 `TailcatP2p` 量隧道往返用的是同一个思路：它一定不存在，服务端只回一个 404，
+ * 路由之外几乎不做事 —— 这样量到的主要是路本身，而不是服务器拼 JSON 的时间。
+ * 不带凭据也照样会被路由拦下来，401 与 404 都证明「这条地址是活的」。
+ */
+private const val PROBE_PATH = "/api/mobile/__latency"
 
 /** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码。 */
 private class CrewHttpStatus(val status: Int, message: String) : IOException(message)

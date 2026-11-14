@@ -60,22 +60,61 @@ object CrewNearby {
      * 「记住上一次哪条通」——网段一换，记住的地址就是另一台机器甚至不存在。认同一台
      * 只用 mDNS 的 `crew` 指纹（stateDir 派生，与网卡无关），地址一律取当次广播。
      *
-     * 认不出就返回 null：没存指纹、广播里没有、或者指纹对不上，一律不猜，配好的是什么
-     * 就保持什么。同一网段里有好几台时也不会把别人的地址写进来。
+     * ## 配对记录里没有指纹的老记录（真机上就是这个状态）
+     *
+     * `crew` 是后加的字段。加之前配好的记录里没有它，于是 `paired.crew` 是空串，
+     * 这条地址就**永远不会**自更新 —— 这正是 issue 里「死地址一直绕公网」的第一环。
+     *
+     * 补一条身份判据，仍然不猜：隧道地址 `tc-addr` 里内嵌的是**这台电脑的密钥**，
+     * 两台机器不可能撞上。所以「已存的 p2pAddr 与广播里的逐字相同」就是同一台的硬证据 ——
+     * 它比 stateDir 指纹更强，只是晚到（P2P 起来才有）。用上它，并顺手把指纹补进配对记录，
+     * 下一次就走强判据。
+     *
+     * 公网入口不参与认人：同一个域名可能被反代到别处，它证明不了「还是那台机器」。
+     *
+     * 认不出就返回 null：没存指纹、广播里没有、指纹对不上、也没有可比的隧道地址，
+     * 一律不猜，配好的是什么就保持什么。同一网段里有好几台时也不会把别人的地址写进来。
      *
      * `pub` / `p2p` 只在广播给了非空值时更新：一次短暂的广播缺项不该把已经存好的、能跨网
      * 用的那条路抹掉（那是手机出了门唯一能走的路）。地址这格则每次都取广播的现值。
      * 没有任何变化时返回 null，调用方据此不写盘、不重建连接。
      */
     fun refresh(paired: PairedCrew, beacon: CrewBeacon): PairedCrew? {
-        if (paired.crew.isEmpty() || beacon.crew.isEmpty() || paired.crew != beacon.crew) return null
+        if (!sameMachine(paired, beacon)) return null
         val fresh = paired.copy(
             base = CrewPairing.normalize(beacon.base),
             fallbackBase = beacon.publicBase.ifEmpty { paired.fallbackBase },
             p2pAddr = beacon.p2pAddr.ifEmpty { paired.p2pAddr },
+            // 老记录没有指纹：这次既然认出来了，就补上，下次走强判据。
+            crew = paired.crew.ifEmpty { beacon.crew },
         )
         return if (fresh == paired) null else fresh
     }
+
+    /**
+     * 广播里这一台，是不是配对记录里那台。
+     *
+     * 两条判据，都不靠猜：
+     * 1. `crew` 指纹两侧都有且相同 —— 正路，与网卡、网段、密钥轮换都无关；
+     * 2. 配对记录没有指纹时，退回隧道地址逐字相同 —— `tc-addr` 里是这台电脑的密钥，
+     *    撞不上。只在两侧都非空时成立，一次短暂广播缺 `p2p` 不会让它误认。
+     */
+    fun sameMachine(paired: PairedCrew, beacon: CrewBeacon): Boolean {
+        if (paired.crew.isNotEmpty() && beacon.crew.isNotEmpty()) return paired.crew == beacon.crew
+        if (paired.crew.isEmpty() && paired.p2pAddr.isNotEmpty() && beacon.p2pAddr.isNotEmpty()) {
+            return paired.p2pAddr == beacon.p2pAddr
+        }
+        return false
+    }
+
+    /**
+     * 这条配对记录能不能靠广播自更新。
+     *
+     * 不能的时候界面要说清「地址没法自动跟着走」：那意味着电脑下次换 IP 时，
+     * 只能人工重配对 —— 让人自己发现这件事，比让他对着一条死地址猜要诚实得多。
+     */
+    fun canSelfUpdate(paired: PairedCrew): Boolean =
+        paired.crew.isNotEmpty() || paired.p2pAddr.isNotEmpty()
 
     /**
      * 自动填地址的条件：只有一台，而且人还没动过地址框。

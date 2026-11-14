@@ -442,6 +442,40 @@ class CrewDebugTest {
         assertTrue(CrewDebug(bridge).invoke("refresh", JSONObject()).ok)
         assertEquals(listOf("refresh"), target.calls)
     }
+
+    // ── 局域网那条地址的状态 ──────────────────────────────────────────────
+
+    // 走公网时「为什么没走直连」全靠这几个字段回答：只读 way=public 分不清
+    // 「家里本来就该走公网」和「局域网地址废了只能绕」。
+    @Test
+    fun theShellSnapshotCarriesTheLanVerdictAndItsEvidence() {
+        val bridge = DebugBridge()
+        bridge.shell = DebugShell(
+            paired = true,
+            way = "public",
+            route = "局域网地址已失效（电脑可能换过 IP），现在走公网中转",
+            lanVerdict = "stale",
+            lanHost = "192.168.113.134",
+            lanSubnet = "192.168.113",
+            lanFailures = 2,
+        )
+        val snap = bridge.snapshot()
+        assertEquals("stale", snap.getString("lanVerdict"))
+        assertEquals("192.168.113.134", snap.getString("lanHost"))
+        assertEquals("192.168.113", snap.getString("lanSubnet"))
+        assertEquals(2, snap.getInt("lanFailures"))
+        assertEquals("局域网地址已失效（电脑可能换过 IP），现在走公网中转", snap.getString("route"))
+    }
+
+    // 没有证据时如实报 ok + 空地址，不拿一个假地址冒充「判过了」。
+    @Test
+    fun aShellWithNoLanEvidenceReportsOkAndNoAddress() {
+        val snap = DebugBridge().snapshot()
+        assertEquals("ok", snap.getString("lanVerdict"))
+        assertEquals("", snap.getString("lanHost"))
+        assertEquals("", snap.getString("lanSubnet"))
+        assertEquals(0, snap.getInt("lanFailures"))
+    }
 }
 
 /** [DebugBridge] 的动作表在 CrewDebug 里；这里给测试一个直通的入口。 */

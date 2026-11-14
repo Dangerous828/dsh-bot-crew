@@ -327,7 +327,7 @@ class CrewDebugScreen(
     }
 }
 
-/** MainActivity 写的那一半：配对、走哪条路、隧道往返。CrewRoot 还没挂上来时也能答。 */
+/** MainActivity 写的那一半：配对、走哪条路、隧道往返、局域网那条地址的状态。 */
 data class DebugShell(
     val paired: Boolean = false,
     val crew: String = "",
@@ -336,6 +336,17 @@ data class DebugShell(
     val tunnelMillis: Long? = null,
     val p2pNote: String = "",
     val route: String = "",
+    /**
+     * 配对记录里那条局域网地址的判定（`ok` / `unreachable` / `stale`）。
+     *
+     * 单独摊出来是因为它解释「为什么绕公网」：只看 `way=public` 分不清「家里本来就该走
+     * 公网」和「局域网地址废了只能绕」。`host` / `subnet` 是判据里的两个地址，
+     * 脚本拿它们和自己读到的网段一对，就能验证判定不是编的。
+     */
+    val lanVerdict: String = "ok",
+    val lanHost: String = "",
+    val lanSubnet: String = "",
+    val lanFailures: Int = 0,
     val session: String = SessionRoute.MAIN,
 )
 
@@ -364,6 +375,11 @@ class DebugBridge : CrewDebugTarget {
             .put("tunnelMillis", shell.tunnelMillis ?: JSONObject.NULL)
             .put("p2pNote", shell.p2pNote)
             .put("route", shell.route)
+            // 局域网那条地址的状态：走公网时它解释「为什么没走直连」。
+            .put("lanVerdict", shell.lanVerdict)
+            .put("lanHost", shell.lanHost)
+            .put("lanSubnet", shell.lanSubnet)
+            .put("lanFailures", shell.lanFailures)
             .put("session", shell.session)
             .put("screenReady", screen != null)
             .put("screen", screen?.snapshot() ?: JSONObject())

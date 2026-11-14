@@ -481,6 +481,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // （桌面端则由能力位先验保证零发出），绝不降级成 200 静默落库。
     const askedSession = url.searchParams.get('session_id')
     const headerSession = incoming.headers.get(SESSION_HEADER)
+    // 「显式会话」= 任一个载体出现（值合法与否不影响这一点）。它只依赖两个载体在不在，
+    // 所以在会话校验之前就能算出来 —— 提前到这里，下面的 `reply()` 才能在**校验失败的 400**
+    // 上也生效，`invalidSession()` 不必自己再手写一份 `session_api`。
+    const explicitSession = askedSession !== null || headerSession !== null
     // 非法会话的 400 也带能力位（#14 第 3 处）：能力位口径是「显式会话请求的**所有**响应都带」，
     // 错误响应不是例外。这一层在回 400 时已经知道客户端声明的原值，没有任何「还不知道会话是谁」
     // 的借口 —— 网关那边的 400 刻意不带，是因为 `_send` 里 resolve 不出值就注入不了（且那个
@@ -506,11 +510,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         && (value as { error?: unknown }).error === 'unsupported_session')
         ? response(status, { ...(value as Record<string, unknown>), session_api: SESSION_API })
         : response(status, value)
-    // 这里刻意不走 reply：`explicitSession` 要等会话解析完才算得出来，而这条 400 恰恰
-    // 是「解析不出来」时回的 —— 依赖 reply 会形成 TDZ。所以它自己把两个字段都带齐，
-    // 与 reply 的产物同形；下面那条结构测试按「显式带 session_api」认它，不算绕过。
+    // 走 reply：能力位由那一处统一注入，这里只管回显声明的原值（仅排障，不表示后端采纳了它）。
     const invalidSession = (declared: string) =>
-      response(400, { error: 'invalid_session', session_id: declared, session_api: SESSION_API })
+      reply(400, { error: 'invalid_session', session_id: declared })
     if (askedSession !== null && headerSession !== null && askedSession !== headerSession) {
       // 冲突时回显 query 那一侧（query 优先，与正常解析同一条口径）；另一个值原样不进响应体 ——
       // 把两个值都塞进去等于让客户端再猜一次「哪个算数」，而这条 400 的全部意思就是「不猜」。
@@ -521,7 +523,6 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     const declaredSession = askedSession ?? headerSession
     if (declaredSession !== null && !SESSION_ID.test(declaredSession)) return invalidSession(declaredSession)
     const sessionId = declaredSession ?? DEFAULT_SESSION_ID
-    const explicitSession = declaredSession !== null
     // 只有客户端真的带了 header 才透传，值用校验后的 sessionId（与 query 同一个值，绝不制造冲突）。
     const forwardHeader = headerSession !== null
     // 会话名单与登记都在宿主侧答，不经过网关；`sessions` 是唯一不转发的新增 operation。

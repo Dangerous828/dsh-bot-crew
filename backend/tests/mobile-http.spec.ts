@@ -1351,13 +1351,11 @@ it('injects the session capability bit in exactly one place inside the handler',
   const end = lines.findIndex((line, index) => index > start && line === '}')
   expect(end).toBeGreaterThan(start)
   const body = lines.slice(start, end)
-  // `response(` 只该出现在两类地方：
-  //   1) reply 自己的两个分支（`? response(...)` / `: response(...)`）；
-  //   2) 少数**解析阶段**就要回的错误（此刻 explicitSession 还算不出来，走 reply 会 TDZ），
-  //      它们必须自己把 `session_api: SESSION_API` 写在同一行 —— 这样「漏补能力位」仍会被抓到。
+  // `response(` 只该出现在 reply 自己的两个分支里（`? response(...)` / `: response(...)`）。
+  // 没有任何例外：会话校验失败的 400 也走 reply（`explicitSession` 只依赖两个载体在不在，
+  // 在校验之前就能算出来），所以「手写一份 session_api」那条绕路也堵上了。
   const bare = body.filter(line => line.includes('response(')
-    && !/^\s*[?:] response\(/.test(line)
-    && !/session_api:\s*SESSION_API/.test(line))
+    && !/^\s*[?:] response\(/.test(line))
   expect(bare).toEqual([])
   // reply 的两个分支仍在。
   expect(body.filter(line => /^\s*[?:] response\(/.test(line))).toHaveLength(2)

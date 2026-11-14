@@ -286,7 +286,11 @@ def source_evidence(source_path, spec_path):
     src = open(source_path, encoding='utf-8').read().splitlines()
     spec = open(spec_path, encoding='utf-8').read().splitlines()
     guard = [i + 1 for i, line in enumerate(src) if 'data.session_api !== SESSION_API' in line]
-    conflict = [i + 1 for i, line in enumerate(src) if "response(409, { error: 'unsupported_session' })" in line]
+    # 409 可能走裸 response，也可能走统一注入点 reply（能力位判据一处）；
+    # 两种都算证据，否则把实现重构成 reply 之后这条就假红了。
+    conflict = [i + 1 for i, line in enumerate(src)
+                if ("response(409, { error: 'unsupported_session' })" in line
+                    or "reply(409, { error: 'unsupported_session' })" in line)]
     # 证据必须是**成对**的：某个 session_api 守卫行，紧跟其后的几行里就有 409 unsupported_session。
     # 不能要求「文件里第一个 409 在守卫之后」—— 源码现在有两处 409（steer 内联分支 + 统一先验），
     # 位置先后会随重构变动，那种写法会把「有守卫的 409」误判成缺失。按邻近成对匹配才是

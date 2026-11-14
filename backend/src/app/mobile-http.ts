@@ -17,7 +17,7 @@ import type { MemoryView } from './views/memory.ts'
 import type { AuditRow } from './audit.ts'
 import type { Spend } from './spend.ts'
 import type { Transcript } from './voice.ts'
-import type { Quota, ReplySpend } from './quota.ts'
+import type { Quota, QuotaSourceReading, ReplySpend } from './quota.ts'
 import type { SpeakOutcome } from './speech.ts'
 import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
@@ -50,8 +50,15 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   spend?: (ticketId: string) => Promise<Spend | undefined>
   /** 审计账：谁派的、谁判的、谁干的、花了多少，一票一行。 */
   audit?: (ticketId: string) => Promise<AuditRow | undefined>
-  /** 逐条用量：每一步用的哪个模型、花了多少、上下文还剩多少。 */
-  replySpends?: (ticketId: string) => Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string } | undefined>
+  /**
+   * 逐条用量：每一步用的哪个模型、花了多少、上下文还剩多少。
+   *
+   * `real` 是**真实额度源**（provider 的订阅窗口与余额），`real_line` 是它的一句话。
+   * 两个额度分开报：`quota` 是上下文余量，`real` 是 provider 那边的账 —— 混成一个字段
+   * 会让人拿「上下文还剩多少」当「这个月还能花多少」。
+   */
+  replySpends?: (ticketId: string) => Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string; real?: QuotaSourceReading;
+    real_line?: string } | undefined>
   /** 播报：把一句话念成 WAV。宿主没有播报能力时如实说，不假装念了。 */
   speak?: (text: string) => Promise<SpeakOutcome>
   /** 语音：把一段 WAV 转成文字。宿主没有识别能力时如实回 `available: false`。 */

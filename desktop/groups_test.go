@@ -288,3 +288,20 @@ func TestGroupsComeThroughTheRealTimeline(t *testing.T) {
 		t.Errorf("第一行应显示 main 与 2 张票：%q", lines[0].text)
 	}
 }
+
+// 展开一张票时 `replyOf[ticketID]` 可能是 nil：读逐条用量失败时留 nil，
+// 而旧代码从没往这个 map 里填过东西（`spendResult` 不设 replies 字段）。
+// 绘制处若只判 `ok` 不判 `!= nil`，`len(replies.Replies)` 会解引用空指针 —— 实测会崩。
+//
+// 这条直接画真函数 `spendRow`，不是复述判据：判据复述得再对，也和线上那行代码没关系。
+func TestSpendRowToleratesANilRepliesPointer(t *testing.T) {
+	s := newApp(nil)
+	// newApp 不建这两张表（正常路径下是 refresh 建的）：这里显式建，模拟「已经读过、读回来是 nil」。
+	s.spendOf = map[string]*Spend{}
+	s.replyOf = map[string]*ReplySpends{}
+	// 有 spend（否则函数在第一步就 return，根本走不到那行），但 replies 是 nil。
+	s.spendOf["tk-nil"] = &Spend{}
+	s.replyOf["tk-nil"] = nil
+	tt := ui.NewTester(func(c *ui.Context) { s.spendRow(c, PaletteFor(false), "tk-nil") }, 720, 900)
+	_ = tt // 构造即渲染；崩了这条测试会直接挂掉整个进程
+}

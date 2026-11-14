@@ -25,7 +25,8 @@ export interface MainToolsHost {
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
-  readonly resources: ResourceHost
+  /** 资源面：共用部分 + 主 Session 专有的那几项（`sessions` / `settings` 由这里补齐，`quotaSource` 是真实额度面）。 */
+  readonly resources: ResourceHost & Pick<MainResourceHost, 'quotaSource'>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
   sendReplies(): Promise<void>

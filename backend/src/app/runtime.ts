@@ -36,7 +36,8 @@ import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './co
 import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
 import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
 import { approvalOf, approvalPrompt, readAnswer, type ApprovalDecision } from './approval.ts'
-import { quotaOf, quotaWarning, replySpendOf, type Quota, type ReplySpend } from './quota.ts'
+import { QuotaSourceReader, quotaOf, quotaSourceLine, quotaSourceUrl, quotaWarning, replySpendOf, type Quota,
+  type QuotaSourceReading, type ReplySpend } from './quota.ts'
 import { allowedTools, connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
 import { speak as speakText, systemSpeakHost, DEFAULT_VOICE, type SpeakOutcome, type SpeakHost } from './speech.ts'
 import { MasterAssessor } from './assessment.ts'
@@ -63,7 +64,7 @@ import { checkRoleRoutes, type RoutedModel } from './role-models.ts'
 import { sandboxAvailable } from '../infra/environment.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
-import type { ResourceHost } from './resources.ts'
+import type { MainResourceHost, ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { MemoryLayer } from './memory-layer.ts'
@@ -189,6 +190,14 @@ export class Runtime extends Service implements SourceHost {
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
+  /**
+   * 真实额度源（provider 的订阅窗口与余额），按需读、带缓存。
+   *
+   * 这里是**唯一**一处「额度」跨出这台机器的地方：本部署唯一的路由是 magpie 网关，
+   * 它的 `/v1/magpie/quotas` 就是源头。读不到时它如实说读不到，绝不退回上下文余量顶账 ——
+   * 两个数不是一回事，混在一起会让人拿「上下文还剩多少」当「这个月还能花多少」。
+   */
+  private readonly quotaSource = new QuotaSourceReader(() => quotaSourceUrl())
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
@@ -224,9 +233,14 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      // `sessions` / `settings` 由主 Session 的 `ResourceHost` 另行提供（见 `readResource` 的
+      // `main()` 守卫），这里只放两者共用的那部分，外加真实额度面。
+      const resources: ResourceHost & Pick<MainResourceHost, 'quotaSource'> = { store, pages: new TextCache(4_000_000), prompts,
+        commands, masterId, context: ctx,
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
-        feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
+        feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link,
+        // 真实额度面：主 Session 与面板读的是同一次读数（同一个带缓存的 reader）。
+        quotaSource: () => this.quotaSource.read() }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
@@ -843,14 +857,18 @@ export class Runtime extends Service implements SourceHost {
   }
 
   /**
-   * 逐条用量：这张票每一步用的哪个模型、花了多少、上下文还剩多少。
+   * 逐条用量：这张票每一步用的哪个模型、花了多少、上下文还剩多少，以及**真实额度**。
    *
    * 与 `spend()` 的区别是粒度：那个给一张票一个合计，这个给每一步一条 ——
    * 「它刚才那一下用的谁」问的是后者。
    *
-   * `contextWindow` 从模型目录里读；provider 没公布就不写余量，不猜。
+   * 两种「额度」分两格报，不混：
+   * - `quota`：上下文余量，从这条票自己的 `usage` 算，`contextWindow` 从模型目录里读；
+   * - `real`：真实额度源（provider 的订阅窗口与余额），读不到就带 `state: 'unavailable'`
+   *   与原因。**不拿上下文余量去顶这一格** —— 那是两个数。
    */
-  async replySpends(ticketId: string): Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string } | undefined> {
+  async replySpends(ticketId: string): Promise<{ replies: ReplySpend[]; quota: Quota; warning?: string; real?: QuotaSourceReading;
+    real_line?: string } | undefined> {
     const id = ticketId.trim()
     if (!id || !this.store.tickets.get(id)) return undefined
     let events: SpendEvent[]
@@ -872,15 +890,29 @@ export class Runtime extends Service implements SourceHost {
     if (replies.length === 0) return undefined
     const quota = quotaOf(replies)
     const warning = quotaWarning(quota)
-    return { replies, quota, ...(warning ? { warning } : {}) }
+    // 真实额度：读一次（带缓存），原样交出去。读不到也有话说，见 `real_line`。
+    // 这句话把**这张票最后那一步的路由**排在最前：一张票最该看的是它自己那条路由还剩多少。
+    const real = await this.quotaSource.read()
+    const route = replies.at(-1)?.route
+    return { replies, quota, ...(warning ? { warning } : {}), real,
+      real_line: quotaSourceLine(real, route ? { route } : {}) }
   }
 
-  /** 这条路由公布的上下文窗口。目录里没有就说没有 —— 不拿常见的 128k 当默认值。 */
+  /**
+   * 这条路由公布的上下文窗口。目录里没有就说没有 —— 不拿常见的 128k 当默认值。
+   *
+   * 宿主 `LlmRuntime.resolveModelInfo()` 把窗口放在 **`context.contextWindow`**（见
+   * `@deepseek-ai/dsh-llm` 的 `LlmResolvedModelInfo`，`normalizeModelInfo()` 只认这一层）。
+   * 早先这里读的是顶层的 `info.contextWindow`，那一格永远不存在，于是余量在真实运行里
+   * **一次都没出来过** —— 面板上那行小字只有「进 / 出」，没有「余」。读错的字段不会报错，
+   * 只会安静地少一行；所以这里两种形状都认，但以宿主真实形状为准。
+   */
   private async contextWindowOf(provider?: string, model?: string): Promise<number | undefined> {
     if (!provider || !model) return undefined
     try {
-      const info = await this.ctx.llm.resolveModelInfo(provider, model) as { contextWindow?: number } | undefined
-      const window = info?.contextWindow
+      const info = await this.ctx.llm.resolveModelInfo(provider, model) as
+        { context?: { contextWindow?: number }; contextWindow?: number } | undefined
+      const window = info?.context?.contextWindow ?? info?.contextWindow
       return typeof window === 'number' && window > 0 ? window : undefined
     } catch { return undefined }
   }

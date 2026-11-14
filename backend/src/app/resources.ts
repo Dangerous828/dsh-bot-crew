@@ -19,6 +19,7 @@ import type { Settings } from './settings.ts'
 import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
+import type { QuotaSourceReading } from './quota.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
@@ -50,6 +51,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
+  { name: 'quota', holds: 'the real quota source: each provider account\'s subscription windows and key balances, as the source '
+    + 'states them, with when it was read and why it could not be read when it could not' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
@@ -72,6 +75,8 @@ export interface ResourceHost {
 export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
+  /** 真实额度源（provider 的订阅窗口与余额）；宿主没接就是没有，`quota` 资源据此报错而不是编一栏。 */
+  readonly quotaSource?: () => Promise<QuotaSourceReading>
 }
 interface Read {
   host: ResourceHost; resource: string; rest: string; offset: number; limit?: number
@@ -198,6 +203,16 @@ const ROUTES: readonly Route[] = [
     const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
+  }],
+  // 真实额度：provider 那边的账。`state: 'unavailable'` 时 `reason` 说清为什么读不到 ——
+  // 不退回上下文余量顶账，那是另一个数（见 quota.ts 顶部）。
+  ['quota', async read => {
+    const host = main(read)
+    const reading = host.quotaSource ? await host.quotaSource() : undefined
+    if (!reading) throw new Error('This deployment has no real quota source wired')
+    const { windows, ...rest } = reading
+    return { ...rest, windows: windows.slice(read.offset, read.offset + Math.min(read.limit ?? 40, 200)),
+      next_offset: windows.length > read.offset + Math.min(read.limit ?? 40, 200) ? read.offset + Math.min(read.limit ?? 40, 200) : null }
   }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)

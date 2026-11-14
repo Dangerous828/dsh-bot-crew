@@ -4357,7 +4357,8 @@ func (s *app) spendRow(c *ui.Context, p Palette, ticketID string) {
 		})
 	}
 	// 逐条用量：最后一条就是「它刚才那一下」。
-	if replies, ok := s.replyOf[ticketID]; ok && len(replies.Replies) > 0 {
+	// 判空要显式：`map` 里存在一个 nil 指针时 `ok` 也是 true，只判 ok 会解引用空指针。
+	if replies, ok := s.replyOf[ticketID]; ok && replies != nil && len(replies.Replies) > 0 {
 		last := replies.Replies[len(replies.Replies)-1]
 		ui.Row(c).FillWidth().PaddingStart(12).Children(func() {
 			ui.Text(c, "刚才那一下："+replyLine(last)).FontSize(FontHairline).TextColor(p.Faint).MaxLines(1).Ellipsis("…")
@@ -4470,6 +4471,12 @@ func (s *app) openWork(ticketID string) {
 		}
 		if audit, auditOK, _ := s.client.Audit(ctx, ticketID); auditOK {
 			result.audit = audit
+		}
+		// 逐条用量也要读：`replyOf[ticketID]` 里存的是这个指针，而绘制处写的是
+		// `if replies, ok := ...; ok && len(replies.Replies) > 0` —— `ok` 为 true 而指针为 nil
+		// 时那一句会解引用空指针，展开任意一张票就崩。读失败就留 nil，绘制处另有判空。
+		if replies, repliesOK, _ := s.client.ReplySpends(ctx, ticketID); repliesOK {
+			result.replies = replies
 		}
 		s.spendCh <- result
 		s.wake()

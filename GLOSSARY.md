@@ -44,20 +44,21 @@ _Avoid_: 会话 id、session_id、crew 指纹、instanceId
 _Avoid_: Session、masterId、session_id（线上字段名）
 
 **session_id**
-线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身。载体有 URL query 参数 `session_id` 与请求头 `x-crew-session` 两种，**query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`。手机端只用 query，桌面端非 `main` 双写且值相同；两种载体都不带即老调用，缺省 `main`。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与裁决见 [契约 §9.7](docs/00-contract.md)。
-_Avoid_: masterId、Session id、conversation_id、X-Session-Id（头名是 `x-crew-session`）
+线上消息面的字段名：一次请求选哪一段 conversation，值就是那段 conversation 的 id，缺省 `main`。它是**传输层的字段**，不是 DSH Session，也不是队列列本身。载体有 URL query 参数 `session_id` 与请求头 `x-crew-session` 两种，**query 优先、header 兜底**；两者都给且不一致 → 400 `invalid_session`。手机端只用 query，桌面端非 `main` 双写且值相同；两种载体都不带即老调用，缺省 `main`。它只有 id 没有显示名 —— 名字由客户端派生，后端不提供（见 **会话名单（sessions）**）。取舍见 [ADR 0007](docs/adr/0007-multi-session-seam.md)，线上字节与裁决见 [契约 §9.7](docs/00-contract.md)。
+_Avoid_: masterId、Session id、conversation_id、X-Session-Id（头名是 `x-crew-session`）、会话标题 / 显示名
 
 **x-crew-session（header 形态 session_id）**
 `session_id` 的 header 载体，与 `x-crew-device` / `x-crew-credential` 同族。query 优先、它兜底；能力位判据同步覆盖带它的请求。老网关不认它由能力位先验 / 409 兜住，**不静默按 `main` 落库**（[ADR 0007](docs/adr/0007-multi-session-seam.md) 的裁决）。
 _Avoid_: X-Session-Id、X-Crew-Session-Id、`session_id`（那是 query 参数名）
 
 **能力位（session_api）**
-后端在显式会话响应里回显的标记，`1` 表示这台后端按会话分片、认得 `session_id`；判据同时覆盖 query 与 `x-crew-session` 两种载体。客户端先验它再启用显式非 `main`；缺位即视为老后端，锁 `main` 并如实提示，不静默降级。
+后端在显式会话响应里回显的标记，`1` 表示这台后端按会话分片、认得 `session_id`；判据同时覆盖 query 与 `x-crew-session` 两种载体。口径是「显式会话请求的**所有**响应都带」，不按状态码分档：连它自己回的 400 `invalid_session` 也带（消息面这一层回 400 时已经知道声明的原值，见 [契约 §9.3](docs/00-contract.md)）；网关的 400 是例外，那里 `_send` 解析不出会话值就注入不了。它只说明「对端已升级」，不说明那个 id 合法、也不说明这次请求被服务了。客户端先验它再启用显式非 `main`；缺位即视为老后端，锁 `main` 并如实提示，不静默降级。
 _Avoid_: feature flag、版本号、能力协商（它不是一次协商，只是响应里的一个回显字段）
 
 **会话名单（sessions）**
 后端持有的会话 id 列表，`main` 恒在首位，配一个 `default_session_id`。唯一真源在后端，客户端每次启动重新拉，不落盘；它也是 Source 准入的唯一真源（S4）：`scope()` / `channel.allowed` 合并手配 `conversations` 与注册名单。
-_Avoid_: 本地名单、缓存名单、花名册（那是 Bot 目录）
+**条目就是 id 字符串**（`["main", "work", ...]`），后端不提供 `name` / `title` 之类的显示名，这是明确裁决而非遗漏：显示名是产品决策（叫什么、能不能改名、改到哪去），后端先发一个就成了事实上的默认值。显示名由客户端按需派生（如 `main` 显示为「主会话」，其余先显示 id）。裁决与理由见 [契约 §9.2](docs/00-contract.md)。
+_Avoid_: 本地名单、缓存名单、花名册（那是 Bot 目录）、显示名 / name（后端不提供）、会话标题
 
 **当前会话（current session）**
 客户端此刻选中的那一段 conversation 的 id。它落盘以便下次启动恢复，缺键回落 `main`；只是名单里被选中的一个值，不是名单本身。

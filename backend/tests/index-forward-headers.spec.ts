@@ -187,8 +187,9 @@ it('joins repeated session headers instead of guessing the first, and the surfac
   const answer = await lanRequest(lan, '/api/mobile/read', { 'x-crew-session': ['work', 'other'] }, JSON.stringify({ last_read_id: 'r1' }))
   expect(held.seen[0]!.headers.get('x-crew-session')).toBe('work, other')
   // 拼出来的值过不了会话名形状校验：真处理器回 400，绝不静默按 main 落库。
+  // 这条 400 也带能力位（契约 §9.3 / #14 第 3 处），拼出来的原值逐字回显便于排障。
   expect(answer.status).toBe(400)
-  expect(await answer.json()).toEqual({ error: 'invalid_session' })
+  expect(await answer.json()).toEqual({ error: 'invalid_session', session_id: 'work, other', session_api: 1 })
 })
 
 it('passes a single-element array through as one value, not as a joined oddity', async () => {
@@ -210,7 +211,7 @@ it('refuses even two identical session headers rather than collapsing them', asy
   const answer = await lanRequest(lan, '/api/mobile/read', { 'x-crew-session': ['work', 'work'] }, JSON.stringify({ last_read_id: 'r1' }))
   expect(held.seen[0]!.headers.get('x-crew-session')).toBe('work, work')
   expect(answer.status).toBe(400)
-  expect(await answer.json()).toEqual({ error: 'invalid_session' })
+  expect(await answer.json()).toEqual({ error: 'invalid_session', session_id: 'work, work', session_api: 1 })
 })
 
 it('forwards an empty session header verbatim so the surface can refuse it', async () => {
@@ -221,7 +222,8 @@ it('forwards an empty session header verbatim so the surface can refuse it', asy
   const answer = await lanRequest(lan, '/api/mobile/read', { 'x-crew-session': '' },
     JSON.stringify({ last_read_id: 'r1' }))
   expect(answer.status).toBe(400)
-  expect(await answer.json()).toEqual({ error: 'invalid_session' })
+  // 原值就是空串：回显空串（不是把它美化掉，也不是换成 main）。
+  expect(await answer.json()).toEqual({ error: 'invalid_session', session_id: '', session_api: 1 })
   // 而且没有任何会话水位被写下来（既没写 main，也没写空会话）。
   const runtime = held.runtimes.at(-1)!
   expect(runtime.store.get('mobile-read-cursor')).toBeUndefined()

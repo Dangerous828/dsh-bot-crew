@@ -481,13 +481,45 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     // （桌面端则由能力位先验保证零发出），绝不降级成 200 静默落库。
     const askedSession = url.searchParams.get('session_id')
     const headerSession = incoming.headers.get(SESSION_HEADER)
+    // 非法会话的 400 也带能力位（#14 第 3 处）：能力位口径是「显式会话请求的**所有**响应都带」，
+    // 错误响应不是例外。这一层在回 400 时已经知道客户端声明的原值，没有任何「还不知道会话是谁」
+    // 的借口 —— 网关那边的 400 刻意不带，是因为 `_send` 里 resolve 不出值就注入不了（且那个
+    // 响应必须逐字是 {'error':'invalid_session'}），那是另一层的约束，不该被抄到这一层。
+    //
+    // 回显的原值只用于排障，**不表示后端采纳了它**：值本身就是非法的那一个，任何 2xx 才是
+    // 「这次请求被服务了」。`session_api: 1` 说的是「本后端认得这套协议」，与这个 id 合不合法无关。
+    // 老调用（两个载体都不带）不走这里，一条会话字段都不加，逐字保持老形状。
+    // 能力位注入（#14 第 3 处）：与网关 `_send` 同构 —— **判据只有这一处**，本 handler 之后
+    // 回的每一个响应都从 `reply()` 出去，所以「显式会话请求的所有响应都带 session_api」不再靠
+    // 逐条分支记得补字段。早先只有 timeline 与转发成功分支带它，自己回的 400 / 503 全光着：
+    // 客户端在同一段会话里发两次请求，一次带能力位、一次不带，就无从判断对端认不认得这套协议。
+    //
+    // 两条边界，都是刻意的：
+    // - 老调用（两个载体都不带，`explicitSession === false`）一个字段都不加，逐字保持老形状。
+    // - `unsupported_session` 不注入：那条错误的意思正是「对端未升级」，同一条响应里再说
+    //   `session_api: 1` 自相矛盾。判据是**错误码字面值**而不是状态码 —— 状态码会随语义漂，
+    //   错误码是契约钉死的。
+    // `session_id` 不在这里补：正常响应由各分支自己算（timeline 以本次会话为准），非法值的 400
+    // 要回显客户端声明的原值，那是 `invalidSession()` 的事。
+    const reply = (status: number, value: unknown): Response =>
+      explicitSession && !(value && typeof value === 'object'
+        && (value as { error?: unknown }).error === 'unsupported_session')
+        ? response(status, { ...(value as Record<string, unknown>), session_api: SESSION_API })
+        : response(status, value)
+    // 这里刻意不走 reply：`explicitSession` 要等会话解析完才算得出来，而这条 400 恰恰
+    // 是「解析不出来」时回的 —— 依赖 reply 会形成 TDZ。所以它自己把两个字段都带齐，
+    // 与 reply 的产物同形；下面那条结构测试按「显式带 session_api」认它，不算绕过。
+    const invalidSession = (declared: string) =>
+      response(400, { error: 'invalid_session', session_id: declared, session_api: SESSION_API })
     if (askedSession !== null && headerSession !== null && askedSession !== headerSession) {
-      return response(400, { error: 'invalid_session' })
+      // 冲突时回显 query 那一侧（query 优先，与正常解析同一条口径）；另一个值原样不进响应体 ——
+      // 把两个值都塞进去等于让客户端再猜一次「哪个算数」，而这条 400 的全部意思就是「不猜」。
+      return invalidSession(askedSession)
     }
     // Headers.get 对「头存在但值为空」返回 ''（不是 null），与网关 get_all 一样视为显式非法值；
     // 多个同名头会被拼成带 ', ' 的值，同样过不了形状校验 —— 两种都不许猜。
     const declaredSession = askedSession ?? headerSession
-    if (declaredSession !== null && !SESSION_ID.test(declaredSession)) return response(400, { error: 'invalid_session' })
+    if (declaredSession !== null && !SESSION_ID.test(declaredSession)) return invalidSession(declaredSession)
     const sessionId = declaredSession ?? DEFAULT_SESSION_ID
     const explicitSession = declaredSession !== null
     // 只有客户端真的带了 header 才透传，值用校验后的 sessionId（与 query 同一个值，绝不制造冲突）。
@@ -496,21 +528,29 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
     if (operation === 'sessions') {
       await runtime.ready
       if (incoming.method === 'GET') {
-        return response(200, { sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
+        return reply(200, { sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
       }
       const raw = await incoming.text()
-      if (Buffer.byteLength(raw) > 8 * 1024) return response(413, { error: 'Request too large' })
+      if (Buffer.byteLength(raw) > 8 * 1024) return reply(413, { error: 'Request too large' })
       const asked = askedBody(raw)
       const id = typeof asked?.id === 'string' ? asked.id : ''
-      if (!SESSION_ID.test(id)) return response(400, { error: 'invalid_session' })
-      if (typeof runtime.store.set !== 'function') return response(503, { error: 'Session registry is unavailable' })
+      // 登记接口自己的 400 也带能力位：这个端点整体就是会话协议的产物，它的每个响应都该让客户端
+      // 一眼看出「对端认得这套协议」，不该只有 200 才带。但**不回显 `session_id`**：body 里的
+      // `id` 是「想登记哪个名字」的候选，不是本请求声明的会话；把它写成 `session_id` 等于宣称
+      // 「这次请求属于那段会话」，而那段会话此刻可能并不存在。
+      if (!SESSION_ID.test(id)) return reply(400, { error: 'invalid_session', session_api: SESSION_API })
+      if (typeof runtime.store.set !== 'function') return reply(503, { error: 'Session registry is unavailable' })
       // 重复 id 幂等：写同一个键、回同一份名单，不报错。`main` 恒在首位，不必落键。
       if (id !== DEFAULT_SESSION_ID) runtime.store.set(KV.mobile.sessions(id), true)
-      return response(200, { id, sessions: sessionIds(runtime.store), session_api: SESSION_API })
+      // 与 GET 同形：同一资源的两个 verb 都带 `default_session_id`（#14 第 1 处）。
+      // 早先 POST 缺这个字段，客户端只能按「缺字段就回落 main」兜着 —— 那条兜底正是
+      // 后端形状不一致逼出来的，不是客户端的选择。缺省会话是后端的事实，两个 verb 都该说。
+      return reply(200, { id, sessions: sessionIds(runtime.store),
+        default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
     }
     // A work or agent lookup without a ticket would ask the gateway to guess; refuse it here instead.
     const ticketId = url.searchParams.get('ticket') ?? ''
-    if ('needsTicket' in OPERATIONS[operation] && !ticketId) return response(400, { error: 'ticket is required' })
+    if ('needsTicket' in OPERATIONS[operation] && !ticketId) return reply(400, { error: 'ticket is required' })
     let body: string | undefined
     if (operation === 'model') {
       body = await incoming.text()
@@ -521,59 +561,59 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const clearing = value && !Array.isArray(value) && typeof value.model === 'string' && !value.model.trim()
           && typeof value.bot_id === 'string' && value.bot_id.trim() !== ''
         if (!value || Array.isArray(value) || typeof value.model !== 'string' || (!value.model.trim() && !clearing) || value.model.length > 200) {
-          return response(400, { error: 'model is required' })
+          return reply(400, { error: 'model is required' })
         }
         // 只放行这三个开关：provider 决定去哪儿，bot_id 决定给谁，reasoningEffort 决定档位。
         // 早先这里只留了 provider/model，导致「选推理档位」「指定成员模型」两个动作被静默丢掉。
         const botId = typeof value.bot_id === 'string' && value.bot_id.trim() ? value.bot_id.trim() : undefined
         const effort = typeof value.reasoningEffort === 'string' && value.reasoningEffort.trim() ? value.reasoningEffort.trim() : undefined
-        if (botId !== undefined && (botId.length > 64 || !BOT_ID.test(botId))) return response(400, { error: 'Invalid bot_id' })
-        if (effort !== undefined && effort.length > 64) return response(400, { error: 'Invalid reasoningEffort' })
+        if (botId !== undefined && (botId.length > 64 || !BOT_ID.test(botId))) return reply(400, { error: 'Invalid bot_id' })
+        if (effort !== undefined && effort.length > 64) return reply(400, { error: 'Invalid reasoningEffort' })
         body = JSON.stringify({ ...typeof value.provider === 'string' && value.provider ? { provider: value.provider } : {}, model: value.model,
           ...(botId ? { bot_id: botId } : {}), ...(effort ? { reasoningEffort: effort } : {}) })
-      } catch { return response(400, { error: 'Invalid JSON' }) }
+      } catch { return reply(400, { error: 'Invalid JSON' }) }
     }
     if (operation === 'pair') {
       // 配对请求只有四个短字段，给一点余量就够；它不经过网关，所以大小由这里把。
       body = await incoming.text()
-      if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Pairing request too large' })
+      if (Buffer.byteLength(body) > 8 * 1024) return reply(413, { error: 'Pairing request too large' })
     }
     if (operation === 'steer') body = await incoming.text()
     if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'read' || (operation === 'bots' && incoming.method === 'POST') || (operation === 'routines' && incoming.method === 'POST')) {
       // 控制请求与花名册只带几个短字段，和配对请求同量级。
       body = await incoming.text()
-      if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
+      if (Buffer.byteLength(body) > 8 * 1024) return reply(413, { error: 'Request too large' })
     }
     // 重试是执行器上的动作，不经过网关转发，所以放在下面那条转发分支之前。
     if (operation === 'retry') {
-      if (!runtime.store.tickets.get(ticketId)) return response(404, { error: 'No such ticket' })
-      if (!runtime.engine?.retryTicket) return response(503, { error: 'Ticket control is unavailable' })
-      try { runtime.engine.retryTicket(ticketId) } catch { return response(409, { error: 'Ticket cannot be retried' }) }
-      return response(200, { ok: true, retried: true })
+      if (!runtime.store.tickets.get(ticketId)) return reply(404, { error: 'No such ticket' })
+      if (!runtime.engine?.retryTicket) return reply(503, { error: 'Ticket control is unavailable' })
+      try { runtime.engine.retryTicket(ticketId) } catch { return reply(409, { error: 'Ticket cannot be retried' }) }
+      return reply(200, { ok: true, retried: true })
     }
     if (operation === 'send') {
       body = await incoming.text()
-      if (Buffer.byteLength(body) > 64 * 1024) return response(413, { error: 'Message too large' })
+      if (Buffer.byteLength(body) > 64 * 1024) return reply(413, { error: 'Message too large' })
       try {
         const value = JSON.parse(body) as Record<string, unknown> | null
         if (!value || Array.isArray(value) || typeof value.text !== 'string' || !value.text.trim()
           || typeof value.request_id !== 'string' || !value.request_id || value.request_id.length > 128) {
-          return response(400, { error: 'text and request_id are required' })
+          return reply(400, { error: 'text and request_id are required' })
         }
         // The authenticated owner is the sender. No client-supplied policy identity crosses this boundary.
         const mentions = Array.isArray(value.mentions)
           ? value.mentions.filter((item): item is string => typeof item === 'string' && item.length > 0).slice(0, 10) : []
         // A mention only names who should answer; authorization stays with the owner identity above.
         body = JSON.stringify({ text: value.text, request_id: value.request_id, mentions })
-      } catch { return response(400, { error: 'Invalid JSON' }) }
+      } catch { return reply(400, { error: 'Invalid JSON' }) }
     }
     if (operation === 'withdraw') {
       body = await incoming.text()
-      if (Buffer.byteLength(body) > 8 * 1024) return response(413, { error: 'Request too large' })
+      if (Buffer.byteLength(body) > 8 * 1024) return reply(413, { error: 'Request too large' })
       const value = askedBody(body)
       const requestId = typeof value?.request_id === 'string' ? value.request_id : ''
       // 撤回只认 request_id，和 send 用同一个长度上限；其余字段一律丢掉，不替客户端猜。
-      if (!requestId || requestId.length > 128) return response(400, { error: 'request_id is required' })
+      if (!requestId || requestId.length > 128) return reply(400, { error: 'request_id is required' })
       body = JSON.stringify({ request_id: requestId })
     }
     // The three work routes read the store and the live session tree, which the gateway does not hold. They answer
@@ -587,12 +627,12 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 「常规任务」：GET 读账本，POST 新增/修改/删除一条（契约 §5.5 已开写接口）。
         if (incoming.method === 'POST') {
           const write = runtime.writeRoutine?.bind(runtime)
-          if (!write) return response(503, { error: 'Routine editing is unavailable' })
+          if (!write) return reply(503, { error: 'Routine editing is unavailable' })
           const raw = body
           let value: { action?: unknown; id?: unknown; title?: unknown; cycle?: unknown; bot_id?: unknown; enabled?: unknown }
-          try { value = JSON.parse(raw ?? '') } catch { return response(400, { error: 'Invalid JSON' }) }
+          try { value = JSON.parse(raw ?? '') } catch { return reply(400, { error: 'Invalid JSON' }) }
           const action = value?.action
-          if (action !== 'create' && action !== 'edit' && action !== 'remove') return response(400, { error: 'action must be create, edit or remove' })
+          if (action !== 'create' && action !== 'edit' && action !== 'remove') return reply(400, { error: 'action must be create, edit or remove' })
           const outcome = write(action, {
             ...(typeof value.id === 'string' ? { id: value.id } : {}),
             ...(typeof value.title === 'string' ? { title: value.title } : {}),
@@ -600,45 +640,45 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             ...(typeof value.bot_id === 'string' ? { bot_id: value.bot_id } : {}),
             ...(typeof value.enabled === 'boolean' ? { enabled: value.enabled } : {}),
           })
-          if (!outcome.ok) return response(400, { ok: false, reason: outcome.reason ?? 'write failed' })
-          return response(200, outcome.record ? { ok: true, record: outcome.record } : { ok: true })
+          if (!outcome.ok) return reply(400, { ok: false, reason: outcome.reason ?? 'write failed' })
+          return reply(200, outcome.record ? { ok: true, record: outcome.record } : { ok: true })
         }
         // GET：KV 里那张定时账本。宿主没接这项能力时说「读不到」，不说「还没有常规任务」—— 那是在替队伍编一句话。
         const readRoutines = runtime.routines?.bind(runtime)
         if (!readRoutines) {
-          return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
+          return reply(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
             runner: 'none', reason: '后端还没有接入常规任务' })
         }
         try {
-          return response(200, await readRoutines())
+          return reply(200, await readRoutines())
         } catch {
-          return response(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
+          return reply(200, { items: [], state: 'unavailable', counts: { enabled: 0, paused: 0 },
             runner: 'none', reason: '常规任务暂时读不出来' })
         }
       }
       if (operation === 'reply-spend') {
         const ticketId = url.searchParams.get('ticket')?.trim() ?? ''
-        if (!ticketId) return response(400, { error: 'ticket is required' })
+        if (!ticketId) return reply(400, { error: 'ticket is required' })
         const read = runtime.replySpends?.bind(runtime)
-        if (!read) return response(200, { available: false, reason: '后端还没有接入逐条用量' })
+        if (!read) return reply(200, { available: false, reason: '后端还没有接入逐条用量' })
         try {
           const value = await read(ticketId)
-          return response(200, value === undefined ? { available: false, reason: '这张票没有可读的用量记录' } : { available: true, ...value })
+          return reply(200, value === undefined ? { available: false, reason: '这张票没有可读的用量记录' } : { available: true, ...value })
         } catch (error) {
-          return response(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
+          return reply(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
         }
       }
       if (operation === 'speak') {
         const speak = runtime.speak?.bind(runtime)
-        if (!speak) return response(200, { available: false, reason: '这台后端没有接入播报' })
+        if (!speak) return reply(200, { available: false, reason: '这台后端没有接入播报' })
         const raw = await incoming.text()
-        if (Buffer.byteLength(raw) > 64 * 1024) return response(413, { error: 'Request too large' })
+        if (Buffer.byteLength(raw) > 64 * 1024) return reply(413, { error: 'Request too large' })
         const asked = askedBody(raw)
         const text = typeof asked?.text === 'string' ? asked.text : ''
-        if (!text.trim()) return response(400, { error: 'text is required' })
+        if (!text.trim()) return reply(400, { error: 'text is required' })
         const outcome = await speak(text)
         if (outcome.status !== 'ok') {
-          return response(200, { available: false, status: outcome.status, reason: outcome.reason })
+          return reply(200, { available: false, status: outcome.status, reason: outcome.reason })
         }
         // 二进制回包：`audio/wav`。手机直接写进播放器。
         // 长度与「有没有截断」放进响应头：手机不必解析 WAV 头就能显示这两件事。
@@ -655,25 +695,25 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (operation === 'voice') {
         // 语音输入：body 就是录音本身（不是 JSON、不是 base64 —— 多一层编码就多一次出错的机会）。
         const transcribeVoice = runtime.transcribe?.bind(runtime)
-        if (!transcribeVoice) return response(200, { available: false, reason: '后端还没有接入语音识别' })
+        if (!transcribeVoice) return reply(200, { available: false, reason: '后端还没有接入语音识别' })
         const raw = await incoming.arrayBuffer()
         try {
-          return response(200, await transcribeVoice(new Uint8Array(raw), incoming.signal))
+          return reply(200, await transcribeVoice(new Uint8Array(raw), incoming.signal))
         } catch (error) {
-          return response(200, { available: false, reason: error instanceof Error ? error.message : '识别没成功' })
+          return reply(200, { available: false, reason: error instanceof Error ? error.message : '识别没成功' })
         }
       }
       if (operation === 'spend' || operation === 'audit') {
         // 两张账都按票读。没有票号或宿主没接这项能力时如实说读不到，不回一个像样的假数。
         const ticketId = url.searchParams.get('ticket')?.trim() ?? ''
-        if (!ticketId) return response(400, { error: 'ticket is required' })
+        if (!ticketId) return reply(400, { error: 'ticket is required' })
         const read = operation === 'spend' ? runtime.spend?.bind(runtime) : runtime.audit?.bind(runtime)
-        if (!read) return response(200, { available: false, reason: '后端还没有接入这一项' })
+        if (!read) return reply(200, { available: false, reason: '后端还没有接入这一项' })
         try {
           const value = await (read as (id: string) => Promise<unknown>)(ticketId)
-          return response(200, value === undefined ? { available: false, reason: '这张票没有可读的记录' } : { available: true, [operation]: value })
+          return reply(200, value === undefined ? { available: false, reason: '这张票没有可读的记录' } : { available: true, [operation]: value })
         } catch (error) {
-          return response(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
+          return reply(200, { available: false, reason: error instanceof Error ? error.message : '暂时读不出来' })
         }
       }
       if (operation === 'memory') {
@@ -681,53 +721,53 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const name = url.searchParams.get('bot')?.trim()
         if (incoming.method === 'GET') {
           const readMemory = runtime.memories?.bind(runtime)
-          if (!readMemory) return response(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 },
+          if (!readMemory) return reply(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 },
             reason: '后端还没有接入记忆' })
-          try { return response(200, await readMemory(name ? { bot: name } : {})) }
-          catch { return response(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 }, reason: '记忆账本暂时读不出来' }) }
+          try { return reply(200, await readMemory(name ? { bot: name } : {})) }
+          catch { return reply(200, { items: [], state: 'unavailable', counts: { active: 0, forgotten: 0, superseded: 0 }, reason: '记忆账本暂时读不出来' }) }
         }
         const raw = await incoming.text()
-        if (Buffer.byteLength(raw) > 32 * 1024) return response(413, { error: 'Request too large' })
+        if (Buffer.byteLength(raw) > 32 * 1024) return reply(413, { error: 'Request too large' })
         let value: { action?: unknown; name?: unknown; description?: unknown; body?: unknown; importance?: unknown }
-        try { value = JSON.parse(raw) } catch { return response(400, { error: 'Invalid JSON' }) }
+        try { value = JSON.parse(raw) } catch { return reply(400, { error: 'Invalid JSON' }) }
         const target = typeof value?.name === 'string' ? value.name.trim() : ''
-        if (!target) return response(400, { error: 'name is required' })
+        if (!target) return reply(400, { error: 'name is required' })
         // 只认记忆账本那个前缀下的名字：这是主人改账本，不是任意改 KV。
-        if (!target.startsWith('bot-')) return response(400, { error: 'No such memory' })
+        if (!target.startsWith('bot-')) return reply(400, { error: 'No such memory' })
         if (value.action === 'forget') {
           const forget = runtime.forgetMemory?.bind(runtime)
-          if (!forget) return response(200, { ok: false, reason: '后端还没有接入记忆' })
-          return response(200, { ok: forget(target), name: target })
+          if (!forget) return reply(200, { ok: false, reason: '后端还没有接入记忆' })
+          return reply(200, { ok: forget(target), name: target })
         }
         if (value.action === 'edit') {
           const edit = runtime.editMemory?.bind(runtime)
-          if (!edit) return response(200, { ok: false, reason: '后端还没有接入记忆' })
+          if (!edit) return reply(200, { ok: false, reason: '后端还没有接入记忆' })
           const patch: { description?: string; body?: string; importance?: number } = {}
           if (typeof value.description === 'string') patch.description = value.description
           if (typeof value.body === 'string') patch.body = value.body
           if (typeof value.importance === 'number') patch.importance = value.importance
-          try { return response(200, { ok: edit(target, patch), name: target }) }
-          catch (error) { return response(400, { error: error instanceof Error ? error.message : 'Invalid memory' }) }
+          try { return reply(200, { ok: edit(target, patch), name: target }) }
+          catch (error) { return reply(400, { error: error instanceof Error ? error.message : 'Invalid memory' }) }
         }
-        return response(400, { error: 'action must be forget or edit' })
+        return reply(400, { error: 'action must be forget or edit' })
       }
       if (operation === 'outputs') {
         // 「产出」：worker 真正写过的文件。宿主没接这项能力时如实说「读不到」，
         // 不说「没有产出」—— 那是在替队伍编一句话。
         // runtime.outputs 是实例方法，脱离 this 调会读不到 store，所以先 bind 再调。
         if (!runtime.outputs) {
-          return response(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 }, reason: '后端还没有接入产出' })
+          return reply(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 }, reason: '后端还没有接入产出' })
         }
         const readOutputs = runtime.outputs.bind(runtime)
         const wanted = ticketId ? [ticketId] : []
-        if (ticketId && !runtime.store.tickets.get(ticketId)) return response(404, { error: 'No such ticket' })
+        if (ticketId && !runtime.store.tickets.get(ticketId)) return reply(404, { error: 'No such ticket' })
         // 不带票号时列最近的几张：产出是「交出来的东西」，不是全部历史。手机与队伍两条通道的票都算。
         const tickets = (wanted.length > 0 ? wanted.flatMap(id => runtime.store.tickets.get(id) ?? []) : runtime.store.tickets.list())
           .filter(ticket => ticket.channels.some(channel => channel.source === 'mobile' || channel.source === 'team'))
           .slice(0, 12)
         // 票存在、但它不走手机/队伍这两条通道：这不是「队伍还没有工单」，如实说它不在产出通道里。
         if (ticketId && tickets.length === 0) {
-          return response(200, { items: [], state: 'empty', counts: { file: 0, image: 0 }, ticket_id: ticketId,
+          return reply(200, { items: [], state: 'empty', counts: { file: 0, image: 0 }, ticket_id: ticketId,
             reason: '这张票不在产出通道里（只有手机与队伍工单有产出）' })
         }
         try {
@@ -737,24 +777,24 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
               ...(botId ? { bot_id: botId } : {}),
               ...(ticket.execution?.directory ? { cwd: ticket.execution.directory } : {}) }
           }))
-          return response(200, ticketId ? { ...view, ticket_id: ticketId } : view)
+          return reply(200, ticketId ? { ...view, ticket_id: ticketId } : view)
         } catch {
-          return response(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 },
+          return reply(200, { items: [], state: 'unavailable', counts: { file: 0, image: 0 },
             ...(ticketId ? { ticket_id: ticketId } : {}), reason: '产出暂时读不出来' })
         }
       }
       if (operation === 'steer') {
-        if (!runtime.steer) return response(503, { error: 'Steering is unavailable' })
+        if (!runtime.steer) return reply(503, { error: 'Steering is unavailable' })
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const id = typeof asked.ticket === 'string' ? asked.ticket : ''
         const requestId = typeof asked.request_id === 'string' ? asked.request_id : ''
-        if (!id) return response(400, { error: 'ticket is required' })
-        if (!requestId || requestId.length > 128) return response(400, { error: 'request_id is required' })
+        if (!id) return reply(400, { error: 'ticket is required' })
+        if (!requestId || requestId.length > 128) return reply(400, { error: 'request_id is required' })
         const ticket = runtime.store.tickets.get(id)
-        if (!ticket || ticket.ended) return response(409, { error: 'Ticket is not running' })
+        if (!ticket || ticket.ended) return reply(409, { error: 'Ticket is not running' })
         const token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim()
-        if (!token) return response(503, { error: 'Mobile transport is not configured' })
+        if (!token) return reply(503, { error: 'Mobile transport is not configured' })
         // steer 在宿主侧直答，不走下面统一的那道 409 先验，但它内部要往网关写/认领消息。
         // 两条内部请求必须同样带会话字段并验能力位：否则 header 形态的非 main steer 会
         // 绕过先验、把消息静默按 main 落库（审查发现的真串线口子）。
@@ -764,7 +804,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const steerCapability = async (upstream: Response): Promise<Response | undefined> => {
           if (!explicitSession || sessionId === DEFAULT_SESSION_ID) return undefined
           const data = await upstream.clone().json().catch(() => undefined) as { session_api?: unknown } | undefined
-          if (data?.session_api !== SESSION_API) return response(409, { error: 'unsupported_session' })
+          if (data?.session_api !== SESSION_API) return reply(409, { error: 'unsupported_session' })
           return undefined
         }
         const authored = typeof asked.text === 'string' ? asked.text.trim() : ''
@@ -775,7 +815,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             headers: steerHeaders,
             body: JSON.stringify({ text: authored, request_id: requestId, mentions: [], steer: true }),
             signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error' })
-          if (!sent.ok) return response(sent.status === 401 ? 503 : sent.status, { error: 'Mobile request was rejected' })
+          if (!sent.ok) return reply(sent.status === 401 ? 503 : sent.status, { error: 'Mobile request was rejected' })
           const denied = await steerCapability(sent)
           if (denied) return denied
           text = authored
@@ -788,67 +828,67 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
           if (!claimed.ok) {
             if (claimed.status === 404 || claimed.status === 409) {
               const refused = await claimed.json().catch(() => undefined) as { error?: unknown } | undefined
-              return response(claimed.status, { error: typeof refused?.error === 'string' ? refused.error : 'Steer refused' })
+              return reply(claimed.status, { error: typeof refused?.error === 'string' ? refused.error : 'Steer refused' })
             }
-            return response(claimed.status === 401 ? 503 : claimed.status, { error: 'Mobile request was rejected' })
+            return reply(claimed.status === 401 ? 503 : claimed.status, { error: 'Mobile request was rejected' })
           }
           const message = await claimed.clone().json() as { text?: unknown }
           const denied = await steerCapability(claimed)
           if (denied) return denied
           text = typeof message.text === 'string' ? message.text : ''
         }
-        if (!text) return response(409, { error: 'no such message' })
-        if (!await runtime.steer(id, requestId, text)) return response(409, { error: 'Ticket is not running' })
-        return response(200, { ok: true, ticket: id, request_id: requestId })
+        if (!text) return reply(409, { error: 'no such message' })
+        if (!await runtime.steer(id, requestId, text)) return reply(409, { error: 'Ticket is not running' })
+        return reply(200, { ok: true, ticket: id, request_id: requestId })
       }
       if (operation === 'efforts') {
-        if (!runtime.efforts) return response(503, { error: 'Model details are unavailable' })
+        if (!runtime.efforts) return reply(503, { error: 'Model details are unavailable' })
         const provider = url.searchParams.get('provider') ?? ''
         const model = url.searchParams.get('model') ?? ''
-        if (!provider || !model) return response(400, { error: 'provider and model are required' })
-        try { return response(200, await runtime.efforts(provider, model)) }
-        catch (error) { return response(400, { error: error instanceof Error ? error.message : 'Model is unavailable' }) }
+        if (!provider || !model) return reply(400, { error: 'provider and model are required' })
+        try { return reply(200, await runtime.efforts(provider, model)) }
+        catch (error) { return reply(400, { error: error instanceof Error ? error.message : 'Model is unavailable' }) }
       }
       if (operation === 'screen') {
         // 画面源是会话活动快照（命令/输出/回话），不是像素截帧：worker 不跑浏览器，但它在终端里
         // 做了什么，手机上应该看得见。宿主没接这项能力时如实说「没有」，不给一个永远转圈的画面。
-        if (!runtime.screen) return response(200, { state: 'unavailable', reason: '后端还没有接入画面源' })
-        try { return response(200, await runtime.screen(ticketId)) }
-        catch { return response(200, { state: 'unavailable', ticket_id: ticketId, reason: '这张工单的会话暂时读不出来' }) }
+        if (!runtime.screen) return reply(200, { state: 'unavailable', reason: '后端还没有接入画面源' })
+        try { return reply(200, await runtime.screen(ticketId)) }
+        catch { return reply(200, { state: 'unavailable', ticket_id: ticketId, reason: '这张工单的会话暂时读不出来' }) }
       }
       if (operation === 'takeover') {
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const id = typeof asked.ticket === 'string' ? asked.ticket : ''
-        if (!id) return response(400, { error: 'ticket is required' })
+        if (!id) return reply(400, { error: 'ticket is required' })
         const ticket = runtime.store.tickets.get(id)
-        if (!ticket) return response(404, { error: 'No such ticket' })
-        if (!runtime.engine) return response(503, { error: 'Ticket control is unavailable' })
+        if (!ticket) return reply(404, { error: 'No such ticket' })
+        if (!runtime.engine) return reply(503, { error: 'Ticket control is unavailable' })
         // 已结束的票必须如实拒绝，不能回 stopped: true 假成功。
         // Tickets.stop() → end() 遇到 !liveTicket 是静默 return（票已经不在跑了，
         // 结束它是空操作），路由若无条件报成功，界面就会显示「已接手：这张票停下了」
         // —— 那是一句假话，而且调用方拿不到任何信号。所以这里先判票还活着。
-        if (!liveTicket(ticket)) return response(409, { error: 'Ticket is already ended' })
-        try { runtime.engine.stopTicket(id) } catch { return response(409, { error: 'Ticket cannot be stopped' }) }
-        return response(200, { ok: true, stopped: true })
+        if (!liveTicket(ticket)) return reply(409, { error: 'Ticket is already ended' })
+        try { runtime.engine.stopTicket(id) } catch { return reply(409, { error: 'Ticket cannot be stopped' }) }
+        return reply(200, { ok: true, stopped: true })
       }
       if (operation === 'pause') {
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const id = typeof asked.ticket === 'string' ? asked.ticket : ''
         // 给出了票号就得对得上：一张不存在的票不该让整台执行器停下来。
-        if (id && !runtime.store.tickets.get(id)) return response(404, { error: 'No such ticket' })
-        if (!runtime.settings) return response(503, { error: 'Pause control is unavailable' })
+        if (id && !runtime.store.tickets.get(id)) return reply(404, { error: 'No such ticket' })
+        if (!runtime.settings) return reply(503, { error: 'Pause control is unavailable' })
         await runtime.settings.pause(true, 'panel')
         // 目前只有执行器这一种暂停。如实写 scope，别让手机以为只停了这一张票。
-        return response(200, { ok: true, scope: 'executor' })
+        return reply(200, { ok: true, scope: 'executor' })
       }
       if (operation === 'resume') {
-        if (!askedBody(body || '{}')) return response(400, { error: 'Invalid JSON' })
-        if (!runtime.settings?.pause) return response(503, { error: 'Resume control is unavailable' })
+        if (!askedBody(body || '{}')) return reply(400, { error: 'Invalid JSON' })
+        if (!runtime.settings?.pause) return reply(503, { error: 'Resume control is unavailable' })
         try { await runtime.settings.pause(false, 'panel') }
-        catch { return response(500, { error: 'Resume control failed' }) }
-        return response(200, { ok: true, resumed: true, scope: 'executor' })
+        catch { return reply(500, { error: 'Resume control failed' }) }
+        return reply(200, { ok: true, resumed: true, scope: 'executor' })
       }
       if (operation === 'read') {
         // 「未读回话」原来没有，是因为后端从来收不到「主人看过哪条回话」这个输入
@@ -856,19 +896,19 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 这条路由只补那一个输入：客户端报上它读到的最后一条回话 id，后端记一条会话级水位。
         // 不逐条改 replies 表、不发明阅读回执；数由 GET /timeline 按这份水位算（unreadRepliesOf）。
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const lastReadId = typeof asked.last_read_id === 'string' ? asked.last_read_id.trim() : ''
-        if (!lastReadId || lastReadId.length > 128) return response(400, { error: 'last_read_id is required' })
-        if (typeof runtime.store.set !== 'function') return response(503, { error: 'Read cursor is unavailable' })
+        if (!lastReadId || lastReadId.length > 128) return reply(400, { error: 'last_read_id is required' })
+        if (typeof runtime.store.set !== 'function') return reply(503, { error: 'Read cursor is unavailable' })
         // 按会话分键；老的无参调用落到 main 那一份（升级前的那个单键），已存过的水位不丢。
         runtime.store.set(READ_CURSOR(sessionId), lastReadId)
-        return response(200, { ok: true, last_read_id: lastReadId })
+        return reply(200, { ok: true, last_read_id: lastReadId })
       }
       if (operation === 'bots') {
         const settings = runtime.store.settings()
         const config = (settings.sources?.team?.config ?? {}) as Record<string, unknown>
         const bots = Array.isArray(config.bots) ? config.bots as Record<string, unknown>[] : []
-        if (incoming.method === 'GET') return response(200, { bots: teamBotRows(bots) })
+        if (incoming.method === 'GET') return reply(200, { bots: teamBotRows(bots) })
         // `action` 是这条请求要做的事。DSH 的 Connection 只放行 GET/POST，所以编辑与删除
         // 走 POST + action，而不是 PUT/DELETE —— 否则手机上根本没有这条路。
         const askedFor = askedBody(body)
@@ -877,9 +917,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         if (action === 'remove') {
           const asked = askedBody(body)
           const botId = typeof asked?.bot_id === 'string' ? asked.bot_id.trim() : ''
-          if (!botId) return response(400, { error: 'bot_id is required' })
+          if (!botId) return reply(400, { error: 'bot_id is required' })
           const gone = bots.find(bot => bot.bot_id === botId)
-          if (!gone) return response(404, { error: 'No such bot' })
+          if (!gone) return reply(404, { error: 'No such bot' })
           const next = bots.filter(bot => bot.bot_id !== botId)
           // 目录要求恰好一个 default：撤掉的若是它，下一位顶上；撤空了就没有 default。
           const wasDefault = gone.role === 'default' || config.default_bot_id === botId
@@ -890,27 +930,27 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             ...(defaultId ? { default_bot_id: defaultId } : { default_bot_id: '' }) })
         }
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const botId = typeof asked.bot_id === 'string' ? asked.bot_id.trim() : ''
-        if (!BOT_ID.test(botId)) return response(400, { error: 'Invalid bot id' })
+        if (!BOT_ID.test(botId)) return reply(400, { error: 'Invalid bot id' })
         const name = typeof asked.name === 'string' ? asked.name.trim() : ''
-        if (!name) return response(400, { error: 'name is required' })
-        if (name.length > 100) return response(400, { error: 'name is too long' })
+        if (!name) return reply(400, { error: 'name is required' })
+        if (name.length > 100) return reply(400, { error: 'name is too long' })
         const persona = typeof asked.persona === 'string' ? asked.persona.trim() : ''
-        if (persona.length > 2000) return response(400, { error: 'persona is too long' })
+        if (persona.length > 2000) return reply(400, { error: 'persona is too long' })
         const existing = bots.find(bot => bot.bot_id === botId)
         // 改这位的人设 / 名字。bot_id 不改 —— 记忆命名空间挂在它上面，改了等于换人。
         if (action === 'edit') {
-          if (!existing) return response(404, { error: 'No such bot' })
+          if (!existing) return reply(404, { error: 'No such bot' })
           const next = bots.map(bot => bot.bot_id === botId
             ? { ...bot, name, ...(persona ? { persona } : { persona: '' }) } : bot)
           return saveTeamBots(runtime, settings, { ...config, bots: next })
         }
-        if (existing) return response(400, { error: 'Bot already exists' })
+        if (existing) return reply(400, { error: 'Bot already exists' })
         const askedRole = asked.role === 'default' ? 'default' : 'member'
         const hasDefault = bots.some(bot => bot.role === 'default')
         if (askedRole === 'default' && hasDefault) {
-          return response(400, { error: 'The crew already has a default bot' })
+          return reply(400, { error: 'The crew already has a default bot' })
         }
         // 目录要求恰好一个 default。队里没有就由这一位顶上：空队的第一位，或者配置已经坏了
         // （有 Bot 没 default）时，加一位就能自愈 —— 只看「是不是空队」会留下永远读不回来的配置。
@@ -924,7 +964,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const catalog = await runtime.models()
         const settings = runtime.store.settings()
         const current = settings.executor.model
-        return response(200, {
+        return reply(200, {
           ...current ? { current } : {},
           // 每位成员的模型：界面上要能显示「这一位现在用的是什么」。
           bot_models: settings.executor.botModels ?? {},
@@ -937,33 +977,33 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       }
       if (operation === 'pair') {
         const devices = (runtime as unknown as { remote?: DeviceStore }).remote
-        if (!devices) return response(503, { error: 'Pairing is unavailable' })
+        if (!devices) return reply(503, { error: 'Pairing is unavailable' })
         const asked = askedBody(body)
-        if (!asked) return response(400, { error: 'Invalid JSON' })
+        if (!asked) return reply(400, { error: 'Invalid JSON' })
         const { code, deviceId, name, platform } = asked
         if (typeof code !== 'string' || typeof deviceId !== 'string' || !code || !deviceId) {
-          return response(400, { error: 'code and deviceId are required' })
+          return reply(400, { error: 'code and deviceId are required' })
         }
         const credential = devices.redeem({ code, deviceId,
           name: typeof name === 'string' && name ? name : deviceId,
           platform: typeof platform === 'string' ? platform : 'unknown' })
         // 码错和设备不对在这里看起来一样：说清楚是哪一个只对尝试者有好处。
-        return credential ? response(200, credential) : response(403, { error: 'Pairing refused' })
+        return credential ? reply(200, credential) : reply(403, { error: 'Pairing refused' })
       }
       if (operation === 'model') {
-        if (!body) return response(400, { error: 'model is required' })
+        if (!body) return reply(400, { error: 'model is required' })
         const asked = JSON.parse(body) as { provider?: string; model: string; reasoningEffort?: string; bot_id?: string }
         // A provider has to be named for a real switch: a model name alone does not say where to reach it.
         // 只清成员路由（model 为空）不需要 provider。
         if (!(asked.bot_id && !asked.model.trim()) && (typeof asked.provider !== 'string' || !asked.provider.trim())) {
-          return response(400, { error: 'provider is required' })
+          return reply(400, { error: 'provider is required' })
         }
         // 指定成员时必须是花名册里存在的 bot_id；拼错的 id 会静默变成一条没人用的配置。
         if (asked.bot_id !== undefined) {
           const config = (runtime.store.settings().sources?.team?.config ?? {}) as { bots?: { bot_id?: string }[] }
           const bots = Array.isArray(config.bots) ? config.bots : []
           if (typeof asked.bot_id !== 'string' || !BOT_ID.test(asked.bot_id) || !bots.some(bot => bot.bot_id === asked.bot_id)) {
-            return response(400, { error: 'Unknown bot_id' })
+            return reply(400, { error: 'Unknown bot_id' })
           }
         }
         const current = runtime.store.settings()
@@ -975,28 +1015,31 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 走 Settings.save，而不是直接写 store：它会先 resolveRoleModel 验一遍这条路由。
         // 直接落盘的话，一个不存在的 provider/model 会被每个新工单在 initializeRoleModel 里
         // 撞到，launch 全部记 failed，直到面板改回来。
-        if (!runtime.settings?.save) return response(503, { error: 'Model switching is unavailable' })
+        if (!runtime.settings?.save) return reply(503, { error: 'Model switching is unavailable' })
         try {
           await runtime.settings.save('executor', next.executor, runtime.store.blockRevision('executor'), 'panel')
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           // SettingsConflict 是空 extends Error，它的 name 仍是 'Error'，只能按类型判。
-          return response(error instanceof SettingsConflict ? 409 : 400, { error: message || 'Model unavailable' })
+          return reply(error instanceof SettingsConflict ? 409 : 400, { error: message || 'Model unavailable' })
         }
-        return response(200, { ok: true, ...(asked.bot_id ? { bot_id: asked.bot_id, model: next.executor.botModels[asked.bot_id] } : { model: next.executor.model }) })
+        return reply(200, { ok: true, ...(asked.bot_id ? { bot_id: asked.bot_id, model: next.executor.botModels[asked.bot_id] } : { model: next.executor.model }) })
       }
-      if (operation === 'work') return response(200, workOf(runtime.store.tickets.get(ticketId)) ?? response(404, { error: 'No such ticket' }))
+      if (operation === 'work') {
+        const work = workOf(runtime.store.tickets.get(ticketId))
+        return work ? reply(200, work) : reply(404, { error: 'No such ticket' })
+      }
       const agents = (runtime as unknown as { agents?: Parameters<typeof agentTree>[0] }).agents
-      if (!agents) return response(503, { error: 'Session tree is unavailable' })
+      if (!agents) return reply(503, { error: 'Session tree is unavailable' })
       // `ctx.agents` answers by id only, so the ids that may be subagents come from the sessions the store recorded.
       // `keys` takes the family itself, not a prefix string; the id is what follows the family's prefix.
       const known = runtime.store.keys?.(KV.sessions.prompts)?.map(name => name.slice(KV.sessions.prompts.prefix.length)) ?? []
-      return response(200, { ticket_id: ticketId, agents: agentTree(agents, ticketId, 8, known) })
+      return reply(200, { ticket_id: ticketId, agents: agentTree(agents, ticketId, 8, known) })
     }
     try {
       await runtime.ready
       const token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim()
-      if (!token) return response(503, { error: 'Mobile transport is not configured' })
+      if (!token) return reply(503, { error: 'Mobile transport is not configured' })
       const query = ticketId ? `?ticket=${encodeURIComponent(ticketId)}` : ''
       // 只在显式带了会话字段时追加：老调用的转发 URL 逐字不变，网关自己缺省 main（S1 契约第 1 节）。
       // 有 ticket 时接 `&`，没有时接 `?`，两种形状都让网关从 url.search 取到同一个字段。
@@ -1014,10 +1057,10 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // 原样带回状态码和文案；其余上游错误仍然只回笼统的一句话，避免泄露内部信息。
         if (operation === 'withdraw' && (upstream.status === 404 || upstream.status === 409)) {
           const refused = await upstream.json().catch(() => undefined) as { error?: unknown } | undefined
-          return response(upstream.status, { error: typeof refused?.error === 'string' ? refused.error : 'Withdraw refused' })
+          return reply(upstream.status, { error: typeof refused?.error === 'string' ? refused.error : 'Withdraw refused' })
         }
         // Credentials and internal paths never appear in upstream error responses.
-        return response(upstream.status === 401 ? 503 : upstream.status,
+        return reply(upstream.status === 401 ? 503 : upstream.status,
           { error: upstream.status === 401 ? 'Mobile transport credential mismatch' : 'Mobile request was rejected' })
       }
       const data = await upstream.json() as Record<string, unknown>
@@ -1032,7 +1075,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       // 会被自己补的字段伪装成已升级。桌面端另有一道能力位先验，先验没过就零发出。
       // 老调用与显式 main 不受影响（main 本来就是 main，老网关照常服务）。
       if (explicitSession && sessionId !== DEFAULT_SESSION_ID && data.session_api !== SESSION_API) {
-        return response(409, { error: 'unsupported_session' })
+        return reply(409, { error: 'unsupported_session' })
       }
       if (operation === 'timeline') {
         const settings = runtime.store.settings()
@@ -1072,7 +1115,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             return { groups: [], state: 'unavailable', reason: `群组投影读不出来：${String(error)}` }
           }
         })()
-        return response(200, { ...data, ...roster,
+        return reply(200, { ...data, ...roster,
           // 能力位（S1 契约第 2 节）：老调用也回显 session_id: "main"，内容其余部分逐字不变。
           // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
           session_id: sessionId, session_api: SESSION_API,
@@ -1134,9 +1177,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       }
       // `work` and `agents` are the gateway's own JSON; hand it back untouched so a new field it adds
       // reaches the phone without a change here.
-      return response(200, data)
+      return reply(200, data)
     } catch {
-      return response(502, { error: 'Mobile transport is temporarily unavailable; retry with the same request_id' })
+      return reply(502, { error: 'Mobile transport is temporarily unavailable; retry with the same request_id' })
     }
   }
 }

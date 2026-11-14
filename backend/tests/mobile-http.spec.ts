@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { phoneHandler, registerMobileHttp } from '../src/app/mobile-http.ts'
@@ -829,11 +829,15 @@ it('registers a session id, keeps main first, and is idempotent', async () => {
   }
   const first = await handler(post('work'))
   expect(first.status).toBe(200)
-  expect(await first.json()).toEqual({ id: 'work', sessions: ['main', 'work'], session_api: 1 })
+  // POST 与 GET 同一资源，形状也必须同形（#14 第 1 处）：都带 default_session_id。
+  // 客户端不该因为「哪个 verb」而走不同的解析分支。
+  expect(await first.json()).toEqual({ id: 'work', sessions: ['main', 'work'],
+    default_session_id: 'main', session_api: 1 })
   // 重复 id 幂等：还是 200、同一份名单。登记效果一律通过公开接口 GET 验证，不锁内部键名。
   const again = await handler(post('work'))
   expect(again.status).toBe(200)
-  expect(await again.json()).toEqual({ id: 'work', sessions: ['main', 'work'], session_api: 1 })
+  expect(await again.json()).toEqual({ id: 'work', sessions: ['main', 'work'],
+    default_session_id: 'main', session_api: 1 })
   expect(await (await handler(new Request('http://dsh/api/mobile/sessions'))).json())
     .toEqual({ sessions: ['main', 'work'], default_session_id: 'main', session_api: 1 })
   // 尾部连字符与 32 位上限都是合法 id；main 恒在首位、不重复，登记它也只是幂等返回。
@@ -846,6 +850,30 @@ it('registers a session id, keeps main first, and is idempotent', async () => {
   expect(listed.sessions).toEqual(expect.arrayContaining(['work', 'trail-', 'x'.repeat(32)]))
 })
 
+// #14 第 2 处裁决：**会话条目就是 id 字符串，后端不提供显示名**（契约 §9.2 / GLOSSARY）。
+// 给它编名字是产品决策（叫「工作」「私人」还是让主人自定义），后端不该替主人定。
+// 这条断言固化现状：哪天有人「顺手」把条目改成 `{ id, name }`，这里会先红 —— 那必须是一次
+// 明确的契约变更（§9.2 + GLOSSARY + 两端客户端解析一起改），不能是悄悄多出来的字段。
+it('keeps session entries as bare id strings — no display name from the backend', async () => {
+  const { runtime } = sessionHost()
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn() as unknown as typeof fetch)
+  await handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body: JSON.stringify({ id: 'work' }) }))
+  const listed = await (await handler(new Request('http://dsh/api/mobile/sessions'))).json() as { sessions: unknown[] }
+  // 每个条目都是字符串，没有一个是对象（对象形态会带 name / title 之类的显示名）。
+  expect(listed.sessions.every(entry => typeof entry === 'string')).toBe(true)
+  expect(listed.sessions).toEqual(['main', 'work'])
+  // 反向验证：整份响应里不存在任何「显示名」字段 —— 后端连一个都还没开始提供，
+  // 客户端「拿 id 当显示名」不是因为它偷懒，是因为这就是线上唯一的东西。
+  expect(JSON.stringify(listed)).not.toMatch(/"(name|title|label|display_name)"/)
+  // timeline 里那份 sessions[] 同源同形，同样只有 id（别只改一处留下一半）。
+  const timeline = await phoneHandler(runtime, 'http://gw',
+    vi.fn(async () => Response.json({ items: [], session_api: 1 })) as unknown as typeof fetch)(
+    new Request('http://dsh/api/mobile/timeline'))
+  const wire = await timeline.json() as { sessions: unknown[] }
+  expect(wire.sessions).toEqual(['main', 'work'])
+  expect(JSON.stringify(wire.sessions)).not.toMatch(/"(name|title|label|display_name)"/)
+})
+
 it('refuses an invalid session_id before it reaches the gateway', async () => {
   const { runtime } = sessionHost()
   const upstream = vi.fn(async () => Response.json({ items: [], session_api: 1 })) as unknown as typeof fetch
@@ -853,9 +881,61 @@ it('refuses an invalid session_id before it reaches the gateway', async () => {
   for (const bad of ['Work', 'a b', '', 'x'.repeat(33), '-bad', 'a_b', 'bad!']) {
     const result = await handler(new Request(`http://dsh/api/mobile/timeline?session_id=${encodeURIComponent(bad)}`))
     expect(result.status).toBe(400)
-    expect(await result.json()).toEqual({ error: 'invalid_session' })
+    // 非法值的 400 也带能力位（#14 第 3 处），原值原样回显便于排障。
+    expect(await result.json()).toEqual({ error: 'invalid_session', session_id: bad, session_api: 1 })
   }
   expect(upstream).not.toHaveBeenCalled()
+})
+
+// #14 第 3 处：能力位口径是「显式会话请求的所有响应都带」。消息面这一层已经知道客户端
+// 声明的原值（哪怕是非法值），所以它自己回的 400 也必须带 —— 这是明面缺口。
+// 回显的原值只用于排障，**不代表后端采纳了它**；真正说明「这次请求被服务了」的是 2xx。
+it('carries session_api on the surface’s own 400s and echoes the declared value', async () => {
+  const { runtime, kv } = sessionHost()
+  const upstream = vi.fn() as unknown as typeof fetch
+  const handler = phoneHandler(runtime, 'http://gw', upstream as unknown as typeof fetch)
+  // 形状非法：原值逐字回显（大写 / 超长 / 非法字符都原样，别替客户端美化）。
+  for (const bad of ['Work', 'a b', 'x'.repeat(33), '-bad', 'a_b', 'bad!']) {
+    const result = await handler(new Request(`http://dsh/api/mobile/timeline?session_id=${encodeURIComponent(bad)}`))
+    expect(result.status).toBe(400)
+    expect(await result.json()).toEqual({ error: 'invalid_session', session_id: bad, session_api: 1 })
+  }
+  // 头存在但值为空：显式非法值，原值就是空串，同样带能力位。
+  const empty = await handler(withHeader('http://dsh/api/mobile/timeline', ''))
+  expect(empty.status).toBe(400)
+  expect(await empty.json()).toEqual({ error: 'invalid_session', session_id: '', session_api: 1 })
+  // 冲突：回显 query 那一侧（query 优先），仅用于排障 —— 两个值不一致本身就是这条 400 的全部内容，
+  // 回显谁都不表示「后端替客户端挑了这一个」。
+  const conflict = await handler(withHeader('http://dsh/api/mobile/timeline?session_id=work', 'other'))
+  expect(conflict.status).toBe(400)
+  expect(await conflict.json()).toEqual({ error: 'invalid_session', session_id: 'work', session_api: 1 })
+  // 反向验证一：能力位不能被读成「这次请求被服务了」—— 一条都没转发给网关，也没写任何会话状态。
+  expect(upstream).not.toHaveBeenCalled()
+  expect([...kv.keys()]).toEqual([])
+  // 反向验证二：老调用（不带任何会话字段）的 400 一个会话字段都不加，逐字是老形状。
+  // 否则「显式会话」这个前提就被悄悄取消了，能力位会变成人人都有。
+  const legacy = await handler(new Request('http://dsh/api/mobile/spend'))
+  expect(legacy.status).toBe(400)
+  expect(await legacy.json()).toEqual({ error: 'ticket is required' })
+})
+
+// 登记端点（`/sessions`）整体是会话协议的产物，它的 400 也该带能力位 —— 客户端看这一个字段
+// 就能判断「对端认得这套协议」，不必先猜 200 会不会来。但它**不回显 `session_id`**：
+// body 的 `id` 是「想登记哪个名字」的候选，不是本请求声明的会话；写成 session_id 等于宣称
+// 「这次请求属于那段会话」，而那段会话此刻可能并不存在。
+it('carries session_api but no session_id on the registry’s own 400', async () => {
+  const { runtime, kv } = sessionHost()
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn() as unknown as typeof fetch)
+  const post = (body: string) => handler(new Request('http://dsh/api/mobile/sessions', { method: 'POST', body }))
+  for (const body of [JSON.stringify({ id: 'Work' }), JSON.stringify({ id: 'a b' }), JSON.stringify({ id: 7 }), '{}', 'null']) {
+    const result = await post(body)
+    expect(result.status).toBe(400)
+    expect(await result.json()).toEqual({ error: 'invalid_session', session_api: 1 })
+  }
+  // 反向验证：被拒的登记一个键都没写，名单没变。
+  expect([...kv.keys()]).toEqual([])
+  expect(await (await handler(new Request('http://dsh/api/mobile/sessions'))).json())
+    .toEqual({ sessions: ['main'], default_session_id: 'main', session_api: 1 })
 })
 
 it('echoes the session capability bits and keeps a legacy timeline unchanged', async () => {
@@ -1164,10 +1244,11 @@ it('takes the query over an equal header, and refuses a conflicting pair with 40
   expect(seen[0]?.url).toBe('http://gw/timeline?session_id=work')
   expect(seen[0]?.headers[SESSION_HEADER]).toBe('work')
   // 两者都给且值不一致 -> 400 invalid_session，不许猜哪个算数，一个请求都不转发。
+  // 回显 query 那一侧只用于排障，不表示后端采纳了它（#14 第 3 处：错误响应也带能力位）。
   upstream.mockClear()
   const conflict = await handler(withHeader('http://dsh/api/mobile/timeline?session_id=work', 'other'))
   expect(conflict.status).toBe(400)
-  expect(await conflict.json()).toEqual({ error: 'invalid_session' })
+  expect(await conflict.json()).toEqual({ error: 'invalid_session', session_id: 'work', session_api: 1 })
   expect(upstream).not.toHaveBeenCalled()
   // main 也不是「缺省值优先」的偷偷放行口。
   expect((await handler(withHeader('http://dsh/api/mobile/timeline?session_id=main', 'work'))).status).toBe(400)
@@ -1180,16 +1261,20 @@ it('rejects an invalid or ambiguous header session before it reaches the gateway
   for (const bad of ['Work', 'a b', '', 'x'.repeat(33), '-bad', 'a_b', 'bad!', 'main%0A']) {
     const result = await handler(withHeader('http://dsh/api/mobile/timeline', bad))
     expect(result.status).toBe(400)
-    expect(await result.json()).toEqual({ error: 'invalid_session' })
+    expect(await result.json()).toEqual({ error: 'invalid_session', session_id: bad, session_api: 1 })
   }
   // 头存在但值为空同样不是「老调用」：显式的空值必须报错，不能静默按 main。
   const empty = new Request('http://dsh/api/mobile/timeline', { headers: { [SESSION_HEADER]: '' } })
-  expect((await handler(empty)).status).toBe(400)
-  // 多个同名 header 拼成带 ', ' 的值，也不许猜取第一个。
+  const emptyAnswer = await handler(empty)
+  expect(emptyAnswer.status).toBe(400)
+  expect(await emptyAnswer.json()).toEqual({ error: 'invalid_session', session_id: '', session_api: 1 })
+  // 多个同名 header 拼成带 ', ' 的值，也不许猜取第一个；拼出来的原值同样回显。
   const doubled = new Request('http://dsh/api/mobile/timeline')
   doubled.headers.append(SESSION_HEADER, 'work')
   doubled.headers.append(SESSION_HEADER, 'other')
-  expect((await handler(doubled)).status).toBe(400)
+  const doubledAnswer = await handler(doubled)
+  expect(doubledAnswer.status).toBe(400)
+  expect(await doubledAnswer.json()).toEqual({ error: 'invalid_session', session_id: 'work, other', session_api: 1 })
   expect(upstream).not.toHaveBeenCalled()
 })
 
@@ -1252,4 +1337,59 @@ it('echoes session_id + session_api on every response of a header-declared reque
   }
   const timeline = await handler(withHeader('http://dsh/api/mobile/timeline', 'work'))
   expect(await timeline.json()).toMatchObject({ session_id: 'work', session_api: 1 })
+})
+
+// #14 第 3 处的**根因**不在那两条 400，而在「能力位靠逐条分支记得补」。这条测试锁住结构：
+// handler 体内除 `reply` 自身外不许再出现裸 `response(`，否则下一条新加的错误分支又会光着出去。
+// 这与网关 `_send` 是同一个形状 —— 判据一处，所有响应都从那儿过。
+it('injects the session capability bit in exactly one place inside the handler', async () => {
+  const source = readFileSync(new URL('../src/app/mobile-http.ts', import.meta.url), 'utf8')
+  const lines = source.split('\n')
+  const start = lines.findIndex(line => line.includes('const reply = (status: number'))
+  expect(start).toBeGreaterThan(0)
+  // handler 的收尾：`reply` 之后第一个顶格的 `}`（函数体结束）。
+  const end = lines.findIndex((line, index) => index > start && line === '}')
+  expect(end).toBeGreaterThan(start)
+  const body = lines.slice(start, end)
+  // `response(` 只该出现在两类地方：
+  //   1) reply 自己的两个分支（`? response(...)` / `: response(...)`）；
+  //   2) 少数**解析阶段**就要回的错误（此刻 explicitSession 还算不出来，走 reply 会 TDZ），
+  //      它们必须自己把 `session_api: SESSION_API` 写在同一行 —— 这样「漏补能力位」仍会被抓到。
+  const bare = body.filter(line => line.includes('response(')
+    && !/^\s*[?:] response\(/.test(line)
+    && !/session_api:\s*SESSION_API/.test(line))
+  expect(bare).toEqual([])
+  // reply 的两个分支仍在。
+  expect(body.filter(line => /^\s*[?:] response\(/.test(line))).toHaveLength(2)
+})
+
+// 上面那条结构测试锁的是「注入点只有一处」，这条锁的是**那一处真的在起作用**：
+// 与会话校验无关的错误（缺 ticket、解析失败、宿主没接这项能力）在显式会话请求上也得带能力位。
+// 没有这条，把 reply 的注入删掉、只留 invalidSession() 里那份手写字段，测试会全绿 —— 那正是
+// #14 第 3 处一开始的样子：个别分支有、其余光着。
+it('carries session_api on unrelated errors of an explicit-session request', async () => {
+  const { runtime } = sessionHost()
+  // 老网关：响应里没有 session_api，显式非 main 会被 409 挡住；下面单独验它不注入能力位。
+  const handler = phoneHandler(runtime, 'http://gw',
+    vi.fn(async () => Response.json({ items: [] })) as unknown as typeof fetch)
+  // 缺 ticket 的 400（与会话无关的一条校验）：显式 query 会话照样带能力位。
+  const noTicket = await handler(new Request('http://dsh/api/mobile/spend?session_id=work'))
+  expect(noTicket.status).toBe(400)
+  expect(await noTicket.json()).toEqual({ error: 'ticket is required', session_api: 1 })
+  // 同一个错误走 header 形态，结果一样（两种载体同一条判据）。
+  const viaHeader = await handler(withHeader('http://dsh/api/mobile/spend', 'work'))
+  expect(viaHeader.status).toBe(400)
+  expect(await viaHeader.json()).toEqual({ error: 'ticket is required', session_api: 1 })
+  // 请求体不是 JSON：同样带。
+  const badBody = await handler(withHeader('http://dsh/api/mobile/pause', 'work', { method: 'POST', body: 'not json' }))
+  expect(badBody.status).toBe(400)
+  expect(await badBody.json()).toMatchObject({ session_api: 1 })
+  // 反向验证一：老调用（不带会话字段）同样这条错误，一个能力位字段都不加。
+  const legacy = await handler(new Request('http://dsh/api/mobile/spend'))
+  expect(await legacy.json()).toEqual({ error: 'ticket is required' })
+  // 反向验证二：`unsupported_session` 是刻意的例外 —— 那条错误的意思正是「对端未升级」，
+  // 同一条响应里再说 session_api: 1 会自相矛盾。判据按错误码，不按状态码。
+  const unsupported = await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))
+  expect(unsupported.status).toBe(409)
+  expect(await unsupported.json()).toEqual({ error: 'unsupported_session' })
 })

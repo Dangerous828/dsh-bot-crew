@@ -184,6 +184,15 @@ class MainActivity : ComponentActivity() {
                                 // 光靠它数不出失败，也就永远说不出「地址已失效」。
                                 withContext(Dispatchers.IO) { fresh.probeEntry(lanBase) }
                                 lanReport = judgeLan(fresh)
+                                // 局域网那条若已经恢复，就把当前入口切回去（#12 第 2 项）。
+                                // 光靠请求本身回不去：公网一直通，请求从它开始、成功即返回，
+                                // 永远轮不到试局域网。这里主动探一次更优的那条。
+                                val better = withContext(Dispatchers.IO) { fresh.preferBetterEntry() }
+                                if (better != null) {
+                                    way = CrewRoute.kindOf(better, current, proxyPort)
+                                    failures = 0
+                                    lanReport = judgeLan(fresh)
+                                }
                                 delay(CrewRoute.retryDelay(failures))
                                 failures = (failures + 1).coerceAtMost(5)
                             }

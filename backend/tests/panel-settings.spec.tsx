@@ -61,6 +61,56 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
     'settings/executor'])
 })
 
+it('adds a backup route to a role, saves it, and reads the same route back (#25)', async () => {
+  await mount()
+  await click(zh['tab.eval'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  // 备选是可选的：默认没有，页面上只有主路由三个输入。
+  expect(all('.dt-model input')).toHaveLength(3)
+  // 说明走全站一致的 (?) tooltip：主路由不通就退到这里，且明说保存即生效。
+  expect(document.querySelector(`.dt-model .dt-info[aria-label="${zh.backupHint}"]`)).not.toBeNull()
+  expect(text()).toContain(zh.backupEffect)
+  await click(zh.backupAdd)
+  const backup = () => ({
+    provider: field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelProvider}`),
+    model: field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelName}`),
+    effort: field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelEffort}`),
+  })
+  // 与主路由同口径：服务商、模型、推理强度三个输入，建议列表也来自同一份模型目录。
+  expect(backup().provider.getAttribute('list')).toBe('dt-eval-model-backup-providers')
+  await type(backup().provider, 'worker-provider')
+  await type(backup().model, 'worker-model')
+  await type(backup().effort, 'high')
+  await type(field<HTMLInputElement>(zh.modelProvider), 'primary-provider')
+  await type(field<HTMLInputElement>(zh.modelName), 'primary-model')
+  expect([...document.querySelectorAll('#dt-eval-model-backup-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
+  await click(zh.save)
+  expect(server.settings.eval.model).toEqual({ provider: 'primary-provider', model: 'primary-model',
+    backup: { provider: 'worker-provider', model: 'worker-model', reasoningEffort: 'high' } })
+  // 读回：保存后服务端回来的值原样回到输入框，不丢也不串到主路由上。
+  expect(field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelProvider}`).value).toBe('worker-provider')
+  expect(field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelName}`).value).toBe('worker-model')
+  expect(field<HTMLInputElement>(zh.modelProvider).value).toBe('primary-provider')
+  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval'])
+})
+
+it('removes a backup route from a role, saves it, and reads back a route with no backup (#25)', async () => {
+  server.settings = { ...server.settings, executor: { ...server.settings.executor, model: { provider: 'primary-provider',
+    model: 'primary-model', backup: { provider: 'worker-provider', model: 'worker-model' } } } }
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  // 已有备选：表单直接展开，编辑入口与主路由一致。
+  expect(field<HTMLInputElement>(`${zh.backupLabel} · ${zh.modelProvider}`).value).toBe('worker-provider')
+  await click(zh.backupRemove)
+  expect(all(`[aria-label="${zh.backupLabel}"]`)).toHaveLength(0)
+  await click(zh.save)
+  expect(server.settings.executor.model).toEqual({ provider: 'primary-provider', model: 'primary-model' })
+  // 读回：服务端回来的路由没有 backup，表单也不再展开备选。
+  expect(all(`[aria-label="${zh.backupLabel}"]`)).toHaveLength(0)
+  expect(text()).toContain(zh.backupAdd)
+})
+
 it('loads configuration history on demand with localized changes, Source field labels and notified Tickets', async () => {
   server.history = { current: 3, policyVersion: 'abcdef1234567890', items: [{ revision: 3, savedAt: '2026-09-22T00:00:00Z',
     source: 'sync', policyVersion: 'abcdef1234567890', policyChanged: true, notified: [{ id: 't1', title: '修复回归' }], block: 'policy',

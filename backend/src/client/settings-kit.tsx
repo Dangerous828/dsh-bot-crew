@@ -69,37 +69,88 @@ function SwitchRow({ label, hint, checked,
   </div>
 }
 type RoleModel = Settings['eval']['model']
+type RoleRoute = NonNullable<RoleModel>
+type Model = Omit<RoleRoute, 'backup'>
+type ModelText = { provider: string; model: string; effort: string }
+const modelText = (value: Model | null | undefined): ModelText =>
+  ({ provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' })
+/** 一组输入文本对应的路由；三个字段去空白后都空，就是没有这条路由 —— 备选「可选」就靠这一条。 */
+const routeOf = (text: ModelText): Model | undefined => {
+  const provider = text.provider.trim(), model = text.model.trim(), effort = text.effort.trim()
+  return provider || model || effort ? { provider: text.provider, model: text.model,
+    ...effort ? { reasoningEffort: text.effort } : {} } : undefined
+}
+/**
+ * 一个角色的路由：主路由三个输入，外加可选的备选路由（`policy.ts` 的 `RoleRouteSchema`）。
+ *
+ * 备选是「加一条 / 去掉一条」，不是必填：三个输入都空就等于没有备选。备选文本自己存一份 state，
+ * 因为主路由留空表示继承 DSH 默认，这时用户先填的备选不该被「主路由为空」冲掉。
+ */
 export function ModelField({ id, value, onChange }: { id: string; value: RoleModel; onChange: (next: RoleModel) => void }) {
   const { t, call } = usePanel()
   const [catalog, setCatalog] = useState<ApiResponse<'GET models'>>()
   const [error, setError] = useState<string>()
+  const [backup, setBackup] = useState<ModelText>(() => modelText(value?.backup))
+  const [open, setOpen] = useState(value?.backup !== undefined)
+  // 上一次从这里发出去（或采纳）的备选：只有上游给出的备选与它不同，才是别人改的，才回填输入框。
+  const sent = useRef<Model | undefined>(value?.backup)
+  const signature = JSON.stringify(value)
+  useEffect(() => {
+    const given = (JSON.parse(signature) as RoleRoute | null)?.backup
+    if (JSON.stringify(given) === JSON.stringify(sent.current)) return
+    sent.current = given
+    setBackup(modelText(given))
+    setOpen(given !== undefined)
+  }, [signature])
   useEffect(() => { call('GET models').then(setCatalog, failure => setError(errorText(failure))) }, [call])
-  const current = { provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' }
-  const set = (next: Partial<typeof current>) => {
-    const { provider, model, effort } = { ...current, ...next }
-    onChange(provider.trim() || model.trim() || effort.trim() ? { provider, model, ...effort ? { reasoningEffort: effort } : {} } : null)
+  const current = modelText(value)
+  const commit = (head: ModelText, tail: ModelText | undefined) => {
+    const primary = routeOf(head), alternative = tail && routeOf(tail)
+    sent.current = alternative
+    onChange((primary ? { ...primary, ...alternative ? { backup: alternative } : {} } : null) as RoleModel)
   }
-  const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
+  const editPrimary = (next: Partial<ModelText>) => commit({ ...current, ...next }, backup)
+  const editBackup = (next: Partial<ModelText>) => { const text = { ...backup, ...next }; setBackup(text); commit(current, text) }
+  const shown = (open || value?.backup !== undefined)
+  const fields = (which: 'primary' | 'backup') => {
+    const text = which === 'primary' ? current : backup
+    const suffix = which === 'primary' ? '' : '-backup'
+    const prefix = which === 'primary' ? '' : `${t('backupLabel')} · `
+    const models = catalog?.groups.find(group => group.id === text.provider.trim())?.models ?? []
+    const pick = (name: keyof ModelText, label: string, placeholder: string) => <Field label={`${prefix}${label}`}>
+      <Input list={`${id}${suffix}-${name}s`} spellCheck={false} placeholder={placeholder} value={text[name]}
+        onChange={event => (which === 'primary' ? editPrimary : editBackup)({ [name]: event.target.value })} />
+    </Field>
+    return <>
+      <div className="dt-grid3">
+        {pick('provider', t('modelProvider'), t('modelInherit'))}{pick('model', t('modelName'), t('modelInherit'))}{pick('effort',
+          t('modelEffort'), t('modelEffortDefault'))}
+      </div>
+      <datalist id={`${id}${suffix}-providers`}>{catalog?.groups.map(group => <option key={group.id}
+        value={group.id}>{group.name}</option>)}</datalist>
+      <datalist id={`${id}${suffix}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
+      <datalist id={`${id}${suffix}-efforts`}>
+        {(models.find(model => model.id === text.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}
+          value={effort.id}>{effort.name}</option>)}
+      </datalist>
+    </>
+  }
   const fallback = catalog?.default
-  const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
-      onChange={event => set({ [name]: event.target.value })} />
-  </Field>
   return <div className="dt-model">
     <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
       ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
     {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
-    <div className="dt-grid3">
-      {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
-        t('modelEffort'), t('modelEffortDefault'))}
+    {fields('primary')}
+    <div className="dt-subhead">
+      <span className="dt-field-head">{t('backupLabel')}<InfoTip text={t('backupHint')} /></span>
+      <span className="dt-subhead-actions">{shown
+        ? <Button variant="ghost" size="sm" icon={<Icon name="trash" />}
+          onClick={() => { setOpen(false); setBackup(modelText(undefined)); commit(current, undefined) }}>
+          {t('backupRemove')}</Button>
+        : <Button variant="ghost" size="sm" icon={<Icon name="plus" />} onClick={() => setOpen(true)}>{t('backupAdd')}</Button>}</span>
     </div>
-    <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
-      value={group.id}>{group.name}</option>)}</datalist>
-    <datalist id={`${id}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
-    <datalist id={`${id}-efforts`}>
-      {(models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}
-        value={effort.id}>{effort.name}</option>)}
-    </datalist>
+    {shown && <div className="dt-model" role="group" aria-label={t('backupLabel')}>{fields('backup')}</div>}
+    <Hint>{t('backupEffect')}</Hint>
   </div>
 }
 

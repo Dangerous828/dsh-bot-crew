@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -72,17 +73,13 @@ func (s *app) applyAction(r actionResult) {
 	}
 	switch r.kind {
 	case "memory":
-		// 换了另一条再收到旧回执：那句话不该写到新开的编辑层上。
-		if r.name != a.editingMemory {
+		// 落状态只有一处收口（applyMemoryOutcome）：界面那条路与调试口那条路共用，
+		// 免得「点保存」与「memory.save」走出两种结果。
+		if r.ok {
+			s.applyMemoryOutcome(r.name, nil)
 			return
 		}
-		a.memorySaving = false
-		if !r.ok {
-			a.memoryEditError = r.note
-			return
-		}
-		a.editingMemory, a.memoryDescription, a.memoryBody, a.memoryEditError = "", "", "", ""
-		s.loadMemory()
+		s.applyMemoryOutcome(r.name, errors.New(r.note))
 	case "speak":
 		a.speaking = false
 		a.speakNote = r.note

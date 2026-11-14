@@ -114,6 +114,11 @@ export function stateView(runtime: HttpHost) {
     // 只报配置里的值，不把 sandbox 说成「已全覆盖」——ADR 0004 写明它只包住 runAsWorker，
     // agent 自由命令仍依赖 DSH provider。文案的边界写在客户端本地化里。
     isolation: settings.executor.isolation,
+    // 档位是否**真的生效**。配了 sandbox 但 prepare 为空时，`dsh.ts` 的 `if (command)` 会跳过
+    // `runIsolated`，于是这一档一行都没进沙箱，而只看 `isolation` 会以为它在跑。
+    // 实测过：prepare 空 + isolation=sandbox，worker 读 `~/.ssh/id_ed25519` 拿到 419 字节。
+    // 所以这里显式说「没生效」，让面板能如实显示，而不是报一个空转的档位。
+    isolationActive: settings.executor.isolation === 'sandbox' && settings.executor.prepare.trim().length > 0,
     // 看门狗快照：桌面右栏与管理面都从这里读「最近有没有卡住的事」，不依赖 App 系统推送（#8-2）。
     watchdog: runtime.watchdogStatus?.() ?? null }
 }

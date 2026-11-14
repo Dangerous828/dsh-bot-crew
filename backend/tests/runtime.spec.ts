@@ -567,9 +567,13 @@ it('projects read models for the management page and removes thread subscription
   expect((await api('GET', 'state')).body).toMatchObject({ health: { runtime: { state: expect.any(String) } }, paused: false, load: { maxWorkers: 3 } })
   // 隔离档位必须随 /state 出去：翻默认到 sandbox 之前，面板与 doctor 都得读得到现在是哪一档（#11）。
   // 这里报的是配置值，不是「已隔离」的结论 —— ADR 0004 的边界由客户端文案负责说清。
-  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'none' })
+  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'none', isolationActive: false })
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, isolation: 'sandbox' } })
-  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'sandbox' })
+  // 配了 sandbox 但 prepare 为空：档位没生效（dsh.ts 的 if (command) 会跳过 runIsolated）。
+  // 实测过：这种配置下 worker 读 ~/.ssh/id_ed25519 拿到 419 字节 —— 只看 isolation 会以为它在跑。
+  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'sandbox', isolationActive: false })
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'true' } })
+  expect((await api('GET', 'state')).body).toMatchObject({ isolation: 'sandbox', isolationActive: true })
   expect((await api('GET', 'settings')).body).toMatchObject({ sources: expect.arrayContaining([expect.objectContaining({ id: 'github',
     revision: expect.any(Number), value: expect.objectContaining({ enabled: true }) })]), blocks: { policy: { revision: expect.any(Number) } } })
   expect((await api('POST', `threads/${encodeURIComponent(threadKeyValue)}/unsubscribe`)).body).toMatchObject({ removed: true })

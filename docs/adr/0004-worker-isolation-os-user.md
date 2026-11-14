@@ -158,7 +158,80 @@ agent 在会话里跑的每条命令仍由 DSH subprocess provider 起。**别�
 
 ### 仍然没做的
 
-**默认值仍是 `none`。** 这一节修的是「sandbox 档位能不能跑通一条活」，答案是能；但翻默认
-还牵两个未决问题：非 macOS 上 `sandbox` 会让启动一致性检查直接报错（现在这是有意的
-「拒绝冒充」，但默认值会把它变成常态），以及真机一条活尚未在隔离开启状态下全程验收。
-这两件不做完，不翻。
+**默认值仍是 `none`。** 这一节修的是「`sandbox` 档位的 prepare 阶段能不能跑通一条活」，
+答案是能；但翻默认还牵两个未决问题：非 macOS 上 `sandbox` 会让启动一致性检查直接报错
+（现在这是有意的「拒绝冒充」，但默认值会把它变成常态），以及真机一条活尚未在隔离开启
+状态下全程验收。这两件不做完，不翻。
+
+> 下一节是真机验收的结果。它把「能跑通一条活」这句话收窄了：**只有 prepare 阶段进了沙箱，
+> worker 在会话里跑的命令没有**。所以本节说的「能」，指的是 prepare 那一段，不是整条活。
+
+## 真机活验收（#17 第 1 项，2026-11-14）
+
+在 `isolation: sandbox` 下真跑了三条活，配置经管理接口 `PUT /orchestrator/api/settings/executor`
+热改（`restarting: false`，生产 PID 不变），`repositories` 填本仓绝对路径。三条都是
+`ended.by: executor` / `outcome: completed` / `prepared: true` / 单 assignment 无重试：
+
+| 票 | 做了什么 | 起止 |
+|---|---|---|
+| `1d8c7f4fae01…` | prepare 建 worktree、worker 建 `sandbox-proof.txt`、回话 | 06:07:29 → 06:07:48 |
+| `9aaa07b2be71…` | prepare 内写敏感目录探针，worker 复读 | 06:09:28 → 06:09:42 |
+| `619220c5864e…` | 同一组命令在 prepare 与 worker shell 各跑一遍 | 06:10:42 → 06:10:59 |
+
+**prepare 侧确实在沙箱里**：三条活都在仓库 `.git/worktrees/` 与 `refs/heads/agent/*` 下留了
+worktree，说明 `executor.repositories` 补进 `writableRoots` 的接线成立；prepare 写的探针文件
+里三个凭据目录全部 `Operation not permitted`。
+
+**但 worker 侧读得到。** 同一组命令两处对照（票 `619220c5864e…`）：
+
+| 命令 | prepare（`sandbox-exec` 内） | worker shell |
+|---|---|---|
+| `wc -c < ~/.ssh/id_ed25519` | `Operation not permitted` | `419` |
+| `test -r ~/.ssh/id_ed25519` | `DENIED(1)` | `READABLE` |
+| `wc -c < ~/.config/gh/hosts.yml` | `Operation not permitted` | `68` |
+
+**第 1 项的验收线「凭据读不到」在 `sandbox` 档下不成立。** 根因有两层，第二层是本轮新发现：
+
+1. **worker 会话被固定为 `danger-full-access`**（`backend/src/app/sessions.ts:169`
+   `ctx.permissionPresets.set(result.agent.session, 'danger-full-access')`）。DSH 的
+   `bash-sandbox` 在 `danger-full-access` 下直接 `return` 不 confine，所以 worker 在会话里
+   跑的每条命令都不进沙箱。这是「已知边界」里写的那条，实测确认它足以让整个档位失效。
+2. **`prepare` 为空时 `runIsolated` 根本不被调用**（`backend/src/executor/dsh.ts:291`
+   `if (command) await runIsolated(...)`）。默认 `prepare` 就是空字符串，于是「配置说
+   `sandbox`、实际一行都没进沙箱」——这是「静默当作有隔离」的最坏形态，比不隔离更危险。
+
+### 非 macOS 策略（#17 第 3 项）
+
+**结论：拒绝启动，不自动降级。** 理由与口径：
+
+| 平台 | `sandbox-exec` | 行为 |
+|---|---|---|
+| macOS | 有 | 正常启用 |
+| 其他平台 | 无 | **启动一致性检查报错并停在 `error`，不进入 `ready`** |
+
+现有机制在 `backend/src/app/runtime.ts:1204`（`finishSetup`）：`isolation === 'sandbox'` 且
+`!sandboxAvailable()` 时把 `runtime` health 置 `error`、写明「拒绝以未隔离冒充已隔离」、走
+`retrySetup()` 而不是继续起循环；`runIsolated` 自己还有一道
+（`backend/src/infra/environment.ts:273`）抛错兜底。**不静默退回 `none`** 是刻意的：操作者以为
+隔离了其实没有，比明确不隔离更难发现。
+
+两条已知缺口，都属于「静默当作有隔离」，翻默认前必须堵上：
+
+1. **管理接口热改不校验平台。** `Settings.save`（`backend/src/app/settings.ts`）对
+   `executor.isolation` 没有任何平台检查，`isolation` 也不在 `environment()` 与
+   `SETUP_FIELDS` 里，所以不触发 `finishSetup`。在非 macOS 上 `PUT settings/executor`
+   带 `isolation: 'sandbox'` 会返回 200 并热生效，直到下一次重启才由启动检查暴露——中间
+   这段时间面板显示 `sandbox`、实际未隔离。
+2. **`prepare` 为空时档位空转**（上文根因 2）。`isolation: sandbox` 与空 `prepare` 同时
+   成立时，没有任何一条路径进沙箱，而 `/state` 照样报 `sandbox`。
+
+第 2 条同时说明：**「`sandbox` 档能跑通一条活」这句话只对「配了非空 prepare」成立**。
+默认配置（空 prepare）下这一档没有任何效果。
+
+### 为什么不翻默认（#17 第 2 项未执行）
+
+翻默认的前置是「`sandbox` 档下凭据读不到」这条真机验收线通过。本轮实测它不通过，且失败
+根因在 DSH provider 层（worker 会话的 `danger-full-access`），本仓改不动。此时把默认从
+`none` 翻到 `sandbox` 会让所有安装的 `/state` 显示「已隔离」而实际没有——正好是本 ADR 和
+issue #17 都明令禁止的那种静默。**默认保持 `none`，等 worker 会话的隔离在 provider 层落地
+（或本仓拿到能覆盖 agent 自由命令的包装点）之后再翻。**

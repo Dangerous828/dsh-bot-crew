@@ -208,6 +208,41 @@ class CrewClient(
         }
 
     /**
+     * 现在这条不是最优时，探一下更优的那条，通了就切回去。
+     *
+     * 为什么需要它：换路只发生在「连不上」的时候 —— 公网那条一直通，请求就永远从它开始、
+     * 成功即返回，**再也不会去试局域网**。于是「拔了 LAN 自动走公网」成立，
+     * 「LAN 恢复后自动切回」不成立（#12 第 2 项指的就是这个）。
+     *
+     * 判据是优先级而不是「有没有失败过」：P2P 代理 > 局域网 > 公网
+     * （[CrewRoute.entries] 的顺序就是这个优先级）。比当前更靠前的那些，逐个探，
+     * 第一个探通的就提上来。
+     *
+     * 只探**比当前更优**的：当前已经是最优（P2P 通着）时一个请求都不多发 ——
+     * 后台每 30 秒白敲一次公网是没有意义的。
+     *
+     * 返回切过去的入口；没切返回 null（当前已是最优，或更优的都探不通）。
+     */
+    suspend fun preferBetterEntry(connectTimeoutMs: Int = 3_000): String? {
+        val table = order
+        val here = table.indexOf(current)
+        // current 不在表里（不该发生）或已经是第一条：没有更优的。
+        if (here <= 0) return null
+        for (candidate in table.take(here)) {
+            if (!probeEntry(candidate, connectTimeoutMs)) continue
+            synchronized(this) {
+                // 探的这段时间表可能被换过：只在新表里仍含这条时才切。
+                if (candidate in order) {
+                    current = CrewPairing.normalize(candidate)
+                    return current
+                }
+            }
+            return null
+        }
+        return null
+    }
+
+    /**
      * 记一次「这条入口没连上」。
      *
      * 只累加到 [CrewLanHealth.FAILURES] 就停：再往上数没有意义（判定只看有没有到门槛），

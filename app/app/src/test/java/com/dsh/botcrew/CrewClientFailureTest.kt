@@ -255,4 +255,76 @@ class CrewClientFailureTest {
         assertEquals(0, client.failureCount(""))
         assertEquals(listOf("http://a:1"), client.routeOrder())
     }
+
+    // ── 回切（#12 第 2 项）────────────────────────────────────────────────
+    // 「拔了 LAN 自动走公网」早就成立；不成立的是**恢复后自动切回**。
+    // 原因：换路只在「连不上」时发生，公网一直通 → 请求永远从它开始、成功即返回，
+    // 再也不会去试局域网。preferBetterEntry 补的就是这一段。
+
+    @Test
+    fun switchingBackOnTheSameClientWhenTheBetterEntryComesAliveAgain() {
+        // 拿一个确定没人听的端口，之后能在原地重开 —— 这样「局域网先死、后活」
+        // 是同一个 client、同一个地址上发生的，才是真实的回切场景。
+        val port = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        val lanBase = "http://127.0.0.1:$port"
+        val pub = server(200)
+        val pubBase = "http://127.0.0.1:${pub.localPort}"
+        val client = CrewClient(listOf(lanBase, pubBase), "tok-1")
+        try {
+            // 局域网那条此刻没人听：请求落到公网，当前入口变成公网。
+            runBlocking { client.timeline() }
+            assertEquals(pubBase, client.currentEntry())
+
+            // 局域网那条活了（同一端口原地重开）。
+            val back = ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"))
+            back.soTimeout = 5_000
+            val worker = Executors.newSingleThreadExecutor()
+            worker.submit { runCatching { serveOnce(back, 200, """{"items":[]}""") } }
+            try {
+                // 关键：**不靠下一次请求碰巧先试到它**，而是主动探更优的那条。
+                assertEquals(lanBase, runBlocking { client.preferBetterEntry() })
+                assertEquals(lanBase, client.currentEntry())
+            } finally {
+                back.close()
+                worker.shutdownNow()
+            }
+            // 已经是最优时再问一次：没有更优可探，一个请求都不多发。
+            assertEquals(null, runBlocking { client.preferBetterEntry() })
+        } finally {
+            pub.close()
+        }
+    }
+
+    @Test
+    fun stayingPutWhenTheCurrentEntryIsAlreadyTheBest() {
+        val only = server(200)
+        val base = "http://127.0.0.1:${only.localPort}"
+        val client = CrewClient(listOf(base), "tok-1")
+        try {
+            runBlocking { client.timeline() }
+            // 只有一条、且它就是当前那条：没有「更优」可探。
+            assertEquals(null, runBlocking { client.preferBetterEntry() })
+            assertEquals(base, client.currentEntry())
+        } finally {
+            only.close()
+        }
+    }
+
+    @Test
+    fun notSwitchingToABetterEntryThatIsStillDead() {
+        val dead = "http://127.0.0.1:${closedPort()}"
+        val pub = server(200)
+        val pubBase = "http://127.0.0.1:${pub.localPort}"
+        // 死的那条排在前面（更优），但它探不通 —— 不许切过去。
+        val client = CrewClient(listOf(dead, pubBase), "tok-1")
+        try {
+            runBlocking { client.timeline() }
+            assertEquals(pubBase, client.currentEntry())
+            assertEquals(null, runBlocking { client.preferBetterEntry(connectTimeoutMs = 800) })
+            assertEquals(pubBase, client.currentEntry())
+        } finally {
+            pub.close()
+        }
+    }
+
 }

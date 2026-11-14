@@ -48,20 +48,91 @@
 
 ## 验收与边界
 
-- **自动化回归（本次落地）**：`backend/tests/role-models.spec.ts` 新增一例，模拟
-  「老会话 + 落盘 header 指向 `deepseek-account` + 过时 selection」，`initializeRoleModel`
-  纠正后断言 `selectModel` 被以 `magpie / workbuddy…` 调用，**并**在 `systemPrompt.assemble()`
-  之后断言真实 `request()` 返回新 provider/model。fixture 的 `selectModel` mock 只模拟
-  `selectForNextRequest` 置 `picked` 那一半——不调用它 `current` 就不变，request 就仍走死 provider。
-- **反向验证（两层）**：
-  1. 把生产代码退回 `append('model/selection', replacement)` 后，新例与既有
-     `reclaims a resumed Session` 一起变红（2 failed），还原后 13 例全绿。
-  2. 更精确的一层：生产代码仍调 `selectModel`，只让 fixture 的 mock 不再置 `picked`
-     （模拟宿主 `selectForNextRequest` 那一半没生效）——新例**单独**变红，还原后变绿。
-     这证明新例钉住的是「`request()` 走对」本身，不是重复旧例的「`selectModel` 被调用」。
-- **仍是边界**：#13 第 3 项要「真机复现 `34269a1` 场景」。本例是宿主契约级的单元回归，
-  不是在生产 dsh 进程里发一条真实模型请求。生产进程的复现需要一次重启窗口（红线：不擅自重启
-  正在跑的队伍），且要有可用 provider 凭据；该项保持待验，#13 因此不关。
+三层证据，各层证明的东西不同，不要混用。
+
+### 第一层：宿主契约替身（2026-11-13 已落地，只证明「调了正规接口」）
+
+`backend/tests/role-models.spec.ts` 的 `routes the actual request through the configured provider
+after reclaiming a dead selection (#13)`：`selectModel` 是 mock，`selection.current` 由测试自己赋值，
+`llm` 是 `resolveCallConfig: value => value` 的假服务。它证明本仓**调了** `selectModel`，
+证不了宿主真会把 request 送到新 provider——mock 的语义正是待验的那一环。
+
+### 第二层：真实宿主装配（2026-11-14 落地，证明「宿主实现确实这么走」）
+
+新增两例，把替身换成宿主自己的实现：真实 `SessionController.selectModel`、真实
+`modelSelection` 投影（`dsh-session-projection`）、真实 `installModelSelection`、真实
+`LlmRuntime` 加真实 adapter 注册表。只在 **adapter 的 `stream()` 边界**（provider 真正收到请求
+的那一层）记录 provider/model，断言落在那里，不落在 selection 或 `agent/request` 的返回值上。
+
+- `routes a real request to the new provider through the host's own selection chain (#13)`：
+  老会话（落盘 header 与 selection 都指向 `dead-provider`）→ 走**生产代码** `initializeRoleModel`
+  → 真实组装 → 真实 `agent/request` → 真实 `llm.stream`。断言 `dispatched === ['live-provider/live-model']`。
+- `would fail the real-request assertion if the switch only appended a selection`：
+  同一套装配下只 `append('model/selection', …)` 不走 `selectModel`，断言
+  `dispatched === ['dead-provider/dead-model']`。这一例是前一例的**负对照**：它绿，说明前一例
+  的绿不是恒真。
+
+**反向验证（两层）**：
+
+1. 生产代码退回 `agent.session.append('model/selection', replacement)`：三个用例一起变红
+   （`reclaims a resumed Session`、旧的第 3 项回归、新的真实装配例），还原后 15 例全绿。
+2. 更精确的一层：生产代码照旧调 `selectModel`，只在 `selectModel` 之后把宿主
+   `selectionFor(agent).current` 清成 `undefined`（模拟宿主 `selectForNextRequest` 没置上 `picked`）
+   ——**只有**新例变红，报错正是
+   `expected [ 'dead-provider/dead-model' ] to deeply equal [ 'live-provider/live-model' ]`，
+   其余 14 例保持绿。这证明新例钉的是「request 走对」本身。
+
+### 第三层：真实 dsh 进程（2026-11-14 落地，`34269a1` 场景复现）
+
+**做法**：不改生产队伍（`PID 70723` / `:3082` 全程未动、未重启），另起一个真实 dsh 进程：
+`dsh --profile superagent --patch <临时 overlay> --no-open`，`stateDir` 指向 `/tmp/crew-probe/state`，
+`webserver` 指向 `127.0.0.1:3399`。它是同一个 bundle、同一套 provider 配置、同一份 `lib/`，
+只是状态目录和端口独立。
+
+**复现步骤**：先让主 Session 在 `magpie/workbuddy/deepseek-v4.1-flash-500k` 上真跑过几轮
+（真实 `request/header`、真实 `assistant/message`），再通过真实管理接口
+`PUT /orchestrator/api/settings/eval` 把主 Session 的路由改成另一个 provider
+（`magpie-anthropic/kiro/claude-sonnet-5.5`），重启该进程，投一条真实消息。
+
+**证据**（`orchestrator-9fe0750252f39c6462ca9034927496ab` 的 session log，seq 为事件序号）：
+
+| seq | 事件 | provider/model | 说明 |
+|---|---|---|---|
+| 3 | `model/selection` | `magpie/workbuddy/deepseek-v4.1-flash-500k` | 老会话落盘的旧选择 |
+| 20 / 55 / 82 / 111 | `request/header` | `magpie/workbuddy/…-500k` | 旧路由上的真实请求（含真实回复与 `turn/end completed`） |
+| **139** | `model/selection` | **`magpie-anthropic/kiro/claude-sonnet-5.5`** | `initializeRoleModel` 判定旧选择脱管，走 `selectModel` 纠正 |
+| **147** | `request/header` | **`magpie-anthropic/kiro/claude-sonnet-5.5`** | 纠正后的**第一条真实请求** |
+| 148 | `request/context` | `magpie-anthropic/kiro/claude-sonnet-5.5` | 上下文窗口随新模型重建 |
+| 154 / 170 | `assistant/message` | — | 新路由上真实产出（受理 + 完成回执） |
+
+seq=139 那条不是测试里 append 的，是 `initializeRoleModel` 在真实进程里调
+`ctx.sessionController.selectModel` 的结果；seq=147 的 `request/header` 也不是断言，是
+`dsh-agent-loop` 在真正发起请求时写的。**这一层证明 request 走对了，不只是 selection 写对了。**
+
+**边界（诚实交代）**：第三层跑在临时 `stateDir` + 独立端口上，不是正在服务用户的那个
+生产进程（红线：不擅自重启队伍）。它用的是同一份 bundle 代码、同一套 provider 配置、
+同一个 magpie 网关，所以能证明「真实进程里这条链走对了」；不能证明「生产进程当前那次
+历史切换当时走对了」——那部分由下面的历史日志证据补。
+
+### 历史真实日志（生产进程，只读核对）
+
+把 `~/.dsh/sessions/**/session.v4.jsonl.zstd` 全量解开做交叉核对（975 个会话）：
+
+- 「某条 `model/selection` 之后、下一条真实 `request/header`」的配对共 1070 组，
+  其中 **970 组完全一致**；100 组不一致的全部是「中间又来了更新的 selection」（last-wins，
+  宿主语义正确）——**真正的「最新 selection ≠ 请求路由」为 0 例**。
+- 主队伍（`state/superagent`）当前主 Session `orchestrator-bbbb4bafe8b5e5afe49748149f93df3d`
+  的 `model/selection` 是 `magpie/workbuddy/deepseek-v4.1-flash-500k`，其 3 条真实
+  `request/header` 全部落在同一路由上；生产 settings 的 `eval.model` / `executor.model`
+  也正是这条路由。
+- 另有 6 个历史 worker 会话卡在 `deepseek-account/deepseek-flash`（`34269a1` 的现场），
+  那是修复前的存量，不是修复后的行为。
+
+## 结论
+
+`selectModel` → `picked` → `assembled` → `request` 这条链在**真实 dsh 进程**里成立：
+主 Session 原 selection 指向已不可用的路由时，启动后会被纠正为配置路由，随后一条真实
+请求确实打到新 provider/model。第 2 项的真源设计不需要改动，`role-models.ts` 本次零改动。
 
 ## 依据
 
@@ -69,5 +140,6 @@
   `request/header model=workbuddy → orchestrator_route → worker → assistant/message → turn/end completed`。
 - 宿主源码：`@deepseek-ai/dsh-api-session-controller/lib/index.js`（`selectModel`、
   `selectForNextRequest`、`selectionFor`）、`@deepseek-ai/dsh-agent/lib/types/model-selection.js`
-  （`installModelSelection`）。
+  （`installModelSelection`）、`@deepseek-ai/dsh-agent-loop/lib/index.js`（`prepareRequest`
+  里 `agent/request` waterfall 与 `request/header` 落盘）。
 - 本仓：`backend/src/app/role-models.ts`、`backend/tests/role-models.spec.ts`。

@@ -1,12 +1,21 @@
+import { createRequire } from 'node:module'
+import { realpathSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { agentEvents, installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { initializeRoleModel } from '../src/app/role-models.ts'
 const contexts: Context[] = []
 afterEach(async () => { await Promise.all(contexts.splice(0).map(ctx => ctx.fiber.dispose())); vi.restoreAllMocks() })
+
+// 真实宿主组件只能从 session-controller 自己的依赖树里解析：backend 的 node_modules 没有
+// `dsh-session-projection` / `dsh-agent-default-model` 的顶层符号链接（它们是 controller 的 peer）。
+// 按包的真实安装路径拼出来，装上的就是宿主跑的那一份实现，不是本仓的替身。
+const controllerHome = (): string => realpathSync(dirname(createRequire(import.meta.url).resolve('@deepseek-ai/dsh-api-session-controller/package.json')))
+const siblingModule = (home: string, name: string): string => join(home, '..', name, 'lib', 'index.js')
 async function fixture() {
   const ctx = new Context(); contexts.push(ctx); await ctx.plugin(SystemPrompt)
   const resolve = vi.fn(async value => value)
@@ -106,6 +115,119 @@ it('routes the actual request through the configured provider after reclaiming a
   await ctx.systemPrompt.assemble()
   expect(await request()).toMatchObject({ provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' })
 })
+
+/**
+ * 上面那例验的是「宿主契约替身」：`selectModel` 被换成 mock，`selection.current` 由测试自己赋值，
+ * `llm` 是 `resolveCallConfig: value => value` 的假服务。它能证明本仓**调了**正规接口，
+ * 但证明不了宿主真的会把 request 送到新 provider——mock 的语义正是待验的那一环。
+ *
+ * 下面这例换掉替身：真实 `SessionController.selectModel`、真实 modelSelection 投影、
+ * 真实 `installModelSelection`、真实 `LlmRuntime` + 真实 adapter 注册表，只在 **adapter 的
+ * stream 边界**（provider 真正收到请求的那一层）记录 provider/model。#13 的口径是
+ * 「request 走对才算」，所以断言落在 `stream()` 的入参上，不是 selection、不是 agent/request 的返回值。
+ */
+async function realHost() {
+  const home = controllerHome()
+  const { SessionProjectionRegistry } = await import(siblingModule(home, 'dsh-session-projection'))
+  const { SessionController } = await import(join(home, 'lib', 'index.js'))
+  const { AgentRegistry } = await import('@deepseek-ai/dsh-agent')
+  const { LlmRuntime, LlmAdapter } = await import('@deepseek-ai/dsh-llm')
+
+  const ctx = new Context(); contexts.push(ctx)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(AgentRegistry)
+  const noop = (): void => {}
+  // typert 只是 Remote 传输的查找表，不参与模型链路，用空实现顶掉。
+  ctx.reflect.provide('typert', { lookups: { configure: noop, register: noop }, contexts: { configureHost: noop, registerHost: noop } })
+  const llm = new LlmRuntime(ctx)
+  const dispatched: string[] = []
+  // 真实 adapter：listModels/resolveModel 走宿主的真实校验路径，stream 才是 provider 边界。
+  class Recording extends LlmAdapter {
+    override providerInfo(provider: string): { id: string; name: string } { return { id: provider, name: provider } }
+    override listModels(provider: string): Promise<{ provider: string; id: string; name: string }[]> {
+      return Promise.resolve([{ provider, id: 'dead-model', name: 'dead' }, { provider, id: 'live-model', name: 'live' }])
+    }
+    override resolveModel(provider: string, model: string): Promise<{ provider: string; id: string; name: string }> {
+      return Promise.resolve({ provider, id: model, name: model })
+    }
+    override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+      dispatched.push(`${options.provider}/${options.model}`)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+  }
+  llm.registerAdapter(['dead-provider', 'live-provider'], new Recording())
+  ctx.reflect.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'live-provider', model: 'live-model' }), saveSelection: async () => {} })
+  ctx.reflect.provide('sessions', { get: () => undefined })
+  ctx.reflect.provide('sessionQuery', { query: async () => {}, read: async () => {} })
+  ctx.reflect.provide('fileUploads', { registerAgentResolver: noop, bindPrompt: () => ({ commit: noop }), resolve: () => {} })
+  ctx.reflect.provide('attachments', {})
+  ctx.reflect.provide('fs', {})
+  ctx.reflect.provide('workspaceRegistry', { create: async () => ({ id: 'workspace' }), list: () => [], archivedSessionIds: [] })
+  ctx.reflect.provide('settings', { configure: noop, describe: () => [] })
+  ctx.reflect.provide('credentials', { describe: async () => ({ configured: false }) })
+  const controller = new SessionController(ctx, { nativeOpen: false })
+  // SessionController 的构造函数把自己注册成 `sessionController` 服务，所以生产代码
+  // （initializeRoleModel 的纠正分支）调用 `ctx.sessionController.selectModel` 时拿到的就是它。
+  ctx.reflect.provide('sessionPersistence', { flush: async () => {} })
+  // 宿主内部那个按 Agent 管 selection 的控制器；`agents` 是 private，这里用窄接口取出来，
+  // 只为了在测试里模拟「引用已装好」和「引用没被置上」两种宿主状态。
+  const inner = (controller as unknown as { agents: SelectionHost }).agents
+  return { ctx, controller, inner, llm, dispatched }
+}
+/** 宿主 `ApiSessionAgentController` 里与 selection 相关的公开面（只声明测试要用的部分）。 */
+interface SelectionHost {
+  selectionFor(agent: Agent): { readonly current: ModelSelection | undefined; assembled: ModelSelection | undefined }
+  selectForNextRequest(agent: Agent, selection: ModelSelection): void
+}
+
+it('routes a real request to the new provider through the host\'s own selection chain (#13)', async () => {
+  const { ctx, inner, llm, dispatched } = await realHost()
+  // 老会话：落盘 header 与 selection 都指向一个已经不存在的 provider（`34269a1` 的现场）。
+  const session = Session.create(SessionId('role-model-real'))
+  session.append('request/header', { header: { config: { provider: 'dead-provider', model: 'dead-model' } }, reason: 'initial' })
+  const stale = session.append('model/selection', { provider: 'dead-provider', model: 'dead-model' })
+  ctx.emit('session/event', session, stale)
+  const agent = { id: 'role-model-real', session, ctx, options: {} } as unknown as Agent
+  // 注册成 live agent，让 selectModel 走 liveAgent 分支（与生产里主 Session 已在跑的状态一致）。
+  const detach = ctx.agents.register(agent)
+  try {
+    // 生产里主 Session 是活的、早就在服务请求：selection 引用在第一次请求前就装好并留在那里。
+    // 这里先把引用装出来（等价于宿主在主 Session 首次 assemble 时做的事），纠正才落在同一个引用上。
+    inner.selectForNextRequest(agent, { provider: 'dead-provider', model: 'dead-model' })
+    // 走**生产代码**：initializeRoleModel 判定旧选择脱管后，用 ctx.sessionController.selectModel 纠正。
+    await initializeRoleModel(ctx, agent, { provider: 'live-provider', model: 'live-model' })
+    // 真实组装 + 真实 agent/request waterfall，然后真的把这次请求交给 adapter。
+    await ctx.systemPrompt.assemble({ agent })
+    const proposed = await agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ provider: 'dead-provider', model: 'dead-model' }))
+    for await (const _chunk of llm.stream({ provider: proposed.provider, model: proposed.model, messages: [] })) { /* drain */ }
+    // 断言落在 provider 边界：adapter 真的收到了新路由的请求。
+    expect(dispatched).toEqual(['live-provider/live-model'])
+  } finally { detach() }
+})
+
+it('would fail the real-request assertion if the switch only appended a selection', async () => {
+  const { ctx, controller, llm, dispatched } = await realHost()
+  const session = Session.create(SessionId('role-model-append'))
+  session.append('request/header', { header: { config: { provider: 'dead-provider', model: 'dead-model' } }, reason: 'initial' })
+  session.append('model/selection', { provider: 'dead-provider', model: 'dead-model' })
+  const agent = { id: 'role-model-append', session, ctx, options: {} } as unknown as Agent
+  const detach = ctx.agents.register(agent)
+  try {
+    // 反例：只往 session 里 append 一条新 selection，不走 selectModel。
+    // 这正是 ADR 0006 判定为「写对落盘、request 仍走旧 provider」的那条老路。
+    const event = session.append('model/selection', { provider: 'live-provider', model: 'live-model' })
+    ctx.emit('session/event', session, event)
+    await ctx.systemPrompt.assemble({ agent })
+    const proposed = await agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal },
+      async () => ({ provider: 'dead-provider', model: 'dead-model' }))
+    for await (const _chunk of llm.stream({ provider: proposed.provider, model: proposed.model, messages: [] })) { /* drain */ }
+    // 请求仍打到死 provider：证明上一例的绿灯不是恒真，而是 selectModel 真的起了作用。
+    expect(dispatched).toEqual(['dead-provider/dead-model'])
+  } finally { detach() }
+})
+
 it('inherits the host when unset and fails unavailable routes before recording a selection', async () => {
   const { ctx, agent, resolve, request } = await fixture()
   await initializeRoleModel(ctx, agent, null)

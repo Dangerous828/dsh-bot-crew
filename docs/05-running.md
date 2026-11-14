@@ -190,3 +190,23 @@ export CREW_RELAY_INSTANCE="kenton-mac"
 
 中转本身怎么部署见 [`relay/docs/DEPLOY-NAS.md`](../relay/docs/DEPLOY-NAS.md)，
 为什么是这几条路见 [`06-relay.md`](06-relay.md)。
+
+## 九、改完代码之后：不重启进程加载新构建
+
+`pnpm build`（或 `./node_modules/.bin/tsdown`）之后**不用停进程**：DSH 的 HMR 会在下一次
+profile 重组时把 `backend/lib/` 的新文件换上去，进程 PID 不变，实测约 2.2–2.7 秒。
+
+```sh
+cd backend && ./node_modules/.bin/tsdown
+echo '# touch' >> ~/.dsh/profiles/superagent/cordis.patch.yml   # 触发一次重组
+```
+
+要记住三件事：
+
+1. 这是**插件级重启**（`Runtime.stop()` 会跑），在跑的 assignment 会被标记 `hostRestarted`
+   并带恢复说明重新排队；票、消息、设置不丢。
+2. 只改 `backend/tools/`（`mobilegw`）或 `relay/` 这类插件外面的进程，HMR 管不到，
+   仍然要 `python3 backend/scripts/dsh-superagent restart`（约 3 秒不可用）。
+3. 账户类设置触发的 `ctx.fiber.restart()` **不会**加载新构建——它只按已 import 的模块重挂。
+
+判据、实测数据与复现步骤见 [`07-hot-reload.md`](07-hot-reload.md)。

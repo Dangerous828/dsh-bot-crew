@@ -196,24 +196,33 @@ class MainActivity : ComponentActivity() {
             }
 
             // 调试口的外壳那一半：配对、走哪条路、隧道往返。
-            // 用 SideEffect 而不是在组合体里直接写：组合可能被丢弃重来，
-            // 副作用只在这一次组合真的生效之后才落地。
+            //
+            // **必须在组合阶段把这些状态读出来**，不能直接在 SideEffect 的 lambda 里读：
+            // 快照读取只在组合期间才登记成依赖，SideEffect 是组合之后才跑的副作用 ——
+            // 在它里面读 `way` 不会让这个组件在 `way` 变化时重组，于是 shell 会永远停在
+            // 首帧的值（实测：日志里 promoted way=P2P，而 state.dump 里 way 一直是空串）。
+            // 在这里读进局部变量，变化才会触发重组，SideEffect 才会带着新值重跑。
             if (bridge != null) {
+                val shellWay = way
+                val shellTunnel = tunnelMillis
+                val shellNote = p2pNote
+                val shellReport = lanReport
+                val shellPaired = paired
                 SideEffect {
                     bridge.shell = DebugShell(
-                        paired = paired != null,
-                        crew = paired?.crew.orEmpty(),
-                        device = paired?.deviceId.orEmpty(),
-                        way = way?.name?.lowercase().orEmpty(),
-                        tunnelMillis = tunnelMillis,
-                        p2pNote = p2pNote,
-                        route = CrewRoute.label(way, tunnelMillis, p2pNote),
+                        paired = shellPaired != null,
+                        crew = shellPaired?.crew.orEmpty(),
+                        device = shellPaired?.deviceId.orEmpty(),
+                        way = shellWay?.name?.lowercase().orEmpty(),
+                        tunnelMillis = shellTunnel,
+                        p2pNote = shellNote,
+                        route = CrewRoute.label(shellWay, shellTunnel, shellNote),
                         // 局域网那条的状态也摊在这里：判据是「连续连不上 + 跨网段」，
                         // 只读它的结论与那两个地址，脚本能直接断言，不必反推。
-                        lanVerdict = lanReport.verdict.name.lowercase(),
-                        lanHost = lanReport.host,
-                        lanSubnet = lanReport.subnet,
-                        lanFailures = lanReport.failures,
+                        lanVerdict = shellReport.verdict.name.lowercase(),
+                        lanHost = shellReport.host,
+                        lanSubnet = shellReport.subnet,
+                        lanFailures = shellReport.failures,
                         session = pairing.session(),
                     )
                 }

@@ -52,6 +52,7 @@ class CrewDebug(private val target: CrewDebugTarget) {
         },
         "state.dump" to { _ -> DebugReply.ok(target.snapshot()) },
         "refresh" to { _ -> target.refresh() },
+        "session.reload" to { _ -> target.reloadSessions() },
         "session.list" to { _ -> target.sessions() },
         "session.set" to { args ->
             val session = argString(args, "session")
@@ -178,6 +179,15 @@ interface CrewDebugTarget {
     /** 会话名单与能力位状态。 */
     fun sessions(): DebugReply
 
+    /**
+     * 重拉会话名单（等价于点界面那个「重试」，或等价于进队伍时那次先验）。
+     *
+     * 为什么要这个动作：`refresh` 只刷时间线，不重读名单。真机验收里在别的门新建了会话，
+     * 手机这边不重拉名单就永远只看到旧的 —— 那不是产品 bug（界面上有「重试」按钮），
+     * 而是调试口缺一个等价入口，验收会卡在这儿。
+     */
+    fun reloadSessions(): DebugReply
+
     /** 触发一次时间线刷新（界面每 6 秒自己也在做同一件事）。 */
     fun refresh(): DebugReply
 
@@ -215,6 +225,8 @@ class CrewDebugScreen(
     private val entries: () -> List<String>,
     private val currentEntry: () -> String,
     private val onRefresh: () -> Unit,
+    /** 重拉会话名单：CrewRoot 传 `sessionRetry += 1`（与「重试」按钮同一条路）。 */
+    private val onReloadSessions: () -> Unit,
     /** 切会话：CrewRoot 传进来的是 enterSession 那一整段（落盘 + 清草稿 + 重拉时间线）。 */
     private val onEnterSession: (SessionState) -> Unit,
     /** 发消息：CrewRoot 用 client.send 那条路；失败由 CrewRoot 写进 problem，下次 dump 读得到。 */
@@ -289,6 +301,11 @@ class CrewDebugScreen(
     override fun refresh(): DebugReply {
         onRefresh()
         return DebugReply.ok(JSONObject().put("refreshing", true))
+    }
+
+    override fun reloadSessions(): DebugReply {
+        onReloadSessions()
+        return DebugReply.ok(JSONObject().put("reloading", true))
     }
 
     override fun switchSession(id: String): DebugReply {
@@ -388,6 +405,7 @@ class DebugBridge : CrewDebugTarget {
 
     override fun sessions(): DebugReply = screen?.sessions() ?: notInCrew()
     override fun refresh(): DebugReply = screen?.refresh() ?: notInCrew()
+    override fun reloadSessions(): DebugReply = screen?.reloadSessions() ?: notInCrew()
     override fun switchSession(id: String): DebugReply = screen?.switchSession(id) ?: notInCrew()
     override fun send(text: String, requestId: String): DebugReply =
         screen?.send(text, requestId) ?: notInCrew()

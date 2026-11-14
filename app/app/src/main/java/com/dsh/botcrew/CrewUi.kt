@@ -351,6 +351,8 @@ fun CrewRoot(
                 entries = { client.routeOrder() },
                 currentEntry = { client.currentEntry() },
                 onRefresh = { refresh() },
+                // 重拉名单与「重试」按钮同一条路（sessionRetry 变化会让上面那个 LaunchedEffect 重跑）。
+                onReloadSessions = { sessionRetry += 1 },
                 // 切会话走 enterSession：落盘、清草稿、重拉时间线一次做完，与点切换条同一条路。
                 onEnterSession = { next -> enterSession(next) },
                 onSend = { text, requestId ->

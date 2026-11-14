@@ -41,6 +41,11 @@ class CrewDebugTest {
             return DebugReply.ok(JSONObject().put("refreshing", true))
         }
 
+        override fun reloadSessions(): DebugReply {
+            calls += "session.reload"
+            return DebugReply.ok(JSONObject().put("reloading", true))
+        }
+
         override fun switchSession(id: String): DebugReply {
             calls += "session.set:$id"
             if (!switchable) return DebugReply.fail("session switching is locked")
@@ -124,7 +129,7 @@ class CrewDebugTest {
         val names = reply.result!!.getJSONArray("actions")
         val got = (0 until names.length()).map { names.getString(it) }
         assertEquals(
-            listOf("actions.list", "mode.set", "refresh", "send", "session.list", "session.set", "state.dump", "tab.set"),
+            listOf("actions.list", "mode.set", "refresh", "send", "session.list", "session.reload", "session.set", "state.dump", "tab.set"),
             got,
         )
     }
@@ -182,6 +187,7 @@ class CrewDebugTest {
             entries = { listOf("http://127.0.0.1:9", "http://192.168.31.127:43499") },
             currentEntry = { "http://127.0.0.1:9" },
             onRefresh = {},
+            onReloadSessions = {},
             onEnterSession = {},
             onSend = { _, _ -> },
             onTab = {},
@@ -240,6 +246,7 @@ class CrewDebugTest {
             entries = { listOf("http://192.168.31.127:43499") },
             currentEntry = { "http://192.168.31.127:43499" },
             onRefresh = {},
+            onReloadSessions = {},
             onEnterSession = {},
             onSend = { _, _ -> },
             onTab = {},
@@ -276,6 +283,7 @@ class CrewDebugTest {
             paused = { false }, problem = { null }, draft = { "" }, sending = { false },
             entries = { emptyList() }, currentEntry = { "" },
             onRefresh = {}, onEnterSession = {}, onSend = { _, _ -> }, onTab = {}, onMode = {},
+            onReloadSessions = {},
         ).snapshot()
         assertTrue("problem 没说清时是 null", snap.isNull("problem"))
         val timeline = snap.getJSONObject("timeline")
@@ -362,6 +370,7 @@ class CrewDebugTest {
             override fun snapshot() = JSONObject()
             override fun sessions() = DebugReply.ok()
             override fun refresh() = throw IllegalStateException("界面炸了")
+            override fun reloadSessions() = DebugReply.ok()
             override fun switchSession(id: String) = DebugReply.ok()
             override fun send(text: String, requestId: String) = DebugReply.ok()
             override fun setTab(tab: String) = DebugReply.ok()

@@ -367,7 +367,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/voice.ts` | 语音输入的壳：认出宿主有没有识别能力、校验录音是不是 WAV 且不过大过长，再把字节交给宿主的 `speechToText`；认不出字与跑不起来分开说 |
 | `src/app/compact-memory.ts` | 压缩产物进账本：宿主折完会话那一段摘要值不值得记、怎么掐到上限、怎么按 compactionId 保持幂等；压缩本身归宿主 |
 | `src/app/push.ts` | 推送投递层：在线直送、离线留件（按到期限长、同 kind 只留最新）、系统推送留了接口但没内置；送不到如实说，绝不把「没配」说成「已送达」 |
-| `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写今天真发生过的数、什么也没发生就不发 |
+| `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写今天真发生过的数、什么也没发生就不发；早报（`MORNING_HOUR`、`morningDue`、`morningNotice`）的三段口径与当天只说一次的账本 `onceToday` |
+| `src/app/inbox.ts` | 收件箱的「要不要提醒」判定（issue #23）：`judgeMail` 按噪声 → 已处理 → 与我的关系 → 急迫度 的顺序排除邮件列表、自动回复、已回、只被抄送，只留「有时限 / 要决策 / 直接找我」；`mailDedupKey` 归一化 Message-ID 供去重；`scanInbox` 是 Source 骨架，真实接入点只有 `MailPort.fetch` |
+| `src/app/calendar.ts` | 日历的「要不要提醒」判定（issue #23）：`judgeEvent` 判全天、已结束、取消、变更、临期（`SOON_MS` 十五分钟），同一场会一轮只说一句；`eventSignature` 是变更判据；`scanCalendar` 收 `known` / `told` 两本账，真实接入点只有 `CalendarPort.fetch` |
 | `src/app/approval.ts` | 审批三档「做不做」：auto / ask / off 的判定顺序（档位 → 敏感规则 → 额度）、停下来时问什么、认不出的回答一律当「先别做」 |
 | `src/app/quota.ts` | 逐条用量与额度：每条回复的模型与花费、上下文余量（窗口由 provider 公布才有）、最紧那一步的告急；金额余额不在这里算，因为它在会话事件里读不到 |
 | `src/app/connections.ts` | 对外连接（邮箱 / 日历 / 文件）经宿主的 MCP 桥：哪些工具算「读」直接放行、哪些算「写」停下来等人点头、认不出来的按写处理；默认只读，凭据不在这一层 |
@@ -473,6 +475,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-compact-memory.spec.ts` | 压缩进账本：什么摘要值得记、按 compactionId 幂等、超长掐断并说明、太短的不进账本 |
 | `tests/crew-push.spec.ts` | 推送投递层：在线直送不留件、离线留件并如实标 queued、同 kind 只留最新、到期限长与每设备上限、坏设备号与空正文被拒 |
 | `tests/crew-notices-out.spec.ts` | 通知内容层：按设备铺开与静音过滤、日报只写发生过的数、什么都没发生就不发、晚上九点才说 |
+| `tests/inbox.spec.ts` | 收件箱判定：直接找我要提醒、newsletter 与自动回复不说、回过的与只被抄送的不说、同一 message-id 第二次不说、旧信进晨报而不弹窗、两次扫描不重复、游标推进 |
+| `tests/calendar.spec.ts` | 日历判定：十五分钟内提醒、进行中说明已开始、已结束与全天不说、改时间改题目都算变更、认识的那场取消才说、一轮只挑最急的一条、同一类不重复 |
+| `tests/notices-morning.spec.ts` | 早报：八点到日报之间才说、三段固定顺序与空段不写、全天日程不给时刻、待处理截断并报余数、与日报共用当天账不重复 |
 | `tests/crew-approval.spec.ts` | 审批三档：off 一律问、auto 照做、ask 只停在敏感规则上、额度将尽时先问、判定顺序不会被额度盖掉禁区、三个选项与回答的读法 |
 | `tests/crew-quota.spec.ts` | 逐条用量：路由与花费、只在公布窗口时算余量、输出不占「已用」、超窗不为负、最紧一步决定告急、不知道时不吓人 |
 | `tests/crew-connections.spec.ts` | 对外连接：配了读列表才算读、其余落到写、没配时吃内置白名单、未接入的服务器一律拒、只读开关只影响写、坏条目跳过不拖垮全表 |

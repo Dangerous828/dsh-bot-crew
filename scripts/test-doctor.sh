@@ -15,7 +15,10 @@ contains() { grep -qF -- "$2" "$1"; }
 
 # 一个不存在的 profile：patch 读不到，stateDir 推导必然为空。不碰真实 profile、不启停任何服务。
 OUT=$(mktemp); trap 'rm -f "$OUT"' EXIT
-DSH_PROFILE=doctor-no-such-profile sh scripts/doctor.sh > "$OUT" 2>&1
+# 构造「端口推导不出来」：用一个不存在的 stateDir，而不是靠一个假的 profile 名。
+# 后者依赖「DSH_PROFILE 会盖过实际在跑的」那个旧行为 —— 那正是被修掉的 bug
+# （环境变量不该让 doctor 拿错 profile 的 stateDir 去查端口）。
+DSH_STATE_DIR=/nonexistent/doctor-state-dir sh scripts/doctor.sh > "$OUT" 2>&1
 rc=$?
 
 [ "$rc" -eq 1 ]; check "$?" "profile 无法推导端口时退出 1（有明确硬失败，不是静默放行）"
@@ -25,7 +28,11 @@ if contains "$OUT" "not listening — it starts with the service"; then
 else
   printf 'ok   不再把空端口误报成「网关没起」\n'
 fi
-if contains "$OUT" "note: DSH_PROFILE=doctor-no-such-profile, but the running crew is"; then
+# 不一致提示要单独构造一次调用：上面那次用的是 DSH_STATE_DIR，没设 DSH_PROFILE。
+# 这里设一个与在跑的不一样的 profile，看 doctor 是否明说「你设的与在跑的不一致」。
+OUT2=$(mktemp); trap 'rm -f "$OUT" "$OUT2"' EXIT
+DSH_PROFILE=doctor-no-such-profile sh scripts/doctor.sh > "$OUT2" 2>&1
+if contains "$OUT2" "note: DSH_PROFILE=doctor-no-such-profile, but the running crew is"; then
   printf 'ok   显式 profile 与实际在跑的不一致时给出提示\n'
 else
   # 没有带 --profile 的 node 进程时（例如 CI 里没起服务）无从比较，这条跳过不算失败。

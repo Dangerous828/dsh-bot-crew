@@ -417,6 +417,11 @@ const TEXT = {
   blockedCommands: ['禁止调用的命令', 'Blocked commands'],
   blockedCommandsHint: ['执行器 Session 调用这些命令名时直接失败，例如用你个人账号登录的 CLI。只拦按名字的调用，用绝对路径仍能运行，所以不是安全边界。gh、git、lark-cli 不能禁止。', 'Command names that fail when an Executor Session calls them, such as a CLI signed in to your own account. Only calls by name fail; an absolute path still runs, so this is not a security boundary. gh, git and lark-cli cannot be blocked.'],
   blockedCommandsNone: ['以空格分隔；没有', 'Separated by spaces; none'],
+  // 隔离档下 prepare 要能写仓库的 .git（worktree/refs），否则推荐的那条 prepare 会被拦。
+  repositories: ['仓库目录', 'Repository directories'],
+  repositoriesHint: ['隔离档下额外允许写的目录，一行一个绝对路径，通常填仓库 checkout 的根。推荐的准备命令要在仓库的 .git 下建 worktree 与分支，不列出来会被沙箱拦掉。留空表示只允许写工单目录。', 'Extra directories the prepare command may write to under the sandbox level, one absolute path per line, usually the root of a repository checkout. The recommended prepare command creates a worktree and a branch under the repository\'s .git, which the sandbox blocks unless listed here. Empty allows only the Ticket directory.'],
+  repositoriesNote: ['只对隔离档有效；未隔离时不影响任何行为。', 'Only affects the sandbox level; nothing changes without isolation.'],
+  repositoriesEmpty: ['留空：只允许写工单目录', 'Empty: only the Ticket directory'],
   environmentIntro: ['执行器和各来源向执行环境登记变量，每个有键、值和说明。准备命令以环境变量读取它们，执行器 Session 在指令里读到它们和说明。工单自己的值来自它的目录和接下它的触发，其余是部署的当前值；不含任何密钥。只能在管理页修改。', 'The Executor and the Sources register variables with the execution environment, each with a key, a value and a description. The prepare command reads them as environment variables, and the Executor Session reads them with their descriptions in its instructions. A Ticket\'s own values follow from its directory and the Trigger that started it; the others are the deployment\'s current values. None holds a credential. Only the management page can change these settings.'],
   environmentVariables: ['可用的环境变量', 'Available variables'],
   environmentPick: ['点击键名插入到准备命令。', 'Choose a key to insert it into the prepare command.'],

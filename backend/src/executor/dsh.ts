@@ -8,7 +8,7 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
-import { runAsWorker, runIsolated, verifyDirectory } from '../infra/environment.ts'
+import { runAsWorker, runIsolated, verifyDirectory, workerGhConfig } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
@@ -280,13 +280,17 @@ export class DshExecutor implements Executor {
     const settings = this.host.store.settings().executor
     const command = settings.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+    // prepare 也要能跑 gh / git fetch：给它 worker 自己的 gh 配置目录，否则隔离档下 gh 读不到配置、
+    // `git credential` 拿不到 token，推荐的 prepare（fetch + worktree add）必挂。
+    env.GH_CONFIG_DIR = workerGhConfig(this.host.machine.stateDir)
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    // 隔离档（Step 2）：sandbox 时 prepare 只能写本 ticket 执行目录 + 其父，读不到操作者凭据与别的 ticket。
-    // none 时退回原来的 runAsWorker，行为不变。
+    // 隔离档（Step 2）：sandbox 时 prepare 只能写本 ticket 执行目录 + 其父 + 显式列出的仓库目录，
+    // 读不到操作者凭据与别的 ticket。none 时退回原来的 runAsWorker，行为不变。
+    // 仓库目录要进来，否则推荐的 `git -C <仓库> worktree add` 会在 .git/refs 上撞 Operation not permitted。
     if (command) await runIsolated(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, {
       mode: settings.isolation,
-      writableRoots: [directory, dirname(directory)],
+      writableRoots: [directory, dirname(directory), ...settings.repositories],
       readableDeny: workerSensitivePaths(this.host.machine.stateDir),
       env,
     })

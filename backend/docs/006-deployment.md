@@ -154,6 +154,8 @@ Setup must succeed before polling or work starts. Overview lists missing require
    ```
 
    List personal CLIs, such as one signed in to your own account, as blocked commands.
+
+   That command writes into the repository's own `.git` (a worktree and a branch), so when `isolation` is `sandbox` also list the repository root under **Repository directories** — for this example, `/home/me/src/widgets`. The sandbox allows writes only inside the Ticket directory and those listed roots; without the entry the prepare command fails with `cannot lock ref …: Operation not permitted`. The setting does nothing while `isolation` is `none`.
 4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
 
 ### Management API

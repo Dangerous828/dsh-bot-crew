@@ -26,13 +26,34 @@ running_profile() {
   # otherwise win the race and answer for a profile that is not running. `pgrep -x node` finds the candidates by
   # executable name, and LC_ALL=C keeps the argument scan byte-wise — the process table holds non-ASCII names,
   # which makes awk fail on multibyte input in the default locale.
+  #
+  # 一台机器上可能同时跑着几个 dsh（另一个 profile 的调试实例、或一次临时探针）。原先取 `head -1`，
+  # 谁先被 pgrep 列出来就用谁 —— 实测挑到过 `hot2` 那种不相干的实例，于是 doctor 拿错 profile 的
+  # stateDir 去查端口，报出一堆假的「读不到」。现在按「哪一个真的持有 crew」挑：
+  # 带 `dsh-superagent` 插件（`--patch` 或 profile 名里含 superagent）且不是一次性探针的，优先。
+  #
+  # 判据的顺序就是可信度：`--patch .../superagent` > profile 名含 superagent > 其它。
   for pid in $(pgrep -x node 2>/dev/null); do
     LC_ALL=C ps -p "$pid" -o args= 2>/dev/null \
-      | LC_ALL=C awk '{for (i = 1; i < NF; i++) if ($i == "--profile") {print $(i + 1); exit}}'
-  done | head -1
+      | LC_ALL=C awk -v pid="$pid" '{
+          profile = ""; crew = 0
+          for (i = 1; i < NF; i++) {
+            if ($i == "--profile") profile = $(i + 1)
+            if ($i == "--patch" && $(i + 1) ~ /superagent/) crew = 1
+          }
+          if (profile ~ /superagent/) crew = 1
+          # 一次性探针（把 stateDir 指到 /tmp 的那种）不算在跑的队伍。
+          if ($0 ~ /\/tmp\//) crew = 0
+          if (profile != "") print (crew ? "1" : "0") " " profile
+        }'
+  done | sort -r | head -1 | awk '{print $2}'
 }
 RUNNING_PROFILE="$(running_profile)"
-PROFILE="${DSH_PROFILE:-$RUNNING_PROFILE}"; PROFILE="${PROFILE:-superagent}"
+# 以**实际在跑的那个**为准。DSH_PROFILE 只作兜底（没有任何 dsh 在跑时），并在下面作为
+# 「你设的与在跑的不一致」提示出来 —— 而不是让一个环境变量把探测结果盖掉。
+# 实测：本机 shell 里注入了 DSH_PROFILE=desktop，doctor 于是拿 desktop 的 stateDir 去查
+# superagent 的端口，报出一堆假的「读不到」。
+PROFILE="${RUNNING_PROFILE:-${DSH_PROFILE:-superagent}}"
 PATCH="$HOME/.dsh/profiles/$PROFILE/cordis.patch.yml"
 web_port() { awk '/^- id: webserver/{f=1} f && /^ +port:/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$PATCH" 2>/dev/null; }
 state_dir() { awk '/^- id: dsh-superagent/{f=1} f && /stateDir:/{print $2; exit}' "$PATCH" 2>/dev/null; }
@@ -40,8 +61,9 @@ STATE="${DSH_STATE_DIR:-$(state_dir)}"
 # 宿主会话会注入 DSH_PROFILE（例如 desktop）。显式变量优先是脚本的承诺，但那会让
 # doctor 去检查一个没有桥的 profile：stateDir 读不到、端口全部推导为空，接着报一页
 # "not listening" 的假故障。把不一致明说出来，让人一眼知道该用哪个 profile 重跑。
+# 打印**你设的那个**（DSH_PROFILE），不是最终生效的那个 —— 否则两边相同时会报出一句自相矛盾的提示。
 if [ -n "$RUNNING_PROFILE" ] && [ -n "${DSH_PROFILE:-}" ] && [ "$DSH_PROFILE" != "$RUNNING_PROFILE" ]; then
-  say "profile" "note: DSH_PROFILE=$PROFILE, but the running crew is '$RUNNING_PROFILE' — unset it or set DSH_PROFILE=$RUNNING_PROFILE"
+  say "profile" "note: DSH_PROFILE=$DSH_PROFILE, but the running crew is '$RUNNING_PROFILE' — unset it or set DSH_PROFILE=$RUNNING_PROFILE"
 fi
 # A profile with no `webserver` block takes dsh's own default, and the only honest way to learn it is to look at
 # what the process bound. The patch file is the first choice because it is readable while the service is down.
@@ -52,8 +74,16 @@ WEB_PORT="${DSH_WEB_PORT:-$(web_port)}"
 [ -z "$WEB_PORT" ] && [ -n "${orch_pid:-}" ] && WEB_PORT=$(listening_web_port "$orch_pid")
 [ -z "$WEB_PORT" ] && [ -n "$(port_pid 3080)" ] && WEB_PORT=3080
 WEB_PORT="${WEB_PORT:-3082}"
-GATEWAY_PORT="${DSH_GATEWAY_PORT:-$( [ -n "$STATE" ] && python3 "$(dirname "$0")/portcheck.py" gateway "$STATE" )}"
-LAN_PORT="${DSH_LAN_PORT:-$( [ -n "$STATE" ] && python3 "$(dirname "$0")/portcheck.py" lan "$STATE" )}"
+# 端口是从 stateDir 推出来的，而 portcheck.py 对**任何字符串**都能算出一个端口（纯哈希）。
+# 所以这里必须先确认那个目录真的存在：拿一个不存在的 stateDir 推出端口，再拿它去 lsof，
+# 得到的是「not listening」—— 那是输入不足，不是网关没起，会把人引去查一个根本没问题的服务。
+if [ -n "$STATE" ] && [ -d "$STATE" ]; then
+  GATEWAY_PORT="${DSH_GATEWAY_PORT:-$(python3 "$(dirname "$0")/portcheck.py" gateway "$STATE")}"
+  LAN_PORT="${DSH_LAN_PORT:-$(python3 "$(dirname "$0")/portcheck.py" lan "$STATE")}"
+else
+  GATEWAY_PORT="${DSH_GATEWAY_PORT:-}"
+  LAN_PORT="${DSH_LAN_PORT:-}"
+fi
 
 # The backend may bind the loopback or a LAN address, so find which one answers. The Host header stays
 # on loopback either way, because that is the authority the management fence accepts.

@@ -64,3 +64,101 @@
 3. 记忆落盘收口：确认 worker 拿不到明文记忆库。
 4. 审批闸与隔离衔接：隔离环境下外部写仍 ask。
 5. 重验全部流程：三端测试 + 真机一条活 + `doctor.sh`。
+
+## 沙箱 profile 的放行项（2026-11-14 实测修订）
+
+「面板看得见档位」做完之后，下一步本该是翻默认。**实测发现翻不了**：`sandbox` 档位当时
+的 profile 连一条真活的 prepare 都跑不通。这一节记下那三个缺口、修法，以及修完之后
+**隔离边界到底划在哪**。
+
+### 当初漏了什么，为什么会漏
+
+原先的 profile 只有 `process* / signal / file-read* / 写白名单目录 / 写 /dev`。测试只覆盖
+本地 `git init`、`git config --get-regexp`、写 `note.txt`、读 fake 凭据目录——这些都过，
+于是全量测试全绿，而真活 100% 挂。三个缺口都不是「代码写错」，是「profile 少了一条规则，
+而测试从没碰过需要那条规则的程序」：
+
+| 缺口 | 实测症状 | 修法 |
+|---|---|---|
+| 没有 `sysctl-read` | `gh --version` → `fatal error: failed to get system page size`（Go 运行时启动即崩，exit 2） | `(allow sysctl-read)` |
+| 没有网络放行 | 推荐的 prepare（`git fetch` + `worktree add`）→ `Could not resolve host: github.com` | `(allow network-outbound)` |
+| 没有 Mach 服务 | keychain 读不到（`security find-generic-password` → `SecKeychainSearchCreateFromAttributes`，exit 44）；`gh auth token` → `no oauth token found`；`gh api` → `x509: OSStatus -2627` | `(allow mach-lookup …)` 三个具名服务 |
+
+第四个缺口不在 profile 里，在调用点：`writableRoots` 只有「工单目录 + 其父」，而推荐的
+prepare 要写**仓库**的 `.git/refs/heads/` 与 `.git/worktrees/`：
+
+```
+git -C <仓库> worktree add -b agent/t1 <工单目录>
+→ fatal: cannot lock ref 'refs/heads/agent/t1': Operation not permitted
+```
+
+修法是新增 `executor.repositories`（绝对路径数组，最多 8 条），由它补进 `writableRoots`。
+**不从 prepare 文本里反推路径**：命令是 shell，带变量、管道、多条语句，解析必然脆；
+显式列出的目录才是白名单该有的形态。
+
+### 网络：收窄到了「只出不进」，但这仍然不是网络隔离
+
+先用的是 `(allow network*)`，实测能收窄：
+
+- `(allow network-outbound)` 下 `socket.bind()+listen()` **失败**，`network*` 下成功。
+- 两种写法下 `git ls-remote`、`gh api` 都正常。
+
+worker 只需要出站（fetch / push / API），不需要对外开端口，所以取窄的那个。`gh` 的 TLS
+还要 `trustd`：只放 `trustd` 时 `git ls-remote` 已通，但 `gh api` 报 401（能连、验不过证书）；
+`git ls-remote` 走 libcurl 用系统根证书，所以它通不代表 TLS 通——这条差异是本轮实测发现的。
+
+**但边界必须说清**：即便收窄到 outbound，**sandbox 档位挡的是文件系统与凭据，不挡网络**。
+`sandbox-exec` 的 profile 只能按 socket 方向放行，不能按域名或端口过滤。worker 一旦被
+提示注入，仍可把读到的内容发到任意地址。真正拦住外泄的是「读不到凭据」（`~/.ssh`、
+`~/.config`、`~/.aws`、`~/.gnupg`、`~/.docker` 仍 deny）与审批闸，不是网络策略。
+不要把这一档说成「网络隔离」。
+
+### 凭据：配置进 stateDir，token 不落盘
+
+`workerSensitivePaths` deny 了 `~/.config`，而 `gh` 的配置就在 `~/.config/gh`。原先没意识到
+这两件事冲突：deny 掉之后 `gh` 连偏好设置都读不到，而 `gh auth git-credential` 正是 worker
+的 git 凭据 helper，于是 fetch/push 全断。
+
+修法：`agentVariables` 注入 `GH_CONFIG_DIR`，指向 stateDir 内的 `worker-gh/`，由
+`writeEnvironment` 写两个文件：
+
+- `config.yml`：只有偏好（https、不交互、不分页）；
+- `hosts.yml`：只有 `user: <login>`，**没有任何 token**。
+
+token 仍由 keychain 提供（靠放行的 `com.apple.SecurityServer`）。这样即使 `worker-gh/` 被
+读走也不泄露凭据——它本来就没有。这也解释了为什么**不能**图省事去复制操作者的
+`~/.config/gh/hosts.yml`：那个文件在 token 存于文件时是明文的，复制等于把凭据搬进
+worker 可写目录。
+
+### 现在的隔离强度（如实记录）
+
+| 面 | `none` | `sandbox` |
+|---|---|---|
+| 写文件 | 操作者权限内任意位置 | 仅工单目录 + 其父 + `executor.repositories` |
+| 读凭据目录（`~/.ssh` 等） | 可以 | 被 deny |
+| 网络出站 | 可以 | 可以（**不按目标过滤**） |
+| 网络监听 | 可以 | 被挡 |
+| Mach 服务 | 全部 | 仅 `trustd` / `trustd.agent` / `SecurityServer` |
+| agent 自由命令 | 不受本仓约束 | **仍不受本仓约束**（见上文「已知边界」） |
+
+最后一行没变：本仓 `runIsolated` 只包住 `runAsWorker` 的调用点（当前唯一处是 prepare），
+agent 在会话里跑的每条命令仍由 DSH subprocess provider 起。**别把这张表读成「全覆盖」。**
+
+### 测试怎么防住再次退化
+
+新增的回归用例不再只测本地 git，而是直接跑真程序、真沙箱：
+
+- `gh --version` 在沙箱里必须成功（钉住 `sysctl-read`）；
+- 出站请求不被沙箱挡、`listen()` 必须失败（钉住 `network-outbound` 而非 `network*`）；
+- `security find-generic-password` 的 stderr 里不许出现 `SecKeychainSearchCreateFromAttributes`（钉住 `SecurityServer`）；
+- 推荐的那条 prepare（`worktree add`）必须成功并留下 `.git`（钉住 `writableRoots` 含仓库）；
+- `executor.repositories` 必须真的出现在 prepare 的 profile 里（钉住接线，不只钉 schema）。
+
+每条都做过反向验证：把对应的修复撤掉，用例精确变红，恢复后转绿。
+
+### 仍然没做的
+
+**默认值仍是 `none`。** 这一节修的是「sandbox 档位能不能跑通一条活」，答案是能；但翻默认
+还牵两个未决问题：非 macOS 上 `sandbox` 会让启动一致性检查直接报错（现在这是有意的
+「拒绝冒充」，但默认值会把它变成常态），以及真机一条活尚未在隔离开启状态下全程验收。
+这两件不做完，不翻。

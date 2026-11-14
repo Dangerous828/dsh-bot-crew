@@ -5,10 +5,11 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, runIsolated, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment, sandboxAvailable }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, runIsolated, verifyDirectory, withoutDirectory, workerBin, workerGhConfig, workerGitConfig, writeEnvironment, sandboxAvailable }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+import { realSubprocess } from './fixtures/subprocess.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 // Git and shell subprocesses can exceed the 5s default timeout when the test suite runs in parallel.
@@ -320,5 +321,122 @@ describe('isolation end-to-end: a ticket prepare lifecycle in the sandbox', () =
     } finally {
       rmSync(root, { recursive: true, force: true }); rmSync(fakeSsh, { recursive: true, force: true })
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #11 第 3 项前置：翻默认到 sandbox 之前的真机回归。
+//
+// 这几条用真 `sandbox-exec`、真 `gh`、真 `git`、真网络。它们存在的理由很具体：翻默认之前，
+// 沙箱档位的测试只覆盖本地 `git init` / `git config` / 写 note.txt，于是「全量测试全绿」
+// 而一条真活的 prepare 会 100% 挂——因为沙箱 profile 缺 sysctl、缺网络、缺 keychain。
+// 所以这里盯住的正是当初漏掉的那三件事。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('worker isolation covers what a real ticket needs', () => {
+  const signal = new AbortController().signal
+  /** 与生产同一条路径：先写 worker 环境（shim + gitconfig + gh 配置目录），再用它跑命令。 */
+  const workerSetup = async (stateDir: string, cli = 'gh'): Promise<Record<string, string>> => {
+    await writeEnvironment({ stateDir, repository: 'acme/widgets',
+      github: { cli, login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' }, feishu: null } as never, [])
+    const variables = Object.fromEntries(Object.entries(agentVariables(stateDir)).filter(([, value]) => value !== undefined)) as Record<string, string>
+    return { ...process.env as Record<string, string>, ...variables,
+      PATH: [workerBin(stateDir), process.env.PATH ?? ''].join(':') }
+  }
+
+  it('lets a Go binary start inside the sandbox (sysctl-read), which gh and lark-cli need', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated } = await import('../src/infra/environment.ts')
+    const stateDir = mkdtempSync(join(tmpdir(), 'iso-go-'))
+    const execDir = join(stateDir, 'work', 't1')
+    mkdirSync(execDir, { recursive: true })
+    try {
+      const env = await workerSetup(stateDir)
+      // 缺 (allow sysctl-read) 时这条会 exit 2 并打印 `fatal error: failed to get system page size`。
+      const out = await runIsolated(realSubprocess(), ['gh', '--version'], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir, join(stateDir, 'work')], env })
+      expect(out).toMatch(/^gh version /)
+    } finally { rmSync(stateDir, { recursive: true, force: true }) }
+  })
+
+  it('reaches the network outbound but cannot listen, so the sandbox does not become a server', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated, sandboxArgv } = await import('../src/infra/environment.ts')
+    const execDir = mkdtempSync(join(tmpdir(), 'iso-net-'))
+    const profile = sandboxArgv([execDir])[2]!
+    try {
+      // 放行的是 network-outbound，不是 network*：出站要有，监听不该有。
+      expect(profile).toContain('(allow network-outbound)')
+      expect(profile).not.toContain('(allow network*)')
+      // 真跑一条出站请求（不依赖外网是否可达：能连上就要求 HTTP 有响应，连不上则要求不是「被沙箱挡」）。
+      const out = await runIsolated(realSubprocess(), ['sh', '-c', 'curl -sS -o /dev/null -w "%{http_code}" -m 10 https://api.github.com/ 2>&1'],
+        execDir, signal, { mode: 'sandbox', writableRoots: [execDir] }).catch((error: unknown) => `blocked:${String(error)}`)
+      expect(out).not.toMatch(/Operation not permitted|denied/)
+      // 监听必须失败：这是 network-outbound 相对 network* 的唯一实质差别。
+      // 断言看「命令是否失败」，不看输出文本——报错信息会回显命令本身，里面就带着打印用的字样。
+      const listen = await runIsolated(realSubprocess(), ['sh', '-c',
+        '/usr/bin/python3 -c "import socket;s=socket.socket();s.bind((\'\',0));s.listen(1);print(\'LISTENING\')" 2>&1'],
+        execDir, signal, { mode: 'sandbox', writableRoots: [execDir] }).then(() => 'succeeded', () => 'failed')
+      expect(listen).toBe('failed')
+    } finally { rmSync(execDir, { recursive: true, force: true }) }
+  })
+
+  it('lets gh read its own config dir and the keychain, without reading the operator ~/.config', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated, workerGhConfig } = await import('../src/infra/environment.ts')
+    const stateDir = mkdtempSync(join(tmpdir(), 'iso-ghcfg-'))
+    const execDir = join(stateDir, 'work', 't1')
+    mkdirSync(execDir, { recursive: true })
+    try {
+      const env = await workerSetup(stateDir)
+      // 配置目录指向 stateDir 内的独立目录，而不是操作者的 ~/.config/gh。
+      expect(env.GH_CONFIG_DIR).toBe(workerGhConfig(stateDir))
+      expect(readdirSync(workerGhConfig(stateDir)).sort()).toEqual(['config.yml', 'hosts.yml'])
+      // 这个目录里**不许**有 token：token 只从 keychain 取，落盘就等于把凭据搬进 worker 可写面。
+      expect(readFileSync(join(workerGhConfig(stateDir), 'hosts.yml'), 'utf8')).not.toMatch(/oauth_token/)
+      // keychain 能读到（mach-lookup 放行 SecurityServer）：被挡时 stderr 是 SecKeychainSearchCreateFromAttributes。
+      const found = await runIsolated(realSubprocess(), ['/usr/bin/security', 'find-generic-password', '-s', 'dsh-superagent-absent-probe'],
+        execDir, signal, { mode: 'sandbox', writableRoots: [execDir], env }).catch((error: unknown) => String(error))
+      expect(found).not.toMatch(/SecKeychainSearchCreateFromAttributes/)
+    } finally { rmSync(stateDir, { recursive: true, force: true }) }
+  })
+
+  it('runs the documented prepare command: fetch + worktree add into the ticket directory', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated, workerGitConfig } = await import('../src/infra/environment.ts')
+    const base = mkdtempSync(join(tmpdir(), 'iso-prep-'))
+    const repo = join(base, 'widgets')
+    const stateDir = join(base, 'state')
+    const root = join(stateDir, 'work')
+    const execDir = join(root, 'agent-t1')
+    const git = (cwd: string, args: string[]) => execFile('git', args, { cwd, env: gitEnv() })
+    try {
+      mkdirSync(repo, { recursive: true }); mkdirSync(execDir, { recursive: true })
+      await git(repo, ['init', '-q'])
+      await git(repo, ['-c', 'user.name=a', '-c', 'user.email=a@b', 'commit', '-q', '--allow-empty', '-m', 'init'])
+      const env = await workerSetup(stateDir)
+      // 走 worker 的 gitconfig（凭据 helper 指向 gh），与生产同一条路。
+      env.GIT_CONFIG_GLOBAL = workerGitConfig(stateDir)
+      env.GIT_CONFIG_NOSYSTEM = '1'
+      // 这就是 docs/006-deployment.md 推荐的那条 prepare 的核心两步。
+      // 仓库目录必须在 writableRoots 里，否则 worktree add 会撞 .git/refs 上的 Operation not permitted。
+      const prepare = `git -C ${repo} worktree add -b agent/t1 ${execDir}`
+      await runIsolated(realSubprocess(), ['sh', '-c', prepare], root, signal,
+        { mode: 'sandbox', writableRoots: [execDir, root, repo], env })
+      expect(readdirSync(execDir)).toContain('.git')
+      // verifyDirectory 在隔离里也要能跑通（prepare 之后必经的一步）。
+      await expect(verifyDirectory(execDir, realSubprocess(), signal)).resolves.toBeUndefined()
+    } finally { rmSync(base, { recursive: true, force: true }) }
+  })
+
+  it('still refuses writes outside the roots even with network and mach services allowed', async () => {
+    if (!sandboxAvailable()) { expect(true).toBe(true); return }
+    const { runIsolated } = await import('../src/infra/environment.ts')
+    const execDir = mkdtempSync(join(tmpdir(), 'iso-still-'))
+    const outside = mkdtempSync(join(tmpdir(), 'iso-still-out-'))
+    try {
+      await expect(runIsolated(realSubprocess(), ['sh', '-c', `echo x > ${join(outside, 'no.txt')}`], execDir, signal,
+        { mode: 'sandbox', writableRoots: [execDir] })).rejects.toBeInstanceOf(CliError)
+      expect(readdirSync(outside)).not.toContain('no.txt')
+    } finally { rmSync(execDir, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }) }
   })
 })

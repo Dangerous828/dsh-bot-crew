@@ -18,6 +18,16 @@ const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Wr
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
+/**
+ * worker 自己的 `gh` 配置目录。
+ *
+ * 为什么不让 worker 用操作者的 `~/.config/gh`：那正是隔离要 deny 的凭据目录（ADR 0004 的 gap 3）。
+ * 但 `gh` 的配置**必须**能读——`gh auth git-credential` 是 worker 的 git 凭据 helper，读不到配置
+ * 就连 `gh auth token` 都报 `no oauth token found`。所以给 worker 一个自己的目录，里面只放
+ * 与凭据无关的偏好设置；token 本身仍留在 keychain（沙箱经 `SecurityServer` 取），
+ * **不落盘**，所以这个目录被读走也不泄露任何凭据。
+ */
+export const workerGhConfig = (stateDir: string): string => join(stateDir, 'worker-gh')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
 export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
@@ -45,6 +55,9 @@ export const GIT_LOCATION: readonly string[] = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT
 export function agentVariables(stateDir: string): Record<string, string | undefined> {
   return {
     GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
+    // 让 worker 的 gh 读自己的配置目录，而不是操作者的 ~/.config/gh（隔离要 deny 的那个）。
+    // 目录里只有偏好设置，token 仍从 keychain 取，不落盘。
+    GH_CONFIG_DIR: workerGhConfig(stateDir),
     // A worker's git finds the repository from its directory, never from the host's environment.
     ...Object.fromEntries(GIT_LOCATION.map(name => [name, undefined])),
     GIT_CONFIG_GLOBAL: workerGitConfig(stateDir), GIT_CONFIG_NOSYSTEM: '1',
@@ -103,6 +116,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
+  await writeGhConfig(stateDir, github.login)
   await own(workerGitConfig(stateDir), [
     MARKER,
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
@@ -113,6 +127,37 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
   ].join('\n') + '\n')
+}
+
+/**
+ * 写 worker 自己的 `gh` 配置目录：只有偏好设置与身份名，**没有任何 token**。
+ *
+ * 为什么不直接复制操作者的 `~/.config/gh`：那里 `hosts.yml` 可能带 `oauth_token`（明文 token 落盘），
+ * 复制过去等于把凭据搬进 worker 可写目录。这里只写 `config.yml`（协议/分页器等偏好）与
+ * `hosts.yml` 里的 `user` 一行，让 `gh` 知道该以哪个账号的名义干活；token 仍由 keychain 提供。
+ *
+ * 用 `own()` 写，与 shim、gitconfig 同一套「拒绝覆写外来文件」的保护。
+ */
+async function writeGhConfig(stateDir: string, login: string): Promise<void> {
+  const dir = workerGhConfig(stateDir)
+  await mkdir(dir, { recursive: true })
+  await own(join(dir, 'config.yml'), [
+    MARKER,
+    'version: 1',
+    // 走 https：worker 的 git 凭据 helper 是 `gh auth git-credential`，https 才用得上它。
+    'git_protocol: https',
+    // 不交互：worker 里没有终端，任何 prompt 都会把命令挂到超时。
+    'prompt: disabled',
+    // 不分页：worker 读的是程序输出，不是人看的。
+    'pager: cat',
+  ].join('\n') + '\n')
+  await own(join(dir, 'hosts.yml'), [
+    MARKER,
+    'github.com:',
+    '    users:',
+    `        ${login}:`,
+    `    user: ${login}`,
+  ].join('\n') + '\n', 0o600)
 }
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
@@ -143,6 +188,20 @@ export function sandboxAvailable(): boolean {
 }
 
 /**
+ * Mach 服务白名单：TLS 与 keychain 各需要哪一个，实测定出来的最小集（见 ADR 0004「沙箱 profile 的放行项」）。
+ *
+ * - `trustd` / `trustd.agent`：TLS 证书链校验。缺它 `git ls-remote` 仍通（libcurl 走系统根证书），
+ *   但 Go 的 `crypto/x509` 会报 `x509: OSStatus -2627`，`gh api` 一律失败。
+ * - `SecurityServer`：keychain 读写。缺它 `security find-generic-password` 返回 44，`gh auth token`
+ *   报 `no oauth token found`——而 worker 的 git 凭据 helper 正是 `gh auth git-credential`，
+ *   于是 fetch/push 全断。
+ *
+ * 只放这三个具名服务，不用裸 `(allow mach-lookup)`：裸放等于把整个 Mach 命名空间（含别的应用
+ * 的自定义服务）都交出去，而 worker 只需要这两类。
+ */
+const SANDBOX_MACH_SERVICES: readonly string[] = ['com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.SecurityServer']
+
+/**
  * 造一个「只允许写这些目录」的 macOS sandbox 执行前缀。
  *
  * 约束口径（刻意收窄）：
@@ -151,7 +210,14 @@ export function sandboxAvailable(): boolean {
  * - **拒绝**：写 `writableRoots` 之外的任何位置；读操作者凭据目录（`~/.ssh`、`~/.config`）与别的
  *   ticket 目录 —— 做法是 `deny file-read* (subpath "<sesitive>")` 显式压过默认的「读放行」。
  *
- * 这不是「读全放、写白名单」的半个隔离：敏感读被显式 deny，别处写被默认 deny 兜住。
+ * 网络与 Mach 的取舍（**隔离边界如实写在这里**）：
+ * - 网络用 `(allow network-outbound)` 而不是 `(allow network*)`。实测差别是**能否监听**：
+ *   `network-outbound` 下 `socket.bind()+listen()` 失败，`network*` 下成功。worker 只需要出站
+ *   （fetch/push/API），不需要对外开端口，所以取窄的那个。
+ * - 即便收窄，**sandbox 档位挡的是文件系统与凭据，不挡网络**。出站目标不做域名/端口过滤
+ *   （sandbox-exec 没有这个能力，profile 只能按 socket 方向放行）。worker 被注入后仍可把读到的
+ *   内容发到任意地址；挡它的是「读不到凭据」与审批闸，不是网络策略。
+ *
  * 返回可直接拼在 `sh -c` 前面的 `["/usr/bin/sandbox-exec", "-p", profile, ...]`。
  */
 export function sandboxArgv(writableRoots: readonly string[], readableDeny: readonly string[] = []): string[] {
@@ -159,6 +225,7 @@ export function sandboxArgv(writableRoots: readonly string[], readableDeny: read
   const writes = writableRoots.map(root => `(allow file-write* (subpath ${sbQuote(realSubpath(root))}))`).join('')
   // 敏感目录显式 deny 读：sandbox 里 deny 压过 allow（同规则族 deny 优先），所以即使下面读全放行也挡得住。
   const denies = readableDeny.map(dir => `(deny file-read* (subpath ${sbQuote(realSubpath(dir))}))`).join('')
+  const mach = SANDBOX_MACH_SERVICES.map(name => `(global-name ${sbQuote(name)})`).join(' ')
   // 读走「全放行 + 敏感目录 deny」：系统基础路径（/usr /bin /System …）在各版本 macOS 上位置不一，
   // 逐个列举容易因某个不存在的 subpath 让 profile 校验失败；全放行 + 定向 deny 更稳，且隔离强度不降——
   // 真正要挡的是「读操作者凭据 / 别的 ticket」，那是 deny 的活；写面始终只放白名单。
@@ -171,6 +238,12 @@ export function sandboxArgv(writableRoots: readonly string[], readableDeny: read
     // /dev 要能读写：git 等工具会打开 /dev/null（读写模式），默认 deny 会让它们在隔离里直接挂。
     // 这不是放水——设备节点不承载凭据；写面仍只放执行目录。
     '(allow file-write* (subpath "/dev"))',
+    // Go 运行时（gh、lark-cli 之类）启动时要读 sysctl 拿页大小，缺它直接
+    // `fatal error: failed to get system page size` —— 连 --version 都跑不出来。
+    '(allow sysctl-read)',
+    // 只放出站：worker 要 fetch/push/调 API，但不需要对外监听（见上面的取舍说明）。
+    '(allow network-outbound)',
+    `(allow mach-lookup ${mach})`,
     writes,
     denies,
   ].join(' ')

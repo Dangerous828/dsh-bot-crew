@@ -83,9 +83,11 @@ export function ExecutionSettings() {
   const { blocks, environment, sources } = useSettings().settings
   // Keep raw user text (such as separators between blocked commands) in the draft and parse only on save.
   const executor = blocks.executor.value
-  const saved = { ...executor, maxWorkers: String(executor.maxWorkers), blockedCommands: executor.blockedCommands.join(' ') }
+  const saved = { ...executor, maxWorkers: String(executor.maxWorkers), blockedCommands: executor.blockedCommands.join(' '),
+    repositories: executor.repositories.join('\n') }
   const draft = useBlockDraft('executor', saved, blocks.executor.revision,
-    value => ({ ...value, maxWorkers: numberOf(value.maxWorkers), blockedCommands: value.blockedCommands.split(/[\s,]+/).filter(Boolean) }))
+    value => ({ ...value, maxWorkers: numberOf(value.maxWorkers), blockedCommands: value.blockedCommands.split(/[\s,]+/).filter(Boolean),
+      repositories: value.repositories.split('\n').map(line => line.trim()).filter(Boolean) }))
   const value = draft.value
   const edit = (next: Partial<typeof value>) => draft.edit({ ...value, ...next })
   const prepare = useRef<HTMLTextAreaElement>(null)
@@ -123,6 +125,11 @@ export function ExecutionSettings() {
           <Field label={t('blockedCommands')} hint={t('blockedCommandsHint')}>
             <Input className="dt-mono" value={value.blockedCommands} placeholder={t('blockedCommandsNone')} spellCheck={false}
               onChange={event => edit({ blockedCommands: event.target.value })} />
+          </Field>
+          {/* 只在 sandbox 档有用：隔离时 prepare 要写仓库的 .git（worktree/refs），不列出来就会被拦。 */}
+          <Field label={t('repositories')} hint={t('repositoriesHint')} note={t('repositoriesNote')}>
+            <textarea className="dt-textarea dt-mono" rows={3} spellCheck={false} placeholder={t('repositoriesEmpty')}
+              value={value.repositories} onChange={event => edit({ repositories: event.target.value })} />
           </Field>
         </div>
       </Fields>

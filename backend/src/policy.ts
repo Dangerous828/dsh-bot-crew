@@ -129,6 +129,17 @@ export const ExecutorConfigSchema = z.object({
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
+  /**
+   * 隔离档下 prepare 命令额外允许写的目录（绝对路径），通常是你仓库的 checkout 根。
+   *
+   * 为什么需要它：推荐的 prepare 是 `git -C <仓库> worktree add ... "$DSH_SUPERAGENT_DIR"`，
+   * 它不只写工单目录，还要在**仓库**的 `.git/` 下建 `worktrees/` 与 `refs/heads/`。隔离只放
+   * 工单目录时这条命令会报 `cannot lock ref ...: Operation not permitted`。
+   *
+   * 不从 `prepare` 文本里反推路径：命令是 shell，可能带变量、管道、多条语句，解析必然脆。
+   * 这里只收「明确列出的目录」，写面仍是白名单。
+   */
+  repositories: z.array(z.string().trim().refine(path => path.startsWith('/'), 'An absolute path')).max(LIMITS.maxRepositories).default([]),
   blockedCommands: z.array(CommandNameSchema).default([]),
   /**
    * worker 执行面的隔离档（Step 2 强制隔离 / gap 3）：

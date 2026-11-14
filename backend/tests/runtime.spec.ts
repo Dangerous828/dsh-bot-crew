@@ -209,6 +209,9 @@ beforeEach(async () => {
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
+  // 单元测试不碰真实额度源：默认关掉，要测的那几条自己 stub。否则一台开着 magpie 的机器上，
+  // 这些用例会悄悄变成网络测试（结果随外部窗口变，绿红都不算数）。
+  vi.stubEnv('CREW_QUOTA_SOURCE', '')
   runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
   await runtime.ready
   // Source kinds are normally registered by plugins that are not loaded in unit tests.
@@ -216,7 +219,7 @@ beforeEach(async () => {
   runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 })
-afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks();
+afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); vi.unstubAllEnvs();
   // 停服之后偶尔还有 SQLite/隧道 close 的尾巴在写目录，立刻 rm 会撞 ENOTEMPTY。
   // maxRetries+retryDelay 让它在文件落定后再删，消掉这类并发 flaky（不是逻辑问题）。
   rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) })
@@ -1138,7 +1141,8 @@ it('runs the prepare command once for a new ticket, under the execution root wit
 
 it('uses each recorded model window for reply usage after a model switch', async () => {
   const { ticket } = await acceptedTicket()
-  const resolveModelInfo = vi.fn(async (_provider: string, model: string) => ({ contextWindow: model === 'small' ? 100 : 1000 }))
+  // 宿主 `LlmRuntime.resolveModelInfo()` 的真实形状是 `context.contextWindow`。
+  const resolveModelInfo = vi.fn(async (_provider: string, model: string) => ({ context: { contextWindow: model === 'small' ? 100 : 1000 } }))
   Object.assign(services.llm as object, { resolveModelInfo })
   controller.inspect.mockResolvedValue({ events: [
     { type: 'request/header', header: { config: { provider: 'magpie', model: 'small' } } },
@@ -1153,6 +1157,81 @@ it('uses each recorded model window for reply usage after a model switch', async
   ])
   expect(resolveModelInfo).toHaveBeenCalledWith('magpie', 'small')
   expect(resolveModelInfo).toHaveBeenCalledWith('magpie', 'large')
+})
+
+it('counts cache reads against the window, so a cached route does not look almost empty', async () => {
+  // 真数据：这条 worker 会话（worker-681d97d2…）最紧的一步是 input 299 + cacheRead 88832，
+  // 窗口 1M。只减 inputTokens 会报「余 999.7k」；减整个提示词才是「余 910.9k」。
+  const { ticket } = await acceptedTicket()
+  Object.assign(services.llm as object, { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 1_000_000 } })) })
+  controller.inspect.mockResolvedValue({ events: [
+    { type: 'model/selection', provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash' },
+    { type: 'assistant/message', usage: { inputTokens: 299, outputTokens: 511, cacheReadTokens: 88_832, totalTokens: 89_642 } },
+  ] })
+  const spend = await runtime.replySpends(ticket.id)
+  expect(spend?.replies[0]).toMatchObject({ input_tokens: 299, prompt_tokens: 89_131, context_window: 1_000_000, context_left: 910_869 })
+  expect(spend?.quota).toMatchObject({ tightest_left: 910_869, used_ratio: expect.closeTo(0.089131, 6) })
+})
+
+it('says the real quota source is unreadable instead of passing the context left off as a balance', async () => {
+  const { ticket } = await acceptedTicket()
+  Object.assign(services.llm as object, { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 1_000 } })) })
+  controller.inspect.mockResolvedValue({ events: [
+    { type: 'model/selection', provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash' },
+    { type: 'assistant/message', usage: { inputTokens: 100, outputTokens: 1 } },
+  ] })
+  const spend = await runtime.replySpends(ticket.id)
+  // 没有配置源（beforeEach 把它设成空串）：如实说，不给数字。
+  expect(spend?.real).toMatchObject({ state: 'unavailable', windows: [] })
+  expect(spend?.real_line).toContain('读不到真实源')
+  // 上下文余量仍然照报 —— 两种额度分两格，谁都不顶替谁。
+  expect(spend?.quota).toMatchObject({ tightest_left: 900 })
+})
+
+it('reports the provider windows the real source gave, on the same reading the panel shows', async () => {
+  const { ticket } = await acceptedTicket()
+  vi.stubEnv('CREW_QUOTA_SOURCE', 'http://quota.test/v1/magpie/quotas')
+  const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [
+    { provider: 'workbuddy', user: '159****8010', plan: 'Free plan', windows: [
+      { name: 'Credits', used: 100, remaining: 0, display: '500 / 500', unit: 'credits' },
+      { name: 'Extra credits', used: 75.21987638954685, remaining: 24.780123610453145, display: '2921.54 / 3884' },
+    ] },
+    { provider: 'linksub-fun', user: 'sk-J…UOVL', windows: [], balance: '$-3.51' },
+  ] }), { status: 200 }))
+  vi.stubGlobal('fetch', fetch)
+  Object.assign(services.llm as object, { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 500_000 } })) })
+  controller.inspect.mockResolvedValue({ events: [
+    { type: 'request/header', header: { config: { provider: 'magpie', model: 'workbuddy/deepseek-v4.1-flash-500k' } } },
+    { type: 'assistant/message', usage: { inputTokens: 157, outputTokens: 125, cacheReadTokens: 30_080 } },
+  ] })
+  const spend = await runtime.replySpends(ticket.id)
+  expect(fetch).toHaveBeenCalledWith('http://quota.test/v1/magpie/quotas', expect.anything())
+  expect(spend?.real).toMatchObject({ state: 'read', url: 'http://quota.test/v1/magpie/quotas' })
+  expect(spend?.real?.windows).toContainEqual({ provider: 'workbuddy', account: '159****8010', plan: 'Free plan',
+    window: 'Credits', used: 100, remaining: 0, display: '500 / 500', unit: 'credits' })
+  // 这句话把本票那条路由排在最前并标出来：网关路由 magpie/workbuddy/… 对应源里的 workbuddy。
+  expect(spend?.real_line).toContain('workbuddy 剩 0%（500 / 500） 159****8010（本票）')
+})
+
+it('reads the real quota source through the resource the main Session and the panel share', async () => {
+  vi.stubEnv('CREW_QUOTA_SOURCE', 'http://quota.test/v1/magpie/quotas')
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+    { provider: 'workbuddy', user: '159****8010', windows: [{ name: 'Credits', used: 100, remaining: 0, display: '500 / 500' }] },
+    { provider: 'linksub-fun', user: 'sk-J…UOVL', windows: [], balance: '$-3.51' },
+  ] }), { status: 200 })))
+  const page = await runTool(runtime.masterId, 'orchestrator_read', { resource: 'quota' }) as Record<string, unknown>
+  expect(page).toMatchObject({ state: 'read', url: 'http://quota.test/v1/magpie/quotas', next_offset: null })
+  expect(page.windows).toEqual([
+    { provider: 'workbuddy', account: '159****8010', window: 'Credits', used: 100, remaining: 0, display: '500 / 500' },
+    { provider: 'linksub-fun', account: 'sk-J…UOVL', window: 'balance', balance: '$-3.51' },
+  ])
+})
+
+it('says the real quota source is unreadable on the resource, instead of showing an empty list', async () => {
+  // beforeEach 把源设成空串：这一格必须说「为什么没有」，而不是一栏空 windows 让人以为额度归零。
+  const page = await runTool(runtime.masterId, 'orchestrator_read', { resource: 'quota' }) as Record<string, unknown>
+  expect(page).toMatchObject({ state: 'unavailable', windows: [] })
+  expect(String(page.reason)).toContain('没有配置真实额度源')
 })
 
 it('uses a bot-specific fallback route for a worker with no recorded selection', async () => {
@@ -2265,4 +2344,25 @@ it('wraps the prepare command in sandbox-exec when worker isolation is sandbox',
   expect(wrapped!.argv).toEqual(expect.arrayContaining(['/usr/bin/sandbox-exec', '-p']))
   expect(wrapped!.argv.join(' ')).toContain('sh -c true')
   expect(wrapped!.argv.join(' ')).toContain('(deny default)')
+})
+
+// #11 第 3 项：executor.repositories 必须真的进 prepare 的 writableRoots。
+// 只断言 schema 有字段不算接线——推荐的 prepare 要在仓库的 .git 下建 worktree/refs，
+// 不列进白名单就会被沙箱拦成 Operation not permitted（真机实测过）。
+it('passes executor.repositories into the sandboxed prepare command\'s writable roots', async () => {
+  const { sandboxAvailable } = await import('../src/infra/environment.ts')
+  if (!sandboxAvailable()) { expect(true).toBe(true); return }
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor,
+    isolation: 'sandbox', prepare: 'true', repositories: ['/srv/src/widgets', '/srv/src/other'] } })
+  subprocess.spawn.mockClear()
+  await acceptedTicket(feishu('iso2', '@bot 隔离准备 仓库'))
+  const specs = subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[] })
+  const wrapped = specs.find(spec => spec.argv[0] === '/usr/bin/sandbox-exec')
+  expect(wrapped).toBeTruthy()
+  const profile = wrapped!.argv[2]!
+  expect(profile).toContain('(allow file-write* (subpath "/srv/src/widgets"))')
+  expect(profile).toContain('(allow file-write* (subpath "/srv/src/other"))')
+  // 隔离该有的窄口径也一起钉住：出站放行、监听不放行。
+  expect(profile).toContain('(allow network-outbound)')
+  expect(profile).not.toContain('(allow network*)')
 })

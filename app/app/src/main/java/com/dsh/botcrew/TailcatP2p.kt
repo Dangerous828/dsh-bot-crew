@@ -10,6 +10,20 @@ import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
+/**
+ * 一轮探测里某一步还能用多少毫秒。
+ *
+ * **绝不返回 0**：`HttpURLConnection.readTimeout = 0` 的意思是「无限等待」，
+ * 预算耗尽时把 0 传下去会让这次探测永远挂着 —— 实测过一次：断网后 app 全黑屏、
+ * 调试口连续超时，根因就是这里传了 0。耗尽返回 -1，调用点据此直接放弃这一步。
+ *
+ * 抽成顶层纯函数是为了能单测：真实 probe 要开 socket，测不动。
+ */
+internal fun probeBudget(deadlineNanos: Long, nowNanos: Long, waitMs: Int): Int {
+    val leftMs = (deadlineNanos - nowNanos) / 1_000_000L
+    return if (leftMs <= 0) -1 else minOf(waitMs.toLong(), leftMs).toInt()
+}
+
 internal fun acceptsProbeStatus(status: Int, latency: Boolean): Boolean =
     status in 200..299 || (latency && status == 404)
 
@@ -44,6 +58,8 @@ object TailcatP2p {
      * 这个默认值是探测在后台跑、不挡人的前提下给的。
      */
     private const val DEFAULT_PROBE_WAIT_MS = 15_000
+    /** 一整轮探测（warm + 两次计时）的总预算。超了就认这次没通，绝不把调用线程占满 45 秒。 */
+    private const val PROBE_BUDGET_MS = 20_000L
 
     /** 本地把写端关了之后等远端收尾的上限：远端一直不发 FIN 时不能把这条连接永远挂着。 */
     private const val LINGER_MS = 15_000L
@@ -153,15 +169,27 @@ object TailcatP2p {
      * 探不通只是「这次不行」，不负责收摊：代理留在那儿，下一次请求照样可以试它。
      */
     fun probe(port: Int, token: String, deviceId: String?, waitMs: Int = DEFAULT_PROBE_WAIT_MS): Probe {
+        // 整轮探完的总预算。三步（warm + 两次计时）各自 waitMs 的话最坏要 3×15=45 秒，
+        // 而 Wi-Fi 断连时隧道那头根本不回 —— 每次都要等满超时。探测循环在
+        // repeatOnLifecycle 里跑，主线程上的调试口/界面就跟着排队等死
+        // （实测：关 Wi-Fi 再开，app 全黑屏、state.dump 连续超时）。
+        // 所以这里给整轮一个上限：超了就当这次没探通，下一轮再来，不把线程占住。
+        val deadline = System.nanoTime() + PROBE_BUDGET_MS * 1_000_000L
+        fun left(): Int = probeBudget(deadline, System.nanoTime(), waitMs)
+
         // 第一步：证明隧道能跑真接口。这一步输了就没有后面可谈。
         // 它的耗时只进日志（首连要注册、DERP 引导、握手，通常秒级），不参与判直连还是中继。
-        val warm = request(port, "/api/mobile/timeline", token, deviceId, waitMs)
+        val warmBudget = left()
+        if (warmBudget <= 0) return Probe(ok = false)
+        val warm = request(port, "/api/mobile/timeline", token, deviceId, warmBudget)
             ?: return Probe(ok = false)
 
         // 第二步：同一条连接上量一个来回，取两次里小的那次。
         var best = Long.MAX_VALUE
         repeat(TIMING_ATTEMPTS) {
-            val spent = request(port, LATENCY_PATH, token, deviceId, waitMs) ?: return@repeat
+            val budget = left()
+            if (budget <= 0) return@repeat
+            val spent = request(port, LATENCY_PATH, token, deviceId, budget) ?: return@repeat
             if (spent < best) best = spent
         }
         // 计时那两次都没成：隧道刚才明明是通的，多半是代理这一头刚好收摊。当作没探通。

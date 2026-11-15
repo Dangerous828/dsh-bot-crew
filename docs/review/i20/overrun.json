@@ -1,0 +1,35 @@
+[
+  {
+    "case": "慢滴 200ms/字节（预算 20s）",
+    "drip_ms": 200,
+    "wait_ms": 15000,
+    "budget_ms": 20000,
+    "wall_seconds": 21.07,
+    "exceeded_budget": true,
+    "capped": false,
+    "ok": false,
+    "probe_millis": -1
+  },
+  {
+    "case": "慢滴 400ms/字节（预算 20s）",
+    "drip_ms": 400,
+    "wait_ms": 15000,
+    "budget_ms": 20000,
+    "wall_seconds": 41.23,
+    "exceeded_budget": true,
+    "capped": false,
+    "ok": false,
+    "probe_millis": -1
+  },
+  {
+    "case": "慢滴 800ms/字节（预算 20s，上限放到 240s）",
+    "drip_ms": 800,
+    "wait_ms": 15000,
+    "budget_ms": 20000,
+    "wall_seconds": 81.64,
+    "exceeded_budget": true,
+    "capped": false,
+    "ok": false,
+    "probe_millis": -1
+  }
+]

@@ -1,0 +1,29 @@
+== when: 2026-11-14T18:10:30+08:00
+== adb devices
+List of devices attached
+55c86317               device usb:18874368X product:PEDM00 model:PEDM00 device:OP4E5D transport_id:1
+
+== foreground
+    topResumedActivity=ActivityRecord{494f97c u0 com.dsh.botcrew/.MainActivity t140}
+== main pkg
+    versionName=0.1.0
+    lastUpdateTime=2026-11-14 17:56:55
+      firstInstallTime=2026-11-11 22:27:11
+== main prefs hash
+819cd884847d3ebf2d7b0e3a425dfd5c73d6f396604be8664120853a30acc665  -
+== main prefs ls
+-rw-rw---- 1 u0_a16 u0_a16 604 2026-11-14 17:17 shared_prefs/crew-pairing.xml
+== device store hash
+f6bd55eed796031b5c08b916896fdbd417ff4d71aa50165b4c1018c446e69ae4  /Users/cpuser/.dsh/state/superagent/remote-devices.json
+== rotation
+1
+0
+== night
+Night mode: no
+== forwards
+
+== packages
+package:com.dsh.botcrew
+== dsh pids
+41418 /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python /Users/cpuser/Code/dsh-bot-crew/backend/tools/mobilegw
+48129 /Users/cpuser/Code/dsh-bot-crew/backend/tools/tailcat serve --key=default 43499

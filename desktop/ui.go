@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -115,8 +116,28 @@ type app struct {
 	// 不落盘：拖宽了下次启动回到设计稿的宽度，不比「记住上次随手一拖」差。
 	sidebarWidth float32
 	backendWidth float32
-	// services 是 mygo 的窗口服务，后台 goroutine 靠它请求重画。
-	services ui.Services
+	// 状态推进的两段式：**入队**可以在任何 goroutine 上，**执行**只在主线程上。
+	//   postMain  → pending 追加一条，再（去重地）给窗口队列排一次 runPending
+	//   runPending→ 在主线程上把 pending 跑完
+	// 这样「谁都能催状态」与「状态只在一条线程上改」同时成立，也不用两套队列。
+	//
+	// post 是窗口的主线程队列（mygo.Window.Update：主线程执行，然后请求一帧），
+	// 由 main.go 经 bindPost 绑；没绑之前只有 pending，由 runPending 就地跑（单测）。
+	// batchGID 是「此刻正在跑主线程队列的那个 goroutine」—— runOnMain 靠它认出重入：
+	// 主线程把任务排进自己的队列再等它，是必死的死锁。
+	// closedCh 在窗口 / 应用收掉时关闭：之后的任务一律丢弃，等它的调用立刻拿到明确错误，
+	// 而不是干等一个永远不来的超时。
+	postMu     sync.Mutex
+	post       func(func())
+	pending    []func()
+	pumpQueued bool
+	closed     bool
+	closedCh   chan struct{}
+	// batchGID 是「此刻正在跑主线程队列的那个 goroutine」的编号，队列跑完清零。
+	// 用 atomic 是因为 runOnMain 在其它 goroutine 上读它，不该去抢 postMu。
+	// 为什么记编号而不是只记「有人在跑」：队列执行期间 socket goroutine 也可能来问，
+	// 那时只按「有人在跑」会把它误判成主线程，等于又让后台线程直接改状态。
+	batchGID atomic.Uint64
 	// backendTab 是右栏「后台」那一档里当前在看哪一页：进行中 / 待你 / 已完成。
 	backendTab int
 	// mode 是中栏的两个镜头：聊天（常规暗色群聊）与分拣台（纸感案头）。
@@ -164,7 +185,14 @@ type app struct {
 	answerNote   string
 	answerTicket string
 	answerAsked  string
-	answered     chan answerResult
+	// answerStale 表示这句话是「这张卡已过期、已刷新为最新一张」的提示：它不是按某道题说的，
+	// 所以只要还是同一张票就照说（不要求签名一致），否则刷新换了问题之后提示会瞬间消失。
+	answerStale bool
+	// 审批卡上的「自己写一句」：按票存一份草稿，只有 attention_id 的卡才用它、走 /answer。
+	// 用票号作键，两张待决卡并排时各写各的，不会串。存指针：ui.TextInput 要一个可写的 *string。
+	answerRevise     map[string]*reviseDraft
+	answerReviseBusy map[string]bool
+	answered    chan answerResult
 
 	// 插队：把排队中的一句直接交给正在跑的 worker。
 	steering  map[string]bool
@@ -361,6 +389,9 @@ type answerResult struct {
 	ticket string
 	asked  string
 	err    error
+	// stale 表示答复的这张问题卡已过期（后端 409，零变更）：不当成功、也不当断连，
+	// 处理器据此刷新时间线换成最新一张卡，并明说「已更新」。
+	stale bool
 }
 
 // workResult 是哪张票的过程。没有票号就没法判断这份结果还该不该显示。
@@ -406,9 +437,174 @@ const (
 	queuedPreviewRunes = 28
 )
 
-// wake 让窗口尽快画下一帧。后台 goroutine 把一个结果放进通道之后必须调用：
-// 不调的话通道里的结果要等到用户碰一下窗口才被 drain 收走，界面就停在「正在读…」。
-func (s *app) wake() { s.services.Invalidate() }
+// wake 让后台结果立刻落状态，并尽快画下一帧。
+//
+// 状态推进挂在**数据到达**上，不挂在**有没有帧**上：窗口被遮挡 / 锁屏 / App Nap 时
+// 一帧都不来，旧写法（只 services.Invalidate()）会让通道里的结果永远不动，
+// 表现为 messages:-1、memoryCount:-1，以及「重启后界面回到旧状态」这一类现象。
+// 交给主线程执行，保证状态仍然只在一个线程上改。
+func (s *app) wake() { s.postMain(func() { s.drain(nil) }) }
+
+// bindPost 绑上窗口的主线程队列（main.go 在窗口建好后调一次）。
+//
+// 绑定之前攒下的 pending 不用搬走：它们本来就在同一个 pending 里，
+// 只要排一次 runPending 就会在主线程上跑掉。
+func (s *app) bindPost(post func(func())) {
+	s.postMu.Lock()
+	s.post = post
+	needPump := len(s.pending) > 0 && !s.pumpQueued
+	s.pumpQueued = s.pumpQueued || needPump
+	s.postMu.Unlock()
+	if needPump {
+		post(s.runPending)
+	}
+}
+
+// postMain 把 fn 交给主线程执行：只入队，执行统一由 runPending 在主线程上做。
+//
+// 关键点是**执行位置唯一**。旧写法在有窗口时把 fn 直接丢给 Window.Update，
+// 没窗口时攒着等 runPending —— 两套路径，谁都能在任意 goroutine 上把 fn 跑起来。
+// 现在只有一条：入队 → 排一次主线程 → 在主线程上按 FIFO 跑完。
+// 顺带的好处是同一批到达的结果合成一次重绘，不会一条结果一帧。
+func (s *app) postMain(fn func()) { s.enqueue(fn) }
+
+// postMainWait 是 runOnMain 的入队那一半：队列已收掉时返回 false。
+func (s *app) postMainWait(fn func()) bool { return s.enqueue(fn) }
+
+// enqueue 是 postMain / postMainWait 的共同实现：追加一条任务，必要时给主线程排一次泵。
+// pumpQueued 只在**真的排进窗口队列**时置真 —— 没绑窗口时留着 false，
+// 好让 bindPost 知道「攒着的东西还没人跑过」。
+func (s *app) enqueue(fn func()) bool {
+	s.postMu.Lock()
+	if s.closed {
+		s.postMu.Unlock()
+		return false
+	}
+	s.pending = append(s.pending, fn)
+	post := s.post
+	needPump := post != nil && !s.pumpQueued
+	if needPump {
+		s.pumpQueued = true
+	}
+	s.postMu.Unlock()
+	if needPump {
+		post(s.runPending)
+	}
+	return true
+}
+
+// runPending 在主线程上把 pending 跑完。它可能被重复排入（多个 goroutine 同时催），
+// 所以用 pumpQueued 去重；真正跑的时候一次性把当时的队列取空，跑的过程中新到的
+// 任务留给下一次（新到的那次自己会再排一次）。
+//
+// batchGID 在整段执行期间指向跑批的那个 goroutine：runOnMain 据此认出
+// 「我已经在主线程队列里」，别的 goroutine 则认出「我不是」。
+// 没有窗口时（单测、启动早期）由 view() 每帧调一次，行为与有窗口时一致。
+func (s *app) runPending() {
+	s.postMu.Lock()
+	s.pumpQueued = false
+	batch := s.pending
+	s.pending = nil
+	s.postMu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
+	// 存旧值再恢复：调试口的动作体在主线程上会自己再跑一次 runPending（pumpResults），
+	// 嵌套时不能把外层的标记清掉，否则外层剩下的任务会被当成「不在主线程」。
+	previous := s.batchGID.Swap(goroutineID())
+	defer s.batchGID.Store(previous)
+	for _, fn := range batch {
+		fn()
+	}
+}
+
+// runOnMain 在**主线程**上执行 fn 并等它返回，带超时。
+//
+// 这是调试口唯一允许碰 app 状态的入口：动作体（读状态、改状态、读回执）
+// 整段在主线程上跑，因此与 view() 天然串行 —— 不会再出现「后台 goroutine 一边
+// runPending+drain、主线程一边 view」这种同字段两个写者。
+//
+// 已经在主线程上就直接跑：主线程把任务排给自己的队列再等它，是必死的死锁。
+// 关掉之后（closedCh 关闭）立刻返回 errMainClosed，不再干等超时。
+//
+// **超时的语义是「调用方不再等」，不是「动作被撤销」**：队列项没有取消机制
+// （Go 的切片队列删中间一项要么加锁改结构、要么留空洞，都不值当）。所以超时返回
+// 之后，主线程一旦恢复，那条 fn **仍会照常执行**，它的副作用（改状态、发请求）
+// 也照常发生。调用方拿到的是「我没等到结果」，而不是「这件事没发生」——
+// 外部脚本要据此决定是重试还是重新 state.dump 一次读现状，不能假设动作没落地。
+func (s *app) runOnMain(timeout time.Duration, fn func()) error {
+	if s.isMainThread() {
+		fn()
+		return nil
+	}
+	done := make(chan error, 1)
+	if !s.postMainWait(func() {
+		fn()
+		done <- nil
+	}) {
+		return errMainClosed
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-s.closedCh:
+		return finishedOr(done, errMainClosed)
+	case <-timer.C:
+		return finishedOr(done, fmt.Errorf("主线程 %s 内没有执行完这条动作", timeout))
+	}
+}
+
+// finishedOr 在「动作已完成」与另一个信号同时就绪时给出「已完成」的答案。
+//
+// done 是带缓冲的，动作一跑完答案就在里面。而 select 在多个 case 同时 ready 时
+// 均匀随机选一个 —— 不先读一遍 done，就会把「已经跑完、副作用已落地」报成
+// 「这条动作不会执行」/「没有执行完」，那是方向相反的结论：外部脚本据此重试，
+// 就是重复副作用。
+func finishedOr(done <-chan error, otherwise error) error {
+	select {
+	case err := <-done:
+		return err
+	default:
+		return otherwise
+	}
+}
+
+// isMainThread 报告调用方此刻是不是就在跑主线程队列的那个 goroutine 上。
+//
+// 判据是「本 goroutine 编号 == 正在跑批的 goroutine 编号」。不用「绑窗口时记下的
+// 编号」：mygo 的 darwin 后端把队列跑在 CFRunLoop 的 C 回调里，每次从 C 进 Go 都是
+// 新 goroutine，编号不稳定；而跑批期间在同一个 goroutine 内比较是稳的。
+//
+// 没绑窗口时（单测）没有第二个线程，谁调都算主线程。
+func (s *app) isMainThread() bool {
+	s.postMu.Lock()
+	bound := s.post != nil
+	s.postMu.Unlock()
+	if !bound {
+		return true
+	}
+	batch := s.batchGID.Load()
+	if batch == 0 {
+		return false
+	}
+	return goroutineID() == batch
+}
+
+// closeMain 收掉主线程队列：之后的任务一律丢弃，等在 runOnMain 里的调用立刻
+// 拿到 errMainClosed。窗口关掉 / 应用退出时调，避免「窗口没了但调试口还在等」。
+func (s *app) closeMain() {
+	s.postMu.Lock()
+	if s.closed {
+		s.postMu.Unlock()
+		return
+	}
+	s.closed = true
+	s.pending = nil
+	close(s.closedCh)
+	s.postMu.Unlock()
+}
 
 // ── 会话：名单、能力位先验、缓存隔离、切换与新建 ─────────────────────────
 
@@ -576,7 +772,7 @@ func (s *app) switchSession(id string) bool {
 	s.chatScroll.Y = math.MaxFloat32
 	s.openTicket, s.workSteps, s.workError = "", nil, ""
 	s.agents = nil
-	s.answerNote, s.answerTicket, s.answerAsked = "", "", ""
+	s.answerNote, s.answerTicket, s.answerAsked, s.answerStale = "", "", "", false
 	s.steerNote, s.withdrawError = "", ""
 	s.messageMenu, s.previewNote = "", ""
 	s.screen, s.screenFull, s.screenNote = nil, false, ""
@@ -612,7 +808,8 @@ func (s *app) applyConversation(conversation *Conversation) {
 	s.conversation, s.problem = conversation, ""
 	// 答完之后这张票可能已经换了一组新问题：刚才那句回执是按上一道题说的，
 	// 不能跟到新问题下面（「已按这个答了」短暂出现在新问题卡上，就是它）。
-	if s.answerNote != "" && !s.answerIsCurrent() {
+	// 过期提示（answerStale）例外：它说的就是「卡已换新」，刷新后要留着让人看见。
+	if s.answerNote != "" && !s.answerStale && !s.answerIsCurrent() {
 		s.answerNote = ""
 	}
 	// 聊天是「越新越靠下」：第一次读到时直接落到最底，之后只有
@@ -760,7 +957,8 @@ func (s *app) send() {
 	// 会话动作在发起那一刻锁定客户端与花名册：切会话不该把这句话发到另一段。
 	client, conversation := s.client, s.conversation
 	go func() {
-		defer func() { s.sending = false }()
+		// 发送中的标记是主线程状态：后台 goroutine 只把它交回主线程，不自己改（issue #27）。
+		defer s.postMain(func() { s.sending = false })
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := client.Send(ctx, text, mentionsIn(text, conversation)); err != nil {
@@ -816,8 +1014,8 @@ func continuesName(rest string) bool {
 }
 
 func (s *app) view(c *ui.Context) {
-	// 后台 goroutine 靠这个句柄请求下一帧；只拿到 view 里不行，它们不在 UI 线程上。
-	s.services = c.Services()
+	// 没有绑窗口队列时（单测、或者窗口还没建好），把攒下的状态推进在这里跑掉。
+	s.runPending()
 	s.drain(c)
 	p := ThemeColors(c.Theme())
 	// 先把宽度按当前窗口尺寸收进有效范围，再建分隔条：窗口缩过之后，
@@ -939,17 +1137,12 @@ func (s *app) repaint(c *ui.Context) {
 // drain 把后台线程交回来的结果收进状态。
 //
 // 每帧调用一次，把**已经到达**的结果全收掉就返回。它不能一直等：
-// 它是从 view() 里调的，一帧里卡住就等于整个界面冻住。
+// 一帧里卡住就等于整个界面冻住。
 //
 // `c` 可以为 nil：那时只推进状态、不请求重绘。这不是给测试开的方便门 ——
-// 状态推进**不该依赖绘制**。原先它只能从 view() 里跑，于是窗口没在画（锁屏、被遮挡、
-// App Nap）时，后台结果早进了通道而状态永远不动：实测表现为 messages:-1、
-// memoryCount:-1，以及「重启后界面回到旧状态」这一类现象。
-//
-// **还没根治**：试过在 `wake()` 里也 `drain(nil)`，但那样会绕过 S3 的能力位先验门禁
-// （`TestRefreshWaitsForTheCapabilityProbe` 变红：先验未完成时就发出了 timeline 与
-// state 请求）。所以目前只有调试口用得上「c 为 nil」这条路径（`debug.go` 的
-// `pumpResults()`）。产品路径的根治需要让 drain 与「先验门禁」解耦，不是加一行能了事的。
+// 状态推进**不该依赖绘制**。后台结果到达时 `wake()` 会把一次 `drain(nil)` 交给主线程
+// （见 postMain），所以窗口没在画（锁屏、被遮挡、App Nap）时结果照样落状态；
+// 传了 `c` 的那条路只是顺手把这一帧也重画掉。能力位先验门禁在 refresh 里，与这里无关。
 func (s *app) drain(c *ui.Context) {
 	for {
 		select {
@@ -1099,12 +1292,29 @@ func (s *app) drain(c *ui.Context) {
 			}
 			s.repaint(c)
 		case result := <-s.answered:
+			// 自写一句那一格也要清掉「正在发」并（成功时）清空草稿：键是「票号|revise」。
+			if strings.HasSuffix(result.key, "|revise") {
+				tid := strings.TrimSuffix(result.key, "|revise")
+				delete(s.answerReviseBusy, tid)
+				if result.err == nil {
+					if d := s.answerRevise[tid]; d != nil {
+						d.Text = ""
+					}
+				}
+			}
 			// 发出去就重读一次：问题被答掉之后，这张卡要么换成新的一组选项，要么整张消失。
 			delete(s.answers, result.key)
 			s.answerTicket, s.answerAsked = result.ticket, result.asked
-			if result.err != nil {
+			if result.stale {
+				// 旧卡已过期（409，零变更）：不冒充成功、也不当断连；刷新时间线换成最新一张卡并明说。
+				s.answerTicket, s.answerAsked, s.answerStale = result.ticket, result.asked, true
+				s.answerNote = "这张问题卡已更新，请按最新的那张再答"
+				go s.refresh()
+			} else if result.err != nil {
+				s.answerStale = false
 				s.answerNote = actionNote("没答上", result.err)
 			} else {
+				s.answerStale = false
 				// 只在这道题还在等、还是同一组时才说「已答」：结果回来时若已经
 				// 刷新成了新问题（或者这张票走了），那句话说的就是上一道题，收起来。
 				s.answerNote = ""
@@ -1949,7 +2159,8 @@ func (s *app) sendSteer(ticketID string) {
 	}
 	client := s.client
 	go func() {
-		defer func() { s.sending = false }()
+		// 发送中的标记是主线程状态：后台 goroutine 只把它交回主线程，不自己改（issue #27）。
+		defer s.postMain(func() { s.sending = false })
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := client.SteerText(ctx, ticketID, requestID, text); err != nil {
@@ -1958,7 +2169,8 @@ func (s *app) sendSteer(ticketID string) {
 			return
 		}
 		s.sent <- text
-		s.steerNote = "已插话，队伍做完当前这一步会先处理这句"
+		// steerNote 是主线程状态：后台 goroutine 只把它交回主线程，不自己改（issue #27）。
+		s.postMain(func() { s.steerNote = "已插话，队伍做完当前这一步会先处理这句" })
 		s.wake()
 		s.refresh()
 	}()
@@ -2336,13 +2548,78 @@ func (s *app) answer(task Task, option AttentionOption) {
 	}
 	s.answers[slot] = true
 	asked := answerSignature(task)
-	s.answerNote, s.answerTicket, s.answerAsked = "", task.ID, asked
+	s.answerNote, s.answerTicket, s.answerAsked, s.answerStale = "", task.ID, asked, false
 	client, conversation := s.client, s.conversation
+	// 有 attention_id 的票是审批卡：走审批通道 POST /api/mobile/answer（不复用 /send 拼 @文本，
+	// 否则引擎会起一段新活而不是回这张卡）。老后端没这字段 → 退回既有 /send，逐字不变。
+	ticketID, attentionID := task.ID, task.AttentionID
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_, err := client.Send(ctx, text, mentionsIn(text, conversation))
-		s.answered <- answerResult{key: slot, ticket: task.ID, asked: asked, err: err}
+		var err error
+		if attentionID != "" {
+			err = client.Answer(ctx, ticketID, option.Label, attentionID)
+		} else {
+			_, err = client.Send(ctx, text, mentionsIn(text, conversation))
+		}
+		s.answered <- answerResult{key: slot, ticket: task.ID, asked: asked, err: err,
+			stale: err != nil && errors.Is(err, ErrAnswerStale)}
+		s.wake()
+	}()
+}
+
+// reviseDraft 是审批卡上那一格自写草稿的持有者：ui.TextInput 要一个稳定的 *string。
+type reviseDraft struct{ Text string }
+
+// sendButtonBg：能发时是警示实底（赭），不能发时压成轨道底，按下去没反应的形状不骗人。
+func sendButtonBg(p Palette, canSend bool) ui.Color {
+	if canSend {
+		return p.Warn
+	}
+	return p.Track
+}
+
+// reviseOf 拿到这张票的自写草稿（没有就建一份空的）。两张待决卡各写各的，不串。
+func reviseOf(m map[string]*reviseDraft, ticket string) *string {
+	d := m[ticket]
+	if d == nil {
+		d = &reviseDraft{}
+		m[ticket] = d
+	}
+	return &d.Text
+}
+
+// sendRevise 把审批卡上的自写一句交给 /answer（不是 /send）：text 是用户原文，带 attention_id。
+// 没 attention_id 的卡不该走到这里（卡片那时显示的是普通 prefill）。请求中禁重入，409 刷新换卡。
+func (s *app) sendRevise(task Task) {
+	if task.AttentionID == "" || s.client == nil {
+		return
+	}
+	d := s.answerRevise[task.ID]
+	if d == nil {
+		return
+	}
+	said := strings.TrimSpace(d.Text)
+	if said == "" || s.answerReviseBusy[task.ID] {
+		return
+	}
+	if s.answerReviseBusy == nil {
+		s.answerReviseBusy = make(map[string]bool)
+	}
+	if s.answered == nil {
+		s.answered = make(chan answerResult, 4)
+	}
+	s.answerReviseBusy[task.ID] = true
+	key := task.ID + "|revise"
+	asked := answerSignature(task)
+	s.answerNote, s.answerTicket, s.answerAsked, s.answerStale = "", task.ID, asked, false
+	client, ticketID, attentionID := s.client, task.ID, task.AttentionID
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := client.Answer(ctx, ticketID, said, attentionID)
+		s.answered <- answerResult{key: key, ticket: ticketID, asked: asked, err: err,
+			stale: err != nil && errors.Is(err, ErrAnswerStale)}
 		s.wake()
 	}()
 }
@@ -2407,31 +2684,61 @@ func (s *app) pendingCard(c *ui.Context, p Palette, task Task) {
 				}
 				// 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
 				// 同一张票换了新问题也不算「这张卡答过」—— 那句话是按上一道题说的。
-				if s.answerTicket == task.ID && s.answerNote != "" && s.answerAsked == answerSignature(task) {
+				// 过期提示是例外：它按「同一张票」说，不要求签名一致（刷新换了问题也要让人看见已更新）。
+				if s.answerTicket == task.ID && s.answerNote != "" && (s.answerStale || s.answerAsked == answerSignature(task)) {
 					ui.Text(c, s.answerNote).FontSize(FontHairline).TextColor(p.Faint)
 				}
-				// 回一句就落在同一段对话里：直接聚焦输入框，不再多造一个输入层。
-				ui.Row(c).Gap(7).Children(func() {
-					ui.Row(c).Grow(1).PaddingX(11).PaddingY(8).Radius(RadiusItem).
-						Background(p.Card).BorderWidth(1).BorderColor(p.WarnEdge).
-						Cursor(ui.CursorPointer).OnClick(func() {
-						// 点「自己写一句」= 把这句在等的话带进输入框，省得人再想上下文。
-						if s.input == "" {
-							s.input = "@" + s.nameOf(task.BotID) + " "
-						}
-						s.navTab = navBackend
-					}).Children(func() {
-						ui.Text(c, "自己写一句…").FontSize(FontBody).TextColor(p.Hint)
+				// 自由输入：审批卡（有 attention_id）在本卡内就有一格，typed 原文带 attention_id 走 /answer，
+				// 不猜票号、不把回答滑进群聊 /send。老后端没 attention_id 的卡保持原样：带进输入框走普通 /send。
+				if task.AttentionID != "" {
+					if s.answerRevise == nil {
+						s.answerRevise = make(map[string]*reviseDraft)
+					}
+					busy := s.answerReviseBusy[task.ID]
+					ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+						ui.Row(c).Grow(1).PaddingX(11).PaddingY(6).Radius(RadiusItem).
+							Background(p.Card).BorderWidth(1).BorderColor(p.WarnEdge).Children(func() {
+							ui.TextInput(c, reviseOf(s.answerRevise, task.ID)).
+								Placeholder("自己写一句…").Grow(1).
+								PlaceholderColor(p.Hint).TextColor(p.Ink).CaretColor(p.Accent).
+								SelectionColor(p.AccentSoft).Background(p.Card).
+								OnSubmit(func() { s.sendRevise(task) })
+						})
+						canSend := !busy && s.answerRevise[task.ID] != nil &&
+							strings.TrimSpace(s.answerRevise[task.ID].Text) != ""
+						ui.Row(c).PaddingX(13).PaddingY(8).Radius(RadiusItem).
+							Background(sendButtonBg(p, canSend)).Cursor(ui.CursorPointer).Center().Children(func() {
+							ui.Text(c, "回").FontSize(FontBody).TextColor(p.WarnInk)
+						}).OnClick(func() {
+							if canSend {
+								s.sendRevise(task)
+							}
+						})
 					})
-					ui.Row(c).PaddingX(13).PaddingY(8).Radius(RadiusItem).
-						Background(p.Warn).Cursor(ui.CursorPointer).Center().Children(func() {
-						ui.Text(c, "回").FontSize(FontBody).TextColor(p.WarnInk)
-					}).OnClick(func() {
-						if s.input == "" {
-							s.input = "@" + s.nameOf(task.BotID) + " "
-						}
+				} else {
+					// 回一句就落在同一段对话里：直接聚焦输入框，不再多造一个输入层。
+					ui.Row(c).Gap(7).Children(func() {
+						ui.Row(c).Grow(1).PaddingX(11).PaddingY(8).Radius(RadiusItem).
+							Background(p.Card).BorderWidth(1).BorderColor(p.WarnEdge).
+							Cursor(ui.CursorPointer).OnClick(func() {
+							// 点「自己写一句」= 把这句在等的话带进输入框，省得人再想上下文。
+							if s.input == "" {
+								s.input = "@" + s.nameOf(task.BotID) + " "
+							}
+							s.navTab = navBackend
+						}).Children(func() {
+							ui.Text(c, "自己写一句…").FontSize(FontBody).TextColor(p.Hint)
+						})
+						ui.Row(c).PaddingX(13).PaddingY(8).Radius(RadiusItem).
+							Background(p.Warn).Cursor(ui.CursorPointer).Center().Children(func() {
+							ui.Text(c, "回").FontSize(FontBody).TextColor(p.WarnInk)
+						}).OnClick(func() {
+							if s.input == "" {
+								s.input = "@" + s.nameOf(task.BotID) + " "
+							}
+						})
 					})
-				})
+				}
 			})
 		})
 	})

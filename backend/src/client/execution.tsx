@@ -8,8 +8,23 @@ import { SaveBar } from './draft.tsx'
 import { usePanel } from './provider.tsx'
 import { TicketLine } from './rows.tsx'
 import { ConfigHistory, Field, Fields, ModelField, numberOf, useBlockDraft, useSettings } from './settings-kit.tsx'
-import { localized } from './text.ts'
+import { localized, type T } from './text.ts'
 import { ConfirmButton, Hint, LabelValue, LoadMore, LoadState, Section, StatusHead } from './widgets.tsx'
+
+/**
+ * 隔离档位的实际状态：配置值（`isolation`）只说配了哪一档，`isolationActive` 才说 prepare 有没有真进沙箱。
+ * 三态而非两态：宿主构建可能早于 `2364d40`、响应里没有 `isolationActive`，此时是「未知」，
+ * 读成 `false` 会把老宿主说成「配了没生效」，是另一种误导。
+ */
+function isolationStatus(t: T, state: StateView): { text: string; tone: string; hint: string } {
+  if (state.isolation === 'none') return { text: t('isolation.none'), tone: 'warning', hint: t('isolationNoneHint') }
+  const level = t('isolation.sandbox')
+  // 面板可能连到早于该字段的宿主，所以这里不信任类型声明（`http.ts` 是宿主的承诺，不是客户端的输入保证）。
+  const active = (state as { isolationActive?: boolean }).isolationActive
+  if (active === undefined) return { text: `${level} · ${t('isolation.unknown')}`, tone: 'warning', hint: t('isolationUnknownHint') }
+  return active ? { text: `${level} · ${t('isolation.active')}`, tone: 'ongoing', hint: t('isolationHint') }
+    : { text: `${level} · ${t('isolation.inactive')}`, tone: 'error', hint: t('isolationInactiveHint') }
+}
 
 export function ExecutionStatus({ filter: current, state, reload }: {
   filter: TicketFilter; state: StateView; reload: () => Promise<void>
@@ -23,6 +38,7 @@ export function ExecutionStatus({ filter: current, state, reload }: {
   const status = state.setup.problem ? { tone: 'warning', label: t('executorWaitingSetup') } : paused ? { tone: 'warning',
     label: t('processingPaused') }
     : { tone: 'ongoing', label: t('executorRunning') }
+  const isolation = isolationStatus(t, state)
   const action = paused ? 'resumeProcessing' : 'pauseProcessing'
   return <>
     <StatusHead hint={t('executionStatusIntro')} settings="execution" />
@@ -32,10 +48,11 @@ export function ExecutionStatus({ filter: current, state, reload }: {
         <LabelValue label={t('executingLabel')}
           value={`${state.load.running} / ${maxWorkers}`} /><LabelValue label={t('queuedLabel')} value={state.load.queued} />
         {/* 隔离档位紧跟状态：翻默认到 sandbox 之前，这一行必须让人一眼看见现在是哪一档（#11）。
-            与全站一致的 (?) tooltip 承载说明，不用裸 title（005-panel.md「Consistent controls」）。 */}
+            档位与实际生效分开写：`isolation=sandbox` + 空 prepare 时 prepare 一行都没进沙箱（#17 / 2364d40），
+            只报档位会让人以为开着。说明走全站一致的 (?) tooltip，不用裸 title（005-panel.md「Consistent controls」）。 */}
         <LabelValue label={t('isolationLabel')} value={<span className="dt-inline-tip">
-          <span data-state={state.isolation === 'none' ? 'warning' : 'ongoing'}>{t(`isolation.${state.isolation}`)}</span>
-          <InfoTip text={t('isolationHint')} />
+          <span data-state={isolation.tone}>{isolation.text}</span>
+          <InfoTip text={isolation.hint} />
         </span>} />
       </>}
       <ConfirmButton variant="outline" icon={paused ? 'play' : 'pause'} label={t(action)} title={t(action)} message={t(paused

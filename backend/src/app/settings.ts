@@ -97,6 +97,14 @@ export interface SettingsHost {
   readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'blockCommands' | 'restart'>
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
+  /**
+   * `memory` 块保存后调用：让中枢配置（地址 / 超时 / 凭据引用）当场生效。
+   *
+   * 为什么必须是钩子而不是「下次重启自然生效」：`HubProbe` 与 HTTP 客户端持有的引用是
+   * 构造期的快照，不换它就会出现「设置显示新值、记忆还走旧中枢」—— 生产验收实测到过。
+   * 同步执行：保存路径不等网络（探测有自己的超时上界，等在这里只会让保存卡住）。
+   */
+  memoryChanged?(): void
 }
 
 /**
@@ -218,6 +226,9 @@ export class Settings {
     const blocked = settings.executor.blockedCommands
     const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')
     if (changed) await this.host.setup.blockCommands(blocked)
+    // 中枢配置同样是「保存即生效」：不重建就还是旧引用（见 `memoryChanged` 的注释）。
+    // 探测失败不影响保存结果 —— 它落在 health 面上，不是保存错误。
+    if (block === 'memory') this.host.memoryChanged?.()
     // When restarting, the notice stays pending until after the restart; `setup.restart()` defers until this call returns.
     const delivery = restarting ? 'pending' : await sessions.delivery(`settings:${block}`)
     if (restarting) this.host.setup.restart()

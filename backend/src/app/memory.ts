@@ -19,6 +19,18 @@ const seconds = (): number => Math.floor(Date.now() / 1000)
 /** 遗忘区里待多久还没被调起就真删：30 天（秒）。 */
 export const FORGET_EVICT_SECONDS = 30 * 24 * 60 * 60
 
+/** 撤回未完成的持久项（落 KV，重启不丢；下轮重试直到成功）。 */
+export interface RetractPending {
+  botId: string
+  /** 该 source 的全部已知远端 digest（供原子 tombstone 占位）。 */
+  digests: string[]
+  /** 首次失败时间（秒）。 */
+  at: number
+  /** 已重试次数。 */
+  attempts: number
+  lastError: string
+}
+
 export interface SettleInput {
   bot_id: string
   fact: Fact
@@ -33,6 +45,11 @@ export interface SettleResult {
   written: MemoryEntry[]
   /** 被这次写入替代掉的旧条目名（`supersedes`）。 */
   superseded: string[]
+  /**
+   * 需要撤回远端的旧 canonical（同 name 但 body 变更、且旧条目曾显式 toHub:true 上过 Hub）。
+   * 新内容默认 toHub:false，**不自动延伸操作者此前的 opt-in**；调用方须按 source_file 撤该条全部历史版本。
+   */
+  retired: { name: string; botId: string }[]
 }
 
 /**
@@ -83,7 +100,19 @@ export class MemoryLedger {
     const existing = this.byDedupeKey(bot_id, fact.dedupe_key)
     const name = `bot-${bot_id}-${slug(fact.dedupe_key)}`
     if (existing && existing.name === name && existing.body === fact.body && existing.state === 'active') {
-      return { written: [], superseded: [] }
+      // 同键同内容：no-op，保留现 explicit share 状态，不动远端。
+      return { written: [], superseded: [], retired: [] }
+    }
+    // 同 name 但 body 变更：这是「新内容」，默认 toHub:false（不把操作者此前的 opt-in 延伸到 worker 新内容）；
+    // 若旧条目曾显式 share 过（toHub:true），旧远端正文必须撤回 —— 交给调用方 retired 处理。
+    const retired: { name: string; botId: string }[] =
+      existing && existing.name === name && existing.body !== fact.body && existing.toHub === true
+        ? [{ name: existing.name, botId: existing.bot_id }]
+        : []
+    // 持久兜底：把「需撤的旧 canonical」也记进撤回待办，覆盖 hear/close 等所有 settle 路径（不依赖调用方是否读 retired）。
+    // 下轮 retryPendingRetracts 会按 source_file 撤该条全部历史版本；成功后清待办。幂等。
+    for (const old of retired) {
+      this.recordRetractPending(old.name, { botId: old.botId, digests: this.digestsOf(old.name), error: 'settle:body-changed-do-not-extend-optin' })
     }
     const entry: MemoryEntry = {
       name,
@@ -113,7 +142,7 @@ export class MemoryLedger {
       // 同一 dedupe_key 换了 slug 的情况：旧键所指的名字要一并收掉，否则会留下两条 active。
       if (existing && existing.name !== name) this.store.delete(KV.memory.entry(existing.name))
     })
-    return { written: [entry], superseded }
+    return { written: [entry], superseded, retired }
   }
 
   /** 主人说「忘掉这条」：进遗忘区（翻状态 + 记时间），不立刻删行。 */
@@ -158,8 +187,14 @@ export class MemoryLedger {
     })
   }
 
-  /** 主人改了一条记忆的正文或描述。 */
-  edit(name: string, patch: { description?: string; body?: string; importance?: number }): boolean {
+  /**
+   * 主人改了一条记忆的正文或描述（以及**显式分享开关** `toHub`）。
+   *
+   * `toHub` 只由已认证操作者经产品 edit 入口显式设置（裁定 C）：默认 false，不按 origin/type 自动分享；
+   * 置 true 后 author.md 才落盘、才随既有 local_dream 管道上行。这里只翻 KV 里的语义位，
+   * 真正的落盘/撤由运行时接 `AuthorMirror`（见 runtime.editMemory）。
+   */
+  edit(name: string, patch: { description?: string; body?: string; importance?: number; toHub?: boolean }): boolean {
     const raw = this.store.get(KV.memory.entry(name) as Parameters<typeof this.store.get>[0])
     if (!raw || typeof raw !== 'object') return false
     const entry = raw as MemoryEntry
@@ -172,8 +207,63 @@ export class MemoryLedger {
     const description = patch.description?.trim() || entry.description
     const body = patch.body?.trim() || entry.body
     this.store.set(KV.memory.entry(name), { ...entry, description, body, updated: seconds(),
-      ...(patch.importance === undefined ? {} : { importance: patch.importance }) })
+      ...(patch.importance === undefined ? {} : { importance: patch.importance }),
+      ...(patch.toHub === undefined ? {} : { toHub: patch.toHub }) })
     return true
+  }
+
+  /**
+   * 记一条记忆上 author md 时管道会用的远端 digest 历史（只 16hex、去重、不存正文）。
+   *
+   * 为什么要记：md 被 fa/删/改后算不出旧版本的 digest，撤回时无法向中枢占位旧版本槽
+   * （会漏撤未被 bySourceFile 反查到的历史/未入库 pending）。记下真实 render 的 digest 才不丢。
+   */
+  rememberDigest(name: string, digest: string): void {
+    if (!digest) return
+    const key = KV.memory.digests(name)
+    const prev = this.store.get(key as Parameters<typeof this.store.get>[0])
+    const list = Array.isArray(prev) ? prev as string[] : []
+    if (list.includes(digest)) return
+    this.store.set(key, [...list, digest])
+  }
+
+  /** 某条记忆的全部已知远端 digest（撤回占位用）。 */
+  digestsOf(name: string): string[] {
+    const raw = this.store.get(KV.memory.digests(name) as Parameters<typeof this.store.get>[0])
+    return Array.isArray(raw) ? raw as string[] : []
+  }
+
+  /** 末位淘汰真删行时，把 digest 历史一并清掉（记忆本体已不在了）。 */
+  forgetDigests(name: string): void {
+    this.store.delete(KV.memory.digests(name) as Parameters<typeof this.store.delete>[0])
+  }
+
+  /** 记一条「远端撤回未完成」的持久待办（落 KV，重启不丢）。重复记则累加 attempts。 */
+  recordRetractPending(name: string, item: { botId: string; digests: string[]; error: string }): void {
+    const prev = this.store.get(KV.memory.retractPending(name) as Parameters<typeof this.store.get>[0]) as RetractPending | undefined
+    this.store.set(KV.memory.retractPending(name), {
+      botId: item.botId,
+      digests: [...new Set([...(prev?.digests ?? []), ...item.digests])],
+      at: prev?.at ?? seconds(),
+      attempts: (prev?.attempts ?? 0) + 1,
+      lastError: item.error,
+    })
+  }
+
+  /** 全部撤回待办（重试用）。 */
+  listRetractPending(): { name: string; item: RetractPending }[] {
+    const out: { name: string; item: RetractPending }[] = []
+    const prefix = KV.memory.retractPending.prefix
+    for (const key of this.store.keys(KV.memory.retractPending)) {
+      const item = this.store.get(key as Parameters<typeof this.store.get>[0]) as RetractPending | undefined
+      if (item && typeof item === 'object') out.push({ name: key.slice(prefix.length), item })
+    }
+    return out
+  }
+
+  /** 重试成功后清掉该条撤回待办。 */
+  clearRetractPending(name: string): void {
+    this.store.delete(KV.memory.retractPending(name) as Parameters<typeof this.store.delete>[0])
   }
 
   /** 落成本地 md 的计划；`rootDir` 由运行时按 stateDir 给。 */

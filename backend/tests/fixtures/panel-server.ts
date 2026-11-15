@@ -108,6 +108,8 @@ export interface PanelServer {
   opened: string[]
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
+  /** `/state` keys to leave out of the response, to stand in for a host build older than the field. */
+  stateOmit?: string[]
 }
 export let server: PanelServer
 
@@ -157,15 +159,21 @@ function sourceStatuses(): SourceStatusRow[] {
       dropped: server.dropped.filter(item => item.channel.source === kind.kind && item.dropped.at >= dayAgo()) }
   })
 }
-const stateView = (): StateView => ({
-  setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused, isolation: server.settings.executor.isolation,
-  isolationActive: server.settings.executor.isolation === 'sandbox' && server.settings.executor.prepare.trim().length > 0,
-  // The panel does not read health; the service script does.
-  health: {},
-  // 看门狗快照：这份 fixture 不驱动它，给 null（没有告警）。
-  watchdog: null,
-})
+const stateView = (): StateView => {
+  const view: StateView & Record<string, unknown> = {
+    setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
+    masterId: 'master', paused: server.settings.paused, isolation: server.settings.executor.isolation,
+    isolationActive: server.settings.executor.isolation === 'sandbox' && server.settings.executor.prepare.trim().length > 0,
+    // The panel does not read health; the service script does.
+    health: {},
+    // 看门狗快照：这份 fixture 不驱动它，给 null（没有告警）。
+    watchdog: null,
+  }
+  // 宿主构建早于 2364d40 时 `/state` 没有 isolationActive。测试要能重现「宿主没返回」，
+  // 否则只能测到正常响应，测不出面板会不会把缺字段读成 false。
+  for (const key of server.stateOmit ?? []) delete view[key]
+  return view
+}
 const settingsView = (): ApiResponse<'GET settings'> => ({
   policyVersion: 'abcdef1234567890',
   blocks: { policy: { value: server.settings.policy, revision: server.revisions.policy ?? 0 },

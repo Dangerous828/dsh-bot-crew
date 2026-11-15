@@ -107,7 +107,13 @@ export function ConnectionsSettings() {
 
 type Memory = Settings['memory']
 
-/** 记忆中枢设置：中枢地址（空=全本机）与探测超时。只有管理页能改。 */
+/**
+ * 记忆中枢设置：中枢地址（空=全本机）、探测超时，以及**凭据引用**。只有管理页能改。
+ *
+ * 凭据两栏填的都是「去哪儿取」而不是值：`tokenEnv` 是环境变量名，`tokenFile` 是
+ * 0600 凭据文件的绝对路径。这一块会原样出现在 `/state`、设置导出与本页上，
+ * 存明文 token 等于把它同时写进日志、截图与 git diff。
+ */
 export function MemorySettings() {
   const { t } = usePanel()
   const { blocks } = useSettings().settings
@@ -121,13 +127,22 @@ export function MemorySettings() {
         <div className="dt-form dt-block">
           <h2 className="dt-block-title">{t('memoryHubTitle')}<Hint>{t('memoryHubIntro')}</Hint></h2>
           <Field label={t('memoryHubAddress')} hint={t('memoryHubAddressHint')}>
-            <Input className="dt-mono" value={value.hub} placeholder="http://hub.local:8642" spellCheck={false}
+            <Input className="dt-mono" value={value.hub} placeholder="https://hub.example.top/v1" spellCheck={false}
               onChange={event => edit({ hub: event.target.value })} />
           </Field>
           <Field label={t('memoryHubTimeout')} hint={t('memoryHubTimeoutHint')}>
             <Input type="number" min={200} max={10000} value={String(value.timeoutMs)}
               onChange={event => edit({ timeoutMs: Number(event.target.value) })} />
           </Field>
+          <Field label={t('memoryHubTokenEnv')} hint={t('memoryHubTokenEnvHint')}>
+            <Input className="dt-mono" value={value.tokenEnv} placeholder="HUB_TOKEN" spellCheck={false} autoComplete="off"
+              onChange={event => edit({ tokenEnv: event.target.value })} />
+          </Field>
+          <Field label={t('memoryHubTokenFile')} hint={t('memoryHubTokenFileHint')}>
+            <Input className="dt-mono" value={value.tokenFile} placeholder="/Users/you/.config/crew-desktop/hub.env" spellCheck={false}
+              autoComplete="off" onChange={event => edit({ tokenFile: event.target.value })} />
+          </Field>
+          <Hint>{t('memoryHubTokenNote')}</Hint>
         </div>
       </Fields>
       <SaveBar {...draft} onDiscard={draft.discard} />

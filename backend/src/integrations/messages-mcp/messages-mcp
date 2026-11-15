@@ -1,0 +1,17 @@
+#!/bin/bash
+# messages MCP wrapper —— 内部 desktop/mobile 消息 adapter 的稳定可执行入口。
+#
+# 定位：接**真实** `mobileq.db`（不是上一版的本地 JSON 信箱）。工具经 `mobileq` CLI 读写真实队列；
+# 读放行/写审批由宿主 connections.ts + runtime.guardConnection 在 worker 侧判定。
+#
+# 宿主（superagent profile 的 cordis.patch.yml insert 行）这样调：
+#   command: /Users/cpuser/Code/dsh-bot-crew/backend/src/integrations/messages-mcp/messages-mcp
+#   env:
+#     MESSAGES_MCP_DB: /Users/cpuser/.dsh/state/superagent/mobileq.db   # 真实队列（= stateDir/superagent/mobileq.db）
+#
+# 用打包进来的 node（原生剥类型可直接跑 .ts），不依赖 tsx。
+# MESSAGES_MCP_DB 不设时走 CLI 自己的 $DSH_HOME/state/superagent/mobileq.db（与生产同库）。
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE="${MESSAGES_MCP_NODE:-$(command -v node)}"
+exec "$NODE" "$HERE/server.ts" "$@"

@@ -143,7 +143,11 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
+  /**
+   * Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools,
+   * sets its permission preset, and renames it to `title`. The preset is `danger-full-access` by default; only a worker under
+   * an explicit `executor.isolation === 'sandbox'` gets the confining `workspace-write` preset (see the note at the call).
+   */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
@@ -166,7 +170,14 @@ export class Sessions {
     }
     await initializeRoleModel(ctx, result.agent, model)
     await this.decorate(result.agent)
-    ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
+    // 显式 opt-in：只有 `executor.isolation === 'sandbox'` 且这是 worker 会话时，才把 permission preset 从
+    // `danger-full-access` 翻到 confining 的 `workspace-write` —— 这是让 `bash-sandbox` 真正调用
+    // `ctx.sandbox.confine()` 的前提（`danger-full-access` 在 bash-sandbox 里直接 return 不 confine）。
+    // 默认 `none` 保持原样：不静默把任何 worker 从 danger-full 翻走。主会话（router）不受影响。
+    // 配套：worker preset 的 shell 组挂了 backend 的 `WorkerSandboxProvider`（见 cordis.patch.yml），
+    // 该 provider 的 profile 在写白名单之外还 deny 读 `sensitivePaths()`。未挂 provider 时单翻这一档
+    // 只会得到 DSH 自带的「只限写」seatbelt，反而更危险，所以两处必须一起启用。
+    ctx.permissionPresets.set(result.agent.session, role === 'worker' && settings.executor.isolation === 'sandbox' ? 'workspace-write' : 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }

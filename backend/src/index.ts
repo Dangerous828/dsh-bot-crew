@@ -9,7 +9,7 @@ import { createDiscovery } from './app/discovery.ts'
 import { publicEntry } from './app/public-entry.ts'
 import { createP2p } from './app/p2p.ts'
 import { createTunnel } from './app/tunnel.ts'
-import { phoneGate } from './app/phone-gate.ts'
+import { phoneGate, presentedDevice } from './app/phone-gate.ts'
 import { createPairingThrottle } from './app/pairing-throttle.ts'
 import { createChain, parseRelayCandidates, type RelayTarget } from './app/relay-chain.ts'
 import { createHash } from 'node:crypto'
@@ -43,7 +43,10 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     catch { return 'code' as const }
   })()
   const devices = deviceStoreOf(machine.stateDir, pairing)
-  const phone = Object.assign(runtime, { remote: devices })
+  const phone = Object.assign(runtime, { remote: devices,
+    // 手机审批答复：把对 ticket.attention 选项的回答交给与 feishu `approvalReply` 同一套状态机。
+    answer: (ticketId: string, text: string, attentionId: string, actor: string | undefined) =>
+      runtime.answerTicket(ticketId, text, attentionId, actor) })
   // 两条入口共用一个限速实例：分开数等于给同一台机器双倍额度。
   const pairingThrottle = createPairingThrottle()
   registerMobileHttp(ctx, phone)
@@ -68,13 +71,23 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     const value = Array.isArray(raw) ? raw.join(', ') : raw
     return typeof value === 'string' ? { 'x-crew-session': value } : {}
   }
-  const ask = (request: { method: string; url: string; headers?: Record<string, string | string[] | undefined> }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<Response> =>
-    answer(new Request(`http://dsh${request.url}`, {
+  // `principal` 是**入口验过凭据之后**才有的设备号（LAN 的 `presentedDevice`、中转的 `phoneGate`）。
+  // 消息面拿它当「这条请求是哪台设备发的」的唯一依据，绝不读客户端随手带来的 `x-crew-device`：
+  // 那个头谁来都能伪造。内部头 `x-crew-principal` 只由这里注入，并把客户端自带的同名头剔掉，
+  // 保证 handler 看到的 principal 只可能来自这里。
+  const ask = (request: { method: string; url: string; headers?: Record<string, string | string[] | undefined> }, body: string | Uint8Array<ArrayBuffer>, signal?: AbortSignal, principal?: string): Promise<Response> => {
+    const headers: Record<string, string> = sessionHeader(request.headers)
+    if (principal) headers['x-crew-principal'] = principal
+    return answer(new Request(`http://dsh${request.url}`, {
       method: request.method,
-      headers: sessionHeader(request.headers),
+      headers,
       ...(body.length ? { body } : {}),
       ...(signal ? { signal } : {}),
     }))
+  }
+  /** 入口验过的设备号。presentedDevice 只解析不验；验签由 lan-server / phoneGate 在前面做完。 */
+  const principalOf = (headers?: Record<string, string | string[] | undefined>): string | undefined =>
+    headers ? presentedDevice(headers)?.deviceId : undefined
   // 手机换一次网就要重输一次地址，是这套东西最容易卡住人的地方。这里把队伍广播出去，
   // 手机用系统 NSD 就能自己找到它。广播失败只是少一条捷径，手输地址照旧可用。
   /** tailcat 起来之后才有地址，所以广播取的是这个变量而不是一个定值。 */
@@ -90,7 +103,8 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
     devices,
     pairingAllowed: pairingThrottle,
     // 凭据已经验过了，直接交给消息面处理器：它不依赖 Connection，所以这条路上 Connection 那一关不参与。
-    forward: request => ask(request, request.body),
+    // 把**验过的设备号**作为 principal 交下去；配对那一跳还没有设备号（presentedDevice 为空）则不传。
+    forward: request => ask(request, request.body, undefined, principalOf(request.headers)),
   })
   ctx.effect(() => async () => { await lan.close(); await discovery.stop() })
   // 起不来不该挡住整个插件：局域网连不上只是少一条路，本机功能照常。
@@ -177,7 +191,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
         }
         const denied = phoneGate({ pathname, method: request.method, headers: request.headers, devices })
         if (denied) return denied
-        return ask(request, request.rawBody ?? request.body, signal)
+        return ask(request, request.rawBody ?? request.body, signal, principalOf(request.headers))
       },
       onLog: line => ctx.logger.info('%s', line),
     })

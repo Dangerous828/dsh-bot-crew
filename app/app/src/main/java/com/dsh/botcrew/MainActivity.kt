@@ -34,7 +34,9 @@ class MainActivity : ComponentActivity() {
      * 界面这一层与没有这套东西时逐字相同。
      */
     private var debugBridge: DebugBridge? = null
-    private var debugServer: CrewDebugServer? = null
+
+    /** 这一届 Activity 在调试口上的令牌。退场时只摘自己这一份，见 CrewDebugPorts。 */
+    private val debugToken = Any()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,13 +46,14 @@ class MainActivity : ComponentActivity() {
 
         // 调试口：debug 构建默认开，release 永远不开（见 CrewDebug 的注释）。
         // 起不来只记一行日志，界面照常 —— 调试口是外挂，不是界面的一部分。
+        //
+        // 归属按进程算，不按 Activity 算：转屏会重建 Activity，而新的 onCreate 早于旧的 onDestroy，
+        // 「每届各 bind 一次」必然 Address already in use（真机复现三次）。这里只在进程第一次
+        // 进场时开 socket，之后每届只换挂载点。
         val debugOn = CrewDebug.enabled(BuildConfig.DEBUG, CrewDebug.systemProperty(CrewDebug.PROP))
         val bridge = if (debugOn) DebugBridge() else null
         debugBridge = bridge
-        if (bridge != null) {
-            val server = CrewDebugServer(CrewDebug(bridge))
-            if (server.start()) debugServer = server
-        }
+        if (bridge != null) CrewDebugPorts.process.attach(debugToken, bridge)
 
         setContent {
             val palette = if (isSystemInDarkTheme()) DarkPalette else LightPalette
@@ -278,12 +281,13 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 关掉调试口。与桌面端 ctx.Done() 那一路对应：listener 一关，accept 就退出，
-     * abstract socket 随进程一起消失，不留死文件。
+     * 退场：只摘自己这一届的挂载点，**不关 socket**。
+     *
+     * 转屏时新的 onCreate 已经先跑完了，这里关掉就等于把新实例刚接上的口摘掉 ——
+     * 那正是真机上「转屏后空响应到杀进程」的成因。socket 随进程一起消失，不需要谁去 close。
      */
     override fun onDestroy() {
-        debugServer?.stop()
-        debugServer = null
+        if (debugBridge != null) CrewDebugPorts.process.detach(debugToken)
         debugBridge?.screen = null
         debugBridge = null
         super.onDestroy()

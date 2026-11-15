@@ -352,11 +352,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/memory/adapter.ts` | 记忆的格式层：`MemoryRecord` 的形状、按插件 1.3.0 frontmatter 渲染（拒多行 description）、命名空间与落盘路径；不碰数据库，也不内置 Hub 地址 |
 | `src/memory/recall.ts` | recall 的纯函数：中文二元组相关度、按新鲜度加权的排序、只留 `active` 的过滤，以及按 `maxChars` 预算拼段（放不下整条丢掉，绝不截半句） |
 | `src/memory/settle.ts` | settle 的输入端：从人的原话里认得出「定下来的规矩」，从工单收尾的 `ready` / `dropped` 里取出结论；认不出来就不记，每一条都能指回原文 |
-| `src/memory/port.ts` | 记忆端口接口 `MemoryPort`：召回/写账/睡眠期巩固/治理，两个实现（本机版、中枢版）共用一套方法；上层只认接口，按有无中枢选实现 |
+| `src/memory/port.ts` | 记忆端口接口 `MemoryPort`：召回/写账/睡眠期巩固/治理，两个实现（本机版、中枢版）共用一套方法；`ConsolidateResult` 把「真实落账计数」与「中枢合并计划」（`dryRun`/`candidates`/`hubPlan`）分开，不让计划冒充写入 |
 | `src/memory/local.ts` | 本机版记忆端口：正则 settle + 二元组召回 + KV 账本，睡眠期巩固调便宜模型提炼；没中枢或中枢降级时用它 |
-| `src/memory/hub.ts` | 中枢版记忆端口：向量检索与睡眠期巩固走中枢，中枢不可用时降级到本机实现；本机不算 embedding、原始对话不上中枢 |
-| `src/memory/detect.ts` | 记忆中枢探测与降级：按设置里 `memory.hub` 探测 `/health`（带 TTL 缓存），通就用中枢版、不通就本机版；只回答「现在有没有中枢」，不做记忆读写 |
-| `src/memory/hub-client.ts` | 中枢记忆的 HTTP 客户端：按契约 08 调 `POST /memory/search` 与 `/memory/consolidate`，响应按形状校验，坏条目/缺计数不毒化调用方 |
+| `src/memory/hub.ts` | 中枢版记忆端口：召回走向量检索、巩固向中枢要合并**计划**，但账本写入始终是本机那一条路（`dryRun` 不截断本机提炼）；中枢不可用或鉴权被拒时降级本机；本机不算 embedding、原始对话不上中枢 |
+| `src/memory/author.ts` | author md 生命周期镜像：把账本记忆按 dsh-auto-memory frontmatter 落成 local_dream 能搬的 md（仅显式 `toHub:true` 且非敏感才落盘），并把 settle/edit/forget/supersede/evict 同步到 author md 与中枢撤回；`pipelineContent`/`pipelineDigest` 精确复算管道的远端 `dedupe_key`（`sha256(content)[:16]`），供撤回占位旧版本 |
+| `src/memory/hub-retraction.ts` | 记忆撤回的中枢 HTTP 实现：按 canonical `source_file` 反查全部 live 历史版本逐条软删（`DELETE /v1/memories/{id}`，幂等、零行无害），并按已知 digest 调 `POST /v1/memory/retract-tombstone` 原子占位（不传正文、无 live 窗口、conflicts 整请求 409）挡未入库旧 pending |
+| `src/memory/detect.ts` | 记忆中枢探测与降级：按设置里 `memory.hub` 探测 `/health`（带 TTL 缓存 + 单飞，并发调用共用一次探测），通就用中枢版、不通就本机版；鉴权状态与可达性分两个维度（`ReachState` 三态 `up`/`down`/`unknown`），`usable()` 是两者合取；`retarget()` 换整套配置（hub / timeout / 凭据引用）并带配置代数丢弃迟到的旧探测结果，`ensureSettled()` 让「刚保存完配置」的第一次操作等到真实结论；只回答「现在有没有中枢、能不能用」，不做记忆读写 |
+| `src/memory/hub-client.ts` | 中枢记忆的 HTTP 客户端：按契约 08 调 `POST /memory/search` 与 `/memory/consolidate`，带 `X-Hub-Token`（值每次请求现读、不进日志），base 与 timeout 也可传函数以便配置热生效时当场换（不是构造期快照），401/403 单独抛 `HubAuthError`，响应按形状校验，坏条目/缺计数不毒化调用方 |
+| `src/memory/auth.ts` | 中枢凭据的**引用层**：设置里只存「去哪儿取」（环境变量名 / 0600 凭据文件路径），token 值在请求那一刻现读；`HubAuth` 记「被拒 / 就绪 / 无引用」三态并只在状态变化时写日志，`retarget` 换引用时同时作废读到的值与「被拒」结论；`hubHealthOf` 把可达性（`up`/`down`/`unknown`）与鉴权状态一起翻成 `/state.health.memory` 的一行 —— 被拒与**不可达**都是 error，还没探过是 starting，不再有「探测超时降级本机、health 却写 ready」的假成功 |
 | `src/memory/distill.ts` | 睡眠期提炼器：`RuleDistiller` 是规则版默认（零模型、可回查，复用 settle 规则切句提炼），`makeLlmDistiller` 是 LLM 版工厂（给提示词、回 JSON，坏输出返回空不污染账本） |
 | `src/app/memory.ts` | 记忆账本：KV 一族 `memory:entry:`，按 Bot 命名空间和 `dedupe_key` 查重，纠错走 `superseded` 而非硬删，「忘掉」只翻状态 |
 | `src/app/memory-layer.ts` | 记忆层的运行时外壳：上车时召回一小片（超预算整条丢）、收到人话时提炼、一票收尾时记结论，并用 `[memory]` 日志把每次取舍写出来 |
@@ -366,13 +369,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/audit.ts` | 审计账：一票一行地把谁派的、谁判的、谁干的、花了多少编成表，缺的格子写「没有记录」 |
 | `src/app/voice.ts` | 语音输入的壳：认出宿主有没有识别能力、校验录音是不是 WAV 且不过大过长，再把字节交给宿主的 `speechToText`；认不出字与跑不起来分开说 |
 | `src/app/compact-memory.ts` | 压缩产物进账本：宿主折完会话那一段摘要值不值得记、怎么掐到上限、怎么按 compactionId 保持幂等；压缩本身归宿主 |
-| `src/app/push.ts` | 推送投递层：在线直送、离线留件（按到期限长、同 kind 只留最新）、系统推送留了接口但没内置；送不到如实说，绝不把「没配」说成「已送达」 |
-| `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写今天真发生过的数、什么也没发生就不发；早报（`MORNING_HOUR`、`morningDue`、`morningNotice`）的三段口径与当天只说一次的账本 `onceToday` |
+| `src/app/push.ts` | 推送投递层：在线直送、离线留件（按到期限长、同 kind 只留最新）、系统推送留了接口但没内置；送不到如实说，绝不把「没配」说成「已送达」。留件桶经注入的 `NoticeStore` 落库（Runtime 用 `storeNoticeStore` 接项目 `Store`/KV，一桶一键 `KV.notice.pending`）：先写盘成功再回 `queued`、ACK 先持久化再移内存/回 2xx，写盘失败抛出、不假成功；`peek` 不删，仅 TTL 清理同步删盘；HMR/实例重建后从 `KV.notice.pending` 读回未 ACK 的件（只保新链以后入队的，旧进程内存件无来源不假装恢复） |
+| `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写真发生过的数、什么也没发生就不发；早报（`MORNING_HOUR`、`morningDue`、`morningNotice`）的三段口径、当天只说一次的账本 `onceToday`，以及抬头按真实窗口起算的 `windowLabel`（`今日` / `自 M 月 D 日 HH:mm 起` / `上次汇报以来`，不一律说「昨夜」）。两份报告的统计窗口**不由这里现算**：下界是持久化的水位线 `KV.notices.reported`，所以停机错过的那份通知不补发，但下一次真跑到的报告覆盖所有还没报过的窗口 |
 | `src/app/inbox.ts` | 收件箱的「要不要提醒」判定（issue #23）：`judgeMail` 按噪声 → 已处理 → 与我的关系 → 急迫度 的顺序排除邮件列表、自动回复、已回、只被抄送，只留「有时限 / 要决策 / 直接找我」；`mailDedupKey` 归一化 Message-ID 供去重；`scanInbox` 是 Source 骨架，真实接入点只有 `MailPort.fetch` |
 | `src/app/calendar.ts` | 日历的「要不要提醒」判定（issue #23）：`judgeEvent` 判全天、已结束、取消、变更、临期（`SOON_MS` 十五分钟），同一场会一轮只说一句；`eventSignature` 是变更判据；`scanCalendar` 收 `known` / `told` 两本账，真实接入点只有 `CalendarPort.fetch` |
+| `src/app/graph.ts` | 收件箱 / 日历的**真实只读接入**（issue #23 第 1、2 项）：`MicrosoftGraphPort` 一份 token 同时实现 `MailPort`（`fetchMail`：`GET /me/messages` 或 `/users/{upn}/messages` + `$filter receivedDateTime ge`）与 `CalendarPort`（`fetchEvents`：`GET /me/calendarView?startDateTime&endDateTime`），两个 `mail` / `calendar` 只读视图交给 `scanInbox` / `scanCalendar`；`readGraphToken` 只认独立显式 `tokenEnv` / `tokenFile` 引用、值现读不落库（绝不回退 Hub token），`mailOf` / `eventOf` 把 Graph 形状翻成判定层形状（`$select` 只投影元数据，不拉正文）；token 只送官方 Graph 或回环测试服务器、`redirect:'manual'` 不跟随跨 origin 重定向、错误统一 `redactToken` 脱敏 |
+| `src/app/graph-watch.ts` | 收件箱 / 日历监听的运行时接线（issue #23）：`runMailRound` / `runCalendarRound` 各跑一轮「拉→判→推→落账」——**先推后记账**（推送失败不写去重键，下轮重试），游标与去重账本落 `KV.mail` / `KV.calendar`（重启不重报），health 一句话把「未配 / 读失败 / 读过」分开；`todayEvents` 供早报「今日日程」；`configsFromEnv` 从 `GRAPH_TOKEN` / `GRAPH_TOKEN_FILE`（+ `DSH_MAIL_USER` / `DSH_CALENDAR_USER`）读两条配置，没配就零外部请求。不做成 Source 插件（`src/sources` 不许 import `src/app`，且要设备通知不是会话回帖） |
 | `src/app/approval.ts` | 审批三档「做不做」：auto / ask / off 的判定顺序（档位 → 敏感规则 → 额度）、停下来时问什么、认不出的回答一律当「先别做」 |
 | `src/app/quota.ts` | 逐条用量与额度：每条回复的模型与花费、上下文余量（窗口由 provider 公布才有）、最紧那一步的告急；金额余额不在这里算，因为它在会话事件里读不到 |
 | `src/app/connections.ts` | 对外连接（邮箱 / 日历 / 文件）经宿主的 MCP 桥：哪些工具算「读」直接放行、哪些算「写」停下来等人点头、认不出来的按写处理；默认只读，凭据不在这一层 |
+| `src/integrations/messages-mcp/server.ts`, `messages-mcp` | 内部 desktop/mobile 消息 adapter（**真实 `mobileq.db`，非本地 JSON 台架**）：一个 MCP stdio 服务器（JSON-RPC 2.0，`initialize` / `tools/list` / `tools/call`），把工具映射到真实队列——读 `list_channels` / `list_messages` / `get_message`（同 `/api/mobile/timeline` 的合并视图），写 `send_message`（→ `mobileq reply`，落 `replies` 表，server→client，聊天可见、`rkey` UNIQUE 幂等，不写 `messages` 故不触发 worker 自循环）；数据库由 `MESSAGES_MCP_DB` 指定（= `<stateDir>/superagent/mobileq.db`），无默认 JSON 文件；读放行/写审批闸门仍由宿主 `connections.ts` 的 `allowedTools`/`judgeCall` + `runtime.guardConnection` 在 worker 侧做。`messages-mcp` 是可执行入口（`--self-check` 冒烟，可读真实库会话） |
 | `src/app/speech.ts` | 播报：把一句话念成 WAV（系统 `say` + `afconvert`，不出本机）；先剥掉代码块与网址再念、超长截断并说明、没这个声音/转换失败分开说 |
 | `src/app/views/memory.ts` | 记忆这一栏的形状：一条记忆在界面上的一行（含来源与是否上行）、三态 `live` / `empty` / `unavailable`，以及按 Bot 过滤时仍数整本账 |
 | `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes a name, the port, a stateDir fingerprint and, when they exist, two more entries: the public entry as `pub` and the tailcat address as `p2p`, the latter read through a getter on every announce because it arrives late and changes when the network does. Never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
@@ -395,6 +401,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/executor/worker-fs.ts` | worker 文件工具**读面**隔离（#22 补口）：worker preset 的 `fs` 组挂的 `ctx.fs` 装饰器。只覆盖读方法（`stat`/`lstat`/`readText`/`streamText`/`readBytes`/`readByteRange`/`listDir`），把真实文件观察放进固定 helper 子进程（`worker-fs-helper`）在同 `WorkerSandboxProvider` 的 seatbelt profile（写白名单 + 凭据读 deny）内执行，命中内核拒绝即 `FS_SANDBOX_DENIED`；写/改/删原样委托内层全局 fs-sandbox 的 per-call policy fence。**只按真实 per-session 上下文**（`agents.currentInitiator()`）判 mode，缺会话就 fail-closed，不凭 cwd 猜 |
+| `src/executor/worker-fs-helper.mjs` | `WorkerFileSystem` 起的固定 Node helper（纯 JS、tsdown `copy` 原样进 `lib/`）：按 stdin 的 JSON 对绝对路径做一次观察（readText/readBytes/readByteRange/stat/lstat/listDir），路径不进 argv、不拼 shell；内核拒绝 exit 3 不泄内容、不存在 exit 4 |
+| `src/executor/sandbox.ts` | worker 执行隔离档（#22）：把每张票的读写局限在自己的执行目录，档位默认 `none`（不改变默认行为）；只按 per-session 判档、缺会话 fail-closed（见 wb2-worker 的隔离报告） |
+| `src/executor/worker-search-subprocess.ts` | worker `glob`/`grep` 读面隔离（#22 补口）：worker preset 的 file-search 组 isolate `subprocess` 后挂的 `ctx.subprocess` adapter。把打包 ripgrep 的 spawn 包进同 seatbelt profile 内执行（rg 打开敏感文件命中内核拒绝），**不嵌套 sandbox-exec**（与 shell/fs 组是兄弟 scope）；同样只按 per-session 判 mode、缺会话 fail-closed、默认 none 透传 |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -464,8 +474,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-memory-ledger.spec.ts` | 记忆账本落在 SQLite 上：同键幂等、换个名字进同一条、两位 Bot 各自一条、忘掉只翻状态不删行、坏行不拖垮整本账 |
 | `tests/crew-memory-port.spec.ts` | 记忆端口：本机版写账/幂等/忘掉，中枢版第一步委托本机结果一致，本机巩固无提炼器时不假装修理过 |
 | `tests/crew-memory-hub-client.spec.ts` | 中枢 HTTP 客户端：按契约发检索请求并读回条目、5xx 抛错交降级、巩固计数缺项即作废、坏条目被丢掉 |
+| `tests/crew-memory-hub-auth.spec.ts` | 中枢凭据通道：引用解析（环境/文件/键缺失/权限过宽/含空白）、header 与 `/v1` 路径、401/403 归为鉴权错误而 5xx 不算、token 缺失/错/对三态的端口行为、TTL 单飞与换对 token 后自动恢复、`dryRun` 不截断本机真实巩固、token 值不进日志与 health |
 | `tests/crew-memory-distill.spec.ts` | 睡眠期提炼与巩固：规则提炼器只提炼规矩句、同话题去重、LLM 版坏 JSON 返回空、端到端拉日志→提炼→入库、无日志不写 |
 | `tests/crew-memory-detect.spec.ts` | 中枢探测：空地址不探测、可达后 TTL 缓存、探测失败即不可达、工厂选出的端口中枢不可达时走本机 |
+| `tests/crew-memory-lifecycle.spec.ts` | 记忆中枢配置的生命周期（生产验收发现的真实缺陷）：默认探测超时按公网实测取值而非 1500ms、换 hub 地址/超时/凭据引用后立刻生效不用重启、旧探测迟到的结果不覆盖新配置、未配置中枢不报 error、中枢不可达与凭据被拒各有可观察的 health 原因且恢复后回到 ready、同一 TTL 内多次召回只探一次 `/health` |
+| `tests/crew-memory-author.spec.ts` | author md 生命周期镜像：裁定 C 门控（默认不落盘、仅显式 toHub 才写、既有私有记忆不上传）、敏感粗筛（复用 maskSecrets 语义、正常含路径/单词 token 不误伤）、幂等、forget 双保险（md disabled + 原子 tombstone 按 source_file 撤全部 live 版本，conflicts 可观察）、supersede、evict、edit 保留新 digest 撤旧版本、apply 统一生命周期 |
+| `tests/crew-memory-retraction.spec.ts` | 记忆撤回 HTTP 实现：按 source_file live 反查逐条软删（404 幂等、5xx 抛错、分批有上界）、零行无害、keepDigest 保留新版本、原子 retract-tombstone（不传正文、conflicts 409 抛错、existing_live 不擅删） |
 | `tests/crew-memory-view.spec.ts` | 记忆栏：三态不混、active 排前、计数跨页不跳、按 Bot 过滤、坏行只丢一条 |
 | `tests/crew-routine-runner.spec.ts` | 常规任务调度：只派开着的且到点的、逾期久的先派、停机两天后不补跑、没跑过就写「第一次」 |
 | `tests/crew-followup.spec.ts` | 跟进：等人的门槛比在跑的低、长跑不催命、已结束的不追、说不清多久就不提醒、同一件事只算一次 |
@@ -474,13 +488,28 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-voice.spec.ts` | 语音输入的壳：WAV 头校验与时长从头部读、宿主没能力时说没有、非 WAV 不白等、太长不转、「没听出字」与「没跑起来」分开 |
 | `tests/crew-compact-memory.spec.ts` | 压缩进账本：什么摘要值得记、按 compactionId 幂等、超长掐断并说明、太短的不进账本 |
 | `tests/crew-push.spec.ts` | 推送投递层：在线直送不留件、离线留件并如实标 queued、同 kind 只留最新、到期限长与每设备上限、坏设备号与空正文被拒 |
+| `tests/notices-persistence.spec.ts` | 待收留件跨实例重建的持久化：同一 DB 换新 `Store`/新 `PushOutbox` 后 id 与内容仍在、`peek` 重试不删、ACK 后重建确无件、deviceA ACK 不删 B、TTL 过期与 CAP/同 kind 恢复一致、写盘失败 `keep`/`ack`/`deliver` 抛出而非假 queued/假删、空库读空不伪造旧数据 |
+| `tests/notices.spec.ts` | 设备接收链（#23）纯函数：稳定 notice id（入队生成、跨 GET 不变、不泄正文）、peek 不删（崩溃重试不丢件）、ack 只删点名且幂等、跨设备不串件、seen 账本幂等合并与有界 |
 | `tests/crew-notices-out.spec.ts` | 通知内容层：按设备铺开与静音过滤、日报只写发生过的数、什么都没发生就不发、晚上九点才说 |
 | `tests/inbox.spec.ts` | 收件箱判定：直接找我要提醒、newsletter 与自动回复不说、回过的与只被抄送的不说、同一 message-id 第二次不说、旧信进晨报而不弹窗、两次扫描不重复、游标推进 |
 | `tests/calendar.spec.ts` | 日历判定：十五分钟内提醒、进行中说明已开始、已结束与全天不说、改时间改题目都算变更、认识的那场取消才说、一轮只挑最急的一条、同一类不重复 |
-| `tests/notices-morning.spec.ts` | 早报：八点到日报之间才说、三段固定顺序与空段不写、全天日程不给时刻、待处理截断并报余数、与日报共用当天账不重复 |
+| `tests/graph.spec.ts` | Graph 只读端口：token 从引用现读、形状映射（信与会的判定层形状可直接喂 `judgeMail` / `judgeEvent`）、`$filter` / `calendarView` 窗口与上游 `Bearer`、401/403 与网络失败分开、非官方基址拒（只官方 Graph 或回环）、跨 origin 重定向拒绝且不外泄 token、负对照「只给 Hub token 则零请求」 |
+| `tests/graph-watch.spec.ts` | 收件箱 / 日历监听一轮：提醒一条并落去重键与游标、跨轮同信不重推、未配凭据不请求、401 与网络失败分开报、推送失败不记账；日历临期/变更/只对认识的会报取消、一轮不重复；早报今日日程全日在前；`configsFromEnv` 的开关 |
+| `tests/notices-morning.spec.ts` | 早报：八点到日报之间才说、三段固定顺序与空段不写、全天日程不给时刻、待处理截断并报余数、与日报共用当天账不重复、本地日不按 UTC 算、日历读不到不冒充「今天没会」、今天零点只是「从没报过」时的兜底下界、`windowLabel` 三态（今日 / 自 M 月 D 日 HH:mm 起 / 上次汇报以来）且任何窗口都不叫「昨夜」 |
+| `tests/crew-morning.spec.ts` | 早报的运行时接线：tick 里真被调到且排在日报之前、早上八点到日报之间才发、同一天只说一次（含重启后）、待处理与日报共用一本账、日历读不到时如实写、常规任务次数跨重启不归零；报表窗口以持久化水位线为准 —— 整夜/整日不在线时下一份报告覆盖未报窗口（早报没跑时由日报补上）、跨日接续、首次启动不考古、水位跨重启 |
 | `tests/crew-approval.spec.ts` | 审批三档：off 一律问、auto 照做、ask 只停在敏感规则上、额度将尽时先问、判定顺序不会被额度盖掉禁区、三个选项与回答的读法 |
 | `tests/crew-quota.spec.ts` | 逐条用量：路由与花费、只在公布窗口时算余量、输出不占「已用」、超窗不为负、最紧一步决定告急、不知道时不吓人 |
 | `tests/crew-connections.spec.ts` | 对外连接：配了读列表才算读、其余落到写、没配时吃内置白名单、未接入的服务器一律拒、只读开关只影响写、坏条目跳过不拖垮全表 |
+| `tests/issue21-integration-readiness.spec.ts` | #21 就绪探针：重演 `workOnly` 的「连接工具 ∩ 宿主真注册工具」闸门——当前宿主无 messages/shopping 服务器故交集为空=blocked；正向对照读 allow/写 ask；并记录「只声明一半时内置读白名单整批失效、读写两列须显式写全」两条真实配置约束 |
+| `tests/integrations/messages-mcp.spec.ts` | 内部消息 adapter 真实 `mobileq.db` 端到端（**非 JSON 台架**）：真 spawn `messages-mcp/server.ts`，MCP over stdio 走 initialize/tools/list/tools/call，store 是真实临时 `mobileq.db`（真 `tools/mobileq` CLI 灌 canary / 读回）；断言读真实会话、写回复落 `replies` 且出现在会话视图、`rkey` 幂等、写 reply 不新增 `messages`（不触发 worker 自循环）、allowedTools/judgeCall 读 allow·写 ask、拒后 `replies` 不新增 |
+| `tests/integrations/internal-messages-e2e.spec.ts` | 内部消息真实投递链：真 `Outbox`→真 `sendMobile`→真 `tools/mobileq` CLI→真临时 `mobileq.db`，断言队伍回话落 `replies` 表（客户端 timeline 可见那一行）且 receipt 结算 `sent`；source 未启用则停在 outbox、`replies` 不新增（真存储没被写） |
+| `tests/integrations/internal-messages-live-acceptance.spec.ts` | **ticket-bound 真审批**验收（task-11）：真 `Runtime` + 真 `store.tickets`（真 ticket，非顶层 headless）+ 真 `runtime.guardConnection` 判写闸，adapter 为真 stdio 子进程、store 是本 spec 独占临时 canary `mobileq.db`。断言：读放行无 pendingApproval；写 `send_message` 未批准→held 且 ticket.pendingApproval(waiting)、`replies` 零新增；批准同一次→放行→真写 `replies` 净 +1；同参数再调→重问且不再写；改参数→重问零写；拒后→永不放行零写。由 `backend/scripts/verify-internal-messages.sh` 机械驱动并双库前后只读核对生产不变 |
+| `tests/integrations/internal-messages-live-worker.spec.ts` | **真执行器会话**端到端（task-11）：真 DSH `Context`（App bundle 真实 dsh-agent-loop/dsh-tools/dsh-mcp-client 服务类）+ 真 `ScriptedAdapter` 驱动真 AgentLoop turn；真 `dsh-mcp-client` 以 stdio 拉起真 `messages-mcp/server.ts`（store=隔离 canary）；真 `tools.guard` 委托真 `Runtime.guardConnection`。断言：未批准→guard 拦截、工具不派发、canary 零写、pendingApproval(waiting)；经**公开批准入口** `runtime.receive(feishu)`→approved→重跑 turn→真 tools.execute→真 MCP stdio→canary replies **+1** 且正文真实；同参数再调→授权已消费→拒、+0；经**公开拒绝入口** `feishu(先别做)`→stopTicket→零写 |
+| `tests/integrations/internal-messages-executor-auto.spec.ts` | **真执行器自动接线**（task-9 收口）：真 DSH `Context` 挂真 dsh-agent-loop（提供 `agents.setFactory`）+ 真 `dsh-mcp-client` stdio 拉起真 `messages-mcp/server.ts`（store=隔离 canary）；经**项目真组合根** `Runtime`/`Engine`/真 `DshExecutor` 接受流建 worker。断言真 agent factory 在场、4 个 `mcp__messages__*` 真注册、接受出真 ticket、canary `replies` 零写；再走**真 `Runtime.answerTicket`**（带 attentionId+actor）批准→真 guard 放行→真 MCP stdio canary +1。完整 launch→自动重投递现场受本进程内 SessionController 装配限制（spec 显式 print seam），真 `Sessions.ensure` 自动 guard 的孤立证明见下一行 |
+| `tests/integrations/internal-messages-real-executor.spec.ts` | **真 `Sessions.ensure` 自动装 guard**（task-9 收口 · 孤立真宿主）：真 DSH `Context`（真 agents factory + 真 mcp-client stdio→真 messages-mcp，store=隔离 canary）+ 真 `Store/Effects/Prompts/HealthBoard` + 最小真 `sessionController`（`create` 走真 `ctx.agents.create`）。由**项目真实 `Sessions.ensure`** 建 worker，`agent/created → decorate → workOnly` **自动**装 `tools.restrict+guard`（委托真 `guardConnection`），非测试手装。断言：未批准→真 guard 拦、canary 零写、pendingApproval(waiting)；批准→真 guard 放行→真 MCP stdio canary +1 正文真实；再调→授权消费→+0；`先别做`→票结束→+0 |
+| `tests/integrations/internal-messages-executor-runtime.spec.ts` | **真业务效果**（task-9 收口 · lead 裁定）：真 `Runtime`（真 Engine/store/tickets/**真 DshExecutor**/Sessions/effects）+ 最小 SessionController IO adapter（`create` 走真 `ctx.agents.create`）+ 真 `dsh-mcp-client` stdio→真 messages-mcp（隔离 canary）。seed 一张含 pending assignment 的真票 → `runtime.executor.start` → **真 launch** → worker AgentLoop 调 `mcp__messages__send_message` → 真 `workOnly` restrict+guard 拦（未批准/零写/pendingApproval）；**手机 `answerTicket('做吧')` → 真 `executor.deliver` 自动重投递** → 真 guard 放行 → 真 MCP stdio `replies` **+1** 正文真实。无手绑 guard/手调 followup/HTTP 旁路 exec CLI |
+| `tests/worker-isolation.spec.ts` | worker 执行隔离（#22）：provider 在独立子进程按 per-session 档位执行、缺会话 fail-closed、默认 none 透传、错误可观察（见 wb2-worker 隔离报告） |
+| `tests/worker-files.spec.ts` | worker 文件工具读面隔离（#22/task-5）：read/readDir/stat 受约束路径、symlink/TOCTOU 走子进程而非应用层判断、假 HOME canary（见 wb2-worker-files 报告） |
 | `tests/crew-speech.spec.ts` | 播报：剥掉代码与网址再念、没这个声音先说没有、空文本不念、超长截断并说明、转换错误带回原文、失败也收临时目录、WAV 时长从头部读 |
 | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
@@ -538,6 +567,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/environment-credentials.spec.ts` | prepare 沙箱的凭据 deny 覆盖：正对照（workspace 可读写、带空格路径可用）、按载体类别枚举的每条路径被拒（逐条断言 exit 码 + 名单↔canary 双向对齐）、名单外普通文件仍可读、profile 造好时尚不存在的凭据文件之后仍读不到、完整名单下 `worktree add` 仍成功、`.gitconfig` 替换方案 A/B、prepare 调用点真用 `sensitivePaths()` / `prepareVariables()` |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
@@ -548,6 +578,23 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+
+### 验收夹具：真机/真 desktop 的隔离 canary（`scripts/canary-launcher.ts`）
+
+`scripts/canary-launcher.ts`（+ `tsdown.canary.config.ts` + `tsconfig.canary.json`）是**验证夹具，不是产品 API**，不随交付上线，不进 `lib/`。它起一个**完全隔离**的 canary 后端供真机/真桌面走完整 `/api/mobile/answer` 真业务效果：真 `Runtime`（真 Engine/store/tickets/DshExecutor/Sessions）+最小 SessionController IO adapter（`create` 走真 `ctx.agents.create`）+ 真 `dsh-mcp-client` stdio→真 messages-mcp（独立临时 canary DB）+ 独立 `mobilegw`（`MOBILEGW_STATE`/`MOBILEGW_PORT` 显式）。
+
+可复跑（默认独占状态目录 + 独占端口，启动前机械拒绝端口占用、核 canary DB `dev:inode` ≠ 生产库；结束只精确删自己 `mkdtemp` 的目录，不 rm 通配、不杀不明 PID）：
+
+```
+cd backend
+node_modules/.bin/tsdown --config tsdown.canary.config.ts          # 构建到 backend/.canary-build（gitignore）
+tsc -p tsconfig.canary.json --noEmit                                # 夹具自身类型门
+CANARY_BACKEND_PORT=8799 CANARY_GW_PORT=8798 \
+  DSH_NODE_MODULES="<dsh app>/node_modules/@deepseek-ai" \
+  node .canary-build/launcher.js
+```
+
+登录信息（base URL / 配对码 / 预置票号与 attention_id）由启动日志 `===CANARY_READY===` 给出，**只经私聊传给联调方，不写进交付文档、不打包**。夹具产物（`.canary-build/`、运行临时目录、配对凭据）一律不进交付/上线。
 
 ## Persistence
 

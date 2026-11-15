@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="session">work</string>
+    <string name="p2pAddr">tcpGFwWCDQf-oX6qlVXTmtpBA2ZyVLmqKMur7JEZIXYZXhuXM3BGFrWCCDu1YZnpWMVsxo3MsyvKttPPYruMRuLpfE_1QPaoSvcWFxWCACEkVJgQ5T0f231oipQ3f7U8FWFrb_Ts0a0nA8kaB6iGFpGQEw</string>
+    <string name="deviceId">66e74d226c1e38fa</string>
+    <string name="token">KmOXQs6Mqq_iB5MX1F8CqzLasU1MBWzvPKSQyneX6hU</string>
+    <string name="base">http://192.168.31.127:43499</string>
+    <string name="fallbackBase">https://crew.kentonnie.top</string>
+    <string name="crew">0kvcc5t</string>
+</map>

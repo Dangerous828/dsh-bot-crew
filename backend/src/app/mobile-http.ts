@@ -9,6 +9,7 @@ import { SettingsConflict } from './settings.ts'
 import type { Settings } from '../policy.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
+import type { NoticeDelivery } from './push.ts'
 import { agentTree, switchModel, workOf } from './work.ts'
 import type { ScreenSnapshot } from './screen.ts'
 import type { OutputsTicket, OutputsView } from './outputs.ts'
@@ -64,14 +65,32 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   /** 语音：把一段 WAV 转成文字。宿主没有识别能力时如实回 `available: false`。 */
   transcribe?: (audio: Uint8Array, signal: AbortSignal) => Promise<Transcript>
   forgetMemory?: (name: string) => boolean
-  editMemory?: (name: string, patch: { description?: string; body?: string; importance?: number }) => boolean
+  editMemory?: (name: string, patch: { description?: string; body?: string; importance?: number; toHub?: boolean }) => boolean
   /** 插队：把排队中的话交给正在跑的 worker（下一步边界读）。 */
   steer?: (ticketId: string, requestId: string, text: string) => Promise<boolean>
+  /**
+   * 审批答复（手机这条通道用现有 source 消息完成连接写审批，不必造第二个审批 UI）：
+   * 把对 `ticket.attention` 选项的回答（`做吧`/`先别做`）交给与 feishu `approvalReply` 同一套状态机。
+   * `attentionId` 是客户端看到的那张问题卡 id：与当前 `ticket.attention.id` 不符（旧卡批新请求）→ 宿主回 409 零变更。
+   * `actor` 是入口验过的设备 principal（不信 body），只用于审计。
+   * 认不出、票不匹配、不在等审批都如实回 `{ ok: false, reason }`，绝不猜、绝不动。
+   */
+  answer?: (ticketId: string, text: string, attentionId: string, actor: string | undefined) =>
+    { ok: true; answer: 'go' | 'stop' | 'revise' } | { ok: false; reason: string }
   /** 一条模型路由支持哪些推理档位；不支持的宿主可以不给。 */
   efforts?: (provider: string, model: string) => Promise<{ efforts: { id: string; name: string; description?: string }[]; default?: string }>
   /** 工单控制：停下一张票，以及全局暂停。真实 Runtime 两个都有；测试里的假宿主可以只给需要的那个。 */
   engine?: Pick<HttpHost['engine'], 'stopTicket' | 'retryTicket'>
-  settings?: Pick<HttpHost['settings'], 'pause' | 'save'> }
+  settings?: Pick<HttpHost['settings'], 'pause' | 'save'>
+  /**
+   * 设备接收链（#23）：GET peek 这台设备还欠哪些（不删），POST ack 已持久化的 id（只删点名的那几条），
+   * POST 的 seen_ids 另记账（device-persisted，非人眼读过）。宿主没接时如实说读不到。
+   */
+  pendingNotices?: (deviceId: string) => NoticeDelivery[]
+  ackNotices?: (deviceId: string, ids: readonly string[]) => number
+  noticeSeen?: (deviceId: string) => string[]
+  markNoticeSeen?: (deviceId: string, ids: readonly string[]) => string[]
+}
 /**
  * 手机看得懂的那句人话。
  *
@@ -346,6 +365,17 @@ function gatewayOrigin(stateDir?: string): string {
 const DEFAULT_SESSION_ID = 'main'
 /** header 形态的会话字段，与网关 SESSION_HEADER、桌面端 sessionHeader 同一字面值。 */
 const SESSION_HEADER = 'x-crew-session'
+/**
+ * 已认证设备号的内部头：只由入口（lan-server/中转的 phoneGate 验过凭据之后，index 的 `ask`）注入。
+ * 消息面**只认这个头**当「是哪台设备」，绝不读客户端随手带的 `x-crew-device` —— 后者任何调用者都能伪造。
+ * 空串/缺席都当作「没有被认证的设备」：接收链一律拒，不猜。
+ */
+const PRINCIPAL_HEADER = 'x-crew-principal'
+/** 从内部头取已认证设备号；形状不合格就当没有（不把畸形值送到 push 层）。 */
+const principalOf = (request: Request): string | undefined => {
+  const value = request.headers.get(PRINCIPAL_HEADER)?.trim()
+  return value && /^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$/.test(value) ? value : undefined
+}
 /** 会话名形状（S1 契约第 1 节）。消息面校验与 threadKey 共用这一段，改形状只改一处。 */
 const SESSION_NAME = '[a-z0-9][a-z0-9-]{0,31}'
 const SESSION_ID = new RegExp(`^${SESSION_NAME}$`)
@@ -467,6 +497,11 @@ const OPERATIONS = {
   bots: { methods: ['GET', 'POST'] },
   // 会话名单：GET 列出、POST 登记。两条 exact route 都在宿主侧直接答，不转发到网关。
   sessions: { methods: ['GET', 'POST'] },
+  // 设备接收链（#23）：GET 看欠哪些（peek，不删）、POST ack 已持久化的 id + 记 seen。都在宿主侧答。
+  notices: { methods: ['GET', 'POST'] },
+  // 审批答复：手机把「做吧/先别做」这类对 ticket.attention 选项的回答交给宿主，走与 feishu
+  // `approvalReply` 同一套审批状态机（见 runtime.answerTicket）。宿主侧直答，不转发网关。
+  answer: { methods: ['POST'] },
 } as const
 type Operation = keyof typeof OPERATIONS
 
@@ -556,6 +591,37 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       return reply(200, { id, sessions: sessionIds(runtime.store),
         default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
     }
+    // 设备接收链（#23）：宿主侧直接答，不转发网关。设备号只认入口验过凭据后注入的内部 principal 头，
+    // 不信客户端 x-crew-device。GET=peek（不删），POST=ack（只删点名）+ 记 seen（device-persisted）。
+    if (operation === 'notices') {
+      await runtime.ready
+      const deviceId = principalOf(incoming)
+      // 没有被认证的设备：拒。既不跨设备取件，也不替它猜一个设备号。
+      if (!deviceId) return reply(401, { error: 'Not paired' })
+      if (incoming.method === 'GET') {
+        const readNotices = runtime.pendingNotices?.bind(runtime)
+        if (!readNotices) return reply(200, { items: [], counts: { pending: 0, seen: 0 }, state: 'unavailable', reason: '后端还没有接入设备接收链' })
+        let items: NoticeDelivery[]
+        try { items = readNotices(deviceId) } catch { items = [] }
+        const seen = runtime.noticeSeen?.(deviceId)?.length ?? 0
+        return reply(200, { device: deviceId, items, counts: { pending: items.length, seen } })
+      }
+      // POST：body { ack_ids?: string[], seen_ids?: string[] }。ack 只删点名、seen 幂等并入账本，两件都做。
+      const raw = await incoming.text()
+      if (Buffer.byteLength(raw) > 64 * 1024) return reply(413, { error: 'Request too large' })
+      const asked = askedBody(raw)
+      if (!asked) return reply(400, { error: 'Invalid JSON' })
+      const ids = (value: unknown): string[] => Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string' && item.length > 0 && item.length <= 64).slice(0, 200)
+        : []
+      const ackIds = ids(asked.ack_ids)
+      const seenIds = ids(asked.seen_ids)
+      let removed = 0
+      try { removed = runtime.ackNotices?.(deviceId, ackIds) ?? 0 } catch { removed = 0 }
+      let seen: string[] = []
+      try { seen = runtime.markNoticeSeen?.(deviceId, seenIds.length ? seenIds : ackIds) ?? [] } catch { seen = [] }
+      return reply(200, { ok: true, device: deviceId, acked: removed, seen: seen.length })
+    }
     // A work or agent lookup without a ticket would ask the gateway to guess; refuse it here instead.
     const ticketId = url.searchParams.get('ticket') ?? ''
     if ('needsTicket' in OPERATIONS[operation] && !ticketId) return reply(400, { error: 'ticket is required' })
@@ -587,6 +653,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (Buffer.byteLength(body) > 8 * 1024) return reply(413, { error: 'Pairing request too large' })
     }
     if (operation === 'steer') body = await incoming.text()
+    if (operation === 'answer') body = await incoming.text()
     if (operation === 'takeover' || operation === 'pause' || operation === 'resume' || operation === 'read' || (operation === 'bots' && incoming.method === 'POST') || (operation === 'routines' && incoming.method === 'POST')) {
       // 控制请求与花名册只带几个短字段，和配对请求同量级。
       body = await incoming.text()
@@ -598,6 +665,25 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       if (!runtime.engine?.retryTicket) return reply(503, { error: 'Ticket control is unavailable' })
       try { runtime.engine.retryTicket(ticketId) } catch { return reply(409, { error: 'Ticket cannot be retried' }) }
       return reply(200, { ok: true, retried: true })
+    }
+    // 审批答复：把「做吧/先别做」交给宿主侧的审批状态机（与 feishu `approvalReply` 同源）。
+    // 票号从 body 里显式点名（手机一条 timeline 能看到多张票，不能像 feishu 那样靠「唯一一个待答」）。
+    if (operation === 'answer') {
+      if (!runtime.answer) return reply(503, { error: 'Answering is unavailable' })
+      const asked = askedBody(body)
+      if (!asked) return reply(400, { error: 'Invalid JSON' })
+      const id = typeof asked.ticket === 'string' ? asked.ticket.trim() : ''
+      const said = typeof asked.text === 'string' ? asked.text.trim() : ''
+      const attentionId = typeof asked.attention_id === 'string' ? asked.attention_id.trim()
+        : typeof asked.attentionId === 'string' ? asked.attentionId.trim() : ''
+      if (!id) return reply(400, { error: 'ticket is required' })
+      if (!said) return reply(400, { error: 'text is required' })
+      if (!attentionId) return reply(400, { error: 'attention_id is required' })
+      // actor 只来自入口验过的内置 principal（index.ts 注入 x-crew-principal），绝不读 body 里的自报身份。
+      const actor = principalOf(incoming)
+      const result = runtime.answer(id, said, attentionId, actor)
+      return result.ok ? reply(200, { ok: true, answer: result.answer, ticket: id, attention_id: attentionId })
+        : reply(409, { error: result.reason })
     }
     if (operation === 'send') {
       body = await incoming.text()
@@ -736,7 +822,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         }
         const raw = await incoming.text()
         if (Buffer.byteLength(raw) > 32 * 1024) return reply(413, { error: 'Request too large' })
-        let value: { action?: unknown; name?: unknown; description?: unknown; body?: unknown; importance?: unknown }
+        let value: { action?: unknown; name?: unknown; description?: unknown; body?: unknown; importance?: unknown; toHub?: unknown }
         try { value = JSON.parse(raw) } catch { return reply(400, { error: 'Invalid JSON' }) }
         const target = typeof value?.name === 'string' ? value.name.trim() : ''
         if (!target) return reply(400, { error: 'name is required' })
@@ -750,10 +836,12 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         if (value.action === 'edit') {
           const edit = runtime.editMemory?.bind(runtime)
           if (!edit) return reply(200, { ok: false, reason: '后端还没有接入记忆' })
-          const patch: { description?: string; body?: string; importance?: number } = {}
+          const patch: { description?: string; body?: string; importance?: number; toHub?: boolean } = {}
           if (typeof value.description === 'string') patch.description = value.description
           if (typeof value.body === 'string') patch.body = value.body
           if (typeof value.importance === 'number') patch.importance = value.importance
+          // 裁定 C：显式分享开关只经此产品 edit 入口设置（默认 false，不自动分享）。
+          if (typeof value.toHub === 'boolean') patch.toHub = value.toHub
           try { return reply(200, { ok: edit(target, patch), name: target }) }
           catch (error) { return reply(400, { error: error instanceof Error ? error.message : 'Invalid memory' }) }
         }
@@ -1162,6 +1250,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}),
             // 问题和选项成对下发，见 docs/00-contract §5：没有 options 就是只有一个自写框。
             ...(asking ? { question: ticket.attention!.question,
+              // 问题卡 id：客户端答 `/answer` 时原样带回，防「旧卡批新请求」（见 §3）。
+              attention_id: ticket.attention!.id,
               ...ticket.attention!.options?.length ? { options: ticket.attention!.options } : {} } : {}) }
         }),
         // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
@@ -1325,6 +1415,11 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       // 宿主侧直接答，不转发到网关。
       connection.fetch.register({ path: '/api/mobile/sessions', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
       connection.fetch.register({ path: '/api/mobile/sessions', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // 设备接收链（#23）：GET peek 还欠哪些、POST ack 已持久化 + 记 seen。宿主侧直接答，不转发网关。
+      connection.fetch.register({ path: '/api/mobile/notices', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // 审批答复：把「做吧/先别做」交给与 feishu `approvalReply` 同源的审批状态机。宿主侧直答，不转发网关。
+      connection.fetch.register({ path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
     ]
     child.effect(() => async () => { await Promise.all(disposers.map(dispose => dispose())) })
   })

@@ -2370,3 +2370,25 @@ it('passes executor.repositories into the sandboxed prepare command\'s writable 
   expect(profile).toContain('(allow network-outbound)')
   expect(profile).not.toContain('(allow network*)')
 })
+
+// #26：prepare 的 deny 名单必须真的按载体类别进 profile。
+// 上一版只 deny 五条（`.ssh`/`.config`/`.aws`/`.gnupg`/`.docker`），`.git-credentials`、`.kube`、
+// `.azure`、shell 历史等在 prepare 沙箱里读得到。这条钉住「profile 里有这些路径」这件事本身，
+// 不依赖操作者本机是否恰好存在这些文件（路径不存在也进 profile，见 realSubpath 的注释）。
+it('puts every credential carrier in the prepare profile, not just the five directories', async () => {
+  const { sandboxAvailable, sensitivePaths } = await import('../src/infra/environment.ts')
+  if (!sandboxAvailable()) { expect(true).toBe(true); return }
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor,
+    isolation: 'sandbox', prepare: 'true' } })
+  subprocess.spawn.mockClear()
+  await acceptedTicket(feishu('iso3', '@bot 隔离准备 凭据'))
+  const specs = subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[] })
+  const profile = specs.find(spec => spec.argv[0] === '/usr/bin/sandbox-exec')!.argv[2]!
+  const denied = [...profile.matchAll(/\(deny file-read\* \(subpath "([^"]+)"\)\)/g)].map(match => match[1]!)
+  // 名单里的每一条都要在 profile 里（sensitivePaths 已经做过 realpath，profile 里也是同一形态）。
+  for (const path of sensitivePaths()) expect(denied, path).toContain(path)
+  // 抽查几条曾经可读的载体，按名字钉住，避免整张表被悄悄删短。
+  for (const name of ['.git-credentials', '.gitconfig', '.netrc', '.kube', '.azure', '.npmrc', '.zsh_history', '.bash_history']) {
+    expect(denied.some(path => path.endsWith(`/${name}`)), name).toBe(true)
+  }
+})

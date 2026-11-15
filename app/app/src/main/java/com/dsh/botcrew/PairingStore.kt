@@ -9,7 +9,7 @@ import android.content.Context
  * 放在应用私有目录里已经够了，不需要再叠一层加密（那会引出一个要自己保管的密钥）。
  */
 class PairingStore(context: Context) {
-    private val store = context.getSharedPreferences("crew-pairing", Context.MODE_PRIVATE)
+    private val store = context.getSharedPreferences(PairingRecord.PAIRING_PREFS, Context.MODE_PRIVATE)
 
     fun load(): PairedCrew? {
         val saved = stored()
@@ -60,12 +60,67 @@ class PairingStore(context: Context) {
 }
 
 /**
+ * 「附近设备权限问过没有」。**跨 composable 生命周期、跨进程重启**成立（#34）。
+ *
+ * ## 为什么它是独立的一层，而不是 [PairingStore] 里的一格
+ *
+ * 真机上那个 bug 的机制是：判据存在 composable 级 `rememberSaveable` 里，从队伍页点
+ * 「重新配对」时 `PairingScreen` 重新进场、那一格不恢复，于是又弹一次系统框
+ * （18:14 拒绝、18:21 重进又弹）。把判据落盘就够了吗？不够 —— 落进**配对记录那个文件**
+ * 一样会被抹掉：`PairingStore.save()` 是「先 clear 再写」，而 `clear()` 抹的是整个文件、
+ * **不看键名**。一次 mDNS 广播刷新（`refresh` → `save`）就会把「问过」抹回「没问过」。
+ *
+ * 所以隔离不能靠「键名不撞」这种约定，得靠**所有权**：这一格归 [PermissionStore]，
+ * [PairingStore] 根本不认识它，两个类各开各的文件。谁想把它挪回去，就得先改构造、再删类 ——
+ * 那是一次看得见的改动。
+ *
+ * ## 为什么判定与读写分成两半
+ *
+ * SharedPreferences 在 JVM 单测里跑不了，而这一格出错的表现是「每次重新配对都弹一次框」，
+ * 必须能测。所以「盘上那份 map → 问过没有」是 [PermissionRecord] 的纯函数，读写在 [PermissionStore]。
+ */
+class PermissionStore(context: Context) {
+    /** 与 `crew-pairing` 是不同的文件。见类注释：save() 的 clear 不看键名。 */
+    private val store = context.getSharedPreferences(PERMISSION_PREFS, Context.MODE_PRIVATE)
+
+    fun asked(): Boolean = PermissionRecord.asked(store.all)
+
+    /**
+     * 记下「问过了」。在**弹框那一刻**就写，不等回调：进程在弹框期间被杀，
+     * 下次进来也不该再问一遍。
+     */
+    fun markAsked() {
+        val editor = store.edit()
+        for ((key, value) in PermissionRecord.write()) editor.putBoolean(key, value)
+        editor.apply()
+    }
+
+    companion object {
+        /** 「问过没有」那个 prefs 文件。与 [PairingRecord.PAIRING_PREFS] 必须不同名。 */
+        const val PERMISSION_PREFS = "crew-permission"
+    }
+}
+
+/** 盘上那一格与「问过没有」之间的搬运。缺键 / 坏值一律当没问过：宁可多问一次。 */
+object PermissionRecord {
+    /** 只表示「问过一次」，不表示「给了」：给没给永远以 checkSelfPermission 为准。 */
+    const val ASKED = "askedNearby"
+
+    fun asked(values: Map<String, Any?>): Boolean = values[ASKED] as? Boolean ?: false
+
+    fun write(): Map<String, Boolean> = mapOf(ASKED to true)
+}
+
+/**
  * 盘上那几格与 [PairedCrew] 之间的搬运。
  *
  * 单独抽出来是因为 SharedPreferences 在 JVM 单测里跑不了，而这层映射必须被测到：
  * 少读一格不会报错，只会表现为「每次启动都当成没配过」，或者某个入口静默消失。
  */
 object PairingRecord {
+    /** 配对记录那个 prefs 文件。`PairingStore.save()` 会 clear 它，所以别的状态不许住这儿。 */
+    const val PAIRING_PREFS = "crew-pairing"
+
     const val DEVICE = "deviceId"
     const val TOKEN = "token"
     const val BASE = "base"

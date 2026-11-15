@@ -92,11 +92,25 @@ const TEXT = {
   executingLabel: ['执行中', 'Executing'],
   queuedLabel: ['排队', 'Queued'],
   // 隔离档位（#11 第 3 项）。文案按 ADR 0004 如实说边界，不许把 sandbox 说成「已全覆盖」：
-  // 它只包住本仓 runAsWorker 调用，agent 自由命令仍依赖 DSH provider。
+  // 沙箱只包住本仓 `runAsWorker` 的调用点，当前唯一处是 prepare；agent 在会话里跑的自由命令
+  // 由 DSH subprocess provider 起、被钉死 `danger-full-access`，**worker 未覆盖**（#17 / #22）。
+  // 旧措辞「仅 worker 执行面」把未覆盖的 worker 说成覆盖范围，是事实错误，已改。
+  // 档位（配了哪一档）与生效状态分开：`isolation=sandbox` + 空 prepare 时 prepare 一行都没进沙箱（#17），
+  // 只报档位会让人以为开着。宿主没返回 `isolationActive` 时是「未知」，不是「没生效」。
   isolationLabel: ['隔离', 'Isolation'],
   'isolation.none': ['未隔离 · 沿用本机账号', 'None · runs as your OS user'],
-  'isolation.sandbox': ['平台沙箱 · 仅 worker 执行面', 'Platform sandbox · worker commands only'],
-  isolationHint: ['只隔离 worker 执行面；agent 自由命令仍依赖 DSH 宿主，接真账号前先确认这条边界。', 'Only the worker execution face is sandboxed; free-form agent commands still depend on the DSH host. Confirm this boundary before connecting real accounts.'],
+  'isolation.sandbox': ['平台沙箱 · 仅 prepare 阶段', 'Platform sandbox · prepare stage only'],
+  'isolation.active': ['prepare 已生效', 'prepare in effect'],
+  'isolation.inactive': ['未生效', 'not in effect'],
+  'isolation.unknown': ['生效状态未知', 'effect unknown'],
+  isolationNoneHint: ['未隔离：worker 子进程沿用本机账号，读得到你的凭据。',
+    'Not isolated: worker processes run as your OS user and can read your credentials.'],
+  isolationHint: ['沙箱只覆盖 prepare 阶段；worker 未覆盖 —— agent 在会话里跑的命令由 DSH 宿主直接起、不带沙箱，仍读得到你的凭据。接真账号前先确认这条边界。',
+    'The sandbox covers the prepare stage only; the worker is not covered — commands an agent runs in its session start from the DSH host without a sandbox and can still read your credentials. Confirm this boundary before connecting real accounts.'],
+  isolationInactiveHint: ['档位配了 sandbox，但 prepare 为空：本仓的隔离缝在 prepare 里，没有 prepare 就一行都没进沙箱。worker 本来就未覆盖，此时等于完全没隔离，仍读得到凭据。填上 prepare 才会生效。',
+    'The sandbox level is configured, but prepare is empty: this repo isolates inside prepare, so nothing runs sandboxed. The worker was never covered either, so nothing is isolated at all and your credentials stay readable. Fill in prepare to make it take effect.'],
+  isolationUnknownHint: ['宿主没返回生效状态（isolationActive），这个构建可能早于 2364d40。配了 sandbox 也不代表 prepare 真进了沙箱，按未知处理；worker 无论如何都未覆盖。',
+    'The host did not report whether the level is in effect (isolationActive); this build may predate 2364d40. A configured sandbox does not mean prepare actually ran sandboxed, so read it as unknown; the worker is not covered either way.'],
   resumeProcessing: ['恢复处理', 'Resume processing'],
   resumeProcessingConfirm: ['恢复后继续评估、派工和发送回复。', 'Resuming starts Evals, Assignments and replies again.'],
   restartInterrupts: ['保存会重启 dsh-superagent：{count} 个进行中的派工会中断，并带恢复说明重新开始。', 'Saving restarts dsh-superagent: {count} running Assignments stop and start again with a recovery note.'],
@@ -372,9 +386,14 @@ const TEXT = {
   memoryHubTitle: ['记忆中枢', 'Memory hub'],
   memoryHubIntro: ['有中枢就把向量检索和睡眠期巩固交给它；留空则全部在本机完成。原始对话不上中枢，只上行筛选过的稳定事实。', 'With a hub, vector search and overnight consolidation run there; leave it empty to keep everything on this machine. Raw conversations are not uploaded, only the durable facts that were filtered.'],
   memoryHubAddress: ['中枢地址', 'Hub address'],
-  memoryHubAddressHint: ['记忆中枢 API 基址，例如 http://hub.local:8642；留空=没有中枢，全部本机。', 'Base URL of the memory hub API, e.g. http://hub.local:8642; empty = no hub, everything stays local.'],
+  memoryHubAddressHint: ['记忆中枢 API 基址，含 /v1（探测打 base + /health），例如 https://hub.example.top/v1；留空=没有中枢，全部本机。', 'Base URL of the memory hub API, including /v1 (the probe requests base + /health), e.g. https://hub.example.top/v1; empty = no hub, everything stays local.'],
   memoryHubTimeout: ['探测超时 / 毫秒', 'Probe timeout (ms)'],
   memoryHubTimeoutHint: ['连不上中枢就当没有，几秒内降级本机，不阻塞开工。', 'If the hub cannot be reached, fall back to local within this budget; never blocks starting work.'],
+  memoryHubTokenEnv: ['凭据：环境变量名', 'Credential: environment variable'],
+  memoryHubTokenEnvHint: ['只填变量名（例如 HUB_TOKEN），不填值。请求时现读；token 不进设置、不进 /state、不进日志。与下一项同时填时，从那个文件里取这个键。', 'The variable NAME only (e.g. HUB_TOKEN), never the value. Read at request time; the token never enters settings, /state, or logs. When the file below is also set, this key is read from that file.'],
+  memoryHubTokenFile: ['凭据：文件路径', 'Credential: file path'],
+  memoryHubTokenFileHint: ['绝对路径，应为 0600；只填路径时整份内容就是 token。优先用环境变量，留空则只看环境。', 'Absolute path, should be 0600; when it is the only one set, the whole file is the token. The environment variable wins; leave this empty to read only the environment.'],
+  memoryHubTokenNote: ['凭据只存「去哪儿取」，不存值：这一块会出现在 /state、设置导出与页面上，明文 token 落在那里等于同时进了日志、截图与 git diff。', 'Only the reference is stored, never the value: this block shows up in /state, settings exports and this page, so a plaintext token here would also land in logs, screenshots and git diffs.'],
   'userError.panelOnlyMemory': ['记忆中枢地址只能在管理页修改。', USER_ERRORS.panelOnlyMemory[1]],
   assignmentReportShort: ['报告：{state}', 'Report: {state}'],
   assignmentSpan: ['{from} → {to}', '{from} → {to}'],

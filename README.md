@@ -25,6 +25,13 @@ Gate 判谁能派活、Eval 判该不该开工、Mandate 留不可变授权、Ti
 
 ## 文档
 
+> **当前开发现状唯一入口**：
+> - [`开发进度.md`](开发进度.md) —— 开发进度的**唯一事实来源**，先读它再动手；每批工作落地后同一次提交里更新。
+>
+> 历史参考（非现行口径）：[`docs/review/2026-11-15-completeness-assessment.md`](docs/review/2026-11-15-completeness-assessment.md) 是 `feat/four-blocks @ b2f305e` 时点的静态评估快照（其 `206`/`1927` 等数字为该时点口径，非最新源码断言）。
+>
+> 根目录的 `HANDOFF.md`、`HANDOFF-NEXT.md`、`交接-剩余五项-20261110.md` 是**历史交接**（2026-11-10 ~ 11-12 写成，部分已过时），留作档案，不进现行口径；三者的定位见 [`docs/review/README.md`](docs/review/README.md) 的归档索引。
+
 | 路径 | 是什么 |
 | --- | --- |
 | `GLOSSARY.md` | 这个仓库里每个词的意思，只在这里定义 |

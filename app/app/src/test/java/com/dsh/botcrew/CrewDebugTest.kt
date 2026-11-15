@@ -67,6 +67,16 @@ class CrewDebugTest {
             calls += "mode.set:$mode"
             return DebugReply.ok(JSONObject().put("mode", mode))
         }
+
+        override fun pause(ticketId: String?): DebugReply {
+            calls += "pause:${ticketId ?: "<global>"}"
+            return DebugReply.ok(JSONObject().put("requested", "pause"))
+        }
+
+        override fun resume(): DebugReply {
+            calls += "resume"
+            return DebugReply.ok(JSONObject().put("requested", "resume"))
+        }
     }
 
     private fun bus(target: CrewDebugTarget = FakeTarget()) = CrewDebug(target)
@@ -129,7 +139,10 @@ class CrewDebugTest {
         val names = reply.result!!.getJSONArray("actions")
         val got = (0 until names.length()).map { names.getString(it) }
         assertEquals(
-            listOf("actions.list", "mode.set", "refresh", "send", "session.list", "session.reload", "session.set", "state.dump", "tab.set"),
+            listOf(
+                "actions.list", "mode.set", "pause", "refresh", "resume", "send",
+                "session.list", "session.reload", "session.set", "state.dump", "tab.set",
+            ),
             got,
         )
     }
@@ -192,11 +205,13 @@ class CrewDebugTest {
             onSend = { _, _ -> },
             onTab = {},
             onMode = {},
+            onSetPaused = { _, _ -> },
+            pauseResult = { null },
         )
         val snap = screen.snapshot()
         for (key in listOf(
             "session", "capability", "switchable", "defaultSession", "note", "error",
-            "sessions", "cached", "tab", "mode", "paused", "problem", "draft", "sending",
+            "sessions", "cached", "tab", "mode", "paused", "pauseResult", "problem", "draft", "sending",
             "entries", "entry", "p2p", "timeline",
         )) {
             assertTrue("快照缺字段：$key", snap.has(key))
@@ -251,6 +266,8 @@ class CrewDebugTest {
             onSend = { _, _ -> },
             onTab = {},
             onMode = {},
+            onSetPaused = { _, _ -> },
+            pauseResult = { null },
         ).snapshot()
         val timeline = snap.getJSONObject("timeline")
         assertTrue(timeline.getBoolean("loaded"))
@@ -284,6 +301,7 @@ class CrewDebugTest {
             entries = { emptyList() }, currentEntry = { "" },
             onRefresh = {}, onEnterSession = {}, onSend = { _, _ -> }, onTab = {}, onMode = {},
             onReloadSessions = {},
+            onSetPaused = { _, _ -> }, pauseResult = { null },
         ).snapshot()
         assertTrue("problem 没说清时是 null", snap.isNull("problem"))
         val timeline = snap.getJSONObject("timeline")
@@ -326,6 +344,82 @@ class CrewDebugTest {
         // 空串与全空格都不算给了值 —— 与桌面端 argString 同一口径。
         assertFalse(bus().invoke("session.set", JSONObject().put("session", "   ")).ok)
         assertFalse(bus().invoke("send", JSONObject().put("text", "")).ok)
+    }
+
+    // ── 停一下 / 继续执行：与按钮同一条路 ──────────────────────────────────
+
+    /**
+     * 调试口按「停一下」，必须落到界面按一下会调的同一个函数上。
+     *
+     * 这一条挡的是「调试口自己造一个替身」：替身能让脚本全绿，而真按钮根本没接上。
+     * 判据是目标的账上出现了 pause，且带上了按钮会带的那个票号。
+     */
+    @Test
+    fun pauseReachesTheSameFunctionTheButtonCalls() {
+        val target = FakeTarget()
+        val reply = bus(target).invoke("pause", JSONObject().put("ticket", "t-9"))
+        assertTrue(reply.ok)
+        assertEquals(listOf("pause:t-9"), target.calls)
+    }
+
+    @Test
+    fun pauseWithoutATicketIsTheGlobalPauseTheButtonUsesWhenNothingIsRunning() {
+        // 按钮在「它手上没有在跑的票」时就是这么调的：不带票号，后端如实回 executor 作用域。
+        val target = FakeTarget()
+        assertTrue(bus(target).invoke("pause", JSONObject()).ok)
+        assertEquals(listOf("pause:<global>"), target.calls)
+    }
+
+    @Test
+    fun resumeTakesTheSameRoadInTheOtherDirection() {
+        val target = FakeTarget()
+        assertTrue(bus(target).invoke("resume", JSONObject()).ok)
+        assertEquals(listOf("resume"), target.calls)
+    }
+
+    /**
+     * 回执说「已发出」，不是「已成功」。
+     *
+     * 真正的成没成由 snapshot 的 paused 位表达（那一们只在 HTTP 成功后翻）。
+     * 这里钉住的是「动作层不假报成功」：即使 setPaused 会抛错，pause 这一条也照旧只回
+     * requested —— 脚本因此必须去读 paused，而不是拿这条 ok 当结论。
+     */
+    @Test
+    fun pauseReportsWhatItAskedForNotThatItSucceeded() {
+        val reply = bus().invoke("pause", JSONObject().put("ticket", "t-1"))
+        assertTrue(reply.ok)
+        assertEquals("pause", reply.result!!.getString("requested"))
+        assertFalse("回执里不许出现「已成功」这类字段", reply.result!!.has("paused"))
+    }
+
+    @Test
+    fun theSnapshotCarriesThePauseResultSoAFailureIsVisible() {
+        val snap = CrewDebugScreen(
+            state = { SessionFlow.accept(SessionState(), SessionsView(emptyList(), sessionApi = true)) },
+            tab = { "crew" }, mode = { "chat" }, timelineEpoch = { 0 },
+            paused = { true }, problem = { null }, draft = { "" }, sending = { false },
+            entries = { emptyList() }, currentEntry = { "" },
+            onRefresh = {}, onReloadSessions = {}, onEnterSession = {}, onSend = { _, _ -> },
+            onTab = {}, onMode = {},
+            onSetPaused = { _, _ -> },
+            pauseResult = { "没做成：继续执行未确认：队伍回执不完整" },
+        ).snapshot()
+        assertTrue(snap.getBoolean("paused"))
+        assertEquals("没做成：继续执行未确认：队伍回执不完整", snap.getString("pauseResult"))
+    }
+
+    @Test
+    fun anUnpressedPauseResultIsNullNotAnEmptyString() {
+        val snap = CrewDebugScreen(
+            state = { SessionFlow.accept(SessionState(), SessionsView(emptyList(), sessionApi = true)) },
+            tab = { "crew" }, mode = { "chat" }, timelineEpoch = { 0 },
+            paused = { false }, problem = { null }, draft = { "" }, sending = { false },
+            entries = { emptyList() }, currentEntry = { "" },
+            onRefresh = {}, onReloadSessions = {}, onEnterSession = {}, onSend = { _, _ -> },
+            onTab = {}, onMode = {},
+            onSetPaused = { _, _ -> }, pauseResult = { null },
+        ).snapshot()
+        assertTrue("还没按过是 null，不是空串", snap.isNull("pauseResult"))
     }
 
     // ── 动作真的落到目标上 ────────────────────────────────────────────────
@@ -375,6 +469,8 @@ class CrewDebugTest {
             override fun send(text: String, requestId: String) = DebugReply.ok()
             override fun setTab(tab: String) = DebugReply.ok()
             override fun setMode(mode: String) = DebugReply.ok()
+            override fun pause(ticketId: String?) = DebugReply.ok()
+            override fun resume() = DebugReply.ok()
         }
         val bus = bus(exploding)
         val failed = bus.invoke("refresh", JSONObject())

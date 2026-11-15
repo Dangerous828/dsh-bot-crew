@@ -5,7 +5,8 @@
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
-import { delimiter, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
@@ -202,13 +203,60 @@ export function sandboxAvailable(): boolean {
 const SANDBOX_MACH_SERVICES: readonly string[] = ['com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.SecurityServer']
 
 /**
+ * 隔离时要挡住的宿主凭据载体（Step 2 / ADR 0004 gap 3 的正面拦截）。
+ *
+ * **按载体类别枚举**，不按「猜哪里可能存了 secret」：名单明确、可 review、可逐条测。
+ * 覆盖范围就是这张表本身 —— 表外任意路径的 secret 不在本机制能发现的范围里，
+ * 这条残余边界写在 ADR 0004「凭据 deny 的覆盖与残余边界」一节，不许读成「凭据都挡了」。
+ *
+ * 刻意**不** deny 的两类：
+ * - `<stateDir>/worker-gitconfig` 与 `<stateDir>/worker-gh`：worker 自己的配置，`git` / `gh` 必须读，
+ *   且里面没有 token（token 在 keychain）。deny 了会直接打断 fetch/push。
+ * - `<stateDir>` 整体：ticket 执行目录就在它下面，整片 deny 会把工作目录一起挡了。
+ *
+ * `home` 可注入，测试才能用临时 HOME 造 canary 而不碰操作者的真实凭据。
+ */
+export function sensitivePaths(home: string = homedir()): string[] {
+  const at = (...parts: string[]): string => join(home, ...parts)
+  return [
+    // 版本控制与 git 凭据
+    at('.ssh'), at('.gnupg'), at('.git-credentials'), at('.gitconfig'), at('.netrc'),
+    // 云厂商与集群：`.config` 顺带盖住 `.config/gh`、`.config/gcloud`、`.config/pip`
+    at('.aws'), at('.azure'), at('.kube'), at('.config'),
+    // 容器 registry
+    at('.docker'),
+    // 包管理器与 registry token（`.npm/_authToken` 是旧版 npm 的落盘位置）
+    at('.npmrc'), at('.npm/_authToken'), at('.yarnrc'), at('.yarnrc.yml'), at('.pypirc'),
+    at('.cargo/credentials'), at('.cargo/credentials.toml'), at('.gem/credentials'), at('.m2/settings.xml'),
+    // 密码管理器
+    at('.vault-token'), at('.password-store'),
+    // shell 历史：命令行里带过的 token 会留在这里
+    at('.zsh_history'), at('.bash_history'), at('.zsh_sessions'),
+  ]
+}
+
+/**
+ * prepare 命令的环境：让它在隔离档下用 worker 自己的 git / gh 配置。
+ *
+ * 为什么必须有：`~/.gitconfig` 在 deny 名单里（它可能带 `credential.helper = store`、
+ * `url.<x>.insteadOf` 里嵌 token、`http.extraheader`），而 git 读不到全局配置会直接
+ * `fatal: unable to access '~/.gitconfig': Operation not permitted`（exit 128），推荐的
+ * `worktree add` 全挂。`GIT_CONFIG_GLOBAL` 指到 stateDir 里那份副本即可：它与 worker 会话
+ * 用的是同一份（含 `gh auth git-credential` helper），凭据仍从 keychain 取，不落盘。
+ */
+export function prepareVariables(stateDir: string): Record<string, string> {
+  return { GH_CONFIG_DIR: workerGhConfig(stateDir), GIT_CONFIG_GLOBAL: workerGitConfig(stateDir), GIT_CONFIG_NOSYSTEM: '1' }
+}
+
+/**
  * 造一个「只允许写这些目录」的 macOS sandbox 执行前缀。
  *
  * 约束口径（刻意收窄）：
  * - **允许**：进程/信号（worker 要 fork、git 要起子进程）、读系统基础路径（`/usr`、`/bin`、`/System`、
  *   `/private/var`、`/tmp`、`/dev` 等）、写 `writableRoots` 里列出的目录与其子路径。
- * - **拒绝**：写 `writableRoots` 之外的任何位置；读操作者凭据目录（`~/.ssh`、`~/.config`）与别的
- *   ticket 目录 —— 做法是 `deny file-read* (subpath "<sesitive>")` 显式压过默认的「读放行」。
+ * - **拒绝**：写 `writableRoots` 之外的任何位置；读 `readableDeny` 列出的凭据载体与别的
+ *   ticket 目录 —— 做法是 `deny file-read* (subpath "<sensitive>")` 显式压过默认的「读放行」。
+ *   名单由 `sensitivePaths()` 按载体类别给出，覆盖范围就是那张表（见 ADR 0004 的残余边界一节）。
  *
  * 网络与 Mach 的取舍（**隔离边界如实写在这里**）：
  * - 网络用 `(allow network-outbound)` 而不是 `(allow network*)`。实测差别是**能否监听**：
@@ -250,9 +298,27 @@ export function sandboxArgv(writableRoots: readonly string[], readableDeny: read
   return ['/usr/bin/sandbox-exec', '-p', profile]
 }
 
-/** 把路径解析成真实路径（macOS 上 `/tmp`→`/private/tmp`），失败就原样返回。 */
+/**
+ * 把路径解析成真实路径（macOS 上 `/tmp`→`/private/tmp`）。
+ *
+ * 路径**不存在**时不能直接放弃解析：凭据文件本机常常还没建（`~/.npmrc`、`~/.netrc`），
+ * 而 sandbox 的 `subpath` 是按内核看到的真实路径匹配的。只 `resolve()` 会留下符号链接前缀，
+ * deny 就**静默不生效**（实测：`/var/tmp/x/.git-credentials` 写成 `/var/tmp/...` 时读成功，
+ * 写成 `/private/var/tmp/...` 时 `Operation not permitted`）。所以逐级向上找到第一个存在的
+ * 祖先做 realpath，再把剩下的段接回去。deny 一个尚不存在的路径本身是有效的——实测先建后读
+ * 同样被拒，所以「现在没有这个文件」不是跳过它的理由。
+ */
 function realSubpath(path: string): string {
-  try { return realpathSync(path) } catch { return resolve(path) }
+  const absolute = resolve(path)
+  try { return realpathSync(absolute) } catch { /* Not there yet: resolve the deepest existing ancestor. */ }
+  const rest: string[] = []
+  for (let current = absolute; ;) {
+    const parent = dirname(current)
+    if (parent === current) return absolute
+    rest.unshift(basename(current))
+    current = parent
+    try { return join(realpathSync(current), ...rest) } catch { /* Keep walking up. */ }
+  }
 }
 
 /** sandbox profile 里的字符串要转义双引号与反斜杠。 */

@@ -469,6 +469,7 @@ object CrewWire {
                         else task.optString("state") !in setOf("completed", "merged", "closed", "dropped", "stopped"),
                     retryable = task.optBoolean("retryable", false),
                     question = task.optString("question").trim(),
+                    attentionId = task.optString("attention_id").trim(),
                     options = parseOptions(task),
                     // 契约 §进度：两个字段要么一起出现，要么一起缺省。optInt 缺省给 0，
                     // 「没有计划」就落到 totalSteps = 0，正好是「不画进度条」那一档。
@@ -566,6 +567,12 @@ data class WorkTicket(
      * 卡片只说得清「为什么在等」，不得补一个空问题（契约 §5）。
      */
     val question: String = "",
+    /**
+     * 后端此刻那张问题卡的 id（`ticket.attention.id`）。答案是**按卡**回的：POST /api/mobile/answer
+     * 必须带上它，和当前 ticket.attention.id 不符（旧卡批新请求）后端回 409 零变更。
+     * 老后端不下发这个字段时是空串 —— 那时这张票只能走普通 /send，不能当审批答。
+     */
+    val attentionId: String = "",
     /**
      * 这句话的备选答案，按读的顺序。空表示只有一个自写框 ——
      * 前端不得自己编 A/B，也不得把 question 拆成选项。
@@ -1202,11 +1209,25 @@ object WorkspaceCopy {
     const val TAKEOVER_IDLE = "它手上没有活儿"
 
     /**
-     * 停一下成功。scope 如实来自后端：现在只有执行器的全局暂停，
-     * 恢复要去面板 —— 把这句话说出来，省得人在手机上找恢复按钮。
+     * 停一下成功。scope 如实来自后端：现在只有执行器的全局暂停。
+     *
+     * 这句话以前写「恢复要去面板」—— 那时手机上确实没有恢复按钮。按钮接上以后那半句成了假话：
+     * 同一个按钮停完就变成「继续执行」。说清「再按一下」，人才不会跑去面板找。
      */
     fun pauseDone(scope: String): String =
-        if (scope == "executor") "已让它停一下（全局执行器，恢复要去面板）" else "已让它停一下"
+        if (scope == "executor") "已让它停一下（全局执行器，再按一下继续）" else "已让它停一下"
+
+    /** 继续执行成功。后端确认过 `resumed: true` 才会走到这句话。 */
+    const val RESUMED = "已继续执行（全局执行器）"
+
+    /** 暂停按钮那一格的字：停了就写「继续执行」。同一个按钮，两个方向。 */
+    const val RESUME_LABEL = "继续执行"
+
+    /**
+     * 暂停按钮此刻该写什么。抽成函数是为了让它可断言 —— 真机上看这一格要解锁屏幕，
+     * 而这条判断本身没有副作用，直接测它比隔着 uiautomator 读像素稳。
+     */
+    fun pauseLabel(paused: Boolean): String = if (paused) RESUME_LABEL else WorkspaceAction.Pause.label
 
     /** 动作失败时的原话。detail 来自后端错误体，直译，不粉饰。 */
     fun failed(detail: String?): String = "没做成：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
@@ -2274,5 +2295,65 @@ object SpeechCopy {
         if (length.isNotEmpty()) parts.add(length)
         if (truncated) parts.add("太长了，只念了前面一段")
         return parts.joinToString(" · ")
+    }
+}
+
+/** 一条设备推送：后端稳定 id（去重键）+ 抬头/正文 + 可选会话与来源。 */
+data class CrewNotice(
+    val id: String,
+    val title: String,
+    val body: String,
+    val kind: String = "",
+    val at: String = "",
+    val sessionId: String = "",
+)
+
+/** `GET /api/mobile/notices` 的整份结果：还欠哪些（pending，未 ACK）+ 已持久化条数。 */
+data class NoticesView(
+    val items: List<CrewNotice>,
+    val pending: Int,
+    val seen: Int,
+    val available: Boolean,
+)
+
+/**
+ * 设备接收链的线上解析（#23）。
+ *
+ * 与别的 wire 一样只读字符串、不碰界面状态。缺字段一律当「没有」：id 都没有的条目
+ * 直接丢 —— 没有稳定 id 就没法去重、也没法 ACK，留着它只会让 App 和后端对不上账。
+ */
+object NoticesWire {
+    fun parse(body: String): NoticesView {
+        val root = JSONObject(body)
+        // 宿主没接这项能力时如实回 unavailable，不是「没有新通知」。这一格要能区分。
+        if (root.optString("state") == "unavailable") return NoticesView(emptyList(), 0, 0, available = false)
+        val counts = root.optJSONObject("counts")
+        val array = root.optJSONArray("items")
+        val items = if (array == null) emptyList() else (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val id = item.optString("id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val text = item.optString("body").takeIf(String::isNotBlank) ?: return@mapNotNull null
+            CrewNotice(
+                id = id,
+                title = item.optString("title"),
+                body = text,
+                kind = item.optString("kind"),
+                at = item.optString("at"),
+                sessionId = item.optString("sessionId"),
+            )
+        }
+        return NoticesView(
+            items = items,
+            pending = counts?.optInt("pending") ?: items.size,
+            seen = counts?.optInt("seen") ?: 0,
+            available = true,
+        )
+    }
+
+    /** ACK 请求体：设备已持久化的 id 列表（ack_ids）与已读账（seen_ids）。 */
+    fun ackBody(ackIds: List<String>, seenIds: List<String>): String {
+        val ack = org.json.JSONArray(); ackIds.forEach(ack::put)
+        val seen = org.json.JSONArray(); seenIds.forEach(seen::put)
+        return JSONObject().put("ack_ids", ack).put("seen_ids", seen).toString()
     }
 }

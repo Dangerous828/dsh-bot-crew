@@ -8,12 +8,11 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
-import { runAsWorker, runIsolated, verifyDirectory, workerGhConfig } from '../infra/environment.ts'
+import { prepareVariables, runAsWorker, runIsolated, sensitivePaths, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
-import { homedir } from 'node:os'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { planOf } from '../app/work.ts'
@@ -282,7 +281,8 @@ export class DshExecutor implements Executor {
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     // prepare 也要能跑 gh / git fetch：给它 worker 自己的 gh 配置目录，否则隔离档下 gh 读不到配置、
     // `git credential` 拿不到 token，推荐的 prepare（fetch + worktree add）必挂。
-    env.GH_CONFIG_DIR = workerGhConfig(this.host.machine.stateDir)
+    // `~/.gitconfig` 同理在 deny 名单里，所以全局配置也指到 stateDir 里那份（`prepareVariables` 的注释）。
+    Object.assign(env, prepareVariables(this.host.machine.stateDir))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
     // 隔离档（Step 2）：sandbox 时 prepare 只能写本 ticket 执行目录 + 其父 + 显式列出的仓库目录，
@@ -291,7 +291,7 @@ export class DshExecutor implements Executor {
     if (command) await runIsolated(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, {
       mode: settings.isolation,
       writableRoots: [directory, dirname(directory), ...settings.repositories],
-      readableDeny: workerSensitivePaths(this.host.machine.stateDir),
+      readableDeny: sensitivePaths(),
       env,
     })
       .catch(async (error: unknown) => {
@@ -745,22 +745,4 @@ export class DshExecutor implements Executor {
       }
     })
   }
-}
-
-/**
- * 隔离时要挡住读的宿主凭据目录（Step 2 / ADR 0004）。worker 不需要、也不该能读这些——
- * 这是 gap 3 实测症状（worker 读操作者 `~/.ssh`、`~/.config`）的正面拦截。
- *
- * 只 deny 凭据目录、不 deny stateDir 整体：worker 的执行目录就在 stateDir 下，deny 整片会把它也挡了。
- * ticket 之间互读的进一步收紧留待后续（可配合每 ticket 独立 stateDir），本轮先挡住凭据这条硬边界。
- */
-function workerSensitivePaths(_stateDir: string): string[] {
-  const home = homedir()
-  return [
-    join(home, '.ssh'),
-    join(home, '.config'),
-    join(home, '.aws'),
-    join(home, '.gnupg'),
-    join(home, '.docker'),
-  ]
 }

@@ -66,3 +66,89 @@ describe('pickMemoryPort', () => {
     } finally { globalThis.fetch = original }
   })
 })
+
+describe('HubProbe.retarget（配置热生效）', () => {
+  it('换地址后整套引用都换：base / hub / 探测 URL 一起走新值', async () => {
+    const probed: string[] = []
+    const probe = new HubProbe({ hub: 'http://old.hub/v1', timeoutMs: 1_000, ttlMs: 30_000,
+      probe: async url => { probed.push(url); return true } })
+    await probe.refresh()
+    expect(probe.base()).toBe('http://old.hub/v1')
+    probe.retarget({ hub: 'http://new.hub/v1/', timeoutMs: 4_000, token: {} })
+    await probe.refresh()
+    expect(probe.base()).toBe('http://new.hub/v1')
+    expect(probe.hub()).toBe('http://new.hub/v1/')
+    expect(probe.timeoutMs()).toBe(4_000)
+    expect(probed.at(-1)).toBe('http://new.hub/v1/health')
+    expect(probe.reachable()).toBe(true)
+  })
+
+  it('换配置时丢弃缓存结论：不沿用上一个中枢的可达性', async () => {
+    let up = true
+    const probe = new HubProbe({ hub: 'http://a/v1', timeoutMs: 500, ttlMs: 30_000, probe: async () => up })
+    await probe.refresh()
+    expect(probe.reachable()).toBe(true)
+    up = false
+    // 同一 TTL 内换配置：必须重探，不能把「上一个中枢可达」当成新中枢的结论。
+    probe.retarget({ hub: 'http://b/v1', timeoutMs: 500, token: {} })
+    await probe.refresh()
+    expect(probe.reachable()).toBe(false)
+  })
+
+  it('地址与超时都没变、只换凭据引用时也重探（新 token 不必等下一个 TTL）', async () => {
+    let token = ''
+    let probed = 0
+    const probe = new HubProbe({ hub: 'http://a/v1', timeoutMs: 500, ttlMs: 30_000,
+      probe: async () => { probed += 1; return true }, token: { env: 'T' }, tokenIo: { env: () => token } })
+    await probe.refresh()
+    expect(probed).toBe(1)
+    token = 'fresh'
+    probe.retarget({ hub: 'http://a/v1', timeoutMs: 500, token: { env: 'T' } })
+    await probe.refresh()
+    expect(probed).toBe(2)
+    expect(probe.token()).toBe('fresh')
+  })
+
+  it('换配置后「被拒」结论一并作废（否则新引用会继承旧结论）', async () => {
+    const probe = new HubProbe({ hub: 'http://a/v1', timeoutMs: 500, probe: async () => true, token: { env: 'T' },
+      tokenIo: { env: () => 'tok' } })
+    await probe.refresh()
+    probe.rejectAuth(401, 'invalid hub token')
+    expect(probe.authState().state).toBe('rejected')
+    probe.retarget({ hub: 'http://a/v1', timeoutMs: 500, token: { env: 'T2' } })
+    // 状态在 retarget 里当场重算（不等网络）；可达性由随后那次探测兑现。
+    expect(probe.authState().state).toBe('ok')
+    await probe.ensureSettled()
+    expect(probe.usable()).toBe(true)
+  })
+
+  it('空 hub 时 retarget 不探测、直接不可达', async () => {
+    let probed = 0
+    const probe = new HubProbe({ hub: 'http://a/v1', timeoutMs: 500, probe: async () => { probed += 1; return true } })
+    await probe.refresh()
+    probe.retarget({ hub: '', timeoutMs: 500, token: {} })
+    await probe.refresh()
+    expect(probed).toBe(1)
+    expect(probe.reachable()).toBe(false)
+  })
+
+  it('配置代数：迟到的旧探测结果不改可达性、也不写日志', async () => {
+    const logs: string[] = []
+    let release!: (up: boolean) => void
+    const probe = new HubProbe({ hub: 'http://old/v1', timeoutMs: 500, log: line => logs.push(line),
+      probe: url => url.startsWith('http://old/')
+        ? new Promise<boolean>(resolve => { release = resolve })
+        : Promise.resolve(true) })
+    const stale = probe.refresh()               // 旧中枢的探测悬着
+    expect(probe.reachable()).toBe(false)
+    probe.retarget({ hub: 'http://new/v1', timeoutMs: 500, token: {} })
+    await probe.ensureSettled()                 // 新中枢探通
+    expect(probe.reachable()).toBe(true)
+    const logged = logs.length
+    // 旧探测现在才回 false：配置已换，结论必须被丢弃（可达性仍是 true、也不写一行日志）。
+    release(false)
+    await stale
+    expect(probe.reachable()).toBe(true)
+    expect(logs).toHaveLength(logged)
+  })
+})

@@ -35,6 +35,9 @@ it('defines the worker preset Executor Sessions run under, with a shell that mov
   const plugins = flat(preset.plugins)
   const named = (name: string) => plugins.filter(row => row.name === name).map(row => row.config)
   expect(named('@deepseek-ai/dsh-bash-sandbox')).toEqual([{ timeoutMs: 5000, maxTimeoutMs: 5000 }])
+  // #22：worker 的 shell 组把 worker sandbox provider 挂进来，并 isolate 出自己那份 `sandbox` 服务，
+  // 只有该组的 bash-sandbox 解析到它；router 组不挂、仍用全局 sandbox。
+  expect(named('dsh-superagent/worker-sandbox').length).toBeGreaterThan(0)
   expect(named('@deepseek-ai/dsh-pwsh-sandbox')).toEqual([{ timeoutMs: 5000, maxTimeoutMs: 5000 }])
   expect(named('@deepseek-ai/dsh-tool-jobs')).toEqual([{ waitTimeoutMs: 5000, maxWaitTimeoutMs: 5000 }])
   expect(named('@deepseek-ai/dsh-tool-web')).toEqual([expect.objectContaining({ fetch: false })])

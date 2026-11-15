@@ -90,7 +90,7 @@ export function environmentSection(config: PromptConfig, variables: Variable[] |
  * The wording is fixed here rather than team-overridable, because it is a fact about the run, not a writing choice.
  */
 /** Where the harness keeps persistent memory for this machine, which workers may read and write directly. */
-function memoryRoot(): string {
+export function memoryRoot(): string {
   const home = process.env.DSH_HOME?.trim() || `${process.env.HOME ?? ''}/.dsh`
   return `${home.replace(/\/+$/, '')}/memory`
 }

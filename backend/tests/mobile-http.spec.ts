@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { phoneHandler, registerMobileHttp } from '../src/app/mobile-http.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { phoneGate } from '../src/app/phone-gate.ts'
+import { deliver, pendingFor, PushOutbox, seenLedgerPatch } from '../src/app/push.ts'
 
 const directories: string[] = []
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
@@ -13,6 +14,24 @@ function host() {
   writeFileSync(join(stateDir, 'mobilegw.token'), 'server-only-test-token')
   return { ready: Promise.resolve(), machine: { stateDir }, health: { runtime: { state: 'ready' }, mobile: { state: 'ready' } },
     store: { settings: () => ({ paused: false }), tickets: { list: () => [] } } } as unknown as HttpHost
+}
+/** 接收链的假宿主：真实 PushOutbox + deliver 喂件，运行时的四个方法小改实现。 */
+function noticesHost() {
+  const outbox = new PushOutbox()
+  const ledger = new Map<string, string[]>()
+  const seed = (deviceId: string, over: Partial<{ title: string; body: string; kind: string; at: string }>) =>
+    deliver({ deviceId, title: over.title ?? 't', body: over.body ?? 'b', ...(over.kind ? { kind: over.kind } : {}), ...(over.at ? { at: over.at } : {}) },
+      { online: false, outbox })
+  const base = host()
+  const runtime = Object.assign(base, {
+    pendingNotices: (deviceId: string) => pendingFor(deviceId, outbox).items,
+    ackNotices: (deviceId: string, ids: readonly string[]) => outbox.ack(deviceId, ids),
+    noticeSeen: (deviceId: string) => ledger.get(deviceId) ?? [],
+    markNoticeSeen: (deviceId: string, ids: readonly string[]) => {
+      const next = seenLedgerPatch(ledger.get(deviceId), ids); ledger.set(deviceId, next); return next
+    },
+  }) as unknown as HttpHost
+  return { runtime, seed }
 }
 it('uses Connection authenticated exact routes, never raw public web routes', () => {
   const registered: unknown[] = [], dispose = vi.fn(async () => {})
@@ -47,6 +66,9 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/bots', methods: ['GET', 'POST'], requestBody: 'buffered' },
     { path: '/api/mobile/sessions', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/sessions', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/notices', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered' },
   ])
 })
 it('injects only the server credential and refuses malformed sends before enqueue', async () => {
@@ -123,6 +145,7 @@ it('sends a question with its options only while the ticket waits on an answer',
   const body = await result.json() as { tasks: Record<string, unknown>[] }
   expect(body.tasks).toEqual([
     expect.objectContaining({ id: 't1', needs_person: 'answer', question: 'Which way?',
+      attention_id: 'q1',
       options: [{ id: 'a', label: '按合同回' }, { id: 'b', label: '接受新条款' }] }),
     expect.objectContaining({ id: 't2', needs_person: 'delivery' }),
   ])
@@ -1390,4 +1413,122 @@ it('carries session_api on unrelated errors of an explicit-session request', asy
   const unsupported = await handler(new Request('http://dsh/api/mobile/timeline?session_id=work'))
   expect(unsupported.status).toBe(409)
   expect(await unsupported.json()).toEqual({ error: 'unsupported_session' })
+})
+
+// ── 设备接收链（#23）──────────────────────────────────────────────────────────
+// 覆盖 lead 的四条硬要求：GET 不 drain（崩溃不丢件）、ack 只删点名、device 来自验过的 principal
+// 头（不信客户端 x-crew-device）、跨设备不串、ack 幂等、seen 是 device-persisted 账本。
+it('notices: 只认验过的 principal，不信客户端 x-crew-device，没 principal 就拒', async () => {
+  const { runtime } = noticesHost()
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn(async () => Response.json({})) as unknown as typeof fetch)
+  // 只带客户端 x-crew-device、没有内部 principal 头：拒，不替它猜设备号。
+  const spoof = await handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-device': 'd021988751fdd554' } }))
+  expect(spoof.status).toBe(401)
+  expect(await spoof.json()).toEqual({ error: 'Not paired' })
+  // 内部 principal 头形状不对：同样拒。
+  const malformed = await handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-principal': 'has space' } }))
+  expect(malformed.status).toBe(401)
+})
+
+it('notices: GET 只 peek 不删（崩溃重试不丢件），POST ack 才删，seen 幂等记账', async () => {
+  const { runtime, seed } = noticesHost()
+  seed('d021988751fdd554', { title: '有事', body: '等你', kind: 'followup', at: '2026-11-14T21:00:00.000Z' })
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn(async (url: string) => Response.json({ ok: true })) as unknown as typeof fetch)
+  const get = () => handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-principal': 'd021988751fdd554' } }))
+
+  // 第一次 GET：拿到一条，队列里仍在（pending 未变）。
+  const first = await get(); expect(first.status).toBe(200)
+  const body1 = await first.json() as { items: { id: string; body: string }[]; counts: { pending: number; seen: number } }
+  expect(body1.items.map(i => i.body)).toEqual(['等你'])
+  expect(body1.counts.pending).toBe(1)
+  const id = body1.items[0]!.id
+  // 再 GET 一次：同一条还在、id 相同（模拟 App 解析后崩溃重试，不丢件）。
+  const again = await get(); const body2 = await again.json() as { items: { id: string }[]; counts: { pending: number } }
+  expect(body2.items.map(i => i.id)).toEqual([id])
+  expect(body2.counts.pending).toBe(1)
+
+  // App 已持久化 → POST ack（同时也可带 seen_ids）。此后 GET 应空。
+  const ack = await handler(new Request('http://dsh/api/mobile/notices', { method: 'POST', headers: { 'x-crew-principal': 'd021988751fdd554' },
+    body: JSON.stringify({ ack_ids: [id], seen_ids: [id] }) }))
+  expect(ack.status).toBe(200)
+  const ackBody = await ack.json() as { ok: boolean; acked: number; seen: number }
+  expect(ackBody.acked).toBe(1); expect(ackBody.seen).toBe(1)
+  const after = await get(); const body3 = await after.json() as { items: unknown[]; counts: { pending: number; seen: number } }
+  expect(body3.items).toEqual([]); expect(body3.counts.pending).toBe(0); expect(body3.counts.seen).toBe(1)
+
+  // ack 同一个 id 再来一次：幂等（acked 0），重试安全。
+  const dup = await handler(new Request('http://dsh/api/mobile/notices', { method: 'POST', headers: { 'x-crew-principal': 'd021988751fdd554' },
+    body: JSON.stringify({ ack_ids: [id] }) }))
+  expect((await dup.json() as { acked: number }).acked).toBe(0)
+})
+
+it('notices: 一台设备取不到另一台的留件，ACK 也动不了别人', async () => {
+  const { runtime, seed } = noticesHost()
+  seed('55c86317', { title: 'A', body: 'A 的', kind: 'followup', at: '2026-11-14T21:00:00.000Z' })
+  const handler = phoneHandler(runtime, 'http://gw', vi.fn(async () => Response.json({})) as unknown as typeof fetch)
+  const mine = await handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-principal': 'd021988751fdd554' } }))
+  expect((await mine.json() as { items: unknown[] }).items).toEqual([])   // 别人的留件看不到
+  const theirs = await handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-principal': '55c86317' } }))
+  const theirsBody = await theirs.json() as { items: { id: string; body: string }[] }
+  expect(theirsBody.items.map(i => i.body)).toEqual(['A 的'])
+  // 我这台去 ACK 别人的 id：删不掉。
+  const wrong = await handler(new Request('http://dsh/api/mobile/notices', { method: 'POST', headers: { 'x-crew-principal': 'd021988751fdd554' },
+    body: JSON.stringify({ ack_ids: [theirsBody.items[0]!.id] }) }))
+  expect((await wrong.json() as { acked: number }).acked).toBe(0)
+  const still = await handler(new Request('http://dsh/api/mobile/notices', { method: 'GET', headers: { 'x-crew-principal': '55c86317' } }))
+  expect((await still.json() as { counts: { pending: number } }).counts.pending).toBe(1)
+})
+
+// 审批答复（手机这条通道用现有 source 消息完成连接写审批）：回答交给与 feishu approvalReply 同源的状态机，
+// 认不出/票不符/不在等审批都如实拒绝，绝不猜、绝不动。这里用假 answer 方法验转调与状态码形状。
+it('routes a mobile answer to the host approval machine (attention id + verified actor), refusing staleness/unrecognized/unknown', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'phone-answer-')); directories.push(stateDir)
+  const calls: { ticket: string; text: string; attentionId: string; actor: string | undefined }[] = []
+  const answer = (ticket: string, text: string, attentionId: string, actor: string | undefined) => {
+    calls.push({ ticket, text, attentionId, actor })
+    if (attentionId !== 'att-current') return { ok: false as const, reason: '这张问题卡已经过期（票或请求已变），请刷新后再答' }
+    if (ticket === 't-wait' && text === '做吧') return { ok: true as const, answer: 'go' as const }
+    if (ticket === 't-wait' && text === '先别做') return { ok: true as const, answer: 'stop' as const }
+    if (ticket === 't-wait') return { ok: false as const, reason: '这句不是一个可执行的答复' }
+    return { ok: false as const, reason: '这张票没有在等审批' }
+  }
+  const handler = phoneHandler({ ready: Promise.resolve(), machine: { stateDir }, health: {},
+    store: { settings: () => ({ paused: false }), tickets: { list: () => [] } }, answer } as unknown as HttpHost,
+    'http://127.0.0.1:8788', vi.fn() as unknown as typeof fetch)
+  const post = (value: unknown, headers: Record<string, string> = {}) =>
+    handler(new Request('http://dsh/api/mobile/answer', { method: 'POST', body: JSON.stringify(value), headers }))
+
+  // Verified actor comes from the internal principal header (not body).
+  const go = await post({ ticket: 't-wait', text: '做吧', attention_id: 'att-current' }, { 'x-crew-principal': 'dev-9f2' })
+  expect(go.status).toBe(200)
+  expect(await go.json()).toMatchObject({ ok: true, answer: 'go', ticket: 't-wait', attention_id: 'att-current' })
+  expect(calls.at(-1)).toMatchObject({ actor: 'dev-9f2' })
+
+  const stop = await post({ ticket: 't-wait', text: '先别做', attention_id: 'att-current' })
+  expect(stop.status).toBe(200)
+  expect(await stop.json()).toMatchObject({ ok: true, answer: 'stop' })
+
+  // A body-supplied identity is ignored; actor stays undefined without the verified principal header.
+  const spoof = await post({ ticket: 't-wait', text: '做吧', attention_id: 'att-current', actor: 'i-am-root' })
+  expect(spoof.status).toBe(200)
+  expect(calls.at(-1)).toMatchObject({ actor: undefined })
+
+  // Stale attention id (old card approving a new request) → 409.
+  const stale = await post({ ticket: 't-wait', text: '做吧', attention_id: 'att-old' })
+  expect(stale.status).toBe(409)
+  expect((await stale.json() as { error: string }).error).toContain('过期')
+
+  const junk = await post({ ticket: 't-wait', text: '随便', attention_id: 'att-current' })
+  expect(junk.status).toBe(409)
+  expect(await junk.json()).toMatchObject({ error: '这句不是一个可执行的答复' })
+
+  const unknown = await post({ ticket: 't-nope', text: '做吧', attention_id: 'att-current' })
+  expect(unknown.status).toBe(409)
+
+  // Missing ticket / text / attention_id → 400, no call reaches the machine.
+  const before = calls.length
+  expect((await post({ text: '做吧', attention_id: 'att-current' })).status).toBe(400)
+  expect((await post({ ticket: 't-wait', attention_id: 'att-current' })).status).toBe(400)
+  expect((await post({ ticket: 't-wait', text: '做吧' })).status).toBe(400)
+  expect(calls.length).toBe(before)
 })

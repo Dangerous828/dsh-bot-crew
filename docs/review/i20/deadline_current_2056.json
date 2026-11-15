@@ -1,0 +1,52 @@
+[
+ {
+  "case": "drip800",
+  "wall": 1.56,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=false millis=-1 wall_ms=1508 budget_ms=1500"
+  ]
+ },
+ {
+  "case": "drip100",
+  "wall": 1.57,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=false millis=-1 wall_ms=1511 budget_ms=1500"
+  ]
+ },
+ {
+  "case": "hang",
+  "wall": 1.57,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=false millis=-1 wall_ms=1514 budget_ms=1500"
+  ]
+ },
+ {
+  "case": "drip200 x3",
+  "wall": 4.61,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=false millis=-1 wall_ms=1518 budget_ms=1500",
+   "RESULT round=1 ok=false millis=-1 wall_ms=1510 budget_ms=1500",
+   "RESULT round=2 ok=false millis=-1 wall_ms=1507 budget_ms=1500"
+  ]
+ },
+ {
+  "case": "normal fast",
+  "wall": 0.09,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=true millis=0 wall_ms=29 budget_ms=1500"
+  ]
+ },
+ {
+  "case": "drip800 prod20s",
+  "wall": 20.09,
+  "peer": 0,
+  "lines": [
+   "RESULT round=0 ok=false millis=-1 wall_ms=20015 budget_ms=20000"
+  ]
+ }
+]

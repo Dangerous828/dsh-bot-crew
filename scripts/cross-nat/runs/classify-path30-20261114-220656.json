@@ -1,0 +1,32 @@
+{
+  "derp": 19,
+  "direct": 11,
+  "direct_same_nat": 11,
+  "different_network_candidate": 0,
+  "direct_unknown": 0,
+  "total": 30,
+  "nopong": 0,
+  "sample": [
+    "same-lan(排除跨网): pong in 5ms via [2409:8a55:2236:2590:303a:cef0:2496:ee1b]:59750",
+    "same-lan(排除跨网): pong in 3.86ms via [2409:8a55:2236:2590:303a:cef0:2496:ee1b]:59750",
+    "same-lan(排除跨网): pong in 4.48ms via [2409:8a55:2236:2590:303a:cef0:2496:ee1b]:59750",
+    "same-lan(排除跨网): pong in 2.63ms via 192.168.31.175:59751",
+    "same-lan(排除跨网): pong in 3.63ms via [2409:8a55:2236:2590:303a:cef0:2496:ee1b]:59750"
+  ],
+  "candidate_verified": false,
+  "verify_requested": false,
+  "topology_note": "",
+  "verdict": "SAME-NAT-ONLY-NOT-CROSS-NAT",
+  "mac_v4": [
+    "127.0.0.1",
+    "10.10.10.3",
+    "192.168.31.127"
+  ],
+  "mac_v6": [
+    "2409:8a55:2236:2590:1840:259c:ef38:3d90",
+    "2409:8a55:2236:2590:65c9:345f:d9b8:c465",
+    "2409:8a55:2236:2590::2a6",
+    "2409:8a55:2236:2590:d886:1050:79be:ac94"
+  ],
+  "note": "candidate_verified 需 --verify-cross-nat + --topology-note 且无 same-lan/unknown 反证；不同公网IP/不同/64 只算候选，不单独证明跨NAT已打洞（原生全局IPv6直连通常无NAT）"
+}

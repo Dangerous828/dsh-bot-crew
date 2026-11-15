@@ -142,10 +142,24 @@ export const ExecutorConfigSchema = z.object({
   repositories: z.array(z.string().trim().refine(path => path.startsWith('/'), 'An absolute path')).max(LIMITS.maxRepositories).default([]),
   blockedCommands: z.array(CommandNameSchema).default([]),
   /**
-   * worker 执行面的隔离档（Step 2 强制隔离 / gap 3）：
+   * **prepare 阶段**的隔离档（Step 2 强制隔离 / gap 3）：
    * - `none`：不隔离，沿用操作者 OS 用户（当前默认，保持向后兼容）；
-   * - `sandbox`：用平台沙箱（macOS `sandbox-exec`）把 worker 子进程包起来，只允许写本 ticket
-   *   执行根目录，读系统基础路径但拒绝读操作者凭据（`~/.ssh`、`~/.config`）与别的 ticket 目录。
+   * - `sandbox`：用平台沙箱（macOS `sandbox-exec`）把本仓 `runIsolated` 起的子进程包起来，
+   *   只允许写本 ticket 执行根目录 + `executor.repositories`，读系统基础路径但拒绝读
+   *   **按载体类别枚举的宿主凭据**（`sensitivePaths()` 那张表：git 凭据 `~/.git-credentials`、
+   *   `~/.gitconfig`、`~/.netrc`；云与集群 `~/.kube`、`~/.azure`、`~/.aws`、`~/.config`；
+   *   容器 registry `~/.docker`；包管理器 token `~/.npmrc`、`~/.npm/_authToken`、`~/.yarnrc*`、
+   *   `~/.pypirc`、`~/.cargo/*`、`~/.gem/*`、`~/.m2/*`；密码管理器 `~/.vault-token`、
+   *   `~/.password-store`；shell 历史 `~/.zsh_history`、`~/.bash_history`、`~/.zsh_sessions`；
+   *   以及 `~/.ssh`、`~/.gnupg`）与别的 ticket 目录。
+   *
+   *   **这一档不覆盖 worker。** 本仓只有一处 `runIsolated` 调用点（prepare）；agent 在会话里
+   *   自由跑的命令由 DSH subprocess provider 起，被钉死 `danger-full-access`，不带沙箱，
+   *   仍读得到凭据（#22 追踪）。所以档位名字里的「sandbox」只对 prepare 成立，
+   *   不许读成「worker 已隔离」。`prepare` 为空时本档一行都不生效（#17）。
+   *
+   *   覆盖范围就是那张表：表外任意路径的 secret **不在**本机制能发现的范围里（残余边界写在
+   *   ADR 0004「凭据 deny 的覆盖与残余边界」）。
    *   详情见 `docs/adr/0004-worker-isolation-os-user.md`。
    * 平台不支持该沙箱时启动一致性检查会报错，不会静默退回不隔离。
    */
@@ -164,12 +178,31 @@ export const RemoteConfigSchema = z.object({
  * 空地址 = 没有中枢，记忆全在本机完成（本机版）。配了地址且探测可达才走中枢；
  * 探测失败自动降级本机，不阻塞开工。原始对话不上中枢，只有筛选过的稳定事实走
  * local_dream 直通链路上行 —— 这里只控制「记忆要不要把重活交给中枢」。
+ *
+ * **凭据只存引用，不存值**（见 `memory/auth.ts`）：中枢的 `/memory/*` 要 `X-Hub-Token`，
+ * 而这一块会原样出现在 `/state`、`GET settings` 与管理页表单里。明文 token 一旦落在这里，
+ * 就同时进了日志、截图、导出与 git diff。所以配置里只写「去哪儿取」：
+ * 环境变量名，或一个 0600 凭据文件的绝对路径。
  */
 export const MemoryConfigSchema = z.object({
-  /** 中枢记忆 API 的基址；空表示不启用中枢。 */
+  /** 中枢记忆 API 的基址（**含 `/v1`**：探测打 `base + '/health'`）；空表示不启用中枢。 */
   hub: z.string().trim().refine(url => url === '' || /^https?:\/\//.test(url), 'An http(s) URL, or empty for no hub').default(''),
-  /** 探测超时（毫秒）：连不上就当没有中枢。 */
-  timeoutMs: z.number().int().min(200).max(10_000).default(1500),
+  /**
+   * 探测/请求超时（毫秒）：连不上就当没有中枢。
+   *
+   * **默认 8000ms 是量出来的，不是拍的**：生产中枢 `GET /v1/health` 走公网实测
+   * 0.877s / 1.861s / 1.410s（见 `docs/review/2026-11-14-release-backend-integration.md`）。
+   * 原来的 1500ms 小于这个区间，于是一台到中枢 RTT 稍高的机器会**永久**拿到
+   * 「hub 配了、记忆全本机」，而探测超时本身不报任何错 —— 这是最难查的那种假成功。
+   * 取 8000ms：覆盖实测最慢值（1.86s）的 4 倍余量，给公网抖动与中枢冷启动留空间，
+   * 又不至于让一次卡死的请求把 worker 的召回拖到十秒以上（召回是上工路径上的同步等待）。
+   * 上界仍是 10s：这个预算有天花板，不是「随便调大就更好」。
+   */
+  timeoutMs: z.number().int().min(200).max(10_000).default(8_000),
+  /** 取 token 的环境变量名；空 = 不看进程环境。与 `tokenFile` 同时给时，从该文件里取这个键。 */
+  tokenEnv: z.string().trim().refine(name => name === '' || /^[A-Za-z_][A-Za-z0-9_]*$/.test(name), 'An environment variable name, or empty').default(''),
+  /** 凭据文件的绝对路径（应为 0600）；空 = 不看文件。只给文件时整份内容就是 token。 */
+  tokenFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty').default(''),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({

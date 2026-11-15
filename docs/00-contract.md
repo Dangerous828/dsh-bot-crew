@@ -315,6 +315,50 @@
   （同文返回首次结果，异文仍按 §6 的 `conflict` 拒绝）。
 - 客户端展示的撤回入口可以按时间窗先收窄，但最终以网关判定为准；收到 409 时应刷新时间线，而不是假定撤回成功。
 
+### 审批答复：`POST /api/mobile/answer`
+
+手机用**现有 source 消息**回答一张票正在等的那一个问题（`ticket.attention` 的选项），
+走的是与 feishu `approvalReply` **同一套审批状态机**（同一份 `applyApprovalAnswer`），不是第二个审批 UI。
+
+```jsonc
+{ "ticket": "tk-1", "text": "做吧", "attention_id": "attention-connection-tk-1-<sig>" }
+// 三个都必填：
+//   ticket       显式点名哪张票（手机一条 timeline 能看到多张，不靠自然文本猜）。
+//   text         选项 label 或 id（"做吧"/"先别做"/"换个做法"）。
+//   attention_id 客户端**此刻看到的那张问题卡的 id**（= GET /timeline tasks[].question 卡片对应的 attention.id）。
+//               防「旧卡批新请求」：与后端当前 ticket.attention.id 不符 → 409 且零状态变更。
+```
+
+`attention_id` 从哪来（客户端复用现有 question/options 控件时一并下发，**不要靠自然文本猜票**）：
+`GET /timeline` 的 `tasks[]` 里，处于 `needs_person === 'answer'` 的那张票会带 `question` + `options`；
+后端**同时**下发该卡的 `attention_id`（与 `question`/`options` 同一处，见 §5.4）。客户端把它原样带回来。
+
+成功：`200 {"ok":true,"answer":"go|stop|revise","ticket":"tk-1","attention_id":"<同值>"}`。
+- `go`（如「做吧」）：批准**同一次**调用；若是连接写（`pendingApproval.kind='connection'`），置 `approved` 后由执行器把 turn 重新交付，guard 放行后**只执行一次**。
+- `stop`（如「先别做」）：`stopTicket`，票结束、零写。
+- `revise`（如「换个做法」）：记下新要求，票回到「等确认」。
+
+失败（错误体与 §6 一致，客户端只展示文本）：
+
+| HTTP | 何时 | `error` 文本 |
+| --- | --- | --- |
+| 400 | 缺 `ticket` / `text` / `attention_id` 任一 | `ticket is required` / `text is required` / `attention_id is required` |
+| 409 | 票不存在 / 已结束 / 没在等审批 / **attention_id 过期不符** / 这句认不出是一个可执行答复 | 具体原因（`这张问题卡已经过期（票或请求已变），请刷新后再答` / `这句不是一个可执行的答复` 等） |
+| 503 | 宿主没接这条能力 | `Answering is unavailable` |
+| 401 · 502 | 与其余消息面路由相同（未认证 / 后台不可用） | — |
+
+判定规则：
+
+- `text` 用与 feishu 完全相同的 `readAnswer` 口径认「做吧 / 先别做 / 换个做法」；认不出的**一律不动**，
+  如实回 409，绝不猜（宁可不动，也不要猜主人要什么）。
+- **防旧卡批新请求**：`attention_id` 必须严格等于后端当前 `ticket.attention.id`。签名随工具参数/连接配置变；
+  客户端看到的旧卡在票/请求已变后 id 就对不上，答它一律 409、零状态变更——否则一张过期的「做吧」会批准一个从没看过的参数请求。
+- 与 feishu 的差别只在「怎么找到那张票」：feishu 靠「同一 conversation/Bot 里唯一一个待答」；
+  手机一条 timeline 能看到多张票，所以**显式点名票号** `ticket` + `attention_id`，只答这一张这张卡。
+- **审计 / actor**：答复会作为一条 input 记在票上（既有 input 机制，不另造状态机），`actor` 取自**入口验过的设备 principal**
+  （`x-crew-principal`，由网关注入；**不读 body 里自报的身份**）。body 里的 `actor` 一律忽略。
+- 手机没有走网关：这条路由在**宿主侧直答**，不转发（与 `takeover` / `retry` 同）。
+
 ## 5.1 `GET /api/mobile/screen?ticket=<id>`
 
 「看它的屏幕」返回的是这张工单的**实景**：它此刻在干什么、这一段是从几点开始的、它刚执行了什么命令、
@@ -828,7 +872,11 @@ header 形态与能力位裁决见 §9.7，Source 准入见 §9.8，群组只读
 **S2 / S3 已落地，S4 机制已落地**：手机端（S2）与桌面端（S3）的列出 / 新建 / 切换会话已落地；
 S4 落下 header 双载体（§9.7）、Source 准入收口（§9.8）与群组只读投影（§10）。
 事实描述见 §9.4，客户端能力位先验与缓存隔离见 §9.6。
-真机 / 人工验收窗口与 issue #15 七项仍属未做，按本文件顶部的书写约定在 §9.4 留一条欠账；
+真机 / 人工验收窗口已走过一轮（`33dd955` + `b2f305e`：手机经 **relay 门**切一次会话并发一条、
+桌面真 GUI 切会话并切回、桌面记忆编辑重启后仍在）。issue #15 七项现状按项分开读，
+不笼统算「几项已过」：第 2 / 5 / 7 项真机证据齐；第 1 项记忆编辑齐、takeover 只到接口级；
+第 4 项在独立 `DSH_HOME` 实测跑通、生产未重启验证；第 6 项前提被纠正且真实额度源已接；
+**只剩第 3 项远程恢复**，已移交 #19。**剩余未覆盖的部分**按本文件顶部的书写约定在 §9.4 留一条欠账；
 真机证据缺位时如实标注未做，不作覆盖性结论。
 
 ### 9.1 字段形状
@@ -954,13 +1002,73 @@ S4 落下 header 双载体（§9.7）、Source 准入收口（§9.8）与群组�
   不静默吞掉；登记后立刻可派单，不手改 Source 配置、不重启。四条断言与证据见 §9.8。
 - ~~（原 `gw` 欠账，2026-11-13）S4：真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、真机配对与
   `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state` 与归档守卫）尚未做。~~
-  → **2026-11-13 订正**：S4 真机 / 人工窗口与 issue #15 七项（Step 0 四期收尾）仍属未做，
-  需要设备与人工窗口、每项要有截图 / 录屏 / 日志证据；本轮只有独立临时网关的 HTTP 断言，
-  不代替真机。欠账按顶部书写约定继续标出：
-- `TODO(gw, 2026-11-13)` 真机验收：S4 真机 / 人工窗口（APK 切会话经 relay 与 lan-server 两道门、
-  真机配对与 `phone-gate` 401、mygo GUI 切屏与双徽标、第二个 conversation 真派单后 `/state`
-  与归档守卫），以及 issue #15 七项（桌面端、手机端、远程恢复、运行中 profile 加载新构建、
-  真机 APK 安装、真实额度数据源、relay 重新部署）均未做，缺真机证据；每项有证据才勾。
+  → **2026-11-14 逐项结清**（证据见 `docs/PHASE_ISSUE18_RELAY_AND_GUI.md` 与 `开发进度.md`）：
+  - ~~APK 切会话经 **relay 门**~~ ✅ `33dd955` + `b2f305e`：手机 shell 用真实设备凭据打
+    `jarvis.kentonnie.top/crew-relay/i/kenton-mac`，不带凭据 401、带上 200 回
+    `{"sessions":["main","work"],"session_api":1}`；带 `x-crew-session: work` 发一条 →
+    `{"ok":true,"id":47,"session_id":"work"}`，源地址是 CF 边缘（3.8s，比 LAN 的 10ms 高一个量级）。
+    队列判据（**当时**现场值，之后队列继续增长属正常）`main|43` 不变、`work|1→2`，`request_id` 逐字一致。
+  - ~~APK 切会话经 **lan-server 门**~~ ✅ `8b2c436`（记录已在 `c880aaa` 订正为「只走了 LAN 门」，
+    现由 relay 门补齐另一半，两道门至此各走一次）。
+  - ~~`phone-gate` 401~~ ✅ 同上：不带凭据经 relay 回 `401 {"error":"Not paired"}`，
+    说明请求真到了后端而不是中转自己编的错。
+  - ~~mygo GUI 切屏~~ ✅ `33dd955`：重打包 `.app`、`open -g` 后台启动（全程 `lsappinfo front`
+    是 `loginwindow`，没发任何桌面输入事件），经 unix socket 驱动调试口 `session.set` 切
+    main/work 并各发一条；队列（当时）`main|47`、`work|4`，两段 timeline 68 / 4 条互不串。
+    本轮复核这些行仍在 `mobileq.db` 里（`id=47|work`、`52|main`、`53|work`），不是一次性截图。
+- `TODO(gw, 2026-11-14)` 真机验收剩余（上面那条里**没被划掉**的部分，逐项保留）。
+  2026-11-14 17:36–17:47 又结清一条（第二个 conversation 真派单），**剩两条**：
+  - **桌面真 GUI 双徽标未看过**：`unreadReplies` 徽标有代码（`desktop/ui.go:1666`）与单测
+    （`desktop/nav_test.go`），但没在真 GUI 里同时看到「未读」与「未读回话」两枚徽标。
+    **2026-11-14 17:47 复核：仍未覆盖。**
+  - ~~**第二个 conversation 真派单后 `/state` 与归档守卫未验**~~ ✅ **2026-11-14 17:36–17:47 已验**
+    （报告 `docs/review/2026-11-14-work-conversation-ticket-acceptance.md`，
+    复跑脚本 `docs/review/2026-11-14-work-conversation-verify.py`，**39 条断言全 PASS / `FAILS: 0` / `EXIT=0`**）。
+    走的是真实链路，一处旁路都没有：桌面凭据 → `POST /api/mobile/send?session_id=work`
+    → lan-server 门 → `phone-gate` → `mobilegw` → `mobileq.db`（`conversation='work'`）
+    → team Source 轮询 → `Trigger(meta.conversation=work)` → Gate/Eval/判官 → Decision(accept)
+    → Ticket → Executor 起 `worker-<ticketId>`；**没有** `mobileq inject`、没有手写
+    `orchestrator.sqlite`、没有伪造 decision 或 ticket。
+    - 票 A `9a0a8727ddecce7ce03d2030c0808dd8`（completed，5.6 秒）与票 B
+      `afdf7ef7e63570ab546605028990c186`（completed，25 秒运行窗口）的
+      `mandate.basis.scope.conversation` **都是 `work`**（`messageId` 分别为 `"60"` / `"61"`，
+      `origin.triggerId` → `thread team:work:60` / `team:work:61`）。
+    - **`main` 不串线**：票数 15→15、队列 51→51、timeline 78 条不变；`m60`/`m61` 不在 `main` timeline 里。
+    - **`/state` 与归档守卫正常**：六拍快照（17:44:13–17:44:44，每 4 秒一拍）`load.running` 从 1 归 0、
+      `paused: false`、`runtime: ready`、`masterId` 未变、12 项 health 全 `ready`、无 `master_archived` 告警；
+      主 Session 不在归档集合，两个新 worker Session 都已归档。
+    - **当前设计边界（不是缺口，不加需求）**：`/state` 的 `load` 是**全局**的，不按会话分列负载 ——
+      「work 会话在跑几张票」要从 `timeline tasks` / 票表读，不从 `/state` 读。本轮验收按这个口径做的。
+  - **配对屏真机三验未做**（`开发进度.md` §四仍挂着 `[ ]`）：干净安装弹权限框、拒绝后手输仍能配对、
+    同网段两台机器能选第二行、手改过的地址不被自动填抢走。「这台手机已配对」是事实，
+    「配对屏的四条路径都验过」不是。**2026-11-14 17:47 复核：仍未覆盖。**
+- `TODO(desktop, 2026-11-14)` 桌面 **GUI 上真点一次「接手 →」** 仍未验：`POST /api/mobile/takeover`
+  已用真票验到真停（`20ec7f99`，`ended.by: human` / `outcome: stopped`，`cf8dd59` 的假成功修复有效），
+  但那是**接口级**；`desktop/ui_takeover.go` 的按钮路径只有 httptest 与纯函数单测
+  （`action_takeover_test.go` 10 例）。接口通 ≠ 按钮通。
+- issue #15 七项（Step 0 四期收尾）现状逐项（不笼统说「都过了」）：
+  - 第 1 项 桌面 takeover + 记忆编辑：记忆编辑 ✅（`33dd955`，KV 真写入 + 杀进程重启 84471→85051 后仍在 + 已回滚）；
+    takeover **只到接口级** ✅（真票 `20ec7f99` 真停，`ended.by: human` / `outcome: stopped`），
+    GUI 按钮未点（见上一条 `TODO(desktop, …)`）。
+  - 第 2 项 手机花名册 / 48dp / 暂停→继续 ✅（花名册 3 个逐字一致；`uiautomator` 真实 bounds 16/16 ≥48dp；
+    暂停期间 3 条消息 200 且顺序对、恢复成功、整条 Trigger→Eval→判官链路走通）。
+  - 第 3 项 远程恢复 4 项联调 ✅ —— **已由 #19 关单覆盖**：①真实设备凭据经 LAN+RELAY 两路 resume 200；
+    ②无凭据/坏凭据/坏设备全部 401 `{"error":"Not paired"}`；③暂停后按钮切回继续、真机 `paused False→True→False`；
+    ④对 takeover 已停票 resume 后仍 stopped（失败路径 409、20s 复查 open=0，**不复活**）。四项逐项真机证据，
+    含失败路径。见 `docs/review/2026-11-14-issue19-pause-direction-fix.md`、#19 收口评论。
+    （原「未做 / 移交」状态已由本条取代。）
+  - 第 4 项 运行中加载新构建 ✅ **但有边界**（`331371d`）：机制查清（`dsh-hmr` profile 重组），
+    在临时 `DSH_HOME` + 独立端口实测 5 轮 5/5、2.19–2.69 秒、状态不丢、坏构建自动恢复；
+    **生产 70723 全程只读，没在生产上真做一次**。另有坑：账户类设置触发的 `ctx.fiber.restart()`
+    不会加载新构建。
+  - 第 5 项 真机 APK 安装 ✅（新包已装，调试口 `capability: live` / `timeline.loaded: true`）。
+  - 第 6 项 真实额度数据源 ✅（`6c12766`：前提「是假数据」被纠正——全仓无 mock；
+    另修三个真 bug：`contextWindow` 读错字段、余量口径漏缓存、桌面展开票空指针 panic；
+    接上本机 magpie `GET /v1/magpie/quotas`，源头 33 条 raw ↔ 后端 66 个 windows 逐字相等。
+    **金额按设计留空**：单价与账单不在本机，`LlmAdapter` 无 billing 方法）。
+  - 第 7 项 relay 重新部署 ✅（00:05 `uptimeMs` 264620629→24568、`tunnels` 0→1；
+    尾巴 `6b7ab31`：NAS compose 的 `RELAY_MAX_BODY_BYTES: "262144"` 压住了语音上限，
+    删行重建后同一份 500KB WAV 从 413 变 200）。
 
 ### 9.5 四种组合与静默串线
 
@@ -1089,7 +1197,13 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
 `scripts/test-s4-e2e.sh` 用独立临时网关覆盖 1 / 2 与 3 的队列层证据（`read_at` 为空、无回复行）；
 3 的 `scope()` 记录与 4 的注册即生效由 `backend/tests/source-session-admission.spec.ts` 表达，
 脚本在该文件存在时调用它。真机里「第二个 conversation 真派单后 `/state` 与归档守卫仍正常」
-仍属 §9.4 的真机欠账，本轮没有真机证据。
+**已于 2026-11-14 17:36–17:47 验过**：`work` 会话真派出两张票
+（`9a0a8727ddecce7ce03d2030c0808dd8` / `afdf7ef7e63570ab546605028990c186`，均 completed，
+`mandate.basis.scope.conversation` 都是 `work`），`main` 票数 / 队列 / timeline 三者均不变，
+`/state` 与归档守卫正常。证据与 39 条断言见
+`docs/review/2026-11-14-work-conversation-ticket-acceptance.md`（复跑脚本
+`docs/review/2026-11-14-work-conversation-verify.py`）。§9.4 的 `TODO(gw, 2026-11-14)`
+因此只剩「桌面双徽标」与「配对屏三验」两条。
 
 **两处边界（实现如此，按字面验收会以为漏了）**：
 
@@ -1146,5 +1260,8 @@ Source 拿不到 `store` 时经 `SourceContext` / settings 注入，不用全局
   没有群组写路由（不存在 `POST /api/mobile/groups`），客户端不得本地改完 `groups` 当落盘。
 - 桌面端 `desktop/ui.go` 用 `Conversation.Groups` 画只读栏，手机端不改（#14 只要求桌面或真机
   二选一）。`groups` 的接入字段位置、import 与断言由 lead 在集成时与本节对齐。
-- **验收边界**：三态与结构由 `backend/tests/groups.spec.ts` 覆盖，脚本在该文件存在时调用它；
-  群组投影在真机或桌面端实际打开看过（#10 第 4 项）仍属 §9.4 的真机欠账。
+- **验收边界**：三态与结构由 `backend/tests/groups.spec.ts`（15 例）覆盖，脚本在该文件存在时调用它；
+  桌面端接线（`desktop/client.go:738-740` 的 `Groups` 字段、`desktop/ui.go:1237` 的 `GroupsView`、
+  `groupsOfConversation`）由 `go test` 覆盖。**但「在真 GUI 里实际打开看过这栏」仍未做**
+  —— 与 §9.4 `TODO(gw, 2026-11-14)` 的「双徽标未看过」是同一类欠账：代码与测试齐，
+  缺一次真人眼看。

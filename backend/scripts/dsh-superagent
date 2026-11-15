@@ -131,6 +131,32 @@ def bind_drift(profile: str):
 ARTIFACTS = ROOT / '.artifacts'
 CONTROL = ARTIFACTS / 'control'
 KEEP_LOGS = 20
+# 网关的所有权记录名，与 tools/mobilegw 写的是同一个文件名。
+OWNER_NAME = 'mobilegw.owner'
+# 生产网关的端口，只在「没有 stateDir 可用」这一条兜底路径上出现；正常路径一律由状态目录推出端口。
+PRODUCTION_GATEWAY_PORT = 8788
+
+
+def default_state_dir():
+    """The historical default state directory, the one a profile without `stateDir` gets."""
+    return Path.home() / '.dsh' / 'state' / 'superagent'
+
+
+def owns_gateway(pid, port, state_dir):
+    """Whether the gateway's own ownership record names this PID, port and state directory.
+
+    端口与命令行都不是所有权证明：一个碰巧监听同一端口的进程、或一条恰好含 `mobilegw` 的命令行
+    都能命中。只有网关启动时自己写下的记录同时对上三样，才说明「这是这一支队伍的那一份」，
+    可以回收。记录缺失（老网关、或不是本脚本起的）时一律当作不是自己的 —— 宁可报错让人看，
+    也不替别人做决定。
+    """
+    directory = Path(state_dir).expanduser() if state_dir else default_state_dir()
+    try:
+        record = json.loads((directory / OWNER_NAME).read_text())
+    except (OSError, ValueError):
+        return False
+    return (record.get('pid') == pid and record.get('port') == port
+            and str(record.get('state')) == str(Path(directory).resolve()))
 
 
 def control(profile):
@@ -370,11 +396,13 @@ def ensure_gateway(profile=None):
     if state_dir:
         # 队列与 token 跟着 profile 的 stateDir 走，两套队伍各有各的一份。
         environment['MOBILEGW_STATE'] = str(state_dir)
-        # 端口也必须分开：同一个端口上两个 gateway 只有一个能绑住，另一个会以 Errno 48 退出。
-        environment.setdefault('MOBILEGW_PORT', str(state_dir_identity(state_dir)))
+    # 端口必须**永远**显式给，连没有 stateDir 的 profile 也一样：网关已经不再有缺省端口了
+    # （tools/gateway_binding.py），而这里留空就等于让它带着「我是谁」这个问题启动。
+    # 端口由状态目录推出来，两套队伍各自落在不同的端口上。
+    environment.setdefault('MOBILEGW_PORT', str(state_dir_identity(state_dir or default_state_dir())))
     # 按端口杀，不按路径：两套队伍各有一个 gateway，按路径 pkill 会把另一套也杀掉，
     # 那边的手机会一直连不上，直到它自己的脚本再跑一次。端口是每套队伍独有的。
-    port = int(environment.get('MOBILEGW_PORT', '8788'))
+    port = int(environment.get('MOBILEGW_PORT', str(PRODUCTION_GATEWAY_PORT)))
     for pid in listener_pids(port):
         # 端口不是身份证明：先确认命令行确实是网关，别把碰巧用同一端口的东西杀掉。
         args = process_args(pid)
@@ -393,6 +421,11 @@ def ensure_gateway(profile=None):
                 subprocess.run(['launchctl', 'kickstart', '-k', f'gui/{os.getuid()}/{label}'], check=False)
                 time.sleep(1.0)
             return
+        # 命令行里出现 mobilegw 只是必要条件，不是所有权证明：一份从别处起、命令行恰好含这个词的进程
+        # 也会命中。所以只回收「自己的所有权记录写着这个 pid、这个端口、这个状态目录」的那一个。
+        if not owns_gateway(pid, port, environment.get('MOBILEGW_STATE')):
+            raise RuntimeError(f'port {port} is held by PID {pid}, which is not this crew\'s gateway '
+                               f'(no matching {OWNER_NAME} record); refusing to signal it')
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:

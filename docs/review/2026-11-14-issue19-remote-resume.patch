@@ -1,0 +1,431 @@
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewDebug.kt b/app/app/src/main/java/com/dsh/botcrew/CrewDebug.kt
+index 02b245e..dbf6e1c 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewDebug.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewDebug.kt
+@@ -73,6 +73,8 @@ class CrewDebug(private val target: CrewDebugTarget) {
+                 target.send(text, argString(args, "request_id").orEmpty())
+             }
+         },
++        "pause" to { args -> target.pause(argString(args, "ticket")) },
++        "resume" to { _ -> target.resume() },
+         "tab.set" to { args ->
+             val tab = argString(args, "tab")
+             when {
+@@ -202,6 +204,18 @@ interface CrewDebugTarget {
+ 
+     /** 切镜头（聊天 / 分拣台）。 */
+     fun setMode(mode: String): DebugReply
++
++    /**
++     * 停一下 / 继续执行。
++     *
++     * 存在的理由：工作区那个按钮在 adb 眼里是坐标，按不中也不可断言。这条动作必须落到
++     * **界面按一下会调的同一个函数**（CrewRoot.setPaused）—— 状态位、pauseRevision、
++     * 回执话术都在那一份里，这里不许另写一套替身，否则「调试口验过」不代表按钮验过。
++     */
++    fun pause(ticketId: String?): DebugReply
++
++    /** 继续执行。与 [pause] 同一条路，只是方向相反。 */
++    fun resume(): DebugReply
+ }
+ 
+ /**
+@@ -233,6 +247,14 @@ class CrewDebugScreen(
+     private val onSend: (String, String) -> Unit,
+     private val onTab: (String) -> Unit,
+     private val onMode: (String) -> Unit,
++    /**
++     * 停一下 / 继续执行：CrewRoot 传 `scope.launch { setPaused(...) }`，与工作区那个按钮
++     * 落到同一个函数上。这里只发起，**不在这里断言成功** —— 结果由 [snapshot] 的
++     * `paused` 与 `pauseResult` 读回，脚本按那两处断言，不认这一条回执。
++     */
++    private val onSetPaused: (Boolean, String?) -> Unit,
++    /** 上一次停/继续的回执原话（成功话术或失败原话）；还没按过是 null。 */
++    private val pauseResult: () -> String?,
+ ) : CrewDebugTarget {
+ 
+     override fun snapshot(): JSONObject {
+@@ -251,6 +273,8 @@ class CrewDebugScreen(
+             .put("tab", tab())
+             .put("mode", mode())
+             .put("paused", paused())
++            // 停/继续的回执原话。null 表示还没按过 —— 与 problem 同一规矩，不拿空串冒充。
++            .put("pauseResult", pauseResult() ?: JSONObject.NULL)
+             .put("problem", problem() ?: JSONObject.NULL)
+             .put("draft", draft())
+             .put("sending", sending())
+@@ -342,6 +366,22 @@ class CrewDebugScreen(
+         onMode(name)
+         return DebugReply.ok(JSONObject().put("mode", mode()))
+     }
++
++    /**
++     * 停一下。ticket 给了就带上（与按钮上「屏幕上显示的是哪张票」同一口径），没给就是全局。
++     *
++     * 回执只说「已发出」，不在这里报成功：真正成没成看 `paused` 有没有翻过来 ——
++     * 那一位由 setPaused 在 HTTP 成功后写。所以脚本要断言 `paused`，不是断言这里的 ok。
++     */
++    override fun pause(ticketId: String?): DebugReply {
++        onSetPaused(true, ticketId)
++        return DebugReply.ok(JSONObject().put("requested", "pause"))
++    }
++
++    override fun resume(): DebugReply {
++        onSetPaused(false, null)
++        return DebugReply.ok(JSONObject().put("requested", "resume"))
++    }
+ }
+ 
+ /** MainActivity 写的那一半：配对、走哪条路、隧道往返、局域网那条地址的状态。 */
+@@ -412,6 +452,8 @@ class DebugBridge : CrewDebugTarget {
+ 
+     override fun setTab(tab: String): DebugReply = screen?.setTab(tab) ?: notInCrew()
+     override fun setMode(mode: String): DebugReply = screen?.setMode(mode) ?: notInCrew()
++    override fun pause(ticketId: String?): DebugReply = screen?.pause(ticketId) ?: notInCrew()
++    override fun resume(): DebugReply = screen?.resume() ?: notInCrew()
+ 
+     /** 还没进队伍：如实说，不假装动作成功。 */
+     private fun notInCrew(): DebugReply = DebugReply.fail("界面还没进队伍：先配对")
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt b/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
+index 45ded95..faf0c5f 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
+@@ -246,6 +246,9 @@ fun CrewRoot(
+     // 时间线刷新的单飞记号（见下面 refresh）。
+     val refreshGuard = remember { RefreshGuard() }
+     var executorPaused by remember { mutableStateOf(false) }
++    // 上一次停/继续的回执原话。调试口靠它断言「按下去之后到底成没成」——
++    // 与工作区页上那行 `touched` 是同一个来源，只是那边是页面内状态，脚本读不到。
++    var pauseResult by remember { mutableStateOf<String?>(null) }
+     // 动作回执回来之后，已在途的时间线不再覆盖它；下一趟拉取仍以后端为准。
+     var pauseRevision by remember { mutableStateOf(0) }
+     // 名单先验失败后，人点「重试」就再问一次；不改变锁 main 的结论。
+@@ -315,6 +318,31 @@ fun CrewRoot(
+         }
+     }
+ 
++    /**
++     * 停一下 / 继续执行。**界面按钮与调试口共用这一条**，不各写一份。
++     *
++     * 为什么要一个函数而不是两处各写一遍：暂停的状态位（[executorPaused] + [pauseRevision]）
++     * 与回执话术绑在一起 —— 复制一份出来，就一定会有一份忘记把 revision 加一，
++     * 那时时间线的下一趟刷新会把刚按下的状态覆盖掉，界面闪回「正在干活」。
++     *
++     * 成功才改状态：`client.pause/resume` 抛错时这里什么都不动，调用方照实说失败。
++     * 返回那句给人看的话（与后端回的 scope 对得上）。
++     */
++    suspend fun setPaused(paused: Boolean, ticketId: String?): String {
++        val said = if (paused) {
++            // scope 用后端回执里的那个，不在这里写死 —— 将来多一种作用域时这句话才对得上。
++            WorkspaceCopy.pauseDone(client.pause(ticketId))
++        } else {
++            client.resume()
++            WorkspaceCopy.RESUMED
++        }
++        executorPaused = paused
++        // 回执已到：在途的时间线不再拿它手里那份旧 status 覆盖刚按下的结果。
++        pauseRevision += 1
++        pauseResult = said
++        return said
++    }
++
+     /**
+      * 进入另一格会话：切过去与新建成功后走同一段，草稿/幂等键/结果条轮次一律不复用。
+      * 请求路径不靠任何全局状态 —— 各处显式读 [SessionState.requestSession]，
+@@ -380,6 +408,20 @@ fun CrewRoot(
+                 },
+                 onTab = { name -> screenFromName(name)?.let { screen = it } },
+                 onMode = { name -> mode = if (name == "triage") Mode.Triage else Mode.Chat },
++                // 调试口按的停/继续与工作区那个按钮落到同一个 setPaused 上。
++                // 失败也写进 pauseResult：脚本要能看见「没做成」，不能只看得见成功。
++                onSetPaused = { next, ticketId ->
++                    scope.launch {
++                        try {
++                            setPaused(next, ticketId)
++                        } catch (error: CancellationException) {
++                            throw error
++                        } catch (error: Exception) {
++                            pauseResult = WorkspaceCopy.failed(error.message)
++                        }
++                    }
++                },
++                pauseResult = { pauseResult },
+             )
+         }
+         DisposableEffect(debug) {
+@@ -508,7 +550,7 @@ fun CrewRoot(
+                     ticket = ticketOf(conversation, onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId }),
+                     // 执行器被全局暂停这件事压过单个 Bot 的 activity 词，所以从队伍状态里取。
+                     paused = executorPaused,
+-                    onPausedChanged = { executorPaused = it; pauseRevision += 1 },
++                    onSetPaused = { next, ticketId -> setPaused(next, ticketId) },
+                     palette = palette,
+                     preview = previewTicket,
+                     previewView = previewView,
+@@ -1381,7 +1423,11 @@ private fun WorkspaceScreen(
+     bot: BotCard?,
+     ticket: WorkTicket?,
+     paused: Boolean,
+-    onPausedChanged: (Boolean) -> Unit,
++    /**
++     * 停一下 / 继续执行。挂到 CrewRoot.setPaused 上 —— 按钮与调试口共用同一条实现，
++     * 这里只负责把结果写进页面（成功的话术，或失败原话）。
++     */
++    onSetPaused: suspend (Boolean, String?) -> String,
+     palette: CrewPalette,
+     /** 代码卡带过来的票号；有值时这一页读的是它，而不是 bot 手上那张。 */
+     preview: String? = null,
+@@ -1641,22 +1687,16 @@ private fun WorkspaceScreen(
+                     }
+                 }
+                 WorkspaceButton(WorkspaceAction.Pause, palette, enabled = !busy,
+-                    label = if (paused) "继续执行" else WorkspaceAction.Pause.label) {
++                    label = WorkspaceCopy.pauseLabel(paused)) {
+                     if (busy) return@WorkspaceButton
+                     val resuming = paused
+                     busy = true
+                     scope.launch {
+                         try {
+                             // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
+-                            if (resuming) {
+-                                client.resume()
+-                                onPausedChanged(false)
+-                                touched = "已继续执行（全局执行器）"
+-                            } else {
+-                                client.pause(preview ?: ticket?.id)
+-                                onPausedChanged(true)
+-                                touched = "已让它停一下（全局执行器）"
+-                            }
++                            // 状态位与回执话术都在 onSetPaused 里（CrewRoot.setPaused），
++                            // 调试口按同一条路走，这里不另写一份。
++                            touched = onSetPaused(resuming, preview ?: ticket?.id)
+                             // 停完重读：画面顶上那一行要说「停住了」，不能还写着「正在干活」。
+                             reread()
+                         } catch (error: Exception) {
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt b/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
+index 078917d..9495827 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
+@@ -1202,11 +1202,25 @@ object WorkspaceCopy {
+     const val TAKEOVER_IDLE = "它手上没有活儿"
+ 
+     /**
+-     * 停一下成功。scope 如实来自后端：现在只有执行器的全局暂停，
+-     * 恢复要去面板 —— 把这句话说出来，省得人在手机上找恢复按钮。
++     * 停一下成功。scope 如实来自后端：现在只有执行器的全局暂停。
++     *
++     * 这句话以前写「恢复要去面板」—— 那时手机上确实没有恢复按钮。按钮接上以后那半句成了假话：
++     * 同一个按钮停完就变成「继续执行」。说清「再按一下」，人才不会跑去面板找。
+      */
+     fun pauseDone(scope: String): String =
+-        if (scope == "executor") "已让它停一下（全局执行器，恢复要去面板）" else "已让它停一下"
++        if (scope == "executor") "已让它停一下（全局执行器，再按一下继续）" else "已让它停一下"
++
++    /** 继续执行成功。后端确认过 `resumed: true` 才会走到这句话。 */
++    const val RESUMED = "已继续执行（全局执行器）"
++
++    /** 暂停按钮那一格的字：停了就写「继续执行」。同一个按钮，两个方向。 */
++    const val RESUME_LABEL = "继续执行"
++
++    /**
++     * 暂停按钮此刻该写什么。抽成函数是为了让它可断言 —— 真机上看这一格要解锁屏幕，
++     * 而这条判断本身没有副作用，直接测它比隔着 uiautomator 读像素稳。
++     */
++    fun pauseLabel(paused: Boolean): String = if (paused) RESUME_LABEL else WorkspaceAction.Pause.label
+ 
+     /** 动作失败时的原话。detail 来自后端错误体，直译，不粉饰。 */
+     fun failed(detail: String?): String = "没做成：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+diff --git a/app/app/src/test/java/com/dsh/botcrew/CrewDebugTest.kt b/app/app/src/test/java/com/dsh/botcrew/CrewDebugTest.kt
+index b4d898c..f0b07ef 100644
+--- a/app/app/src/test/java/com/dsh/botcrew/CrewDebugTest.kt
++++ b/app/app/src/test/java/com/dsh/botcrew/CrewDebugTest.kt
+@@ -67,6 +67,16 @@ class CrewDebugTest {
+             calls += "mode.set:$mode"
+             return DebugReply.ok(JSONObject().put("mode", mode))
+         }
++
++        override fun pause(ticketId: String?): DebugReply {
++            calls += "pause:${ticketId ?: "<global>"}"
++            return DebugReply.ok(JSONObject().put("requested", "pause"))
++        }
++
++        override fun resume(): DebugReply {
++            calls += "resume"
++            return DebugReply.ok(JSONObject().put("requested", "resume"))
++        }
+     }
+ 
+     private fun bus(target: CrewDebugTarget = FakeTarget()) = CrewDebug(target)
+@@ -129,7 +139,10 @@ class CrewDebugTest {
+         val names = reply.result!!.getJSONArray("actions")
+         val got = (0 until names.length()).map { names.getString(it) }
+         assertEquals(
+-            listOf("actions.list", "mode.set", "refresh", "send", "session.list", "session.reload", "session.set", "state.dump", "tab.set"),
++            listOf(
++                "actions.list", "mode.set", "pause", "refresh", "resume", "send",
++                "session.list", "session.reload", "session.set", "state.dump", "tab.set",
++            ),
+             got,
+         )
+     }
+@@ -192,11 +205,13 @@ class CrewDebugTest {
+             onSend = { _, _ -> },
+             onTab = {},
+             onMode = {},
++            onSetPaused = { _, _ -> },
++            pauseResult = { null },
+         )
+         val snap = screen.snapshot()
+         for (key in listOf(
+             "session", "capability", "switchable", "defaultSession", "note", "error",
+-            "sessions", "cached", "tab", "mode", "paused", "problem", "draft", "sending",
++            "sessions", "cached", "tab", "mode", "paused", "pauseResult", "problem", "draft", "sending",
+             "entries", "entry", "p2p", "timeline",
+         )) {
+             assertTrue("快照缺字段：$key", snap.has(key))
+@@ -251,6 +266,8 @@ class CrewDebugTest {
+             onSend = { _, _ -> },
+             onTab = {},
+             onMode = {},
++            onSetPaused = { _, _ -> },
++            pauseResult = { null },
+         ).snapshot()
+         val timeline = snap.getJSONObject("timeline")
+         assertTrue(timeline.getBoolean("loaded"))
+@@ -284,6 +301,7 @@ class CrewDebugTest {
+             entries = { emptyList() }, currentEntry = { "" },
+             onRefresh = {}, onEnterSession = {}, onSend = { _, _ -> }, onTab = {}, onMode = {},
+             onReloadSessions = {},
++            onSetPaused = { _, _ -> }, pauseResult = { null },
+         ).snapshot()
+         assertTrue("problem 没说清时是 null", snap.isNull("problem"))
+         val timeline = snap.getJSONObject("timeline")
+@@ -328,6 +346,82 @@ class CrewDebugTest {
+         assertFalse(bus().invoke("send", JSONObject().put("text", "")).ok)
+     }
+ 
++    // ── 停一下 / 继续执行：与按钮同一条路 ──────────────────────────────────
++
++    /**
++     * 调试口按「停一下」，必须落到界面按一下会调的同一个函数上。
++     *
++     * 这一条挡的是「调试口自己造一个替身」：替身能让脚本全绿，而真按钮根本没接上。
++     * 判据是目标的账上出现了 pause，且带上了按钮会带的那个票号。
++     */
++    @Test
++    fun pauseReachesTheSameFunctionTheButtonCalls() {
++        val target = FakeTarget()
++        val reply = bus(target).invoke("pause", JSONObject().put("ticket", "t-9"))
++        assertTrue(reply.ok)
++        assertEquals(listOf("pause:t-9"), target.calls)
++    }
++
++    @Test
++    fun pauseWithoutATicketIsTheGlobalPauseTheButtonUsesWhenNothingIsRunning() {
++        // 按钮在「它手上没有在跑的票」时就是这么调的：不带票号，后端如实回 executor 作用域。
++        val target = FakeTarget()
++        assertTrue(bus(target).invoke("pause", JSONObject()).ok)
++        assertEquals(listOf("pause:<global>"), target.calls)
++    }
++
++    @Test
++    fun resumeTakesTheSameRoadInTheOtherDirection() {
++        val target = FakeTarget()
++        assertTrue(bus(target).invoke("resume", JSONObject()).ok)
++        assertEquals(listOf("resume"), target.calls)
++    }
++
++    /**
++     * 回执说「已发出」，不是「已成功」。
++     *
++     * 真正的成没成由 snapshot 的 paused 位表达（那一们只在 HTTP 成功后翻）。
++     * 这里钉住的是「动作层不假报成功」：即使 setPaused 会抛错，pause 这一条也照旧只回
++     * requested —— 脚本因此必须去读 paused，而不是拿这条 ok 当结论。
++     */
++    @Test
++    fun pauseReportsWhatItAskedForNotThatItSucceeded() {
++        val reply = bus().invoke("pause", JSONObject().put("ticket", "t-1"))
++        assertTrue(reply.ok)
++        assertEquals("pause", reply.result!!.getString("requested"))
++        assertFalse("回执里不许出现「已成功」这类字段", reply.result!!.has("paused"))
++    }
++
++    @Test
++    fun theSnapshotCarriesThePauseResultSoAFailureIsVisible() {
++        val snap = CrewDebugScreen(
++            state = { SessionFlow.accept(SessionState(), SessionsView(emptyList(), sessionApi = true)) },
++            tab = { "crew" }, mode = { "chat" }, timelineEpoch = { 0 },
++            paused = { true }, problem = { null }, draft = { "" }, sending = { false },
++            entries = { emptyList() }, currentEntry = { "" },
++            onRefresh = {}, onReloadSessions = {}, onEnterSession = {}, onSend = { _, _ -> },
++            onTab = {}, onMode = {},
++            onSetPaused = { _, _ -> },
++            pauseResult = { "没做成：继续执行未确认：队伍回执不完整" },
++        ).snapshot()
++        assertTrue(snap.getBoolean("paused"))
++        assertEquals("没做成：继续执行未确认：队伍回执不完整", snap.getString("pauseResult"))
++    }
++
++    @Test
++    fun anUnpressedPauseResultIsNullNotAnEmptyString() {
++        val snap = CrewDebugScreen(
++            state = { SessionFlow.accept(SessionState(), SessionsView(emptyList(), sessionApi = true)) },
++            tab = { "crew" }, mode = { "chat" }, timelineEpoch = { 0 },
++            paused = { false }, problem = { null }, draft = { "" }, sending = { false },
++            entries = { emptyList() }, currentEntry = { "" },
++            onRefresh = {}, onReloadSessions = {}, onEnterSession = {}, onSend = { _, _ -> },
++            onTab = {}, onMode = {},
++            onSetPaused = { _, _ -> }, pauseResult = { null },
++        ).snapshot()
++        assertTrue("还没按过是 null，不是空串", snap.isNull("pauseResult"))
++    }
++
+     // ── 动作真的落到目标上 ────────────────────────────────────────────────
+ 
+     @Test
+@@ -375,6 +469,8 @@ class CrewDebugTest {
+             override fun send(text: String, requestId: String) = DebugReply.ok()
+             override fun setTab(tab: String) = DebugReply.ok()
+             override fun setMode(mode: String) = DebugReply.ok()
++            override fun pause(ticketId: String?) = DebugReply.ok()
++            override fun resume() = DebugReply.ok()
+         }
+         val bus = bus(exploding)
+         val failed = bus.invoke("refresh", JSONObject())
+diff --git a/app/app/src/test/java/com/dsh/botcrew/WorkspaceCopyTest.kt b/app/app/src/test/java/com/dsh/botcrew/WorkspaceCopyTest.kt
+index 85b9103..21fc969 100644
+--- a/app/app/src/test/java/com/dsh/botcrew/WorkspaceCopyTest.kt
++++ b/app/app/src/test/java/com/dsh/botcrew/WorkspaceCopyTest.kt
+@@ -28,9 +28,10 @@ class WorkspaceCopyTest {
+     fun actionResultsSayWhatActuallyHappened() {
+         assertEquals("已接手，这个工单停了", WorkspaceCopy.TAKEOVER_DONE)
+         assertEquals("它手上没有活儿", WorkspaceCopy.TAKEOVER_IDLE)
+-        // 停一下停的是执行器：必须把「恢复要去面板」说出来，别让人在手机上找。
+-        assertEquals("已让它停一下（全局执行器，恢复要去面板）", WorkspaceCopy.pauseDone("executor"))
++        // 停一下停的是执行器；同一个按钮按第二下就继续 —— 那句话要指向按钮，不是面板。
++        assertEquals("已让它停一下（全局执行器，再按一下继续）", WorkspaceCopy.pauseDone("executor"))
+         assertEquals("已让它停一下", WorkspaceCopy.pauseDone("ticket"))
++        assertEquals("已继续执行（全局执行器）", WorkspaceCopy.RESUMED)
+         // 失败原话带后端理由，不粉饰；没理由时也不留空。
+         assertEquals("没做成：Bot already exists", WorkspaceCopy.failed("Bot already exists"))
+         assertEquals("没做成：队伍没回话", WorkspaceCopy.failed(null))
+@@ -52,6 +53,19 @@ class WorkspaceCopyTest {
+         assertEquals("让它停一下", WorkspaceAction.Pause.label)
+     }
+ 
++    /**
++     * 暂停按钮停了之后必须换成「继续执行」—— #19 第 3 项的判据就是这一格的字。
++     *
++     * 这一条与真机那一步是同一句判断：真机上按下去之后 paused 翻成 true，这一格就该是
++     * 「继续执行」。抽成纯函数才好在锁屏（读不到像素）时也有断言可依。
++     */
++    @Test
++    fun thePauseButtonFlipsToResumeWhenTheExecutorIsPaused() {
++        assertEquals("让它停一下", WorkspaceCopy.pauseLabel(paused = false))
++        assertEquals("继续执行", WorkspaceCopy.pauseLabel(paused = true))
++        assertEquals(WorkspaceCopy.RESUME_LABEL, WorkspaceCopy.pauseLabel(paused = true))
++    }
++
+     @Test
+     fun titleNamesWhoseScreenItIs() {
+         // 画板上是「林 的屏幕」，中间一个空格。

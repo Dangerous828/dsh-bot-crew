@@ -1,0 +1,69 @@
+diff --git a/hub/hub_service/main.py b/hub/hub_service/main.py
+index bf04d45..dd4705d 100644
+--- a/hub/hub_service/main.py
++++ b/hub/hub_service/main.py
+@@ -325,9 +325,44 @@ async def audit_requests(request: Request, call_next):
+ 
+ @app.get("/healthz")
+ async def healthz() -> dict[str, str]:
++    # 通用探针保持原样：外部监控/容器 healthcheck 只认 status/service/version，
++    # 兼容面状态只加在 /v1/health 上（那是宿主机客户端读的那一条）。
+     return {"status": "ok", "service": "home-agent-hub", "version": "1.0.0"}
+ 
+ 
++# dsh-bot-crew#24: 宿主机探测打的是 `GET <hub>/health`（无 header，2xx 即可达），
++# 而 `/v1` router 上挂着 require_token —— 探测没有 token，必然 401 被判「无中枢」，
++# 记忆就永远静默退回本机版。所以在 **app 级**（不经 router 依赖）加一条免鉴权探针。
++#
++# 为什么是 `/v1/health` 而不是根 `/health`：公网 Caddy 只把 `/v1/*` 与 `/healthz`
++# 反代到 hub-api（`jarvis/deploy/caddy/Caddyfile`），根路径 `/health` 会落到前端
++# catch-all 返回 200 HTML —— 那是「假通」，探测永远成功但调用全 405，比 401 更难查。
++# 挂 `/v1/health` 正好命中现成的 `/v1/*` 反代，零 Caddy 改动。
++# 宿主机侧因此把 `memory.hub` 填成 `https://jarvis.kentonnie.top/v1`。
++# 响应与 /healthz 等价，另加 `memory_compat` 字段如实报兼容面注册状态：
++# 模块导入失败时旧实现照样回 `{"status":"ok"}`，探针 200 → 客户端认为中枢可用，
++# 每次召回都 404 后静默降级本机，运维只看得到「hub reached」。
++# 兼容面挂掉不等于整个 hub 挂掉，所以通用 `status` 仍是 `ok`；否定信息放在
++# `memory_compat` 里，让探针/面板能单独判读，既有按 service/version 断言的
++# 外部消费者一个字段都不少。
++MEMORY_COMPAT_STATUS = "unknown"
++
++
++def health_payload(memory_compat: str | None = None) -> dict[str, str]:
++    """健康响应。`memory_compat` 缺省取模块级实际注册结果。"""
++    return {
++        "status": "ok",
++        "service": "home-agent-hub",
++        "version": "1.0.0",
++        "memory_compat": memory_compat if memory_compat is not None else MEMORY_COMPAT_STATUS,
++    }
++
++
++@app.get("/v1/health")
++async def v1_health() -> dict[str, str]:
++    return health_payload()
++
++
+ @router.get("/readyz")
+ async def readyz(session: Session) -> dict[str, str]:
+     await session.execute(select(func.now()))
+@@ -1146,5 +1181,19 @@ except Exception as _metrics_reg_exc:  # noqa: BLE001 — metrics 缺失不阻
+ 
+     _logging.getLogger(__name__).warning("metrics routes not registered: %s", _metrics_reg_exc)
+ 
++# dsh-bot-crew#24: 记忆中枢兼容面 /v1/memory/{search,consolidate}。
++# 不改 /v1 既有 API；契约见 backend/docs/08-memory-hub.md（宿主机侧）。
++try:
++    from .memory_compat_routes import register_memory_compat_routes
++
++    register_memory_compat_routes(router, session_type=Session)
++    MEMORY_COMPAT_STATUS = "registered"
++except Exception as _compat_reg_exc:  # noqa: BLE001 — 兼容面缺失不阻断 hub 启动
++    import logging as _logging
++
++    # 如实记下失败原因，`/v1/health` 会把它报出去（见 health_payload）。
++    MEMORY_COMPAT_STATUS = f"unavailable:{type(_compat_reg_exc).__name__}"
++    _logging.getLogger(__name__).warning("memory compat routes not registered: %s", _compat_reg_exc)
++
+ 
+ app.include_router(router)

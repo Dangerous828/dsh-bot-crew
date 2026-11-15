@@ -6,9 +6,13 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gateway_binding import binding_problem, parse_port  # noqa: E402  (same directory, script not a package)
 
 # MOBILEGW_STATE 让一个后端把 gateway 指到它自己的状态目录：两套队伍（例如 desktop 与 web）各自持有队列和 token，
 # 而不是抢同一份。不设时仍落到历史默认位置，老部署的行为一字不变。
@@ -16,8 +20,10 @@ STATE = os.environ.get('MOBILEGW_STATE') or os.path.join(
     os.environ.get('DSH_HOME') or os.path.expanduser('~/.dsh'), 'state', 'superagent')
 DB = os.path.join(STATE, 'mobileq.db')
 TOKEN_FILE = os.path.join(STATE, 'mobilegw.token')
-PORT = int(os.environ.get('MOBILEGW_PORT', '8788'))
+# 端口与状态目录是**一对**：端口不是缺省值，而是这台网关属于谁的声明。没给就是没声明（见 gateway_binding）。
+PORT_TEXT = os.environ.get('MOBILEGW_PORT', '').strip()
 BIND = os.environ.get('MOBILEGW_HOST', '127.0.0.1')
+OWNER_FILE = os.path.join(STATE, 'mobilegw.owner')
 # 会话必须是请求级的：进程级常量会把两个会话静默并进同一条时间线。`main` 是唯一缺省值（契约 §1）。
 DEFAULT_SESSION = 'main'
 SESSION_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
@@ -44,6 +50,57 @@ def load_token():
 
 
 TOKEN = load_token()
+
+
+def current_token():
+    """The credential to compare against, re-read from disk so a rotation takes effect without a restart.
+
+    原先 TOKEN 是模块级常量：换掉 `<stateDir>/mobilegw.token` 之后，网关仍然只认旧值，直到有人
+    重启它 —— 而重启生产网关是不许做的动作。凭据的真理源是那个文件，不是进程启动那一刻的快照，
+    所以每次校验都读它。
+
+    读失败或读成空值就退回启动时那份：文件被临时挪走不该让所有已配对的手机一起掉线；那种情况下
+    保持原值比 fail-closed 更接近「什么都没发生」。真正换掉文件时，新值立刻生效、旧值立刻失效。
+    """
+    try:
+        with open(TOKEN_FILE) as stream:
+            token = stream.read().strip()
+    except OSError:
+        return TOKEN
+    return token or TOKEN
+
+
+def check_binding():
+    """Refuse to start without an explicit port, or on the production gateway's own port.
+
+    判据全部在 `gateway_binding.binding_problem` 里（纯函数、可单测）。这里只负责把结论翻译成
+    (port, error)：error 非空时调用方必须以退出码 2 结束，且不 bind、不写 owner 记录。
+    """
+    problem = binding_problem(PORT_TEXT, STATE)
+    if problem:
+        return None, problem
+    return parse_port(PORT_TEXT), None
+
+
+def write_owner(port):
+    """Record who owns this process, so a later cleanup can check before it signals anything.
+
+    带 pid + 启动时刻 + 状态目录 + 端口：pid 会被系统回收，只凭 pid 去 kill 可能杀到别人的新进程。
+    **不写凭据值**，也不写任何能反推出凭据的东西。
+
+    这里不写「是不是 launchd 托管的」：`XPC_SERVICE_NAME` 会被 launchd 的子进程继承，任何在
+    launchd 会话里起的网关都会带上它，写下来就是一条会误导人的断言。谁守着哪个端口，由
+    「端口 + 状态目录」这一对回答（见 check_binding）。
+    """
+    record = {'pid': os.getpid(), 'parent': os.getppid(), 'port': port, 'host': BIND,
+              'state': os.path.realpath(STATE), 'started_at': int(time.time())}
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    temporary = OWNER_FILE + '.tmp'
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(record, stream, ensure_ascii=False)
+        stream.write('\n')
+    os.replace(temporary, OWNER_FILE)
 
 
 def db():
@@ -133,7 +190,7 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def _auth(self):
-        return hmac.compare_digest(self.headers.get('X-GW-Token', '').encode(), TOKEN.encode())
+        return hmac.compare_digest(self.headers.get('X-GW-Token', '').encode(), current_token().encode())
 
     def _send(self, code, obj):
         # 能力位覆盖**所有**响应，而不只是 timeline：消息面据此在任何 operation 上判断
@@ -348,7 +405,25 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    # 先判归属，再碰数据库、再 bind：一次没写全的启动必须在「还不知道自己是谁」的时候就停下。
+    PORT, PROBLEM = check_binding()
+    if PROBLEM:
+        print(PROBLEM, file=sys.stderr, flush=True)
+        raise SystemExit(2)
     # Initialize/migrate before accepting concurrent HTTP requests. Never log credentials.
     db().close()
-    print('mobilegw on %s:%d conv=%s session_api=1' % (BIND, PORT, DEFAULT_SESSION), flush=True)
-    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
+    # 先落所有权记录再报启动行：读启动行的一方（台架、测试）应当能立刻读到它。
+    write_owner(PORT)
+    # 启动行只说「凭据在哪一支」和「谁在守着这个端口」，不说凭据本身 —— 2026-11-06 那版把 token 打进了
+    # 一个 0644 的日志，值至今有效。要查用的哪一支，看路径；要验它通不通，发一次请求。
+    print('mobilegw on %s:%d conv=%s session_api=1 state=%s token_file=%s'
+          % (BIND, PORT, DEFAULT_SESSION, os.path.realpath(STATE), TOKEN_FILE), flush=True)
+    try:
+        ThreadingHTTPServer((BIND, PORT), H).serve_forever()
+    except OSError as error:
+        # 端口被别人占着就是别人占着：这里既不重试换端口，也不去动那个进程。
+        print('mobilegw cannot bind %s:%d: port already in use (%s). '
+              'Nothing was killed; pick another MOBILEGW_PORT.' % (BIND, PORT, error),
+              file=sys.stderr, flush=True)
+        raise SystemExit(1)
+

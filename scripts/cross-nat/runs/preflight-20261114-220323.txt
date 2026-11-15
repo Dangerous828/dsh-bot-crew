@@ -1,0 +1,31 @@
+# cross_nat_preflight  ts=20261114-220323
+# Mac 当前地址（判断是否在小米网）:
+  	inet 127.0.0.1 netmask 0xff000000
+  	inet 10.10.10.3 --> 10.10.10.3 netmask 0xffffff00
+  	inet 192.168.31.127 netmask 0xffffff00 broadcast 192.168.31.255
+# Mac 默认网关: 192.168.31.1
+
+## win-laptop（唯一现成第二 NAT 出口）
+  [FAIL] 192.168.0.109:22
+  [FAIL] 10.10.10.1:22
+  -- 公网 IPv6 win.kentonnie.top --
+  resolved IPv6: 240e:3b3:26ff:f70::1000
+  [FAIL] [240e:3b3:26ff:f70::1000]:22 (timeout)
+
+## EasyTier peer 表（看 win-laptop 10.10.10.1 是否在网）
+  | ipv4          | hostname        | cost  | lat(ms) | loss | rx      | tx      | tunnel  | NAT            | version        |
+  |---------------|-----------------|-------|---------|------|---------|---------|---------|----------------|----------------|
+  | 10.10.10.3/24 | mac-workstation | Local | -       | -    | -       | -       | -       | PortRestricted | 2.6.4-8428a89d |
+  | 10.10.10.2/24 | nas-z4          | p2p   | 4.97    | 0.0% | 4.89 MB | 5.87 MB | udp,tcp | PortRestricted | 2.6.4-8428a89d |
+  -> win-laptop 10.10.10.1 不在 mesh（离线/未接入）
+
+## 对照（同 NAT，不可用于跨 NAT，仅确认身份）
+  [OK]   192.168.31.175:22
+  [FAIL] 192.168.31.183:22
+  [--]   NAS 10.10.10.2:22 关闭(正常, 同NAT)
+
+## 手机蜂窝（若 adb 在线则只读快照；不 toggle、不读 SIM 号码）
+  mobile_data=0  |  mDataRegState=1(OUT_OF_SERVICE)  |  移动口IPv4: 无
+  -> 蜂窝不可用（数据关/未注册/无IPv4），手机不能当异网出口
+
+=== VERDICT: NO-FOREIGN-NAT-PEER  (第二网络出口不具备，#20 第1项维持 OPEN) ===

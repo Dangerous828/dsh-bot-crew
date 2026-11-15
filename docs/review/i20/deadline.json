@@ -1,0 +1,112 @@
+[
+  {
+    "case": "慢滴 800ms/字节（#20 里拖到 81.64s 那例）",
+    "mode": "drip",
+    "drip_ms": 800,
+    "wait_ms": 15000,
+    "budget_ms": 1500,
+    "rounds": 1,
+    "wall_seconds": 1.57,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=false millis=-1 wall_ms=1509 budget_ms=1500"
+    ],
+    "ok": false,
+    "probe_millis": -1,
+    "probe_wall_ms": 1509
+  },
+  {
+    "case": "慢滴 100ms/字节（#20 里 22.52s 且误报 ok）",
+    "mode": "drip",
+    "drip_ms": 100,
+    "wait_ms": 15000,
+    "budget_ms": 1500,
+    "rounds": 1,
+    "wall_seconds": 1.58,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=false millis=-1 wall_ms=1514 budget_ms=1500"
+    ],
+    "ok": false,
+    "probe_millis": -1,
+    "probe_wall_ms": 1514
+  },
+  {
+    "case": "对端收下不回",
+    "mode": "hang",
+    "drip_ms": 0,
+    "wait_ms": 15000,
+    "budget_ms": 1500,
+    "rounds": 1,
+    "wall_seconds": 1.57,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=false millis=-1 wall_ms=1508 budget_ms=1500"
+    ],
+    "ok": false,
+    "probe_millis": -1,
+    "probe_wall_ms": 1508
+  },
+  {
+    "case": "慢滴连续 3 轮（连接不许累积）",
+    "mode": "drip",
+    "drip_ms": 200,
+    "wait_ms": 15000,
+    "budget_ms": 1500,
+    "rounds": 3,
+    "wall_seconds": 4.6,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=false millis=-1 wall_ms=1514 budget_ms=1500",
+      "RESULT round=1 ok=false millis=-1 wall_ms=1509 budget_ms=1500",
+      "RESULT round=2 ok=false millis=-1 wall_ms=1509 budget_ms=1500"
+    ],
+    "ok": false,
+    "probe_millis": -1,
+    "probe_wall_ms": 1509
+  },
+  {
+    "case": "快回（正常探测不受影响）",
+    "mode": "normal",
+    "drip_ms": 0,
+    "wait_ms": 15000,
+    "budget_ms": 1500,
+    "rounds": 1,
+    "wall_seconds": 0.09,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=true millis=0 wall_ms=35 budget_ms=1500"
+    ],
+    "ok": true,
+    "probe_millis": 0,
+    "probe_wall_ms": 35
+  },
+  {
+    "case": "慢滴 800ms/字节，生产默认 20s 预算",
+    "mode": "drip",
+    "drip_ms": 800,
+    "wait_ms": 15000,
+    "budget_ms": 20000,
+    "rounds": 1,
+    "wall_seconds": 20.08,
+    "exceeded_budget": false,
+    "capped": false,
+    "peer_established_after": 0,
+    "results": [
+      "RESULT round=0 ok=false millis=-1 wall_ms=20019 budget_ms=20000"
+    ],
+    "ok": false,
+    "probe_millis": -1,
+    "probe_wall_ms": 20019
+  }
+]

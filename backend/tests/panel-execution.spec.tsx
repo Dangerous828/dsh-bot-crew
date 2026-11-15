@@ -217,28 +217,88 @@ it('words an ended Ticket by its outcome, on its row and its page, with a person
 
 // #11 第 3 项：翻默认到 sandbox 之前，执行页得让人一眼看见现在是哪一档。
 // 文案按 ADR 0004 如实说边界，不许拿 sandbox 冒充「已全覆盖」。
+// 档位（配置值）与生效状态（prepare 有没有真进沙箱）分开说：`2364d40` 起 `/state` 带 `isolationActive`，
+// 只读 `isolation` 会把「配了 sandbox 但 prepare 为空」显示成开着。
+// 边界口径（#17 / #22）：沙箱只作用 **prepare 阶段**；agent 在会话里跑的自由命令由 DSH provider 起、
+// 被钉死 `danger-full-access`，**worker 未覆盖**。任何把 worker 说成已隔离的措辞都是事实错误。
+const isolationRow = () => all('.dt-status-line .dt-lv').find(row => row.querySelector('.dt-lv-label')?.textContent === zh.isolationLabel)!
+const isolationLine = () => isolationRow().querySelector('.dt-lv-value')!
+const isolationTone = () => isolationLine().querySelector('[data-state]')?.getAttribute('data-state')
+const isolationHint = () => isolationLine().querySelector('.dt-info')?.getAttribute('aria-label') ?? ''
+/** 断言这一行的档位与说明都没把 worker 说成已覆盖。 */
+const expectNoWorkerCoveredClaim = (text: string) => {
+  // 旧措辞「仅 worker 执行面」正好把未覆盖的 worker 说成覆盖范围，是这次打回的原句。
+  expect(text).not.toContain('仅 worker 执行面')
+  expect(text).not.toContain('worker 执行面')
+  expect(text.toLowerCase()).not.toContain('worker commands only')
+}
+
 it('shows the current isolation level on the Execution status line', async () => {
   await mount()
   await click(zh['tab.execution'])
   const line = document.querySelector('.dt-status-line')?.textContent ?? ''
   expect(line).toContain(zh.isolationLabel)
   expect(line).toContain(zh['isolation.none'])
+  // 未隔离：`none` 本身就是完整结论，不再挂生效状态后缀。
+  expect(isolationLine().textContent).toBe(zh['isolation.none'])
   // 未隔离那档用警示色，别让人一眼扫过去以为是开着的。
-  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('warning')
+  expect(isolationTone()).toBe('warning')
   // 说明走全站一致的 (?) tooltip，不是裸 title；断言无障碍属性而不是控件实现。
-  const tip = document.querySelector('.dt-status-line .dt-lv-value .dt-info')
-  expect(tip?.getAttribute('aria-label')).toContain('自由命令')
+  expect(isolationHint()).toContain('本机账号')
 })
 
 it('shows the sandbox level with its honest boundary, not "fully isolated"', async () => {
-  server.settings.executor = { ...server.settings.executor, isolation: 'sandbox' }
+  server.settings.executor = { ...server.settings.executor, isolation: 'sandbox', prepare: 'true' }
   await mount()
   await click(zh['tab.execution'])
   const line = document.querySelector('.dt-status-line')?.textContent ?? ''
   expect(line).toContain(zh['isolation.sandbox'])
   expect(line).not.toContain(zh['isolation.none'])
-  expect(document.querySelector('.dt-status-line .dt-lv-value [data-state]')?.getAttribute('data-state')).toBe('ongoing')
-  expect(document.querySelector('.dt-status-line .dt-lv-value .dt-info')?.getAttribute('aria-label')).toContain('自由命令')
+  expect(line).toContain(zh['isolation.active'])
+  expect(isolationTone()).toBe('ongoing')
+  // 档位本身就得写清只包 prepare 阶段，别让人在扫一眼那一行时以为 worker 也进了沙箱。
+  expect(isolationLine().textContent).toContain('prepare 阶段')
+  expectNoWorkerCoveredClaim(isolationLine().textContent ?? '')
+  // 生效也要说边界：只包 prepare，worker 会话里的自由命令仍裸跑（ADR 0004 / #22），且要明说「未覆盖」。
+  expect(isolationHint()).toContain('prepare 阶段')
+  expect(isolationHint()).toContain('worker 未覆盖')
+  expectNoWorkerCoveredClaim(isolationHint())
+})
+
+it('says the sandbox level is not in effect when prepare is empty, rather than showing it as on', async () => {
+  server.settings.executor = { ...server.settings.executor, isolation: 'sandbox', prepare: '' }
+  await mount()
+  await click(zh['tab.execution'])
+  expect(isolationLine().textContent).toContain(zh['isolation.sandbox'])
+  expect(isolationLine().textContent).toContain(zh['isolation.inactive'])
+  expect(isolationLine().textContent).not.toContain(zh['isolation.active'])
+  expect(isolationTone()).toBe('error')
+  // 静默空转是最坏形态：说明里必须点出 prepare 为空，别让人以为是配错了别的。
+  expect(isolationHint()).toContain('prepare 为空')
+  // 没生效的档位也不能把 worker 说成已覆盖。
+  expectNoWorkerCoveredClaim(isolationLine().textContent ?? '')
+  expectNoWorkerCoveredClaim(isolationHint())
+})
+
+it('reads a host that does not report isolationActive as unknown, not as inactive', async () => {
+  // 生产 89699 这类早于 2364d40 的构建：`/state` 没有这个键。缺字段 ≠ false。
+  server.stateOmit = ['isolationActive']
+  server.settings.executor = { ...server.settings.executor, isolation: 'sandbox', prepare: 'true' }
+  await mount()
+  await click(zh['tab.execution'])
+  expect(isolationLine().textContent).toContain(zh['isolation.sandbox'])
+  expect(isolationLine().textContent).toContain(zh['isolation.unknown'])
+  expect(isolationLine().textContent).not.toContain(zh['isolation.inactive'])
+  expect(isolationLine().textContent).not.toContain(zh['isolation.active'])
+  expect(isolationHint()).toContain('宿主没返回')
+  // 未知态同样不许暗示 worker 已覆盖。
+  expectNoWorkerCoveredClaim(isolationLine().textContent ?? '')
+  expectNoWorkerCoveredClaim(isolationHint())
+  // 同一份缺字段响应下，`none` 仍是完整结论，不该被拖成未知。
+  server.settings.executor = { ...server.settings.executor, isolation: 'none' }
+  await remount()
+  await click(zh['tab.execution'])
+  expect(isolationLine().textContent).toBe(zh['isolation.none'])
 })
 
 it('sends one stop for a double click on Confirm', async () => {

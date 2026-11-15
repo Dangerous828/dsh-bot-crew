@@ -631,6 +631,23 @@ class PendingOptionsTest {
     }
 
     @Test
+    fun theAttentionIdIsReadFromTheTimelineSoTheCardCanAnswer() {
+        // 带 attention_id 的票：审批卡必须能读出这张卡的 id，答复时才能原样回传。
+        val withId = CrewWire.parseTimeline(timeline("""
+            {"id":"tk-7","title":"x","state":"person","bot_id":"lin","needs_person":"answer",
+             "question":"首页先改哪一块？","attention_id":"attention-approval-tk-7",
+             "options":[{"id":"a","label":"做吧"},{"id":"b","label":"先别做"}]}
+        """.trimIndent())).tickets.single()
+        assertEquals("attention-approval-tk-7", withId.attentionId)
+        // 老后端没下发这个字段：是空串 —— 客户端据此退回普通 /send，不当审批答。
+        val withoutId = CrewWire.parseTimeline(timeline("""
+            {"id":"tk-8","title":"x","state":"person","bot_id":"lin","needs_person":"answer",
+             "question":"首页先改哪一块？","options":[{"id":"a","label":"做吧"}]}
+        """.trimIndent())).tickets.single()
+        assertEquals("", withoutId.attentionId)
+    }
+
+    @Test
     fun aRepeatedOptionIdIsKeptOnce() {
         // 同一个 id 两行会共用「正在发」那一个键：点第二行看着像没反应。
         val ticket = CrewWire.parseTimeline(timeline("""

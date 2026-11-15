@@ -46,9 +46,40 @@
 ## 四、为什么不上 Hub
 
 用户已经有一份上行链路（`local_dream` 的 `dsh_memory` 直通源）。本地账本再上行一次 = 同一件事在中枢出现两条，
-而且两条的写法还不一样，召回时互相顶。所以：**本地提炼的一条都 `to_hub: false`**，
-`MemoryRecord.toHub` 这个字段留着，是为了将来真有需要时（比如某条用户明确要求跨工具可见）能单条打开，
-而不是现在默认打开。
+而且两条的写法还不一样，召回时互相顶。所以：**本地提炼的一条默认都 `to_hub: false`**。
+
+`MemoryRecord.toHub` 这个字段**已接线**（不再只是"留着"）：`settle()` 仍硬编码 `toHub:false`
+（**origin/type 不构成分享授权，`person:owner` 也不自动 true**）；只有已认证操作者经产品 edit 入口显式置
+`toHub:true`，`author.publish` 才把该条落 author md、才随既有 `local_dream` 管道上行——默认不分享，
+既有私有条目**不回改、不遍历**。
+
+**已验结论（#24，真实产品入口闭环）**：显式 `edit toHub:true` → `author.publish` 落 md → 既有 pipeline →
+中枢 live=1 → 另一物理设备（win-desktop）`HubHttp` 召回命中；`forget` 走 `disabled` + 按 canonical
+`source_file` 撤该逻辑记忆全部历史版本 + 原子 tombstone → 中枢 live=0 → 再召回不命中 → 下轮不复活。
+远端行 stable key 是 `sha256(utf8(pipelineContent))[:16]`（**不是** ledger 业务 `dedupe_key`），
+撤回以 `namespace + metadata.source_file` 为准一网打尽所有版本。doc 见
+仓库根 `docs/review/2026-11-14-issue24-product-ledger-seam.md` §九。
+
+### 4.1 API runbook（默认 false / 显式分享 C）
+
+记忆的生成/分享/撤回都走产品 `/api/mobile/memory`，**默认不分享，仅已认证操作者显式 `toHub:true` 才上行**：
+
+```bash
+# 生成一条记忆（human trigger）——默认 toHub:false，不上行
+curl -s -XPOST "$BASE/api/mobile/send" -H "X-Crew-Token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"text":"以后都用 pnpm"}'
+
+# 显式分享该条（C：认证用户明确 true 才上行：落 author md → local_dream 管道 → 中枢）
+curl -s -XPOST "$BASE/api/mobile/memory" -H "X-Crew-Token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"action":"edit","name":"bot-lead-use-pnpm","toHub":true}'
+
+# 撤回（forget）：md disabled + 按 source_file 撤全历史版本 + 原子 tombstone → 中枢 live=0、不复活
+curl -s -XPOST "$BASE/api/mobile/memory" -H "X-Crew-Token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"action":"forget","name":"bot-lead-use-pnpm"}'
+```
+
+`$BASE` 走 LAN 门或 relay 门任一路（两门同一份回执）；`$TOKEN` 为已配对设备的明文设备凭据（仅内存，不落库）。
+不手工 curl 冒充管道上行；publish 只对显式 `toHub:true` 的新/改条目生效，**不遍历回改既有 28 条私有**。
 
 ## 五、落盘格式
 
@@ -58,5 +89,6 @@
 路径：`<rootDir>/bot/<botId>/<name>.md`。`rootDir` 由运行时给（默认 `stateDir/memory`），
 不写死任何本机绝对路径。
 
-> 当前实现把账本存在 SQLite 的 KV 里，`plan` / `render` 是给「将来真要把 md 落盘」准备的路。
-> 两者不冲突：KV 是读写的真相源，md 是给插件格式消费的导出。
+> 当前实现把账本存在 SQLite 的 KV 里；**显式 `toHub:true` 的条目经 `MemoryLedger.edit → author.publish`
+> 真落 author md**（见 §四 已验结论），md 才被既有 `local_dream` 插件格式消费上行。KV 是读写的真相源，
+> md 是给插件格式消费的导出，两者不冲突。

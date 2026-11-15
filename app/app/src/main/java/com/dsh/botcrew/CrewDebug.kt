@@ -73,6 +73,8 @@ class CrewDebug(private val target: CrewDebugTarget) {
                 target.send(text, argString(args, "request_id").orEmpty())
             }
         },
+        "pause" to { args -> target.pause(argString(args, "ticket")) },
+        "resume" to { _ -> target.resume() },
         "tab.set" to { args ->
             val tab = argString(args, "tab")
             when {
@@ -202,6 +204,18 @@ interface CrewDebugTarget {
 
     /** 切镜头（聊天 / 分拣台）。 */
     fun setMode(mode: String): DebugReply
+
+    /**
+     * 停一下 / 继续执行。
+     *
+     * 存在的理由：工作区那个按钮在 adb 眼里是坐标，按不中也不可断言。这条动作必须落到
+     * **界面按一下会调的同一个函数**（CrewRoot.setPaused）—— 状态位、pauseRevision、
+     * 回执话术都在那一份里，这里不许另写一套替身，否则「调试口验过」不代表按钮验过。
+     */
+    fun pause(ticketId: String?): DebugReply
+
+    /** 继续执行。与 [pause] 同一条路，只是方向相反。 */
+    fun resume(): DebugReply
 }
 
 /**
@@ -233,6 +247,14 @@ class CrewDebugScreen(
     private val onSend: (String, String) -> Unit,
     private val onTab: (String) -> Unit,
     private val onMode: (String) -> Unit,
+    /**
+     * 停一下 / 继续执行：CrewRoot 传 `scope.launch { setPaused(...) }`，与工作区那个按钮
+     * 落到同一个函数上。这里只发起，**不在这里断言成功** —— 结果由 [snapshot] 的
+     * `paused` 与 `pauseResult` 读回，脚本按那两处断言，不认这一条回执。
+     */
+    private val onSetPaused: (Boolean, String?) -> Unit,
+    /** 上一次停/继续的回执原话（成功话术或失败原话）；还没按过是 null。 */
+    private val pauseResult: () -> String?,
 ) : CrewDebugTarget {
 
     override fun snapshot(): JSONObject {
@@ -251,6 +273,8 @@ class CrewDebugScreen(
             .put("tab", tab())
             .put("mode", mode())
             .put("paused", paused())
+            // 停/继续的回执原话。null 表示还没按过 —— 与 problem 同一规矩，不拿空串冒充。
+            .put("pauseResult", pauseResult() ?: JSONObject.NULL)
             .put("problem", problem() ?: JSONObject.NULL)
             .put("draft", draft())
             .put("sending", sending())
@@ -342,6 +366,22 @@ class CrewDebugScreen(
         onMode(name)
         return DebugReply.ok(JSONObject().put("mode", mode()))
     }
+
+    /**
+     * 停一下。ticket 给了就带上（与按钮上「屏幕上显示的是哪张票」同一口径），没给就是全局。
+     *
+     * 回执只说「已发出」，不在这里报成功：真正成没成看 `paused` 有没有翻过来 ——
+     * 那一位由 setPaused 在 HTTP 成功后写。所以脚本要断言 `paused`，不是断言这里的 ok。
+     */
+    override fun pause(ticketId: String?): DebugReply {
+        onSetPaused(true, ticketId)
+        return DebugReply.ok(JSONObject().put("requested", "pause"))
+    }
+
+    override fun resume(): DebugReply {
+        onSetPaused(false, null)
+        return DebugReply.ok(JSONObject().put("requested", "resume"))
+    }
 }
 
 /** MainActivity 写的那一半：配对、走哪条路、隧道往返、局域网那条地址的状态。 */
@@ -412,6 +452,8 @@ class DebugBridge : CrewDebugTarget {
 
     override fun setTab(tab: String): DebugReply = screen?.setTab(tab) ?: notInCrew()
     override fun setMode(mode: String): DebugReply = screen?.setMode(mode) ?: notInCrew()
+    override fun pause(ticketId: String?): DebugReply = screen?.pause(ticketId) ?: notInCrew()
+    override fun resume(): DebugReply = screen?.resume() ?: notInCrew()
 
     /** 还没进队伍：如实说，不假装动作成功。 */
     private fun notInCrew(): DebugReply = DebugReply.fail("界面还没进队伍：先配对")
@@ -423,22 +465,50 @@ class DebugBridge : CrewDebugTarget {
  * 所有动作都**在主线程上执行**（Handler.post + 等回执）。界面状态是 Compose 的
  * snapshot state，从 socket 线程直接改它会绕过组合器的时序；桌面端那边是「界面线程也在碰同一份状态」，
  * 手机端更严格 —— 干脆让调试口的调用与真人点一下走同一条线程。
+ *
+ * ## 归属：socket 属于进程，不属于某一届 Activity
+ *
+ * 这条口子的名字在内核里是全局的（abstract namespace），而 Activity 会重建 —— 转屏、
+ * 锁竖屏、换字号都会重建，重建顺序是**新的 onCreate 先于旧的 onDestroy**。所以「每届 Activity
+ * 各建一个 server、各 bind 一次」必然撞车：新实例 bind 时旧 listener 还活着，报
+ * `Address already in use`；随后旧实例的 onDestroy 把旧 listener 关了，进程里就再没有 listener ——
+ * `adb forward` 仍能建，连上去读到空响应，直到杀进程。
+ *
+ * 真机三次复现（17:27 / 17:35 / 17:49）都是这个形状：失败瞬间 `/proc/net/unix` 里
+ * `crew-debug` 计数为 0，而 bind 仍报占用。所以修法不是「关得更快」或「重试到成功」，
+ * 而是**让 bind 只发生一次**：见 [CrewDebugPorts]。
  */
 class CrewDebugServer(
-    private val debug: CrewDebug,
     private val name: String = CrewDebug.SOCKET_NAME,
-) {
+) : CrewDebugPort {
     private var listener: LocalServerSocket? = null
     private var acceptThread: Thread? = null
+
+    /** 现在台前挂着谁。换人只换这一份，socket 不动。 */
+    @Volatile
+    private var debug: CrewDebug? = null
+
     private val main: Handler by lazy { Handler(Looper.getMainLooper()) }
+
+    /** 挂上这一届的挂载点。socket 已经开着时它只换人。 */
+    override fun bind(target: CrewDebugTarget) {
+        debug = CrewDebug(target)
+    }
+
+    /** 摘掉挂载点，socket 照旧开着：下一届 Activity 进场立刻能用。 */
+    override fun unbind() {
+        debug = null
+    }
 
     /**
      * 开一条调试口。返回 false 表示没起来 —— 调用方只记一行日志，界面照常。
      *
      * 走 abstract namespace，所以这里既没有文件要清（不存在上次崩溃留下的死 socket），
      * 也没有权限要设（内核里的名字不与文件系统上的任何路径对应）。
+     *
+     * 只由 [CrewDebugPorts] 调，且一个进程只成功一次。
      */
-    fun start(): Boolean {
+    override fun open(): Boolean {
         if (listener != null) return true
         val server = try {
             // 只传裸名字：LocalServerSocket 内部用 `LocalSocketAddress(name)`，而那个构造函数
@@ -459,10 +529,15 @@ class CrewDebugServer(
         return true
     }
 
-    /** 关掉监听。Activity 销毁时调，与桌面端 ctx.Done() 那一路对应。 */
-    fun stop() {
+    /**
+     * 关掉监听。**进程退出时才走这条路** —— Activity 重建期间这条口必须一直开着。
+     *
+     * close 一落，阻塞在 accept 里的线程就会抛错退出（acceptLoop 里那一条）。
+     */
+    override fun close() {
         val server = listener ?: return
         listener = null
+        debug = null
         try {
             server.close()
         } catch (t: Throwable) {
@@ -517,10 +592,11 @@ class CrewDebugServer(
         val args = request.optJSONObject("args") ?: JSONObject()
 
         // 界面状态归主线程。这里等回执，超时就如实说「界面没空」，不无限挂住这个连接。
+        val active = debug ?: return DebugReply.fail("界面还没挂上：这一届 Activity 已退场")
         val latch = CountDownLatch(1)
         var reply: DebugReply = DebugReply.fail("ui thread busy")
         main.post {
-            reply = debug.invoke(action, args)
+            reply = active.invoke(action, args)
             latch.countDown()
         }
         if (!latch.await(UI_WAIT_MS, TimeUnit.MILLISECONDS)) {
@@ -532,6 +608,92 @@ class CrewDebugServer(
     private companion object {
         /** 主线程多久没回就算这一条失败。界面在长列表滚动时也远不到这个数。 */
         const val UI_WAIT_MS = 10_000L
+    }
+}
+
+/**
+ * 一条调试口能被怎么对待：开 / 挂载点换人 / 关。
+ *
+ * 拆成接口只为一件事：让 [CrewDebugPorts] 的归属规则能在 JVM 单测里跑（真 socket 在 JVM 上没有）。
+ */
+interface CrewDebugPort {
+    /** 起监听。返回 false 表示没起来，调用方只记日志。 */
+    fun open(): Boolean
+
+    /** 把台前的挂载点换成 [target]。socket 不动。 */
+    fun bind(target: CrewDebugTarget)
+
+    /** 摘掉挂载点。socket 照旧开着。 */
+    fun unbind()
+
+    /** 真正关掉监听。只由进程收尾调。 */
+    fun close()
+}
+
+/**
+ * 调试口的归属：**一个进程一条 socket，谁在台前谁挂上去**。
+ *
+ * 为什么要有这一层（而不是让每届 Activity 各建一个 [CrewDebugServer]）：
+ *
+ * 1. abstract namespace 里的名字是**进程级**的，Activity 重建时名字不跟着变；
+ * 2. Activity 重建的顺序是**新的 onCreate 先于旧的 onDestroy**，所以「新实例 bind」一定早于
+ *    「旧实例 close」。真机上看到的就是新实例 `Address already in use`，随后旧实例把口关掉，
+ *    进程内从此没有 listener —— 空响应到杀进程。
+ * 3. 即使把顺序倒过来也不行：真机判据是失败瞬间 `/proc/net/unix` 里 `crew-debug` 计数为 0，
+ *    说明 `close()` 对 abstract namespace 的释放不是同步可见的。所以「关得更快」和
+ *    「重试到成功」都不是根因修法 —— **唯一可靠的修法是让 bind 只发生一次**。
+ *
+ * 于是：[attach] 第一次进来开 socket，之后每届 Activity 只换挂载点；[detach] 只摘挂载点，
+ * 且**只认自己那一届**（老实例晚到的收尾不会摘掉新实例的口）。
+ *
+ * 线程：Activity 生命周期回调都在主线程，但锁照旧加 —— 调试口的连接线程会读挂载点，
+ * 而 attach/detach 与它不在同一条线程上。
+ */
+class CrewDebugPorts(private val port: CrewDebugPort) {
+
+    /** 现在台前那一届 Activity 的令牌。null 表示 socket 开着但没人挂。 */
+    private var owner: Any? = null
+
+    /** socket 起没起来。起不来时每一届 Activity 各试一次（一次，不是循环重试）。 */
+    var isOpen: Boolean = false
+        private set
+
+    val currentOwner: Any?
+        get() = synchronized(this) { owner }
+
+    /**
+     * 这一届 Activity 上台。返回 false 表示调试口没起来 —— 调用方只记一行日志，界面照常。
+     *
+     * 已经开着时**不重开**：只换挂载点。这正是转屏不再失效的那一下。
+     */
+    fun attach(who: Any, target: CrewDebugTarget): Boolean = synchronized(this) {
+        if (!isOpen) isOpen = port.open()
+        if (!isOpen) return false
+        owner = who
+        port.bind(target)
+        true
+    }
+
+    /**
+     * 这一届 Activity 退场。只摘挂载点，**不关 socket**。
+     *
+     * 令牌对不上就什么都不做：转屏时旧的 onDestroy 晚于新的 onCreate，它不许把新的口摘掉。
+     */
+    fun detach(who: Any) {
+        synchronized(this) {
+            if (owner !== who) return
+            owner = null
+            port.unbind()
+        }
+    }
+
+    companion object {
+        /**
+         * 进程里唯一的那一份。Activity 换了几届都指向它 —— 与桌面端「一个进程一个调试口」同一口径。
+         *
+         * 懒初始化：release 构建永远不读它，也就永远不建 socket。
+         */
+        val process: CrewDebugPorts by lazy { CrewDebugPorts(CrewDebugServer()) }
     }
 }
 

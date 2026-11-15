@@ -82,19 +82,28 @@ export function followupsOf(tickets: readonly { ticket: Ticket; state: string }[
 }
 
 /**
+ * 「等你处理」卡在哪一步，一句话。
+ *
+ * 抽出来给两处共用：跟进那句提醒，和早报「待处理」那一段。各写一份的结果是同一张票
+ * 在两处被叫成两回事，人读起来会以为是两件事。
+ */
+export function waitingWhere(action?: string): string {
+  return action === 'answer' ? '在等你回答'
+    : action === 'delivery' ? '在等你去取'
+      : action === 'review' ? '在等你过目'
+        : action === 'failed' ? '失败了，在等你决定要不要重跑'
+          : '卡住了，在等你处理'
+}
+
+/**
  * 提醒的那句话。写清「停在哪、多久了、你可以做什么」，不说「请及时处理」这种等于没说的话。
  */
 export function followupText(candidate: FollowupCandidate): string {
   const waited = Math.round(candidate.stalled_ms / 60_000)
   const span = waited >= 120 ? `${Math.round(waited / 60)} 小时` : `${waited} 分钟`
   if (candidate.kind === 'waiting_for_person') {
-    const where = candidate.action === 'answer' ? '在等你回答'
-      : candidate.action === 'delivery' ? '在等你去取'
-        : candidate.action === 'review' ? '在等你过目'
-          : candidate.action === 'failed' ? '失败了，在等你决定要不要重跑'
-            : '卡住了，在等你处理'
     const question = candidate.question ? `\n它问的是：${candidate.question}` : ''
-    return `【跟进】「${candidate.title}」${where}，已经 ${span} 没动了。${question}`
+    return `【跟进】「${candidate.title}」${waitingWhere(candidate.action)}，已经 ${span} 没动了。${question}`
   }
   return `【跟进】「${candidate.title}」还在跑，但已经 ${span} 没有新的回报。要不要看一眼它现在做到哪了。`
 }

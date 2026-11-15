@@ -1,6 +1,6 @@
 /** 中枢 HTTP 客户端：把契约 08 的两个接口按形状调通，坏响应降级而不毒化注入。 */
 import { describe, expect, it, vi } from 'vitest'
-import { consolidateResultOf, HubHttp, memoryEntriesOf } from '../src/memory/hub-client.ts'
+import { consolidateResultOf, HubHttp, isHubAuthError, memoryEntriesOf } from '../src/memory/hub-client.ts'
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
@@ -28,6 +28,35 @@ describe('中枢 HTTP 客户端', () => {
     expect(await new HubHttp({ base: 'http://h', fetchImpl: ok }).consolidate({})).toEqual({ facts: 2, merged: 1, superseded: 0 })
     const partial = vi.fn(async () => json({ facts: 2 })) as unknown as typeof fetch
     expect(await new HubHttp({ base: 'http://h', fetchImpl: partial }).consolidate({})).toBeUndefined()
+  })
+
+  it('巩固：dry-run 的读数原样带出（merged 是计划数，不是执行数）', async () => {
+    const dry = vi.fn(async () => json({ facts: 0, merged: 0, superseded: 0, dryRun: true, candidateMerges: 5 })) as unknown as typeof fetch
+    expect(await new HubHttp({ base: 'http://h', fetchImpl: dry }).consolidate({})).toEqual({ facts: 0, merged: 0, superseded: 0, dryRun: true, candidates: 5 })
+  })
+
+  it('巩固：不传 apply（客户端不该驱动批量软删）', async () => {
+    const calls: unknown[] = []
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)))
+      return json({ facts: 0, merged: 0, superseded: 0 })
+    }) as unknown as typeof fetch
+    await new HubHttp({ base: 'http://h', fetchImpl }).consolidate({ since: 10, until: 20 })
+    expect(calls[0]).toEqual({ since: 10, until: 20 })
+  })
+
+  it('带 token 时发 X-Hub-Token，401 单独抛 HubAuthError', async () => {
+    const seen: Record<string, string>[] = []
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      seen.push((init?.headers ?? {}) as Record<string, string>)
+      return json({ detail: 'invalid hub token' }, 401)
+    }) as unknown as typeof fetch
+    const secret = 'zz9-secret-value'
+    const hub = new HubHttp({ base: 'http://h/v1', fetchImpl, token: () => secret })
+    const error = await hub.search({ query: 'x' }).catch(e => e)
+    expect(seen[0]!['x-hub-token']).toBe(secret)
+    expect(isHubAuthError(error)).toBe(true)
+    expect(String(error)).not.toContain(secret)
   })
 
   it('坏条目被丢掉：缺 name/body 的条目不进注入', () => {

@@ -87,6 +87,9 @@ func newApp(client *Client) *app {
 		// 宽度先落在设计稿的两个值上；拖过之后只记在内存里。
 		sidebarWidth: SidebarWidth,
 		backendWidth: BackendWidth,
+		// 主线程队列的关闭信号：窗口 / 应用收掉时关闭，等在 runOnMain 里的调用
+		// 立刻拿到明确错误，而不是干等一个永远不来的超时。
+		closedCh: make(chan struct{}),
 		// 打开窗口右栏先看到「事务板」：聊天的旁边就是同一本账的紧凑列表。
 		navTab:      navBoard,
 		backendOpen: true,
@@ -274,18 +277,19 @@ func main() {
 	s.endpoint = located.Base
 	// 全局调试态：CREW_DEBUG=1 时才建动作表、开本地 unix socket 控制口。
 	// 不设就一个口都不开——调试口能驱动整屏，生产面零暴露。
+	//
+	// 动作表在这里就建（它只看 app，与窗口无关），但 socket 要等主线程队列绑好才开：
+	// 动作体必须在主线程上执行，而主线程队列要窗口建好才有。早开的话，启动那一小段
+	// 到达的动作会落进「没有主线程」的分支，等于又回到跨线程改状态。
+	bus, debugCtx := (*DebugBus)(nil), (context.Context)(nil)
 	if debugEnabled() {
-		bus := newDebugBus(s)
-		ctx, cancel := context.WithCancel(context.Background())
+		bus = newDebugBus(s)
+		var cancel context.CancelFunc
+		debugCtx, cancel = context.WithCancel(context.Background())
 		defer cancel()
-		if err := bus.serveDebug(ctx); err != nil {
-			log.Printf("调试口开不起来（不影响界面）：%v", err)
-		} else {
-			log.Printf("调试口已开：unix %s（CREW_DEBUG=1）", debugSocketPath())
-		}
 	}
 	mygo.App.WhenReady(func() {
-		mygo.NewWindow(mygo.WindowOptions{
+		window := mygo.NewWindow(mygo.WindowOptions{
 			Title: "Bot 队伍",
 			// 画板是 1440×1160：左 329 + 中 718 + 右 393。窗口比这窄，
 			// 中栏就被挤成一条，中文会一字一行地竖着排。
@@ -293,6 +297,25 @@ func main() {
 			Height:  900,
 			Content: ui.View(s.view),
 		})
+		// 后台结果落状态走窗口的主线程队列，不靠帧：窗口被遮挡 / 锁屏 / App Nap
+		// 时一帧都不来，挂到帧上的推进就永远不动（issue #27）。
+		// Window.Update 在主线程执行，执行完请求一帧 —— 两件事都做到了。
+		s.bindPost(window.Update)
+		// 主线程队列已就位，窗口收掉时把队列一起收掉：之后到达的动作立刻拿到
+		// 明确错误，而不是干等一个永远不来的超时。
+		window.OnClosed(func() {
+			s.closeMain()
+			if bus != nil {
+				bus.closeConnections()
+			}
+		})
+		if bus != nil && debugCtx != nil {
+			if err := bus.serveDebug(debugCtx); err != nil {
+				log.Printf("调试口开不起来（不影响界面）：%v", err)
+			} else {
+				log.Printf("调试口已开：unix %s（CREW_DEBUG=1）", debugSocketPath())
+			}
+		}
 		s.refresh()
 	})
 	if err := mygo.App.Run(); err != nil {

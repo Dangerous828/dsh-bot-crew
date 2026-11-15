@@ -22,13 +22,32 @@ export interface RecalledText {
 export interface UpsertResult {
   written: MemoryEntry[]
   superseded: string[]
+  /** 同 name 但 body 变更、旧条目曾显式 toHub:true：需撤回的旧 canonical（调用方按 source_file 撤全历史）。 */
+  retired?: { name: string; botId: string }[]
 }
 
-/** 一轮巩固的结果：提炼出的新事实条数、合并/冲突处理计数。 */
+/**
+ * 一轮巩固的结果：**真实落账**的计数，加上中枢那份「计划」的读数。
+ *
+ * 四层要分清（中枢侧默认 `apply=false`，只统计不写）：
+ * 1. 探测 `GET <base>/health` —— 免鉴权，只说明网络通；
+ * 2. 检索 `POST <base>/memory/search` —— 要 `X-Hub-Token`，才是「记忆真的从中枢来」；
+ * 3. 合并计划 `POST <base>/memory/consolidate` —— 默认 dry-run，`merged` 是**计划数**；
+ * 4. 真实持久化 —— 本机账本（`LocalMemory.consolidate`：拉 episodic → 提炼 → 落 KV）。
+ *
+ * 所以 `facts`/`merged`/`superseded` 只报**真的写了**的数；中枢那份计划放在 `hubPlan` 里，
+ * 两者混在一起就等于把计划当执行结果。
+ */
 export interface ConsolidateResult {
   facts: number
   merged: number
   superseded: number
+  /** 中枢只算出合并计划、没有写（本机版不设此位）。 */
+  dryRun?: boolean
+  /** `dryRun` 为真时：中枢算出的可合并对数。 */
+  candidates?: number
+  /** 中枢那一侧自报的读数（检索侧的窗口统计 + 合并计划），与本机真实写入分开。 */
+  hubPlan?: { facts: number; merged: number; superseded: number; dryRun: boolean; candidates?: number }
 }
 
 /**

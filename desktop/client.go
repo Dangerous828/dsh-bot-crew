@@ -190,6 +190,7 @@ func (t *Task) UnmarshalJSON(data []byte) error {
 		BotID       string            `json:"bot_id,omitempty"`
 		NeedsPerson string            `json:"needs_person,omitempty"`
 		Question    string            `json:"question,omitempty"`
+		AttentionID string            `json:"attention_id,omitempty"`
 		Options     []AttentionOption `json:"options,omitempty"`
 		CreatedAt   string            `json:"created_at,omitempty"`
 		UpdatedAt   string            `json:"updated_at,omitempty"`
@@ -200,7 +201,8 @@ func (t *Task) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*t = Task{ID: wire.ID, Title: wire.Title, State: wire.State, Retryable: wire.Retryable,
-		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, Question: wire.Question, Options: wire.Options,
+		BotID: wire.BotID, NeedsPerson: wire.NeedsPerson, Question: wire.Question, AttentionID: wire.AttentionID,
+		Options: wire.Options,
 		CreatedAt: wire.CreatedAt, UpdatedAt: wire.UpdatedAt, TotalSteps: wire.TotalSteps, StepsDone: wire.StepsDone,
 		Open: !terminalState(wire.State)}
 	if wire.Open != nil {
@@ -233,6 +235,11 @@ type Task struct {
 	// Question is the sentence the ticket waits on, when it waits on an answer rather than on a delivery,
 	// a review, or a failure. Empty means the backend named no question, and the card must not invent one.
 	Question string `json:"question,omitempty"`
+	// AttentionID is the id of the question card the backend is currently waiting on (ticket.attention.id).
+	// An approval answer must echo it as POST /api/mobile/answer's attention_id; a stale id gets a 409 with
+	// zero change. Empty means an older backend that predates this field — then the ticket is only answerable
+	// through the ordinary /send path, never as an approval.
+	AttentionID string `json:"attention_id,omitempty"`
 	// Options are the answers that question offers, in reading order. Empty means it takes a written reply;
 	// the front end never makes up A/B out of the question's own words.
 	Options   []AttentionOption `json:"options,omitempty"`
@@ -1097,6 +1104,45 @@ func (c *Client) Send(ctx context.Context, text string, mentions []string, sessi
 	}
 	body := map[string]any{"text": text, "request_id": requestID, "mentions": mentions}
 	return requestID, c.do(ctx, http.MethodPost, path, body, nil)
+}
+
+// ErrAnswerStale 是 409：客户端看到的这张问题卡已经过期（票/请求已变、已结束或已答过）。
+// 后端零状态变更。界面据此刷新时间线换成最新一张卡，不把它当答复成功、也不当断连。
+var ErrAnswerStale = errors.New("这张问题卡已经过期")
+
+// Answer 把对一张待决问题卡的答复交给审批状态机 POST /api/mobile/answer。
+// body 只带必要三项：ticket / text / attention_id。actor 由服务端认证（x-crew-principal 由入口注入），
+// 客户端不发任何可伪造的身份。text 是所选选项的 label/id 或自写 revise 的原文。
+// attention_id 必须等于后端此刻 ticket.attention.id，否则后端 409（ErrAnswerStale），零变更。
+func (c *Client) Answer(ctx context.Context, ticketID, text, attentionID string, session ...string) error {
+	path, _, err := c.sessionPath("/api/mobile/answer", session)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]string{"ticket": ticketID, "text": text, "attention_id": attentionID})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	c.auth(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("连不上队伍（%s）: %w", c.base, err)
+	}
+	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusOK:
+		return nil
+	case response.StatusCode == http.StatusConflict:
+		return ErrAnswerStale
+	default:
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return fmt.Errorf("队伍返回 %d: %s", response.StatusCode, bytes.TrimSpace(detail))
+	}
 }
 
 // withdrawPath 是撤回排队消息的那条路。契约集中在这里：

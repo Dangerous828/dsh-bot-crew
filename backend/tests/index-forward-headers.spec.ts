@@ -248,8 +248,21 @@ it('forwards no other header into the rebuilt Request', async () => {
   for (const name of ['x-crew-device', 'x-crew-credential', 'x-forwarded-for', 'x-real-ip', 'connection', 'content-length']) {
     expect(rebuilt.headers.get(name), name).toBeNull()
   }
-  // 唯一被带上的就是那一个头。
-  expect([...rebuilt.headers.keys()]).toEqual(['x-crew-session'])
+  // 凭据不进重建的 Request；进的是**入口验过凭据之后**才有的设备号 principal 头 —— 它由宿主注入，
+  // 与客户端带来的 x-crew-device/credential 不同源，且是消息面唯一可信的「哪台设备」。所以这里
+  // 允许且只允许这两个头：会话 + principal。
+  expect(rebuilt.headers.get('x-crew-principal')).toBe('dev-1')
+  expect([...rebuilt.headers.keys()].sort()).toEqual(['x-crew-principal', 'x-crew-session'])
+})
+
+it('ignores a client-supplied principal header and only trusts the verified device', async () => {
+  const { lan } = await boot()
+  // 客户端自己塞一个 x-crew-principal：入口不认它，只按自己验过的 x-crew-device 注入 principal。
+  await lanRequest(lan, '/api/mobile/notices', {
+    'x-crew-device': 'dev-1', 'x-crew-credential': 'good-token', 'x-crew-principal': 'attacker-chosen',
+  })
+  const rebuilt = held.seen[0]!
+  expect(rebuilt.headers.get('x-crew-principal')).toBe('dev-1')
 })
 
 // ── 2. 端到端：LAN 形态 → ask 重建 → 真 phoneHandler ──────────────────

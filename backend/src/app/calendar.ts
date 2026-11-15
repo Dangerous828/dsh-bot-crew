@@ -34,6 +34,15 @@ export interface CalendarEvent {
  */
 export const SOON_MS = 15 * 60_000
 
+/**
+ * 早报「今日日程」那一栏读不出来时的一句原因。
+ *
+ * 这台机器上没有 `CalendarPort` 的实现（真实账号未配置），所以早报的日程栏只能是这一句。
+ * 写成常量而不是让调用方各编一句：接上真实日历的那天，删掉这个常量的引用就等于把「读不到」换成真日程，
+ * 不会漏下某处还在说「读不到」。
+ */
+export const CALENDAR_UNAVAILABLE = '还没有接入日历'
+
 /** 提醒的类别。`null` 表示这一轮不说。 */
 export type CalendarWhen = 'soon' | 'changed' | 'cancelled'
 

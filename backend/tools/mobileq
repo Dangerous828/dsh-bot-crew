@@ -14,6 +14,7 @@ This is the transport seam only; it knows nothing about dsh-superagent internals
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -124,17 +125,50 @@ def cmd_pull(c, args):
     return 0
 
 
-def reply_target(value):
-    """The message a reply hangs under, as the column stores it.
+class GoneTarget(ValueError):
+    """The parent message existed but was withdrawn — exit 410 (gone), not a param bug."""
 
-    Plain messages are numbered, so the usual case stays an integer and every existing query keeps working.
-    A handoff between bots opens a turn under a text id, and SQLite stores that fine in this INTEGER column
-    (it is not strictly typed); coercing it to int only crashed the write and lost the reply.
+
+def reply_target(value, conversation, c):
+    """The inbound **message** a reply hangs under, validated against the real queue.
+
+    Contract (matches the MCP adapter's `to` and `get`'s id shape): a reply's parent is a
+    plain message id — `m<N>` or pure digits `N`, N a positive integer — that **exists in
+    `conversation`**. Anything else is a bad target and must write nothing:
+      * a conversation name like `main` / `work` (NOT a message id) — the old code stripped a
+        leading `m` so `main` became `ain` and was written to `replies.to_msg`, then reported
+        `ok:true`; that is exactly the silent-corruption path this guards against;
+      * a reply id `r<N>` (that is a reply, not an inbound message a reply can hang under);
+      * negative / zero / leading-zero / non-numeric;
+      * a message id that exists but belongs to **another** conversation, or does not exist, or
+        was withdrawn (the last case raises `GoneTarget` → exit 410).
+    Returns the int message id (the column stores it as INTEGER). Raises `ValueError` (exit 2)
+    on any invalid target, so `cmd_reply` writes zero rows.
     """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return value
+    m = re.fullmatch(r"m(\d+)", value or "")
+    digits = m.group(1) if m else (value if re.fullmatch(r"\d+", value or "") else None)
+    if digits is None:
+        raise ValueError(
+            "reply --to must be an inbound message id m<N> or plain digits N (positive int); "
+            "got %r (conversation names like 'main', reply ids like 'r1', negatives and non-numeric are rejected)" % (value,)
+        )
+    if not re.fullmatch(r"[1-9]\d*", digits):
+        raise ValueError("reply --to message number must be a positive integer (no 0, no leading zero); got %r" % (value,))
+    mid = int(digits)
+    row = c.execute(
+        "SELECT id, withdrawn_at FROM messages WHERE id=? AND conversation=?",
+        (mid, conversation),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "reply target m%d is not a message in conversation %r (missing or in another conversation); "
+            "refusing to write" % (mid, conversation)
+        )
+    if row["withdrawn_at"] is not None:
+        # A withdrawn parent is "gone" (410), distinct from a malformed/foreign target (2): callers like
+        # sendTeam already treat CLI exit 410 as `gone` and stop retrying, rather than failing the round.
+        raise GoneTarget("reply target m%d was withdrawn from conversation %r" % (mid, conversation))
+    return mid
 
 
 def cmd_reply(c, args):
@@ -142,15 +176,32 @@ def cmd_reply(c, args):
         print("missing reply target", file=sys.stderr)
         return 2
     try:
+        to_msg = reply_target(args.to, args.conversation, c)
+    except GoneTarget as e:
+        print(str(e), file=sys.stderr)
+        return 410
+    except ValueError as e:
+        # Bad parent / foreign / missing / non-message ref: write nothing, exit non-zero, name why.
+        print(str(e), file=sys.stderr)
+        return 2
+    replayed = False
+    try:
         c.execute(
             "INSERT INTO replies(conversation,to_msg,rkey,text,at,bot_id) VALUES(?,?,?,?,?,?)",
-            (args.conversation, reply_target(args.to), args.key, args.text, now(), getattr(args, 'bot', None)),
+            (args.conversation, to_msg, args.key, args.text, now(), getattr(args, 'bot', None)),
         )
         c.commit()
     except sqlite3.IntegrityError:
-        # idempotent: same key already delivered
-        pass
-    print(json.dumps({"ok": True, "key": args.key}, ensure_ascii=False))
+        # Idempotent: this rkey already delivered a reply. Do NOT pretend a *different* payload was sent —
+        # report it as a replay, with the reply that already exists (its text is NOT this call's text).
+        replayed = True
+    # Resolve the visible reply by the UNIQUE rkey — the stable one row for this key, whether this call
+    # inserted it or replayed it. Exact SELECT in the same transaction right after commit means a caller
+    # (messages-mcp) gets the stable client-visible r<N> without re-pulling and scanning the whole
+    # conversation. Never affected by history length or a concurrent same-text reply.
+    row = c.execute("SELECT id FROM replies WHERE rkey=? ORDER BY id LIMIT 1", (args.key,)).fetchone()
+    print(json.dumps({"ok": True, "key": args.key, "id": ("r%d" % row["id"]) if row else None,
+                      "replayed": replayed}, ensure_ascii=False))
     return 0
 
 
@@ -205,6 +256,91 @@ def cmd_inject(c, args):
     return 0
 
 
+def cmd_conversations(c, args):
+    """Distinct conversations, oldest-first by first message id. Read-only.
+
+    The integration adapter (messages-mcp) needs the channel list that
+    `/api/mobile/timeline` would render; the queue has no such command and the
+    adapter must not read someone else's sqlite layout by hand. This is the one
+    read command added for it — it never writes.
+    """
+    rows = c.execute(
+        "SELECT conversation, MIN(id) AS first, COUNT(*) AS n FROM messages GROUP BY conversation ORDER BY first ASC"
+    ).fetchall()
+    items = [{"id": r["conversation"], "messages": r["n"]} for r in rows]
+    print(json.dumps({"items": items}, ensure_ascii=False))
+    return 0
+
+
+def cmd_timeline(c, args):
+    """Merged conversation view for one conversation: messages + replies in time order.
+
+    This is the same shape `/api/mobile/timeline` renders (role user/agent, id m<N>/r<N>),
+    so the integration adapter reads exactly what a desktop/mobile client displays.
+    """
+    conv = args.conversation
+    msgs = c.execute(
+        "SELECT id,text,sender,bot,at,read_at,withdrawn_at FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id",
+        (conv,),
+    ).fetchall()
+    reps = c.execute(
+        "SELECT id,to_msg,rkey,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id", (conv,)
+    ).fetchall()
+    entries = [(m["at"], 0, m["id"], {
+        "id": "m%d" % m["id"], "role": "user", "sender": m["sender"], "text": m["text"], "at": m["at"],
+        "read_at": m["read_at"] or "", "bot": bool(m["bot"]),
+    }) for m in msgs]
+    entries += [(r["at"], 1, r["id"], {
+        "id": "r%d" % r["id"], "role": "agent", "text": r["text"], "at": r["at"], "rkey": r["rkey"],
+        "to_msg": r["to_msg"], **({"bot_id": r["bot_id"]} if r["bot_id"] else {}),
+    }) for r in reps]
+    entries.sort(key=lambda item: (item[0], item[1], item[2]))
+    items = [item[3] for item in entries]
+    if getattr(args, "limit", None):
+        items = items[-int(args.limit):]
+    print(json.dumps({"conversation": conv, "items": items}, ensure_ascii=False))
+    return 0
+
+
+def cmd_get(c, args):
+    """One message or reply by its id, in one conversation. Read-only, exact primary-key lookup.
+
+    The integration adapter needs to read a single `m<N>` / `r<N>` that may be arbitrarily old (older
+    than any page window); a time/limit window would miss it and lie "no such message". Ids are
+    constrained to `m<digits>` / `r<digits>` and always filtered by conversation, so this is a bounded
+    primary-key read — it never exposes an arbitrary SQL/path to the tool caller.
+    """
+    conv = args.conversation
+    mid = re.fullmatch(r"m(\d+)", args.id or "")
+    rid = re.fullmatch(r"r(\d+)", args.id or "")
+    if mid:
+        r = c.execute(
+            "SELECT id,text,sender,bot,at,read_at,withdrawn_at FROM messages WHERE id=? AND conversation=?",
+            (int(mid.group(1)), conv),
+        ).fetchone()
+        if not r or r["withdrawn_at"] is not None:
+            print(json.dumps({"item": None}, ensure_ascii=False))
+            return 0
+        item = {"id": "m%d" % r["id"], "role": "user", "sender": r["sender"], "text": r["text"],
+                "at": r["at"], "read_at": r["read_at"] or "", "bot": bool(r["bot"])}
+        print(json.dumps({"item": item}, ensure_ascii=False))
+        return 0
+    if rid:
+        r = c.execute(
+            "SELECT id,to_msg,rkey,text,at,bot_id FROM replies WHERE id=? AND conversation=?",
+            (int(rid.group(1)), conv),
+        ).fetchone()
+        if not r:
+            print(json.dumps({"item": None}, ensure_ascii=False))
+            return 0
+        item = {"id": "r%d" % r["id"], "role": "agent", "text": r["text"], "at": r["at"], "rkey": r["rkey"],
+                "to_msg": r["to_msg"], **({"bot_id": r["bot_id"]} if r["bot_id"] else {})}
+        print(json.dumps({"item": item}, ensure_ascii=False))
+        return 0
+    print("bad id (expect m<N> or r<N>)", file=sys.stderr)
+    return 2
+
+
 def cmd_outbox(c, args):
     after = int(args.after or 0)
     q = "SELECT * FROM replies WHERE id > ?"
@@ -231,13 +367,13 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("pull")
-    p.add_argument("--db", default=None)
+    p.add_argument("--db", default=argparse.SUPPRESS)
     p.add_argument("--after", default="0")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("reply")
-    p.add_argument("--db", default=None)
+    p.add_argument("--db", default=argparse.SUPPRESS)
     p.add_argument("--conversation", required=True)
     p.add_argument("--to", required=True)
     p.add_argument("--key", required=True)
@@ -246,7 +382,7 @@ def main():
     p.set_defaults(func=cmd_reply)
 
     p = sub.add_parser("thread")
-    p.add_argument("--db", default=None)
+    p.add_argument("--db", default=argparse.SUPPRESS)
     p.add_argument("--conversation", required=True)
     p.add_argument("--root", required=True)
     p.add_argument("--json", action="store_true")
@@ -263,6 +399,22 @@ def main():
                    help="bot id this message @-mentions; repeatable (team Source)")
     p.add_argument("--bot", action="store_true")
     p.set_defaults(func=cmd_inject)
+
+    p = sub.add_parser("timeline")
+    p.add_argument("--db", default=argparse.SUPPRESS)
+    p.add_argument("--conversation", required=True)
+    p.add_argument("--limit", default=None)
+    p.set_defaults(func=cmd_timeline)
+
+    p = sub.add_parser("conversations")
+    p.add_argument("--db", default=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_conversations)
+
+    p = sub.add_parser("get")
+    p.add_argument("--db", default=argparse.SUPPRESS)
+    p.add_argument("--conversation", required=True)
+    p.add_argument("--id", required=True)
+    p.set_defaults(func=cmd_get)
 
     p = sub.add_parser("outbox")
     p.add_argument("--conversation", default=None)

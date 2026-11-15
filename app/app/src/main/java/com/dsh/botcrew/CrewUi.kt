@@ -218,6 +218,15 @@ fun CrewRoot(
      */
     debug: DebugBridge? = null,
 ) {
+    // 设备接收链（#23）：推送落本地、按 id 去重、持久化后 ACK。用应用私有存储（SharedPreferences），
+    // 不是 rememberSaveable —— force-stop / 冷启动之后仍要在，那是「不丢件」的底线。
+    val appContext = androidx.compose.ui.platform.LocalContext.current.applicationContext
+    val noticeStore = remember { NoticeStore(appContext) }
+    // 屏幕上显示的推送：本进程内从本地持久化那份读出来（新的在前），新增时整体换掉触发重组。
+    var notices by remember { mutableStateOf(noticeStore.all()) }
+    // 推送轮询的健康度：失败多少次、最后什么错。不静默 —— 拉不到时界面上如实显示「重连中」，
+    // 而不是一直挂着「隧道已连接」的假绿（task-10 第三根因）。
+    var noticesHealth by remember { mutableStateOf(NoticesHealth()) }
     // 每会话一份 Conversation：切回 A 只显示 A 的缓存，绝不借 B 的消息来顶。
     // 老后端锁 main 时这张表只有一项，与从前单份 Conversation 的结构完全一致。
     var sessionState by remember {
@@ -246,6 +255,9 @@ fun CrewRoot(
     // 时间线刷新的单飞记号（见下面 refresh）。
     val refreshGuard = remember { RefreshGuard() }
     var executorPaused by remember { mutableStateOf(false) }
+    // 上一次停/继续的回执原话。调试口靠它断言「按下去之后到底成没成」——
+    // 与工作区页上那行 `touched` 是同一个来源，只是那边是页面内状态，脚本读不到。
+    var pauseResult by remember { mutableStateOf<String?>(null) }
     // 动作回执回来之后，已在途的时间线不再覆盖它；下一趟拉取仍以后端为准。
     var pauseRevision by remember { mutableStateOf(0) }
     // 名单先验失败后，人点「重试」就再问一次；不改变锁 main 的结论。
@@ -316,6 +328,31 @@ fun CrewRoot(
     }
 
     /**
+     * 停一下 / 继续执行。**界面按钮与调试口共用这一条**，不各写一份。
+     *
+     * 为什么要一个函数而不是两处各写一遍：暂停的状态位（[executorPaused] + [pauseRevision]）
+     * 与回执话术绑在一起 —— 复制一份出来，就一定会有一份忘记把 revision 加一，
+     * 那时时间线的下一趟刷新会把刚按下的状态覆盖掉，界面闪回「正在干活」。
+     *
+     * 成功才改状态：`client.pause/resume` 抛错时这里什么都不动，调用方照实说失败。
+     * 返回那句给人看的话（与后端回的 scope 对得上）。
+     */
+    suspend fun setPaused(paused: Boolean, ticketId: String?): String {
+        val said = if (paused) {
+            // scope 用后端回执里的那个，不在这里写死 —— 将来多一种作用域时这句话才对得上。
+            WorkspaceCopy.pauseDone(client.pause(ticketId))
+        } else {
+            client.resume()
+            WorkspaceCopy.RESUMED
+        }
+        executorPaused = paused
+        // 回执已到：在途的时间线不再拿它手里那份旧 status 覆盖刚按下的结果。
+        pauseRevision += 1
+        pauseResult = said
+        return said
+    }
+
+    /**
      * 进入另一格会话：切过去与新建成功后走同一段，草稿/幂等键/结果条轮次一律不复用。
      * 请求路径不靠任何全局状态 —— 各处显式读 [SessionState.requestSession]，
      * 在途的旧请求仍带着它发起那一刻的会话 id。
@@ -380,6 +417,20 @@ fun CrewRoot(
                 },
                 onTab = { name -> screenFromName(name)?.let { screen = it } },
                 onMode = { name -> mode = if (name == "triage") Mode.Triage else Mode.Chat },
+                // 调试口按的停/继续与工作区那个按钮落到同一个 setPaused 上。
+                // 失败也写进 pauseResult：脚本要能看见「没做成」，不能只看得见成功。
+                onSetPaused = { next, ticketId ->
+                    scope.launch {
+                        try {
+                            setPaused(next, ticketId)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            pauseResult = WorkspaceCopy.failed(error.message)
+                        }
+                    }
+                },
+                pauseResult = { pauseResult },
             )
         }
         DisposableEffect(debug) {
@@ -414,6 +465,28 @@ fun CrewRoot(
     LaunchedEffect(Unit) {
         while (true) {
             refresh()
+            // 设备推送：先 peek（后端不删），把新条目**先落本地**（merge 用 commit 确认写盘），
+            // 只有本次真正新增、且已确认落盘的 id 才 ACK 回后端（只删这些）。这样 GET 之后崩溃也不丢件，
+            // 落盘之后 ACK 失败重试也不会重复显示（本地按稳定 id 去重）。断链时这一整段跳过，下次轮询再取。
+            try {
+                val view = client.notices()
+                if (view.available && view.items.isNotEmpty()) {
+                    val added = noticeStore.merge(view.items)
+                    if (added.isNotEmpty()) {
+                        notices = noticeStore.all()
+                        client.reportSeen(added)   // 落盘成功之后才 ACK
+                    }
+                }
+                // 这一轮拉到了（哪怕没有新条目）：健康度清零，界面退回正常文案。
+                if (noticesHealth.consecutiveFailures != 0) noticesHealth = noticesHealth.onSuccess()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // 拉推送失败不打断对话刷新，但**绝不静默**：记下失败，界面如实显示「重连中」。
+                // 连续失败逐次累加，成功一次才清零 —— 让人看得出「一直没拉到」而不是看一眼就以为没事。
+                noticesHealth = noticesHealth.onFailure(error.message ?: "推送拉取失败")
+                android.util.Log.w("CrewNotices", "拉取推送失败（第 ${noticesHealth.consecutiveFailures} 次）", error)
+            }
             delay(6_000)
         }
     }
@@ -429,6 +502,17 @@ fun CrewRoot(
                     style = MaterialTheme.typography.labelSmall,
                     color = palette.muted,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+            // 推送拉不到时如实说一句，不让「隧道已连接」的假绿盖住「一条推送都没拿到」。
+            // 只在失败态出现，成功即消失，不占常驻位置。
+            val noticesLine = noticesHealth.line()
+            if (noticesLine.isNotEmpty()) {
+                Text(
+                    text = noticesLine,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.accent,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
                 )
             }
             // 会话切换条只在能力位先验通过时画；老后端 / 读不到名单时如实提示并锁 main，
@@ -508,7 +592,7 @@ fun CrewRoot(
                     ticket = ticketOf(conversation, onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId }),
                     // 执行器被全局暂停这件事压过单个 Bot 的 activity 词，所以从队伍状态里取。
                     paused = executorPaused,
-                    onPausedChanged = { executorPaused = it; pauseRevision += 1 },
+                    onSetPaused = { next, ticketId -> setPaused(next, ticketId) },
                     palette = palette,
                     preview = previewTicket,
                     previewView = previewView,
@@ -555,6 +639,8 @@ fun CrewRoot(
                     onModeChange = { mode = it },
                     // 先验未完成 / 锁 main 时是 null，深层所有会话请求一律走老路径。
                     sessionId = sessionState.requestSession,
+                    // 设备推送落本地那份：顶部一条紧凑提示，复用列表区，不新开屏。
+                    notices = notices,
                 )
             }
 
@@ -826,6 +912,8 @@ private fun CrewScreen(
      * null = 老路径（先验未完成 / 锁 main），一个 `?session_id=` 都不带。
      */
     sessionId: String? = null,
+    /** 设备接收链（#23）落本地、已持久化的推送，最新在前。空表示没有。复用在列表区顶部，不新开一屏。 */
+    notices: List<CrewNotice> = emptyList(),
 ) {
     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
     var profile by remember { mutableStateOf<BotCard?>(null) }
@@ -839,7 +927,7 @@ private fun CrewScreen(
     var boardOpen by remember { mutableStateOf(false) }
     var pendingJump by remember { mutableStateOf<String?>(null) }
 
-    // 分拣台的「丢」与事务板上的回答都走和群聊同一条 POST /send，不另造一套发送。
+    // 分拣台的「丢」走和群聊同一条 POST /send，不另造一套发送。
     fun sendBoardText(text: String, done: (Boolean) -> Unit) {
         onSending(true)
         scope.launch {
@@ -857,11 +945,57 @@ private fun CrewScreen(
             done(ok)
         }
     }
+    /**
+     * 答复一张待决问题卡：**明确 ticket + attention_id 的票**走审批通道 POST /api/mobile/answer，
+     * 不拼 `@某人 label` 再发 /send（那会让引擎起一段新活，而不是回这张卡的审批）。
+     *
+     * - 老后端没下发 attention_id 的票 / 普通聊天：attention_id 为空 → 退回既有 /send 路径，逐字不变。
+     * - 选明确选项：text 传选项 label（后端 label/id 都认）。
+     * - 自写 revise：走 [sendRevise]，text 是用户原文，同样带上这张卡的 attentionId。
+     * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+     * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
+     */
+    fun answerByTicket(ticket: WorkTicket, text: String, done: (Boolean) -> Unit) {
+        onSending(true)
+        scope.launch {
+            val ok = try {
+                client.answer(ticket.id, text, ticket.attentionId, sessionId)
+                onSent()
+                true
+            } catch (error: AnswerStale) {
+                // 旧卡已过期：刷新时间线把卡换成最新一张，明说「已更新」不冒充成功。
+                onSent()
+                onFailed("这张问题卡已更新，请按最新的那张再答")
+                false
+            } catch (error: Exception) {
+                onFailed(error.message ?: "答复没发出去")
+                false
+            } finally {
+                onSending(false)
+            }
+            done(ok)
+        }
+    }
+    /**
+     * 答复一张待决问题卡：**明确 ticket + attention_id 的票**走审批通道 POST /api/mobile/answer，
+     * 不拼 `@某人 label` 再发 /send（那会让引擎起一段新活，而不是回这张卡的审批）。
+     *
+     * - 老后端没下发 attention_id 的票 / 普通聊天：attention_id 为空 → 退回既有 /send 路径，逐字不变。
+     * - 选明确选项：text 传选项 label（后端 label/id 都认）。
+     * - 自写 revise：由队伍消息区的待决卡（TicketStrip）内联输入框直接发 /answer，text 是用户原文。
+     * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+     * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
+     */
     fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (Boolean) -> Unit) {
-        val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
-        val address = name.ifEmpty { ticket.botId.trim() }
-        val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
-        sendBoardText(text, done)
+        // 没有 attention_id 的票不是审批卡：保持既有 /send 行为，不引入审批语义。
+        if (ticket.attentionId.isEmpty()) {
+            val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
+            val address = name.ifEmpty { ticket.botId.trim() }
+            val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
+            sendBoardText(text, done)
+            return
+        }
+        answerByTicket(ticket, option.label, done)
     }
     fun jump(messageId: String) {
         boardOpen = false
@@ -1012,6 +1146,31 @@ private fun CrewScreen(
                     // 挂在滚动帧里就是每帧多一份活。120Hz 上一帧只有 8ms，这点活足够掉帧。
                     // 手一停，它立刻回来 —— 停手的那一帧重算一次，人看不到「刚才没有」。
                     val scrolling = listState.isScrollInProgress
+                    // 设备推送（#23）：复用列表区，不新开屏。只列最新几条，点一条不进别的页 ——
+                    // 这是「有事要你知道」的账，不是又一次消息流。条数与正文都来自已持久化的本地那份。
+                    if (notices.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth()
+                                .background(palette.accentSoft)
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                "有事记得看一下 · ${notices.size}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = palette.accent,
+                            )
+                            for (notice in notices.take(3)) {
+                                Text(
+                                    text = if (notice.title.isNotBlank()) "${notice.title}：${notice.body}" else notice.body,
+                                    fontSize = 12.sp,
+                                    color = palette.ink,
+                                    maxLines = 2,
+                                )
+                            }
+                        }
+                    }
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.weight(1f),
@@ -1359,6 +1518,21 @@ private fun RowScope.SmallCardButton(label: String, palette: CrewPalette, onClic
 }
 
 /**
+ * 工作区暂停按钮按一下要做的那件事。
+ *
+ * [target] 是**目标**状态，不是当前状态：`setPaused(target)` 里 `target == true` 走 pause、
+ * `false` 走 resume。传当前状态进去等于「按了让它停，它反而继续」—— 这个方向错在 Compose
+ * 的点击闭包里看不出来（字是对的、状态位也真的翻了），只有把「算出目标」这一步抽成函数、
+ * 和 [WorkspaceCopy.pauseLabel] 摆在一起断言才钉得住。
+ *
+ * [ticketId] 是作用对象：屏幕上显示的是哪张票就作用在哪张（[preview] 优先），都没有就是全局。
+ */
+data class PausePress(val target: Boolean, val ticketId: String?)
+
+fun pausePress(paused: Boolean, preview: String?, ticket: String?): PausePress =
+    PausePress(target = !paused, ticketId = preview ?: ticket)
+
+/**
  * 工作区：某个 Bot 的屏幕，加上「接手操作」「让它停一下」。
  *
  * 画面不是像素截帧，是**实景**：它此刻在干什么（后端推出的 activity）、这段从几点开始、
@@ -1381,7 +1555,11 @@ private fun WorkspaceScreen(
     bot: BotCard?,
     ticket: WorkTicket?,
     paused: Boolean,
-    onPausedChanged: (Boolean) -> Unit,
+    /**
+     * 停一下 / 继续执行。挂到 CrewRoot.setPaused 上 —— 按钮与调试口共用同一条实现，
+     * 这里只负责把结果写进页面（成功的话术，或失败原话）。
+     */
+    onSetPaused: suspend (Boolean, String?) -> String,
     palette: CrewPalette,
     /** 代码卡带过来的票号；有值时这一页读的是它，而不是 bot 手上那张。 */
     preview: String? = null,
@@ -1641,22 +1819,18 @@ private fun WorkspaceScreen(
                     }
                 }
                 WorkspaceButton(WorkspaceAction.Pause, palette, enabled = !busy,
-                    label = if (paused) "继续执行" else WorkspaceAction.Pause.label) {
+                    label = WorkspaceCopy.pauseLabel(paused)) {
                     if (busy) return@WorkspaceButton
-                    val resuming = paused
+                    // 传出去的是**目标**（取反），不是当前状态 —— 方向算在 pausePress 一处，
+                    // 那里有断言钉着「目标必须与按钮这句话一致」。
+                    val press = pausePress(paused, preview, ticket?.id)
                     busy = true
                     scope.launch {
                         try {
                             // 有票就带上票；没有票就全局停 —— 后端会如实回 scope。
-                            if (resuming) {
-                                client.resume()
-                                onPausedChanged(false)
-                                touched = "已继续执行（全局执行器）"
-                            } else {
-                                client.pause(preview ?: ticket?.id)
-                                onPausedChanged(true)
-                                touched = "已让它停一下（全局执行器）"
-                            }
+                            // 状态位与回执话术都在 onSetPaused 里（CrewRoot.setPaused），
+                            // 调试口按同一条路走，这里不另写一份。
+                            touched = onSetPaused(press.target, press.ticketId)
                             // 停完重读：画面顶上那一行要说「停住了」，不能还写着「正在干活」。
                             reread()
                         } catch (error: Exception) {
@@ -2477,6 +2651,19 @@ private fun TicketStrip(
     // 与桌面端 nameOf 同一条规矩：宁可 @ 一个 id，也不能把回答滑给默认那位。
     val address = botName.ifEmpty { waiting.botId.trim() }
     fun addressed(text: String) = if (address.isEmpty()) text else "@$address $text"
+    // 这张卡是不是审批卡：后端下发了 attention_id 的才是。是就**必须**走审批通道 /answer，
+    // 拼 @label 发 /send 会让引擎起一段新活而不是回这张卡。老后端没这字段 → 退回 /send，逐字不变。
+    val isApproval = waiting.attentionId.isNotEmpty()
+    /** 一次答复的发射：审批卡走 /answer，否则走既有 /send（普通聊天/老卡）。 */
+    suspend fun fire(label: String) {
+        if (isApproval) {
+            client.answer(waiting.id, label, waiting.attentionId, sessionId)
+        } else {
+            val text = addressed(label)
+            client.send(text, CrewWire.mentionsIn(text, conversation.bots),
+                java.util.UUID.randomUUID().toString(), sessionId)
+        }
+    }
 
     // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
     // 和普通工单卡长得一样，而它要的是「现在只有这一件事等你」。
@@ -2510,17 +2697,15 @@ private fun TicketStrip(
                     .clickable(enabled = !sending) {
                         answering = answering + slot
                         note = null
-                        val text = addressed(option.label)
                         scope.launch {
                             try {
-                                client.send(
-                                    text,
-                                    CrewWire.mentionsIn(text, conversation.bots),
-                                    java.util.UUID.randomUUID().toString(),
-                                    sessionId,
-                                )
+                                fire(option.label)
                                 note = AnswerCopy.ANSWER_DONE
                                 // 重读时间线：答完之后这张卡要么消失，要么换成下一道题。
+                                onSent()
+                            } catch (error: AnswerStale) {
+                                // 旧卡已过期：刷新换成最新一张，明说「已更新」，不冒充成功、不重复提交。
+                                note = "这张问题卡已更新，请按最新的那张再答"
                                 onSent()
                             } catch (error: Exception) {
                                 // 失败写在这张卡自己的结果行里，不冒充断连横幅。
@@ -2548,28 +2733,90 @@ private fun TicketStrip(
         note?.let {
             Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 16.sp)
         }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .background(palette.card, RoundedCornerShape(8.dp))
-                    .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
-                    // 点它 = 把这句在等的人带进输入框，省得人再想上下文。
-                    .clickable { onPrefill(address) }
-                    .padding(horizontal = 11.dp),
-                contentAlignment = Alignment.CenterStart,
-            ) {
-                Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp)
+        // 自由输入（revise）：审批卡在本卡内就有一格，typed 原文带 attention_id 走 /answer，
+        // 不猜票号、不把回答滑进群聊 /send（契约：text revise 按既有 question 布局提供）。
+        // 老后端没 attention_id 的卡保持原样：点一下把在等的人带进输入框，仍走普通 /send。
+        if (isApproval) {
+            var revise by remember(waiting.id, signature) { mutableStateOf("") }
+            var busy by remember(waiting.id, signature) { mutableStateOf(false) }
+            val trimmed = revise.trim()
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .background(palette.card, RoundedCornerShape(8.dp))
+                        .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 4.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    OutlinedTextField(
+                        value = revise,
+                        onValueChange = { revise = it },
+                        enabled = !busy,
+                        singleLine = true,
+                        placeholder = { Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color.Transparent,
+                            unfocusedBorderColor = Color.Transparent,
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(if (busy || trimmed.isEmpty()) palette.track else palette.warn, RoundedCornerShape(8.dp))
+                        .clickable(enabled = !busy && trimmed.isNotEmpty()) {
+                            busy = true
+                            note = null
+                            scope.launch {
+                                try {
+                                    fire(trimmed)
+                                    note = AnswerCopy.ANSWER_DONE
+                                    revise = ""
+                                    onSent()
+                                } catch (error: AnswerStale) {
+                                    note = "这张问题卡已更新，请按最新的那张再答"
+                                    onSent()
+                                } catch (error: Exception) {
+                                    note = AnswerCopy.answerFailed(error.message)
+                                } finally {
+                                    busy = false
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("回", color = palette.onWarn, fontSize = 11.5.sp)
+                }
             }
-            Box(
-                modifier = Modifier
-                    .size(48.dp)
-                    .background(palette.warn, RoundedCornerShape(8.dp))
-                    .clickable { onPrefill(address) },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("回", color = palette.onWarn, fontSize = 11.5.sp)
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .background(palette.card, RoundedCornerShape(8.dp))
+                        .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+                        // 点它 = 把这句在等的人带进输入框，省得人再想上下文。
+                        .clickable { onPrefill(address) }
+                        .padding(horizontal = 11.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp)
+                }
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(palette.warn, RoundedCornerShape(8.dp))
+                        .clickable { onPrefill(address) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("回", color = palette.onWarn, fontSize = 11.5.sp)
+                }
             }
         }
     }

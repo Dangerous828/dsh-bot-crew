@@ -11,7 +11,8 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "com.dsh.botcrew"
+        // applicationId 可被 crewAppId 覆盖：只用于「装一份隔离副本做真机验证」，不切包名时逐字不变。
+        applicationId = providers.gradleProperty("crewAppId").getOrElse("com.dsh.botcrew")
         minSdk = 26
         targetSdk = 35
         versionCode = 1
@@ -60,6 +61,10 @@ android {
         compose = true
         buildConfig = true
     }
+
+    // 探测的失败/超时路径会走 android.util.Log，而 JVM 单测里它是「not mocked」直接抛。
+    // 要测的正是那些路径，所以让 stub 返回默认值（Log 变成空操作），不额外引 mock 框架。
+    testOptions { unitTests.isReturnDefaultValues = true }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -19,7 +19,11 @@
     "./mobile": "./lib/mobile-watch.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
-    "./team": "./lib/team-watch.js"
+    "./team": "./lib/team-watch.js",
+    "./worker-sandbox": "./lib/worker-sandbox.js",
+    "./worker-fs": "./lib/worker-fs.js",
+    "./worker-fs-helper": "./lib/worker-fs-helper.mjs",
+    "./worker-search-subprocess": "./lib/worker-search-subprocess.js"
   },
   "files": [
     "lib",

@@ -1,0 +1,80 @@
+[
+  {
+    "case": "A 正常隧道（keep-alive，两步都成）",
+    "mode": "normal",
+    "wait_ms": 15000,
+    "wall_seconds": 0.13,
+    "capped_at_75s": false,
+    "ok": true,
+    "probe_millis": 0,
+    "harness_wall_ms": 40
+  },
+  {
+    "case": "B 端口没人听（拒连）",
+    "mode": "refuse",
+    "wait_ms": 15000,
+    "wall_seconds": 0.09,
+    "capped_at_75s": false,
+    "ok": false,
+    "probe_millis": -1,
+    "harness_wall_ms": 23
+  },
+  {
+    "case": "C 对端收下不回，单步 15s 上限",
+    "mode": "hang",
+    "wait_ms": 15000,
+    "wall_seconds": 15.12,
+    "capped_at_75s": false,
+    "ok": false,
+    "probe_millis": -1,
+    "harness_wall_ms": 15044
+  },
+  {
+    "case": "D 对端收下不回，单步 60s 上限（预算该先触发）",
+    "mode": "hang",
+    "wait_ms": 60000,
+    "wall_seconds": 20.17,
+    "capped_at_75s": false,
+    "ok": false,
+    "probe_millis": -1,
+    "harness_wall_ms": 20051
+  },
+  {
+    "case": "E 对端先挂 30s 再回，单步 15s 上限",
+    "mode": "delay",
+    "wait_ms": 15000,
+    "wall_seconds": 15.26,
+    "capped_at_75s": false,
+    "ok": false,
+    "probe_millis": -1,
+    "harness_wall_ms": 15087
+  },
+  {
+    "case": "F 慢滴 100ms/字节",
+    "mode": "drip",
+    "wait_ms": 15000,
+    "wall_seconds": 22.52,
+    "capped_at_75s": false,
+    "ok": true,
+    "probe_millis": 11715,
+    "harness_wall_ms": 22447
+  },
+  {
+    "case": "G 慢滴 300ms/字节（每次 read 都在刷期限）",
+    "mode": "drip",
+    "wait_ms": 15000,
+    "wall_seconds": 31.15,
+    "capped_at_75s": false,
+    "ok": false,
+    "probe_millis": -1,
+    "harness_wall_ms": 31022
+  },
+  {
+    "case": "H 慢滴 800ms/字节",
+    "mode": "drip",
+    "wait_ms": 15000,
+    "wall_seconds": 75.01,
+    "capped_at_75s": true,
+    "raw": ""
+  }
+]

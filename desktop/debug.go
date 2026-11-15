@@ -28,17 +28,39 @@ import (
 	"time"
 )
 
+// debugActionTimeout 是一条调试动作在主线程上的等待上限。
+//
+// 动作里最长的等待是它自己的 pumpResults 预算（15s，见 session.set / refresh / memory.save），
+// 所以这里给到 20s：够长，不会在动作正常收尾之前抢先判超时；够短，窗口真卡住时
+// 外部脚本不会永远挂着。
+const debugActionTimeout = 20 * time.Second
+
 // debugAction 是一条可调用动作：收一组 JSON 参数，回一个可 JSON 化的结果。
 // 返回 error 表示动作本身拒绝/失败（会变成 ok:false）；result 为 nil 也可以。
+//
+// 它**只在主线程上执行**（见 invoke）：所以动作体可以直接读写真窗口状态，
+// 不需要自己再投一次主线程，也不该在这里起长时间阻塞的调用。
 type debugAction func(args map[string]json.RawMessage) (any, error)
 
 // DebugBus 是一张「名字 → 动作」的表，外加一把锁——动作会读写 app 状态，
 // 而 mygo 的界面线程也在碰同一份状态，所以外部调用统一在这一层串行。
+//
+// 锁与线程是两件事：mu 保证「一次只跑一条动作」（动作之间有先后关系），
+// 而动作体本身一律在主线程上执行（见 invoke）——那才是状态真正的归属线程。
 type DebugBus struct {
 	app *app
 	mu  sync.Mutex
 	// actions 是全部可调用动作。建一次，不随刷新变。
 	actions map[string]debugAction
+	// timeout 是一条动作等主线程的上限。零值用 debugActionTimeout；
+	// 测试里调小，好在几百毫秒内验证超时路径。
+	timeout time.Duration
+	// 连接生命周期：listener 与活连接都记着，窗口关掉时一起收掉，
+	// 免得外部脚本看到「连着但没反应」。
+	connMu     sync.Mutex
+	listener   net.Listener
+	conns      map[net.Conn]struct{}
+	connClosed bool
 }
 
 // newDebugBus 把 app 的方法逐个包成可按名字调用。
@@ -271,12 +293,14 @@ func newDebugBus(s *app) *DebugBus {
 		// 切过去之后那次时间线读是异步的：等它真的落进当前会话的缓存再回话，
 		// 外部脚本才能「切完立刻看 messages」。窗口没在画时靠 pumpResults 收。
 		want := s.currentSession
-		s.pumpResults(10*time.Second, func() bool {
+		settled := s.pumpResults(10*time.Second, func() bool {
 			return s.conversation != nil && s.conversation.SessionID == want
 		})
+		// settled:false = 这次等待被 mainThreadSettleCap 截断：loaded / messages 报的是
+		// 这一刻的真值（可能仍是上一段会话的），不能读成「切过去那段已经读完」。
 		return map[string]any{
 			"session": s.currentSession, "loaded": s.conversation != nil,
-			"messages": s.currentMessageCount(),
+			"messages": s.currentMessageCount(), "settled": settled,
 		}, nil
 	})
 	bus.register("session.reload", func(args map[string]json.RawMessage) (any, error) {
@@ -399,9 +423,10 @@ func newDebugBus(s *app) *DebugBus {
 			return nil, err
 		}
 		// 成功后 applyMemoryOutcome 会重读账本：等重读落地，脚本才能立刻 memory.dump 看到新值。
-		s.pumpResults(15*time.Second, func() bool { return !s.loadingMemory })
+		// settled:false = 重读还没回来（被 mainThreadSettleCap 截断）：saved 是真的，count 是旧值。
+		settled := s.pumpResults(15*time.Second, func() bool { return !s.loadingMemory })
 		return map[string]any{"saved": name, "description": description, "body": body,
-			"count": s.memoryActiveCount()}, nil
+			"count": s.memoryActiveCount(), "settled": settled}, nil
 	})
 
 	// ── 常规任务 ─────────────────────────────────────────────
@@ -480,19 +505,35 @@ func (s *app) sessionCapabilityName() string {
 // 用的是同一个字段（sessionAPI）。调试口不另造一套。
 func (s *app) sessionSwitchable() bool { return s.sessionAPI }
 
+// mainThreadSettleCap 是一条动作在主线程上最多等多久。
+//
+// 动作体整段跑在主线程上（见 invoke），所以它的等待会占住主线程 —— 那期间窗口不画。
+// 正常后端几毫秒就落定，这个上限只在后端卡住时才起作用：到点返回 settled:false，
+// 让调用方知道「还没落定」，而不是把界面冻到动作自己的 15s 预算用尽。
+// 判据字段本来就是给这件事用的，语义不变。
+//
+// 是 var 不是 const，只为让定向测试把上限调小（慢后端用例不必真等 3s），
+// 生产路径没有任何地方改它。
+var mainThreadSettleCap = 3 * time.Second
+
 // pumpResults 把**已经到达**的后台结果收进状态，直到 done() 成立或预算用完。
 //
-// 为什么需要它：drain 只在 view() 每帧被调一次，而一扇没有在画的窗口（被遮挡、
-// 显示器休眠、App Nap）一帧都不会来 —— 后台线程早把结果放进了通道，状态却停在旧值。
-// 调试口是「按名字调方法」，不受帧的节奏约束，所以自己把 drain 走一遍（传 nil：
-// drain 里的 c.Invalidate() 对 nil 是安全的），等结果真的落地再回话。
+// 它等的是「结果真的落地」，而不是「窗口画了一帧」：调试口是按名字调方法，
+// 不受帧的节奏约束，所以自己把主线程队列与 drain 都走一遍再回话。
 //
-// 它不改变产品行为：走的还是同一个 drain、同一批通道、同一套 apply*。
-// 真正的根治（让 drain 不只挂在帧上）在 ui.go 的 drain 调用点，属于另一件事，
-// 已在 docs 里记为发现；这里只保证调试口不因「窗口没画」而看不见真实状态。
+// 产品路径与它走的是同一个机制（wake → postMain → drain），所以这里绿了，
+// 真窗口在没有帧的时候也是绿的（issue #27）。
+//
+// 调用位置：只在主线程上（动作体内）。它 drain 的是 s.pending 里已经排好的任务，
+// 不依赖 mygo 的主循环再转一圈，所以「主线程等自己的队列」在这里不会死锁；
+// 等待时长由 mainThreadSettleCap 封顶。
 func (s *app) pumpResults(budget time.Duration, done func() bool) bool {
+	if budget <= 0 || budget > mainThreadSettleCap {
+		budget = mainThreadSettleCap
+	}
 	deadline := time.Now().Add(budget)
 	for {
+		s.runPending()
 		s.drain(nil)
 		if done == nil || done() {
 			return true
@@ -500,7 +541,7 @@ func (s *app) pumpResults(budget time.Duration, done func() bool) bool {
 		if time.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -527,14 +568,36 @@ func (s *app) applyMemoryOutcome(name string, err error) {
 }
 
 // invoke 按名字调一条动作。未知动作明确报错，不静默。
+//
+// 执行位置是这里的关键：动作体会读、也会改 app 状态，而 app 状态只属于主线程
+// （view() 就在那条线程上跑）。所以整条动作被**投到主线程上串行执行**，
+// 调用方（socket 处理 goroutine）只等结果，等不到就按超时 / 已关闭返回明确错误。
+//
+// 旧写法是在调用方的 goroutine 上直接跑 fn，动作体里的 runPending + drain(nil)
+// 于是与真窗口的 view() 并发改同一批字段 —— 这正是 issue #27 剩下的那一半。
+// 现在动作体与 view() 天然串行，不需要第二套锁，也没有「调试口专用」的旁路。
 func (bus *DebugBus) invoke(name string, args map[string]json.RawMessage) (any, error) {
 	fn, ok := bus.actions[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown action: %s", name)
 	}
+	// 一条一条来：动作之间有先后关系（先 memory.edit 再 memory.save），
+	// 并发跑会互相踩状态，串行才是它本来的语义。
 	bus.mu.Lock()
 	defer bus.mu.Unlock()
-	return fn(args)
+
+	var (
+		result any
+		err    error
+	)
+	timeout := bus.timeout
+	if timeout <= 0 {
+		timeout = debugActionTimeout
+	}
+	if waitErr := bus.app.runOnMain(timeout, func() { result, err = fn(args) }); waitErr != nil {
+		return nil, fmt.Errorf("%s: %w", name, waitErr)
+	}
+	return result, err
 }
 
 func (bus *DebugBus) navName(item navItem) string {
@@ -743,6 +806,11 @@ func debugSocketPath() string {
 // {"action":...,"args":{...}}，回一行 JSON {"ok":...,"result"/"error":...}。
 // 每个连接单独处理；错误只回给这一条，不退出服务。
 func (bus *DebugBus) serveDebug(ctx context.Context) error {
+	// 已收口就不许再 bind：net.Listen 不知道收口这回事，照样成功，而 accept 循环
+	// 第一条连接就会被 trackConn 拒绝并退出 —— 留下一个连得上、永远没回话的死 socket。
+	if bus.isClosed() {
+		return errMainClosed
+	}
 	path := debugSocketPath()
 	_ = os.Remove(path) // 清掉上一次崩溃留下的死 socket
 	listener, err := net.Listen("unix", path)
@@ -751,10 +819,18 @@ func (bus *DebugBus) serveDebug(ctx context.Context) error {
 	}
 	// 只有本用户能读写：调试口能驱动整个界面，不该给别的账号。
 	_ = os.Chmod(path, 0o600)
+	// 登记要在锁内：上面那次 isClosed 与这次 Listen 之间 closeConnections 可能已经跑过，
+	// 那时它读到的是 nil listener，这个 listener 就再没人关。
+	if !bus.admitListener(listener) {
+		_ = listener.Close()
+		_ = os.Remove(path)
+		return errMainClosed
+	}
 	go func() {
 		<-ctx.Done()
 		listener.Close()
 		_ = os.Remove(path)
+		bus.closeConnections()
 	}()
 	go func() {
 		for {
@@ -762,14 +838,84 @@ func (bus *DebugBus) serveDebug(ctx context.Context) error {
 			if err != nil {
 				return // listener 被关时 Accept 报错，正常退出
 			}
+			if !bus.trackConn(conn) {
+				_ = conn.Close()
+				return // 收口了：listener 已被 closeConnections 关掉，没有死 socket 留下
+			}
 			go bus.handleConn(conn)
 		}
 	}()
 	return nil
 }
 
+// isClosed 报连接层是否已收口（窗口关掉 / 应用退出）。
+func (bus *DebugBus) isClosed() bool {
+	bus.connMu.Lock()
+	defer bus.connMu.Unlock()
+	return bus.connClosed
+}
+
+// admitListener 在锁内登记 listener。已经收口时返回 false，调用方自己关掉它。
+// 写与读（closeConnections）在同一把锁里，-race 干净。
+func (bus *DebugBus) admitListener(listener net.Listener) bool {
+	bus.connMu.Lock()
+	defer bus.connMu.Unlock()
+	if bus.connClosed {
+		return false
+	}
+	bus.listener = listener
+	return true
+}
+
+// trackConn 记下一条活连接。已经收口时返回 false，调用方直接关掉它。
+func (bus *DebugBus) trackConn(conn net.Conn) bool {
+	bus.connMu.Lock()
+	defer bus.connMu.Unlock()
+	if bus.conns == nil {
+		bus.conns = map[net.Conn]struct{}{}
+	}
+	if bus.connClosed {
+		return false
+	}
+	bus.conns[conn] = struct{}{}
+	return true
+}
+
+// closeConnections 收掉监听与所有活连接。
+//
+// 为什么需要它：窗口关掉之后主线程队列已经收了，连接上的动作只会立刻拿到
+// errMainClosed —— 但连接本身不会自己断（decoder 还在等下一行）。不主动收的话，
+// 进程退出时这些 socket 会挂到最后，外部脚本看到的是「连着但没反应」。
+func (bus *DebugBus) closeConnections() {
+	bus.connMu.Lock()
+	bus.connClosed = true
+	listener := bus.listener
+	open := make([]net.Conn, 0, len(bus.conns))
+	for conn := range bus.conns {
+		open = append(open, conn)
+	}
+	bus.conns = nil
+	bus.connMu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+	for _, conn := range open {
+		_ = conn.Close()
+	}
+}
+
+// forgetConn 在一条连接收掉时把它从表里去掉。
+func (bus *DebugBus) forgetConn(conn net.Conn) {
+	bus.connMu.Lock()
+	if bus.conns != nil {
+		delete(bus.conns, conn)
+	}
+	bus.connMu.Unlock()
+}
+
 func (bus *DebugBus) handleConn(conn net.Conn) {
 	defer conn.Close()
+	defer bus.forgetConn(conn)
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 	for {

@@ -12,10 +12,11 @@ export interface Notice {
   title: string
   body: string
   /**
-   * `mail` / `calendar` 是 issue #23 的两个监听源；`morning` 是早报。
+   * `mail` / `calendar` 是 issue #23 的两个监听源；`morning` 是早报；`internal` 是客户端内部消息的
+   * 设备横幅（server→client reply 的通知面，非会话面 replies——聊天里看到那条回复走 replies 表）。
    * 分成不同的 kind 而不是都叫 `daily`：人静音「日报」时不该顺手把「有人直接找我」也静掉。
    */
-  kind: 'followup' | 'routine' | 'report' | 'daily' | 'morning' | 'mail' | 'calendar' | 'approval'
+  kind: 'followup' | 'routine' | 'report' | 'daily' | 'morning' | 'mail' | 'calendar' | 'approval' | 'internal'
 }
 
 /** 一条推送要发给谁：设备表里的每一台，但跳过主人明确静音的那些。 */
@@ -102,6 +103,65 @@ export function morningDue(now = new Date()): boolean {
   return hour >= MORNING_HOUR && hour < DAILY_HOUR
 }
 
+/**
+ * 本地日期 `YYYY-MM-DD`。
+ *
+ * 不能用 `toISOString().slice(0, 10)`：那是 UTC 日。北京早上八点是前一天 16:00Z，
+ * 按 UTC 取日会把早报算到昨天，于是「今天说过没有」这笔账天天错一天。
+ */
+export function localDay(now = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+/** 抬头上的日子：`11 月 14 日`。与日报同一个写法，人扫的位置固定。 */
+export function dayLabel(now = new Date()): string {
+  return `${now.getMonth() + 1} 月 ${now.getDate()} 日`
+}
+
+/** 本地今天零点。 */
+export function startOfLocalDay(now = new Date()): Date {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate())
+}
+
+/**
+ * 「昨夜」这个说法现在由运行时的水位线（`KV.notices.reported`）定义，不由这里现算。
+ *
+ * 这里曾经有一个 `overnightStart(now)`：把下界算成「昨天 21:00」。那个公式假设「昨晚日报跑过」，
+ * 而进程整夜不在线时它没跑 —— 昨天 21:00–24:00 结束的票于是两份报告都不数（早报没跑、
+ * 日报从今天零点起算）。审计建议的 `max(今天零点, 昨晚 21 点)` 只是把这个洞缩小，没补上。
+ * 真正的下界只能是**上一次报表真跑到的时刻**，那是个持久化的事实，不是能现算的公式。
+ */
+
+/** 一个时刻的本地钟点 `09:05`。日程正文用它，不写 UTC 时刻。 */
+export function clockOf(iso: string): string {
+  const at = new Date(iso)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}`
+}
+
+/**
+ * 报告里那段统计该怎么称呼：`今日` / `自 11 月 12 日 08:00 起` / `上次汇报以来`。
+ *
+ * **不能一律写「昨夜」**。窗口下界是持久化的水位线（`KV.notices.reported`），进程停机几天后
+ * 第一次报表会把那几天的活一起统计进来；这时候说「昨夜办完 12 件」是在报一个假的时间范围 ——
+ * 数是真的，但人按「昨夜」去理解就错了。
+ *
+ * 三种情形：
+ * - 窗口从今天之内起算（首次启动从今天零点）→ `今日`；
+ * - 窗口起于更早 → 如实写出那一刻 `自 M 月 D 日 HH:mm 起`；
+ * - 没有水位线可用 → `上次汇报以来`（不知道就别说具体时刻）。
+ *
+ * @param windowStart - 窗口下界的 ISO 时刻；缺省表示没有水位线。
+ * @param day - 这份报告抬头上的日子（`dayLabel` 的产物），用来判断窗口是否落在同一天。
+ */
+export function windowLabel(windowStart: string | undefined, day: string): string {
+  if (windowStart === undefined) return '上次汇报以来'
+  const start = new Date(windowStart)
+  if (Number.isNaN(start.getTime())) return '上次汇报以来'
+  return dayLabel(start) === day ? '今日' : `自 ${dayLabel(start)} ${clockOf(windowStart)} 起`
+}
+
 /** 一件「等着人处理」的事。`key` 是跨两份报告的去重键。 */
 export interface PendingItem {
   key: string
@@ -130,6 +190,17 @@ export interface MorningFacts {
   overnight: { finished: number; failed: number }
   events: readonly MorningEvent[]
   pending: readonly PendingItem[]
+  /**
+   * 这段统计的窗口下界（ISO 时刻）。**不传就写「上次汇报以来」**，传了就按它算
+   * `今日` / `自 M 月 D 日 HH:mm 起`（见 `windowLabel`）—— 不能一律说「昨夜」：
+   * 停机几天后第一次报表会把那几天的活一起算进来，那时说「昨夜」是在报假的时间范围。
+   */
+  windowStart?: string
+  /**
+   * 日历这一栏读不出来时的一句原因。**与「今天没有会」是两件事**：`events: []` 且没有这句
+   * 才是「今天真没会」；有这句时正文如实说读不到（设计系统 §六，宁可空着也不造假）。
+   */
+  calendarNote?: string
   /** 今天已经说过的键（两份报告共用的那本账）。 */
   spoken?: readonly string[]
 }
@@ -162,19 +233,23 @@ const PENDING_LIMIT = 5
  */
 export function morningNotice(facts: MorningFacts): (Notice & { spoken: string[] }) | undefined {
   const { items, spoken } = onceToday(facts.pending, facts.spoken ?? [])
-  const lines: string[] = []
   const night: string[] = []
   if (facts.overnight.finished > 0) night.push(`办完 ${facts.overnight.finished} 件`)
   if (facts.overnight.failed > 0) night.push(`失败 ${facts.overnight.failed} 件`)
-  if (night.length > 0) lines.push(`昨夜 ${night.join(' · ')}`)
-  if (facts.events.length > 0) {
-    lines.push(`今日 ${facts.events.map(event => `${event.at} ${event.title}`).join('、')}`)
-  }
-  if (items.length > 0) {
-    const shown = items.slice(0, PENDING_LIMIT).map(item => item.text)
-    const rest = items.length - shown.length
-    lines.push(`待处理 ${shown.join('；')}${rest > 0 ? ` · 还有 ${rest} 件` : ''}`)
-  }
-  if (lines.length === 0) return undefined
+  const pendingLine = items.length > 0
+    ? `待处理 ${items.slice(0, PENDING_LIMIT).map(item => item.text).join('；')}${
+      items.length > PENDING_LIMIT ? ` · 还有 ${items.length - PENDING_LIMIT} 件` : ''}`
+    : undefined
+  // 「日历读不到」这件事**本身不值得推一条**：每天早上一句「还没接入日历」是纯噪音，
+  // 人两天就会把早报静音。它只在早报本来就要说点别的时，作为那一栏的实话出现 ——
+  // 空着与读不到是两件事，但那说的是别冒充「今天没会」，不是要单独播报一次读不到。
+  if (night.length === 0 && facts.events.length === 0 && pendingLine === undefined) return undefined
+  const today = facts.events.length > 0
+    ? `今日 ${facts.events.map(event => `${event.at} ${event.title}`).join('、')}`
+    : facts.calendarNote !== undefined ? `今日日程读不到（${facts.calendarNote}）` : undefined
+  // 抬头按真实窗口起算，不一律写「昨夜」：停机几天后第一次报表会把那几天的活一起算进来，
+  // 那时「昨夜办完 12 件」数是真的、时间范围是假的。
+  const lines = [night.length > 0 ? `${windowLabel(facts.windowStart, facts.day)} ${night.join(' · ')}` : undefined,
+    today, pendingLine].filter((line): line is string => line !== undefined)
   return { title: `${facts.day} 早报`, body: lines.join('\n'), kind: 'morning', spoken }
 }

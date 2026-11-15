@@ -1,0 +1,22 @@
+=== date ===
+Sat Nov 14 19:04:54 CST 2026
+=== device ===
+PEDM00
+34
+=== package ===
+    codePath=/data/app/~~sHaDhYXzoxUkdzr6GNqd7A==/com.dsh.botcrew-7cBGN2AkGDj_k0gSRvs3uw==
+    versionCode=1 minSdk=26 targetSdk=35
+    versionName=0.1.0
+    lastUpdateTime=2026-11-14 17:56:55
+      firstInstallTime=2026-11-11 22:27:11
+=== apk bytes ===
+package:/data/app/~~sHaDhYXzoxUkdzr6GNqd7A==/com.dsh.botcrew-7cBGN2AkGDj_k0gSRvs3uw==/base.apk
+16886003 /data/app/~~sHaDhYXzoxUkdzr6GNqd7A==/com.dsh.botcrew-7cBGN2AkGDj_k0gSRvs3uw==/base.apk
+=== pid ===
+25101
+=== focus ===
+  mCurrentFocus=Window{5427a u0 com.dsh.botcrew/com.dsh.botcrew.MainActivity}
+=== forward ===
+
+=== reverse ===
+

@@ -50,7 +50,15 @@
             group: true
             isolate:
               shell: true
+              # 隔离 worker 的 shell 到自己的 `sandbox` 服务实例：只有这个组里的 `bash-sandbox` 解析到下面挂的
+              # `WorkerSandboxProvider`，主会话 / router 的 shell 组仍用 DSH 自带的全局 `sandbox`（不受影响）。
+              sandbox: true
             config:
+              # backend 自己的 worker sandbox provider：profile 在写白名单外加 deny 读 `sensitivePaths()`，
+              # 补上 DSH 自带 seatbelt「只限写、不限读」的缺口（ADR 0004 gap 3 / #22）。
+              # 只有 executor.isolation === 'sandbox' 时 sessions.ts 才把 worker 翻到 workspace-write 让这条生效。
+              - id: worker-sandbox
+                name: dsh-superagent/worker-sandbox
               - id: bash-sandbox
                 name: '@deepseek-ai/dsh-bash-sandbox'
                 disabled: !!js process.platform === 'win32'
@@ -69,12 +77,48 @@
               - id: tool-pwsh
                 name: '@deepseek-ai/dsh-tool-pwsh'
                 disabled: !!js process.platform !== 'win32'
-          - id: tool-fs
-            name: '@deepseek-ai/dsh-tool-fs'
-          - id: tool-fs-search
-            name: '@deepseek-ai/dsh-tool-fs-search'
+          # 文件工具读面隔离（task-5 / #22 补口）：把 worker 的 fs 工具收进一个 isolate 了 `fs`
+          # 和 `sandbox` 的组。组里挂 backend 的 `WorkerFileSystem` 作为这一组自己的 `ctx.fs`——
+          # 读方法（read/read_image 走 ctx.fs）进隔离子进程（固定 helper + 同组 WorkerSandboxProvider
+          # 的 seatbelt profile：写白名单 + 凭据读 deny），写/改/删原样委托内层全局 fs-sandbox 的
+          # per-call policy fence。**默认 none 透传**：权限只按真实 per-session（agents.currentInitiator()
+          # → 该会话 mode）判；confining 会话读进隔离、显式 none 读透传、缺会话上下文 fail-closed。
+          # 主会话（router）自己的 tool-fs 在 router preset 里，仍用全局 fs-sandbox，不受影响。
+          # 边界：`glob`/`grep` 不经 ctx.fs，由下面的 file-search 组单独隔离（见下）。
+          - id: fs
+            name: cordis:group
+            group: true
+            isolate:
+              fs: true
+              # 让组内 `ctx.sandbox` 解析到下面挂的 `worker-sandbox`（与 shell 组同一 provider，
+              # 同一份 profile），WorkerFileSystem 的 confine() 才用对策略。
+              sandbox: true
             config:
-              sampleOverCapGlobResults: false
+              - id: worker-fs-sandbox
+                name: dsh-superagent/worker-sandbox
+              - id: worker-fs
+                name: dsh-superagent/worker-fs
+              - id: tool-fs
+                name: '@deepseek-ai/dsh-tool-fs'
+          # glob/grep 读面隔离（task-5 / #22 补口）：`glob`/`grep` 不走 ctx.fs，而是
+          # `ctx.subprocess.spawn` 跑打包 ripgrep（注入 subprocess、不注入 fs/sandbox，源码注释
+          # "spawn is unconfined"）。所以给 file-search 单独一个 isolate 了 `subprocess` 的组，挂
+          # backend 的 `WorkerSearchSubprocess`：把 ripgrep 的 spawn 包进与 fs/shell 同一份
+          # seatbelt profile（写白名单 + 凭据读 deny）内执行——rg 打开敏感文件命中内核拒绝。
+          # **不嵌套 sandbox-exec**：shell 组 / fs 组 / 本组是三个兄弟 scope，各自 isolate 自己的
+          # 服务，互不嵌套。**默认 none 透传**：与 WorkerFileSystem 同一套 per-session 判定。
+          - id: file-search
+            name: cordis:group
+            group: true
+            isolate:
+              subprocess: true
+            config:
+              - id: worker-search-subprocess
+                name: dsh-superagent/worker-search-subprocess
+              - id: tool-fs-search
+                name: '@deepseek-ai/dsh-tool-fs-search'
+                config:
+                  sampleOverCapGlobResults: false
           # A wait for a job ends after 5 s too; the job's end wakes the worker with its result.
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'

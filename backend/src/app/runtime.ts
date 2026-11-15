@@ -15,7 +15,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, liveTicket, reasonText, runningAssignment, threadKey, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
-  type Ticket, type Trigger, type AssessmentOutcome } from '../core/index.ts'
+  type Ticket, type Trigger, type AssessmentOutcome, type AttentionOption } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -28,13 +28,17 @@ import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
 import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
 import { buildRoutine, editRoutine, routinesView, routineItemOf, newRoutineId, type RoutineRecord, type RoutinesView } from './routines.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
-import { followupsOf, followupText } from './followup.ts'
+import { followupsOf, followupText, waitingWhere } from './followup.ts'
 import { spendOf, spendSteps, type Spend, type SpendEvent } from './spend.ts'
 import { auditOf, type AuditRow } from './audit.ts'
 import { transcribe as transcribeAudio, type SpeechHost, type Transcript } from './voice.ts'
 import { summaryFact, worthRemembering, type CompactionSummaryEvent } from './compact-memory.ts'
-import { deliver, PushOutbox, type PushMessage, type PushOutcome } from './push.ts'
-import { dailyDue, dailyNotice, pushFor, type Notice, type PushRecipient } from './notices-out.ts'
+import { deliver, pendingFor, PushOutbox, seenLedgerPatch, storeNoticeStore, type NoticeDelivery, type PushMessage, type PushOutcome } from './push.ts'
+import { dailyDue, dailyNotice, dayLabel, localDay, morningDue, morningNotice, onceToday, pushFor, startOfLocalDay,
+  type Notice, type PendingItem, type PushRecipient } from './notices-out.ts'
+import { CALENDAR_UNAVAILABLE } from './calendar.ts'
+import { configsFromEnv, runCalendarRound, runMailRound, type GraphWatchDeps } from './graph-watch.ts'
+import { MicrosoftGraphPort } from './graph.ts'
 import { approvalOf, approvalPrompt, readAnswer, type ApprovalDecision } from './approval.ts'
 import { QuotaSourceReader, quotaOf, quotaSourceLine, quotaSourceUrl, quotaWarning, replySpendOf, type Quota,
   type QuotaSourceReading, type ReplySpend } from './quota.ts'
@@ -46,7 +50,7 @@ import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
-import { Prompts } from './prompts.ts'
+import { Prompts, memoryRoot } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { threadTitle, type LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
@@ -68,7 +72,10 @@ import type { MainResourceHost, ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { MemoryLayer } from './memory-layer.ts'
-import { HubProbe, LocalMemory, pickMemoryPort } from '../memory/detect.ts'
+import { AuthorMirror, pipelineContent, pipelineDigest } from '../memory/author.ts'
+import { makeHubRetraction } from '../memory/hub-retraction.ts'
+import { HubProbe, LocalMemory, pickMemoryPort, type ReachState } from '../memory/detect.ts'
+import { hubHealthOf, type HubTokenRef } from '../memory/auth.ts'
 import { RuleDistiller, type Distiller } from '../memory/distill.ts'
 import { memoryView, type MemoryView } from './views/memory.ts'
 
@@ -102,6 +109,10 @@ const teammateTicket = (tickets: readonly Ticket[], bot_id: string): Ticket | un
 /** How many crew notes a ticket's chain has already carried; a ticket a person started at depth 0. */
 const crewHop = (store: Pick<Store, 'get'>, ticketId: string): number => store.get(KV.crew.hop(ticketId)) ?? 0
 
+/** Graph 监听的 health 翻成面板要的四态：`off`（未配凭据）落到 `paused`（不是 `error`，没配不是故障）。 */
+const graphHealthOf = (watch: { state: 'off' | 'ready' | 'error'; detail: string; at?: string }): Health =>
+  ({ state: watch.state === 'off' ? 'paused' : watch.state, detail: watch.detail, ...watch.at ? { at: watch.at } : {} })
+
 /**
  * Where the gateway answers, as `scripts/dsh-superagent` configured it (tools/mobilegw reads the same two variables).
  * The panel needs it to link a crew conversation: the queue itself has no address of its own.
@@ -113,6 +124,18 @@ const GATEWAY = { host: process.env.MOBILEGW_HOST ?? '127.0.0.1', port: process.
 export interface WatchdogAlert { at: string; kind: string; title: string; body: string; decisionId: string }
 /** 看门狗对外快照：最近几条告警 + 上次真重排过的自愈时刻（证明它是活的）。 */
 export interface WatchdogStatus { alerts: WatchdogAlert[]; lastSelfHealAt?: string }
+
+/**
+ * 语义稳定的 JSON 序列化：对象键递归排序（数组保序）。用于「一次审批签名」——
+ * 模型/工具对同一组参数可能给出不同的键顺序（`{a,b}` vs `{b,a}`），若签名直接 `JSON.stringify`
+ * 就会把「同参数」误判成「改了参数」，导致批准后被反复 ask、永不消费。这里只规范化键序，不改值。
+ */
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']'
+  const obj = value as Record<string, unknown>
+  return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + stableJson(obj[k])).join(',') + '}'
+}
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -137,6 +160,10 @@ export class Runtime extends Service implements SourceHost {
   readonly memory: MemoryLayer
   /** 记忆中枢可达性探测（供记忆层分叉与设置保存后刷新）。 */
   memoryProbe?: HubProbe
+  /** author md 生命周期镜像：把账本记忆落盘/撤回（裁定 C：仅显式 toHub 才落盘上行）。 */
+  private memoryAuthor?: AuthorMirror
+  /** 撤回失败计数与最近错误（可观察；不向 UI 报「已忘」而远端仍 live）。 */
+  private memoryRetractFailures = 0
   /** 睡眠期提炼器（默认规则版；中枢或装了便宜模型时可替换为 LLM 版）。 */
   private readonly distiller: Distiller = new RuleDistiller()
   readonly ready: Promise<void>
@@ -158,8 +185,8 @@ export class Runtime extends Service implements SourceHost {
   private closingFlag = false
   /** 待命期间重跑 setup 的定时器；关掉 runtime 时必须清掉，否则会对着已释放的锁再跑一次。 */
   private setupRetry?: ReturnType<typeof setTimeout>
-  /** 待发件箱：手机离线时留件，连上来的第一时间补发。 */
-  private readonly pushOutbox = new PushOutbox()
+  /** 待发件箱：手机离线时留件，连上来的第一时间补发。持久后端在构造器里接上 `Store` 后才有（见下）。 */
+  private readonly pushOutbox: PushOutbox
   /**
    * 经隧道送一条推送的那只手，由 `index.ts` 在隧道建好后注入。
    *
@@ -167,10 +194,6 @@ export class Runtime extends Service implements SourceHost {
    * Runtime 不该知道中转地址长什么样。而且 `runtime` 先于隧道构造，晚一步注入才不会绕成环。
    */
   private pusher?: (message: PushMessage) => boolean
-  /** 今天报过日报没有（`YYYY-MM-DD`），同一天只说一次。 */
-  private dailySaid = ''
-  /** 今天派出去的常规任务次数（日报用）。 */
-  private routinesToday = 0
   /** 会话压缩的监听只挂一次；挂不上（老宿主）时也不会每轮重试。 */
   private compactionWatch = false
   /** 常规任务的调度器；`start` 之后才有，`stop` 时清掉（`routines()` 据此说 runner 是 live 还是 none）。 */
@@ -214,6 +237,10 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      // 待发件箱接真实持久层：Store 就绪后再建，明确依赖顺序，不靠字段初始化去猜 store 何时可用。
+      // 一桶一键（KV.notice.pending），HMR/实例重建后靠这一族读回、不丢未 ACK 的件。只用新链以后
+      // 入队的件才有来源；更早只活在旧进程内存里的件不在此列，不假装恢复。
+      this.pushOutbox = new PushOutbox({}, storeNoticeStore(store))
       const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
@@ -249,11 +276,43 @@ export class Runtime extends Service implements SourceHost {
       // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
       // 记忆中枢：按设置里的 memory.hub 探测决定走中枢版还是本机版；两版共用同一个本机账本。
       // 允许环境变量 DSH_SUPERAGENT_MEMORY_HUB 兜底：设置里没填时用它，省去先开面板。
-      const memorySettings = store.settings().memory
-      const envHub = (process.env.DSH_SUPERAGENT_MEMORY_HUB ?? '').trim()
-      const memoryHub = memorySettings.hub || (/^https?:\/\//.test(envHub) ? envHub : '')
-      const memoryProbe = new HubProbe({ hub: memoryHub, timeoutMs: memorySettings.timeoutMs,
+      //
+      // 凭据**只传引用**（memory.tokenEnv / memory.tokenFile），不在这里取值：
+      // `HubHttp` 每次请求现读，值不进 settings、不进 /state、不进日志。
+      //
+      // **配置是活的，不是构造期快照**：`memory` 块保存后 `applyMemoryConfig()` 会把整套
+      // 引用（hub / timeout / 凭据引用）换到同一个 `HubProbe` 上，记忆层不必重建。
+      // 早先的写法在这里把三个字段捕获进 probe 与 HTTP 客户端，于是「设置显示新值、记忆还走
+      // 旧中枢」，非得重启才生效 —— 生产验收就是被这个坑住的。
+      const memoryConfig = (): { hub: string; timeoutMs: number; token: HubTokenRef } => {
+        const memory = store.settings().memory
+        const envHub = (process.env.DSH_SUPERAGENT_MEMORY_HUB ?? '').trim()
+        // 凭据引用也允许环境变量兜底（与 hub 地址同一个思路：设置里没填时用环境，省去先开面板）。
+        // 环境里给的同样只是**引用**（变量名 / 文件路径），token 值仍不进设置。
+        return {
+          hub: memory.hub || (/^https?:\/\//.test(envHub) ? envHub : ''),
+          timeoutMs: memory.timeoutMs,
+          token: {
+            env: memory.tokenEnv || (process.env.DSH_SUPERAGENT_MEMORY_HUB_TOKEN_ENV ?? '').trim(),
+            file: memory.tokenFile || (process.env.DSH_SUPERAGENT_MEMORY_HUB_TOKEN_FILE ?? '').trim(),
+          },
+        }
+      }
+      const initialMemory = memoryConfig()
+      // 中枢鉴权与可达性都要能**被看见**：`/state.health.memory` 报真实结论（没配 / 正在探测 /
+      // 不可达 / 无凭据引用 / 凭据就绪 / 被 401 拒绝）。不可达与被拒都是 `error`，会直接进
+      // overview 的 problems —— 不再出现「探测超时降级本机、health 却写 ready」这种查不出来的假成功。
+      //
+      // `reach` 是探测结论的三态：`unknown`（还没探过，报 starting 而不是假故障）。
+      let reach: ReachState = initialMemory.hub ? 'unknown' : 'up'
+      let publishMemoryHealth = (): void => {}
+      const memoryProbe = new HubProbe({ hub: initialMemory.hub, timeoutMs: initialMemory.timeoutMs,
+        token: initialMemory.token,
+        onAuthChange: () => publishMemoryHealth(),
+        onReachChange: next => { reach = next; publishMemoryHealth() },
         log: line => console.log(line) })
+      const memoryHealth = this.board.claim('memory', hubHealthOf(initialMemory.hub, memoryProbe.authState(), reach))
+      publishMemoryHealth = () => memoryHealth.set(hubHealthOf(memoryProbe.hub(), memoryProbe.authState(), reach))
       const localMemory = new LocalMemory({ store, bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
         ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [],
         // 睡眠期提炼：默认规则版（零模型、可回查）；接中枢或便宜模型时换成 LLM 版。
@@ -261,12 +320,40 @@ export class Runtime extends Service implements SourceHost {
         // 原始料：窗口内人写的 Trigger，按时间正序。
         episodic: range => store.read.episodicRange(range) })
       this.memoryProbe = memoryProbe
+      /**
+       * 让 `memory` 设置块**当场**生效。
+       *
+       * 只换 `HubProbe` 内部那一份配置：端口（`pickMemoryPort`）的 base / timeout / token
+       * 全是现读 probe 的函数，所以探测、检索、鉴权、health 四个读数永远来自同一份配置，
+       * 不会出现「探测打新中枢、检索还打旧中枢」的状态分裂。
+       */
+      const applyMemoryConfig = (): void => {
+        const next = memoryConfig()
+        // 启动期就把「配了地址但没有凭据引用」说出来：否则要等到第一次召回 401 才发现。
+        if (next.hub && !next.token.env && !next.token.file) {
+          console.log('[memory] hub 已配置 (%s) 但 memory.tokenEnv / memory.tokenFile 都为空 — 请求不带 X-Hub-Token；需要鉴权的中枢会回 401',
+            next.hub)
+        }
+        memoryProbe.retarget(next)
+      }
       void memoryProbe.refresh().catch(() => undefined)
       this.memory = new MemoryLayer({
         store,
         bots: () => (store.settings().sources?.team?.config as { bots?: { bot_id?: string }[] } | undefined)?.bots
           ?.flatMap(bot => bot.bot_id ? [bot.bot_id] : []) ?? [],
         port: pickMemoryPort(localMemory, memoryProbe) })
+      // author md 生命周期镜像：落盘到 local_dream 的 dsh_memory 监听根（与 prompts 同一套 DSH_HOME 推导），
+      // 撤回走中枢原子 tombstone + live 反查软删。digest 历史由账本 KV 一族存（只 16hex）。
+      this.memoryAuthor = new AuthorMirror({
+        root: memoryRoot(),
+        retract: makeHubRetraction({
+          base: () => memoryProbe.base(),
+          token: () => memoryProbe.token(),
+          timeoutMs: () => memoryProbe.timeoutMs(),
+        }),
+        digestsOf: name => this.memory.ledger.digestsOf(name),
+        rememberDigest: (name, digest) => this.memory.ledger.rememberDigest(name, digest),
+      })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => {
         for (const ticket of store.tickets.open()) {
           if (ticket.pendingApproval?.kind !== 'connection' || ticket.pendingApproval.status !== 'approved') continue
@@ -276,7 +363,9 @@ export class Runtime extends Service implements SourceHost {
         this.engine.policyChanged(from, to, effects)
       }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
-        sourceHost: this, setup, requestPass: () => { this.passes.request() } })
+        sourceHost: this, setup, requestPass: () => { this.passes.request() },
+        // `memory` 块保存后立刻换配置：探测、检索、鉴权、health 一起换，不用重启。
+        memoryChanged: () => applyMemoryConfig() })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger),
@@ -337,7 +426,9 @@ export class Runtime extends Service implements SourceHost {
             if (done) { try { this.memory.close(done) } catch (error) { console.log('[memory] settle failed: %s', String(error)) }
               // 睡眠期巩固的触发点：一票结束时顺手整理最近一天的原始对话（异步、不阻塞关闭）。
               void this.memory.consolidate({ since: Math.floor(Date.now() / 1000) - 24 * 60 * 60 })
-                .catch(error => console.log('[memory] consolidate failed: %s', String(error))) }
+                .catch(error => console.log('[memory] consolidate failed: %s', String(error)))
+              // 顺带重试还没撤干净的中枢记忆（幂等；成功即清待办）。失败只告警不阻塞。
+              void this.retryPendingRetracts().catch(() => undefined) }
           }
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
@@ -495,11 +586,75 @@ export class Runtime extends Service implements SourceHost {
   async memories(options: { bot?: string } = {}): Promise<MemoryView> {
     return memoryView(() => this.memory.ledger.all(), options)
   }
-  /** 忘掉一条：翻状态，不删行。 */
-  forgetMemory(name: string): boolean { return this.memory.ledger.forget(name) }
-  /** 改一条的正文 / 描述 / 重要性。 */
-  editMemory(name: string, patch: { description?: string; body?: string; importance?: number }): boolean {
-    return this.memory.ledger.edit(name, patch)
+  /**
+   * 忘掉一条：翻状态（不删行）+ 同步 author md 与中枢撤回。
+   *
+   * 同步语义保持（mobile-http 依赖 `boolean`），author 侧异步跑：md 打 disabled（管道不再上行）
+   * + 原子 tombstone 占位（挡未入库旧 pending / 未来重扫）+ live 反查软删现存行。失败写 watchdogAlerts
+   * 可观察，不向 UI 谎报「已忘」。幂等：重试 safe。
+   */
+  forgetMemory(name: string): boolean {
+    const entry = this.memory.ledger.all().find(e => e.name === name)
+    const ok = this.memory.ledger.forget(name)
+    if (ok && entry && this.memoryAuthor) {
+      void this.memoryAuthor.forget(name, entry.bot_id, entry)
+        .then(r => {
+          if (r.retractError || r.retracted?.ok === false) this.noteMemoryRetractFailure(name, entry.bot_id, r.retractError)
+          else this.memory.ledger.clearRetractPending(name) // 撤回成功：清掉历史待办
+        })
+        .catch(error => this.noteMemoryRetractFailure(name, entry.bot_id, error))
+    }
+    return ok
+  }
+  /**
+   * 改一条的正文 / 描述 / 重要性 / 显式分享开关 `toHub`（裁定 C）。
+   * 改正文会变远端 digest：author.edit 重写 md，并按新 digest 保留新版本、撤旧版本 live 行。
+   */
+  editMemory(name: string, patch: { description?: string; body?: string; importance?: number; toHub?: boolean }): boolean {
+    const ok = this.memory.ledger.edit(name, patch)
+    if (ok && this.memoryAuthor) {
+      const entry = this.memory.ledger.all().find(e => e.name === name)
+      if (entry) {
+        const keepDigest = patch.body !== undefined ? pipelineDigest(pipelineContent(entry)) : undefined
+        void this.memoryAuthor.edit(entry, keepDigest)
+          .then(r => { if (r.retractError) this.noteMemoryRetractFailure(name, entry.bot_id, r.retractError) })
+          .catch(error => this.noteMemoryRetractFailure(name, entry.bot_id, error))
+      }
+    }
+    return ok
+  }
+  /** 撤回失败可观察：进 watchdogAlerts（桌面右栏/管理面 /state.alerts 读它），不向 UI 报「已忘」。 */
+  /**
+   * 撤回失败可观察 + **持久待重试**：计数进内存、告警进 watchdogAlerts（/state.alerts 读），
+   * 并把 (name, botId, 已知 digest) 落 KV 的撤回待办一族（`KV.memory.retractPending`，重启不丢），下轮统一重试直到成功。
+   * **不向 UI 报「已忘」而远端仍 live**：本地 disabled 已生效、远端撤回如实标「待重试」。
+   */
+  private noteMemoryRetractFailure(name: string, botId: string, error?: unknown): void {
+    this.memoryRetractFailures += 1
+    const message = error instanceof Error ? error.message : String(error ?? 'unknown')
+    this.watchdogAlerts.unshift({ at: now(), kind: 'memory_retract',
+      title: '有一条记忆没能撤回中枢', body: `本地已停用，远端撤回待重试：${message}（失败 #${this.memoryRetractFailures}）`, decisionId: '' })
+    if (this.watchdogAlerts.length > 50) this.watchdogAlerts.length = 50
+    try { this.memory.ledger.recordRetractPending(name, { botId, digests: this.memory.ledger.digestsOf(name), error: message }) }
+    catch (persistError) { console.log('[memory] persist retract-pending failed: %s', String(persistError)) }
+    console.log('[memory] retract failed (%d): %s', this.memoryRetractFailures, message)
+  }
+  /**
+   * 重试未完成的远端撤回（幂等：tombstone 占槽、bySourceFile 零行无害）。成功则清待办。
+   * 由 consolidate 触发点顺带调（票结束/周期），不额外起定时器、不打热路径。
+   */
+  private async retryPendingRetracts(): Promise<void> {
+    if (!this.memoryAuthor) return
+    for (const { name, item } of this.memory.ledger.listRetractPending()) {
+      const entry = this.memory.ledger.all().find(e => e.name === name)
+      try {
+        const r = entry
+          ? await this.memoryAuthor.forget(name, item.botId, entry)
+          : await this.memoryAuthor.evict(name, item.botId)
+        if (r.retractError) this.noteMemoryRetractFailure(name, item.botId, r.retractError)
+        else this.memory.ledger.clearRetractPending(name)
+      } catch (error) { this.noteMemoryRetractFailure(name, item.botId, error) }
+    }
   }
   /**
    * 新建 / 修改 / 删除一条常规任务（手机端可写，契约 §5.5）。
@@ -619,7 +774,7 @@ export class Runtime extends Service implements SourceHost {
         this.store.set(KV.routines.task(task.id), { ...record, ...next })
       }
       console.log('[routine] dispatched id=%s bot=%s ticket_of=%s', task.id, recipient, trigger.id)
-      this.routinesToday += 1
+      this.countRoutine()
       // 到点派了单要说一声：不然主人只会在下次开电脑时才发现队伍早上干过活。
       this.pushNotice({ title: '到点派了一件事', body: `「${task.title}」已经交给 ${recipient}。`, kind: 'routine' })
       dispatched.push(task.id)
@@ -732,7 +887,7 @@ export class Runtime extends Service implements SourceHost {
       const verdict = judgeCall(config, connection.server, tool)
       if (verdict.action === 'deny') return verdict.reason
       if (verdict.action === 'allow') return undefined
-      const signature = key(name, JSON.stringify(args ?? null), JSON.stringify(config))
+      const signature = key(name, stableJson(args ?? null), JSON.stringify(config))
       if (ticket.pendingApproval?.kind === 'connection' && ticket.pendingApproval.status === 'approved'
         && ticket.pendingApproval.signature === signature) {
         delete ticket.pendingApproval
@@ -779,34 +934,190 @@ export class Runtime extends Service implements SourceHost {
     try { return host.remote?.list?.() ?? [] } catch { return [] }
   }
 
-  /** 一条设备连上来时取走它的待发件。 */
+  /** 一条设备连上来时取走它的待发件（老的 drain 口径；新的接收链走下面的 peek+ack）。 */
   takePending(deviceId: string): PushMessage[] { return this.pushOutbox.take(deviceId) }
 
+  /** 设备接收链：看一眼这台设备还有哪些没 ACK 的（**不删**）。GET 只调它，不断根。 */
+  pendingNotices(deviceId: string): NoticeDelivery[] { return pendingFor(deviceId, this.pushOutbox).items }
+
+  /** 设备确认这几条已落进它的本地存储：只删被点名的，其余原封不动。返回删掉几条。 */
+  ackNotices(deviceId: string, ids: readonly string[]): number { return this.pushOutbox.ack(deviceId, ids) }
+
+  /** 这台设备已持久化过的 notice id 账本。 */
+  noticeSeen(deviceId: string): string[] { return this.store.get(KV.notice.seen(deviceId)) ?? [] }
+
+  /** 幂等并入已持久化账本（device-persisted，不是人眼读过），落库不落进程。 */
+  markNoticeSeen(deviceId: string, ids: readonly string[]): string[] {
+    const next = seenLedgerPatch(this.noticeSeen(deviceId), ids)
+    this.store.set(KV.notice.seen(deviceId), next)
+    return next
+  }
+
   /**
-   * 大哥的日报：晚上九点之后说一次，说的是今天真发生过的数。
+   * 大哥的日报：晚上九点之后说一次，说的是**上次报告之后**真发生过的数。
    *
-   * 与跟进分开：跟进说的是「有一件事卡住了」，日报说的是「今天一共怎么样」。
-   * 两件都塞进一条里，人会分不清哪句要他现在动手。
+   * 统计窗口的下界是持久化的水位线 `KV.notices.reported`（上一次报表真跑到的时刻），不是
+   * 「今天零点」：进程整夜不在线时早报一分钟都没跑过，按今天零点起算会把昨天 21:00–24:00
+   * 结束的票整段丢掉 —— 那一段既没进早报（没跑），也进不了日报（在零点之前）。
+   * 也不按「昨晚 21 点」现算：那只是「假设昨晚日报跑过」，停机时同样漏。
+   *
+   * 于是语义是：**错过的那份通知不补发**（过去的时点不再单独推一条），但**下一次真跑到的报表
+   * 统计覆盖所有还没报过的窗口**。两份报告共用这条水位线，所以它们天然首尾相接、不重不漏。
    */
   async runDaily(now = new Date()): Promise<Notice | undefined> {
     if (!dailyDue(now)) return undefined
-    const day = now.toISOString().slice(0, 10)
-    if (this.dailySaid === day) return undefined
-    const tickets = this.store.tickets.open()
-    const finished = tickets.filter(ticket => ticket.ended && ticket.ended.at.startsWith(day)).length
-    // 结局里没有 `failed`：失败是一个中间状态（还能重试）。日报里数的是「今天结束但没办成」的，
-    // 也就是 `dropped` / `stopped` 这两种 —— 别把「还在跑」误报成失败。
-    const failed = tickets.filter(ticket => ticket.ended && ticket.ended.at.startsWith(day)
-      && (ticket.ended.outcome === 'dropped' || ticket.ended.outcome === 'stopped')).length
-    const waiting = tickets.filter(ticket => ticketCard(ticket).state.startsWith('person/')).length
-    const notice = dailyNotice({
-      day: `${now.getMonth() + 1} 月 ${now.getDate()} 日`, finished, failed, waiting, routines: this.routinesToday,
-    })
-    // 什么也没发生的日子不发：一条「今天什么也没发生」只是在占人时间。
-    if (!notice) { this.dailySaid = day; return undefined }
-    this.pushNotice(notice)
-    this.dailySaid = day
+    const day = localDay(now)
+    if (this.store.get(KV.notices.daily) === day) return undefined
+    const from = this.reportedFrom(now)
+    const morning = this.store.get(KV.notices.morning)
+    const pending = this.pendingItems()
+    const notice = dailyNotice({ day: dayLabel(now), ...this.countEnded(from, now),
+      waiting: pending.length, routines: this.routinesOn(day),
+      // 早报已经点过名的事，日报不再点名 —— 这就是 `onceToday` 那本账「两份报告共用」的用处。
+      // 「N 件等你」仍是此刻的真实积压，数不因早上说过而缩水；重复的只是同一条明细。
+      highlights: onceToday(pending, morning?.day === day ? morning.spoken : []).items.map(item => item.text) })
+    // 什么也没发生的日子不发：一条「今天什么也没发生」只是在占人时间。但水位照样前进 ——
+    // 那一段确实报过了，不前进会让下一份报表把它再数一遍。
+    if (notice) this.pushNotice(notice)
+    this.store.set(KV.notices.daily, day)
+    this.store.set(KV.notices.reported, now.toISOString())
     return notice
+  }
+
+  /**
+   * 早报：早上八点到日报之前说一次（issue #23 第 3 项）。
+   *
+   * 三段口径见 `morningNotice`：昨夜动态、今日日程、待处理。
+   * 与日报不重复轰炸靠两处：
+   *
+   * - **时间**：`morningDue` 把窗口卡在 `[8, 21)`，过了日报的点就不再说。
+   * - **内容**：`onceToday` 那本账记在 `KV.notices.morning.spoken`，下次调用接着用 ——
+   *   同一张等人的票当天只出现一次（日报读同一本）。
+   *
+   * 窗口下界与日报同一条水位线（`reportedFrom`）：整夜不在线时，昨夜那段由醒来后第一份报表补上，
+   * 而不是按「昨晚 21 点」现算后凭空丢掉。
+   *
+   * 日历这一栏没有接入源，正文如实说读不到；但「读不到」本身不单独推一条（见 `morningNotice`）。
+   */
+  async runMorning(now = new Date()): Promise<Notice | undefined> {
+    if (!morningDue(now)) return undefined
+    const day = localDay(now)
+    const said = this.store.get(KV.notices.morning)
+    if (said?.day === day) return undefined
+    // 窗口下界只取一次：既用来数票，也用来给正文抬头（`windowLabel`）—— 两处必须是同一刻，
+    // 否则「自 X 起」与它后面那个数说的不是同一段。
+    const from = this.reportedFrom(now)
+    const notice = morningNotice({
+      day: dayLabel(now), overnight: this.countEnded(from, now), events: [],
+      windowStart: from.toISOString(),
+      calendarNote: CALENDAR_UNAVAILABLE, pending: this.pendingItems(),
+    })
+    if (notice) this.pushNotice(notice)
+    this.store.set(KV.notices.morning, { day, spoken: notice?.spoken ?? [] })
+    this.store.set(KV.notices.reported, now.toISOString())
+    if (notice) console.log('[morning] sent day=%s pending=%d', day, notice.spoken.length)
+    return notice
+  }
+
+  /**
+   * 收件箱 / 日历监听（issue #23 第 1、2 项）：一拍里跑一轮「拉→判→推→落账→health」。
+   *
+   * 不做成 `src/sources` 插件：分层约束 `src/sources` 不许 import `src/app`（判定在
+   * `app/inbox.ts` / `app/calendar.ts`），且这里要的是设备通知（`pushNotice`）不是会话回帖。
+   * 复用它，只加这个方法 + tick 一行，最小且不破分层（详见 `graph-watch.ts` 头注）。
+   *
+   * 配置走环境变量引用（`GRAPH_TOKEN` / `GRAPH_TOKEN_FILE` + 可选 `DSH_MAIL_USER` /
+   * `DSH_CALENDAR_USER`）；没配就**零外部请求**（`configsFromEnv` 返回空 → 直接返回）。
+   * 5 分钟节流：Graph 限流 + issue 明确「不许全量轰炸」；节流时间戳只在进程内（重启后第一拍立刻读一次，无害）。
+   * health 落在 `mail` / `calendar` 两个面板条目上：未配 → `paused`、读失败 → `error`、读过 → `ready`，
+   * 于是「源在、但从没触发过」在面板上看得见，不冒充正常。
+   */
+  async runGraphWatch(now = new Date()): Promise<void> {
+    const cfg = configsFromEnv()
+    if (!cfg.mail && !cfg.calendar) {
+      this.graphHealth?.mail.set({ state: 'paused', detail: '未配置 Graph 凭据（GRAPH_TOKEN / GRAPH_TOKEN_FILE）：不请求任何外部' })
+      this.graphHealth?.calendar.set({ state: 'paused', detail: '未配置 Graph 凭据（GRAPH_TOKEN / GRAPH_TOKEN_FILE）：不请求任何外部' })
+      return
+    }
+    // 5 分钟节流：别每分钟都打 Graph。
+    if (this.lastGraphWatch !== undefined && now.getTime() - this.lastGraphWatch < 5 * 60_000) return
+    this.lastGraphWatch = now.getTime()
+    this.graphHealth ??= { mail: this.claimHealth('mail', { state: 'starting', detail: '' }), calendar: this.claimHealth('calendar', { state: 'starting', detail: '' }) }
+    const deps: GraphWatchDeps = {
+      store: this.store, now: () => now,
+      port: config => new MicrosoftGraphPort({ token: config.token, user: config.user }),
+      // pushNotice 返回投递结果数组；非空＝至少给一台设备排上（在线直送或离线留件，queued≠已送达）。
+      push: notice => { this.pushNotice(notice); return true },
+    }
+    const mail = await runMailRound(deps, cfg.mail)
+    this.graphHealth.mail.set(graphHealthOf(mail.health))
+    const calendar = await runCalendarRound(deps, cfg.calendar)
+    this.graphHealth.calendar.set(graphHealthOf(calendar.health))
+  }
+
+  /** Graph 监听的两条 health（懒建：没配凭据时不占用面板条目）。 */
+  private graphHealth?: { mail: HealthEntry; calendar: HealthEntry }
+  /** 上次 Graph 监听拍的毫秒时刻（节流用，仅进程内）。 */
+  private lastGraphWatch?: number
+
+  /**
+   * 报表的窗口下界：上一次真跑到的报表时刻。
+   *
+   * 没有这条水位线（第一次启动、或老版本升上来）时退回今天零点 —— **不考古**：
+   * 从没报过的机器不该把库里所有结束过的票都算成「昨夜」。
+   */
+  private reportedFrom(now: Date): Date {
+    const reported = this.store.get(KV.notices.reported)
+    const at = reported === undefined ? NaN : Date.parse(reported)
+    // 水位在将来（时钟回拨过）时同样退回今天零点：宁可少报一段，也不能让窗口为负、数出 0 件。
+    return Number.isFinite(at) && at <= now.getTime() ? new Date(at) : startOfLocalDay(now)
+  }
+
+  /** 一段窗口里结束了多少张票：办成的与没办成的分开数。 */
+  private countEnded(from: Date, to: Date): { finished: number; failed: number } {
+    const start = from.getTime(), end = to.getTime()
+    let finished = 0, failed = 0
+    // 必须扫 `list()` 而不是 `open()`：`open` 的判定是 `ended IS NULL`，从它里面筛 `ended` 永远是 0 张 ——
+    // 日报的「办完 N 件」曾经因此恒为空，只有 0 的时候不发，于是日报在真办成过事的晚上也从来不说话。
+    for (const ticket of this.store.tickets.list()) {
+      const ended = ticket.ended
+      if (!ended) continue
+      const at = Date.parse(ended.at)
+      if (!(at >= start && at <= end)) continue
+      // 结局里没有 `failed`：失败是中间状态（还能重试）。这里数的是「结束了但没办成」的
+      // `dropped` / `stopped`，与「办完」分开 —— 否则一次失败会被同时报成办完和失败。
+      if (ended.outcome === 'dropped' || ended.outcome === 'stopped') failed += 1
+      else finished += 1
+    }
+    return { finished, failed }
+  }
+
+  /**
+   * 今天等主人处理的事，卡得最久的在前。
+   *
+   * 键用票号，与跟进提醒同一套：同一张票在两处说的是同一件事，`onceToday` 据此去重。
+   */
+  private pendingItems(): PendingItem[] {
+    return this.store.tickets.open()
+      .flatMap(ticket => {
+        const state = ticketCard(ticket).state
+        if (!state.startsWith('person/')) return []
+        return [{ ticket, item: { key: `ticket:${ticket.id}`, text: `「${ticket.title}」${waitingWhere(state.slice('person/'.length))}` } }]
+      })
+      .sort((left, right) => Date.parse(left.ticket.updatedAt) - Date.parse(right.ticket.updatedAt))
+      .map(entry => entry.item)
+  }
+
+  /** 记一次真派出去的常规任务。落在库里，重启不归零 —— 日报的数才是当天的数。 */
+  private countRoutine(now = new Date()): void {
+    const day = localDay(now)
+    this.store.set(KV.notices.routines, { day, count: this.routinesOn(day) + 1 })
+  }
+
+  /** 今天已经派出去几次。换了一天就从 0 起算，不把昨天的数带过来。 */
+  private routinesOn(day: string): number {
+    const record = this.store.get(KV.notices.routines)
+    return record?.day === day ? record.count : 0
   }
 
   /**
@@ -1121,34 +1432,82 @@ export class Runtime extends Service implements SourceHost {
       this.store.triggers.saveDisposition(trigger.id, { fanout: [ticket.id], acked: [ticket.id], at })
       ticket.inputs.push({ id: key('approval-input', trigger.id), kind: 'trigger', triggerId: trigger.id, human: true, at })
       ticket.updatedAt = at
-      const answer = option ? readAnswer(option.label) : 'revise'
-      if (option && answer === 'stop') {
-        this.store.tickets.save(ticket)
-        this.engine.stopTicket(ticket.id, '主人选择先别做')
-      } else if (option && answer === 'revise') {
-        pending.status = 'revise'
-        ticket.attention = { id: `attention-approval-${ticket.id}`, question: '请写下新的做法；确认后才会继续。', triggerId: trigger.id }
-        this.store.tickets.save(ticket)
-      } else if (pending.status === 'revise') {
-        if (ticket.execution) ticket.execution.assignment += `\n\n主人修订：${trigger.text}`
-        ticket.pendingApproval = { kind: 'task', status: 'waiting' }
-        const prompt = approvalPrompt(ticket.title, { ask: true, because: 'mode', reason: `已记录新要求：${text}` })
-        ticket.attention = { id: `attention-approval-${ticket.id}`, ...prompt, triggerId: trigger.id }
-        this.store.tickets.save(ticket)
-      } else {
-        if (pending.kind === 'connection') pending.status = 'approved'
-        else delete ticket.pendingApproval
-        delete ticket.attention
-        const input = { id: key('approval-go', trigger.id), kind: 'text' as const, at,
-          text: '主人已批准这次请求。外部写操作仅批准之前展示的同一工具和同一参数的一次调用；不要扩大范围。' }
-        ticket.inputs.push(input); ticket.undelivered.push(input.id)
-        this.store.tickets.save(ticket)
-        const latest = ticket.assignments.at(-1)
-        if (latest?.state === 'pending') this.executor.start(ticket, latest)
-        else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
-      }
+      this.applyApprovalAnswer(ticket, option, text, at)
       return 'stored' as const
     })
+  }
+
+  /**
+   * 手机消息面直接答一个待批问题（与 feishu 的 `approvalReply` 同一套审计与状态机，不编第二份）。
+   *
+   * 手机这条通道没有「同一 conversation/Bot 里唯一一个待答」的天然约束（一条 timeline 就能看到全部票），
+   * 所以它**显式点名票号**：只答 `ticketId` 这一张，且要求它真的在等一个能被 `text` 认出的选项。
+   * 认不出（不是任何选项标签、也不是 revise）→ 不动、如实说「这句不是一个可执行的答复」，绝不猜。
+   *
+   * 安全：只在 `ticket.attention?.options` 里有匹配时才算一次审批 —— 和 feishu 同一条 `readAnswer` 口径，
+   * 「先别做」→ stopTicket、「做吧」→ 批准并自动重投递、revise → 记新要求。手机因此能用**现有 source 消息**
+   * 完成连接写审批，而不必造第二个审批 UI。
+   *
+   * **防「旧卡批新请求」**：`attentionId` 必须等于当前 `ticket.attention.id`（签名随参数/配置变，见 guardConnection）。
+   * 客户端拿的是它在界面上看到的那张问题卡的 id；若此刻这张票的 attention 已经换了一张（旧卡过期、或 guardConnection
+   * 又产生了一个新签名），就不匹配 → 409 且**零状态变更**。否则手机上一张过期的「做吧」按钮会批准一个它从没看过的参数请求。
+   * `actor` 来自**入口验过的内置 principal**（不信 body）：只用于审计，记进 input。
+   */
+  answerTicket(ticketId: string, text: string, attentionId?: string, actor?: string):
+    { ok: true; answer: 'go' | 'stop' | 'revise' } | { ok: false; reason: string } {
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket) return { ok: false, reason: '没有这张票' }
+    if (ticket.ended || !liveTicket(ticket)) return { ok: false, reason: '这张票已经结束' }
+    const pending = ticket.pendingApproval
+    if (!pending) return { ok: false, reason: '这张票没有在等审批' }
+    // 旧咔不能批新请求：客户端必须带着它看到的当前问题卡 id；缺失或不等于当前 attention.id 一律不动。
+    if (!attentionId) return { ok: false, reason: '缺少问题卡 id，不能确定你批的是哪一次请求' }
+    if (ticket.attention?.id !== attentionId) return { ok: false, reason: '这张问题卡已经过期（票或请求已变），请刷新后再答' }
+    const said = text.replace(/^@\S+\s+/, '').trim()
+    const option = ticket.attention?.options?.find(item => item.label === said || item.id === said)
+    if (!option && pending.status !== 'revise') return { ok: false, reason: '这句不是一个可执行的答复' }
+    const answer = option ? readAnswer(option.label) : 'revise'
+    return this.store.atomic(() => {
+      const at = new Date().toISOString()
+      ticket.updatedAt = at
+      // 审计：在既有 input 机制里记一条（不另造状态机）。actor 来自入口验过的 principal，记进正文供事后核。
+      const input = { id: key('mobile-answer', ticket.id, attentionId, at), kind: 'text' as const, at,
+        text: `手机审批答复：${said}（${answer}）· attention=${attentionId} · actor=${actor ?? 'unknown'}` }
+      ticket.inputs.push(input)
+      this.applyApprovalAnswer(ticket, option, said, at)
+      return { ok: true as const, answer }
+    })
+  }
+
+  /** 审批状态机的唯一应用点：feishu `approvalReply` 与手机 `answerTicket` 共用（审计在上面各自记）。 */
+  private applyApprovalAnswer(ticket: Ticket, option: AttentionOption | undefined, text: string, at: string): void {
+    const pending = ticket.pendingApproval!
+    const answer = option ? readAnswer(option.label) : 'revise'
+    if (option && answer === 'stop') {
+      this.store.tickets.save(ticket)
+      this.engine.stopTicket(ticket.id, '主人选择先别做')
+    } else if (option && answer === 'revise') {
+      pending.status = 'revise'
+      ticket.attention = { id: `attention-approval-${ticket.id}`, question: '请写下新的做法；确认后才会继续。', triggerId: ticket.origin?.triggerId }
+      this.store.tickets.save(ticket)
+    } else if (pending.status === 'revise') {
+      if (ticket.execution) ticket.execution.assignment += `\n\n主人修订：${text}`
+      ticket.pendingApproval = { kind: 'task', status: 'waiting' }
+      const prompt = approvalPrompt(ticket.title, { ask: true, because: 'mode', reason: `已记录新要求：${text}` })
+      ticket.attention = { id: `attention-approval-${ticket.id}`, ...prompt, triggerId: ticket.origin?.triggerId }
+      this.store.tickets.save(ticket)
+    } else {
+      if (pending.kind === 'connection') pending.status = 'approved'
+      else delete ticket.pendingApproval
+      delete ticket.attention
+      const input = { id: key('approval-go', ticket.id, at), kind: 'text' as const, at,
+        text: '主人已批准这次请求。外部写操作仅批准之前展示的同一工具和同一参数的一次调用；不要扩大范围。' }
+      ticket.inputs.push(input); ticket.undelivered.push(input.id)
+      this.store.tickets.save(ticket)
+      const latest = ticket.assignments.at(-1)
+      if (latest?.state === 'pending') this.executor.start(ticket, latest)
+      else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
+    }
   }
 
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
@@ -1357,12 +1716,30 @@ export class Runtime extends Service implements SourceHost {
         if (typeof bot !== 'string' || !bot) return
         try {
           const fact = summaryFact(candidate)
-          this.memory.ledger.settle({
+          const settled = this.memory.ledger.settle({
             bot_id: bot,
             fact: { dedupe_key: fact.dedupe_key, description: fact.description, body: fact.body, type: 'project', importance: 3 },
             origin: `ticket:${ticket.id}`,
             source: { ticket_id: ticket.id },
           })
+          // settle 出的 entry 默认 toHub:false（裁定 C）→ publish 不落盘、不上行；
+          // 只有后续已认证操作者经产品 edit 显式置 toHub:true，才随 author md 上行。
+          if (settled.written.length && this.memoryAuthor) {
+            for (const written of settled.written) {
+              void this.memoryAuthor.publish(written)
+                .then(r => { if (r.retractError) this.noteMemoryRetractFailure(written.name, written.bot_id, r.retractError) })
+                .catch(error => this.noteMemoryRetractFailure(written.name, written.bot_id, error))
+            }
+          }
+          // 同 name 但 body 变更、旧条目曾显式 share 过：新内容默认 false，**撤该条 canonical 全部历史版本**
+          // （不把操作者的旧 opt-in 延伸到 worker 新内容）。不依赖「current.toHub=false 就跳过」。
+          if (settled.retired.length && this.memoryAuthor) {
+            for (const old of settled.retired) {
+              void this.memoryAuthor.evict(old.name, old.botId)
+                .then(r => { if (r.retractError) this.noteMemoryRetractFailure(old.name, old.botId, r.retractError) })
+                .catch(error => this.noteMemoryRetractFailure(old.name, old.botId, error))
+            }
+          }
           console.log('[memory] compact settled ticket=%s chars=%d', ticket.id, fact.body.length)
         } catch (error) {
           console.log('[memory] compact settle failed ticket=%s error=%s', ticket.id, String(error))
@@ -1385,6 +1762,8 @@ export class Runtime extends Service implements SourceHost {
     if (this.routineTimer || this.closing()) return
     this.routineTimer = setInterval(() => {
       if (this.closing()) return
+      // 周期重试未完成的远端撤回（幂等；有才跑，稳态零成本），不额外起定时器。
+      if (this.memory.ledger.listRetractPending().length) void this.retryPendingRetracts().catch(() => undefined)
       const now = Date.now()
       // 睡过头的判定：距上次 tick 超过 3 个周期（>= 3 分钟），基本只可能是机器睡眠/断网挂起，
       // 不是正常节拍。醒来第一拍先补一次自愈扫描（把停机期间超时的 Eval 捡回来），扫描窗口按
@@ -1402,7 +1781,9 @@ export class Runtime extends Service implements SourceHost {
       void this.runRoutines().catch(error => { console.log('[routine] tick failed: %s', String(error)) })
       void this.runSelfHeal(now).catch(error => { console.log('[selfheal] tick failed: %s', String(error)) })
       void this.runFollowups().catch(error => { console.log('[followup] tick failed: %s', String(error)) })
+      void this.runMorning().catch(error => { console.log('[morning] tick failed: %s', String(error)) })
       void this.runDaily().catch(error => { console.log('[daily] tick failed: %s', String(error)) })
+      void this.runGraphWatch(new Date(now)).catch(error => { console.log('[graph] tick failed: %s', String(error)) })
     }, TICK_MS)
     this.lastTickAt = Date.now()
     // 定时器不该一个人把进程钉住（测试、以及脚本里的一次性启动）。

@@ -28,9 +28,10 @@ class WorkspaceCopyTest {
     fun actionResultsSayWhatActuallyHappened() {
         assertEquals("已接手，这个工单停了", WorkspaceCopy.TAKEOVER_DONE)
         assertEquals("它手上没有活儿", WorkspaceCopy.TAKEOVER_IDLE)
-        // 停一下停的是执行器：必须把「恢复要去面板」说出来，别让人在手机上找。
-        assertEquals("已让它停一下（全局执行器，恢复要去面板）", WorkspaceCopy.pauseDone("executor"))
+        // 停一下停的是执行器；同一个按钮按第二下就继续 —— 那句话要指向按钮，不是面板。
+        assertEquals("已让它停一下（全局执行器，再按一下继续）", WorkspaceCopy.pauseDone("executor"))
         assertEquals("已让它停一下", WorkspaceCopy.pauseDone("ticket"))
+        assertEquals("已继续执行（全局执行器）", WorkspaceCopy.RESUMED)
         // 失败原话带后端理由，不粉饰；没理由时也不留空。
         assertEquals("没做成：Bot already exists", WorkspaceCopy.failed("Bot already exists"))
         assertEquals("没做成：队伍没回话", WorkspaceCopy.failed(null))
@@ -50,6 +51,19 @@ class WorkspaceCopyTest {
     fun actionLabelsAreTheOnesOnTheBoard() {
         assertEquals("接手操作", WorkspaceAction.Takeover.label)
         assertEquals("让它停一下", WorkspaceAction.Pause.label)
+    }
+
+    /**
+     * 暂停按钮停了之后必须换成「继续执行」—— #19 第 3 项的判据就是这一格的字。
+     *
+     * 这一条与真机那一步是同一句判断：真机上按下去之后 paused 翻成 true，这一格就该是
+     * 「继续执行」。抽成纯函数才好在锁屏（读不到像素）时也有断言可依。
+     */
+    @Test
+    fun thePauseButtonFlipsToResumeWhenTheExecutorIsPaused() {
+        assertEquals("让它停一下", WorkspaceCopy.pauseLabel(paused = false))
+        assertEquals("继续执行", WorkspaceCopy.pauseLabel(paused = true))
+        assertEquals(WorkspaceCopy.RESUME_LABEL, WorkspaceCopy.pauseLabel(paused = true))
     }
 
     @Test

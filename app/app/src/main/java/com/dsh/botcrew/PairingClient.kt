@@ -31,6 +31,40 @@ class PairingClient(private val base: String) {
         CrewWire.parseReach(body)
     }
 
+    /**
+     * 这个地址现在通不通。**只用来在提交配对码之前确认那一行还活着**（#31）。
+     *
+     * 为什么需要它：mDNS 的 `onServiceLost` 在 Android 13/14 上对「进程被 kill、没有
+     * goodbye 包」的情形实测要 75–90 秒才回调（那是系统缓存 TTL，不是我们漏处理）。
+     * 这段时间里列表上那一行还在，点它填进地址框、提交配对码，必然失败。
+     *
+     * 修法不是「猜它死了就删掉」—— 同网段里正常的再播间隔可以拉到 81 秒，
+     * 按时长删行会误删一台活着的队伍。这里只做一次**可证伪**的确认：
+     * TCP 握得上就是活着，握不上就是现在连不上。结论交给调用方去说，不写回列表。
+     *
+     * 用的是配对本身会走的那个地址和同一条 `call`，所以「通」这个结论与「配对能不能成」
+     * 走的是同一条路，不是另开一个探针。对端回任何 HTTP 状态码都算通 —— 能答话就说明在。
+     */
+    suspend fun reachable(connectTimeoutMs: Int = 3_000): Boolean = withContext(Dispatchers.IO) {
+        val target = base.trimEnd('/')
+        if (target.isEmpty()) return@withContext false
+        try {
+            val connection = URL(target + "/api/mobile/__latency").openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = connectTimeoutMs
+            try {
+                // 不看状态码：401 / 404 都说明这台电脑在答话。
+                connection.responseCode
+                true
+            } finally {
+                connection.disconnect()
+            }
+        } catch (error: java.io.IOException) {
+            false
+        }
+    }
+
     /** 用一支码换凭据。走消息面，拿不到 token 就是没配成。 */
     suspend fun pair(code: String, deviceId: String, name: String, platform: String): Credential =
         withContext(Dispatchers.IO) {

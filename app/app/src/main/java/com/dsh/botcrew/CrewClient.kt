@@ -309,6 +309,26 @@ class CrewClient(
         parse(read(sessionPath("/api/mobile/timeline", sessionId), "GET"), CrewWire::parseTimeline)
 
     /**
+     * 设备接收链（#23）：看一眼这台设备还欠哪些推送（peek，不删）。断链时抛出 IOException，
+     * 上层当作「这一轮没拉到」，不 ACK、不显示，下次轮询再取。
+     */
+    suspend fun notices(): NoticesView = parse(read("/api/mobile/notices", "GET"), NoticesWire::parse)
+
+    /**
+     * 设备接收链（#23）：把已经**落进本地存储**的 id 明确 ACK 回后端（只删点名的），
+     * 顺带报 seen 账（device-persisted，不是人眼读过）。尽力而为：失败下次重试不重复显示，
+     * 因为本地已按 id 去重，ACK 重发是幂等的。
+     */
+    suspend fun reportSeen(ackIds: List<String>, seenIds: List<String> = ackIds) {
+        if (ackIds.isEmpty() && seenIds.isEmpty()) return
+        try {
+            read("/api/mobile/notices", "POST", NoticesWire.ackBody(ackIds, seenIds))
+        } catch (_: java.io.IOException) {
+            // 尽力而为：本地已持久化并按 id 去重，下次轮询再 ACK 不会重复显示也不丢件。
+        }
+    }
+
+    /**
      * 上报已读位置：进对话屏时把主人读到的最后一条回话 id 交给后端（契约 §5.6）。
      *
      * 失败不该打断主人看消息：这是一次「记水位」的后台小事，网络抖一下下次进屏再报就是。
@@ -327,6 +347,25 @@ class CrewClient(
     /** 发一条消息。requestId 由调用方生成并保留，重试时沿用。 */
     suspend fun send(text: String, mentions: List<String>, requestId: String, sessionId: String? = null) {
         read(sessionPath("/api/mobile/send", sessionId), "POST", CrewWire.sendBody(text, mentions, requestId))
+    }
+
+    /**
+     * 对一张待决问题卡的答复走**审批通道** POST /api/mobile/answer，不拼 @文本再发 /send。
+     *
+     * body 只带必要三项：ticket / text / attention_id。actor 由服务端认证（x-crew-principal 由入口注入），
+     * 客户端不发任何可伪造的身份。text 是所选 option 的 label，或自写 revise 的原文。
+     *
+     * 旧卡批新请求 / 票已结束 / 重复答 → 后端 409；这里抛 [AnswerStale] 让界面刷新旧卡并说「已更新」，
+     * 绝不把 409 当成成功。其它失败（网络、400）保持普通 IOException 语义可重试同事件。
+     */
+    suspend fun answer(ticketId: String, text: String, attentionId: String, sessionId: String? = null) {
+        val body = JSONObject().put("ticket", ticketId).put("text", text).put("attention_id", attentionId).toString()
+        try {
+            read(sessionPath("/api/mobile/answer", sessionId), "POST", body)
+        } catch (error: CrewHttpStatus) {
+            if (error.status == 409) throw AnswerStale(error.message ?: "这张问题卡已经过期")
+            throw error
+        }
     }
 
     /** 撤回一条还在排队、没被队伍读走的消息。已经读走/回复的由后端拒绝。 */
@@ -613,6 +652,12 @@ class CrewClient(
 
 /** 对端明确拒绝了凭据：地址是通的，换一条路也一样进不去。 */
 private class CrewRejected(message: String) : IOException(message)
+
+/**
+ * 答复的这张问题卡已经过期（409）：票/请求已变、已结束或已答过。
+ * 界面据此刷新旧卡并明说「已更新」，**不**当成答复成功，也不保着旧卡再点批准新 signature。
+ */
+class AnswerStale(message: String) : IOException(message)
 
 /**
  * 探一条入口通不通时敲的路径。

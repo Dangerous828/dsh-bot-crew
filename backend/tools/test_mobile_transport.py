@@ -196,16 +196,21 @@ class MobileTransportTest(unittest.TestCase):
         self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'cross-1'})[0], 409)
 
     def test_answered_check_does_not_borrow_another_sessions_reply(self):
-        # mobileq writes replies with an explicit --conversation. Plant a reply under main
-        # pointing at work's message id: work's answered-checks must not see it. If either
-        # SELECT still uses a process-level conversation, these two succeed-by-accident.
+        # mobileq writes replies with an explicit --conversation, and now also refuses a reply whose
+        # --to is not a real message in that same conversation. So a reply can no longer be planted
+        # under `main` pointing at `work`'s message id — that is prevented at write time (stronger than
+        # the old runtime scoping). What must still hold: a reply that lives under `main` (pointing at a
+        # real `main` message) must never count as answering `work`'s request. If any SELECT used a
+        # process-level conversation instead of the row's, work's claim would wrongly fail with 409.
+        main_id = self.request('/send?session_id=main', {'text': 'A 侧', 'request_id': 'main-req'})[1]['id']
+        self.queue('reply', '--conversation', 'main', '--to', str(main_id), '--key', 'main-reply-1', '--text', 'main 的答')
+        # work's own request is independent and unanswered by main's reply.
         work_id = self.request('/send?session_id=work', {'text': 'B 侧', 'request_id': 'reply-1'})[1]['id']
-        self.queue('reply', '--conversation', 'main', '--to', str(work_id), '--key', 'main-reply-1', '--text', '别串')
-        self.assertEqual(self.request('/withdraw?session_id=work', {'request_id': 'reply-1'})[0], 200)
-        work_id2 = self.request('/send?session_id=work', {'text': 'B 侧 2', 'request_id': 'reply-2'})[1]['id']
-        self.queue('reply', '--conversation', 'main', '--to', str(work_id2), '--key', 'main-reply-2', '--text', '别串 2')
-        status, body = self.request('/claim?session_id=work', {'request_id': 'reply-2'})
-        self.assertEqual((status, body.get('text')), (200, 'B 侧 2'))
+        status, body = self.request('/claim?session_id=work', {'request_id': 'reply-1'})
+        self.assertEqual((status, body.get('text')), (200, 'B 侧'))
+        # Now answer work's request from within work; work's answered-check sees only work's reply.
+        self.queue('reply', '--conversation', 'work', '--to', str(work_id), '--key', 'work-reply-1', '--text', 'B 的答')
+        self.assertEqual(self.request('/claim?session_id=work', {'request_id': 'reply-1'})[0], 409)
 
     def test_timeline_replies_are_scoped_to_the_requested_session(self):
         main_id = self.request('/send?session_id=main', {'text': 'A 侧', 'request_id': 'scope-1'})[1]['id']

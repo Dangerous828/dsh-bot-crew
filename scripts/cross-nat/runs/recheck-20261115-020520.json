@@ -1,0 +1,91 @@
+{
+  "task": "issue-20-recheck",
+  "issue": 20,
+  "phase": "phase3-network-recheck",
+  "actor": "wb4-nat-recheck",
+  "ts_local": "2026-11-15T02:05:20+08:00",
+  "tz": "Asia/Shanghai",
+  "verdict": "NO-FOREIGN-NAT-PEER",
+  "verdict_meaning": "缺可用异网对端；现在线设备同网。原 #20 第1项维持 OPEN。",
+  "mac": {
+    "ipv4_lan": "192.168.31.127",
+    "lan_cidr": "192.168.31.0/24",
+    "easytier": "10.10.10.3",
+    "default_gateway": "192.168.31.1",
+    "note": "Mac 在小米 LAN，同 NAS/两台 Xiaomi Windows 同 NAT"
+  },
+  "foreign_peer_candidate": {
+    "name": "win-laptop (win-public)",
+    "hostname": "LAPTOP-PK0IEJIU",
+    "identity": "Administrator@ TP-Link 192.168.0.0/24 = 唯一现成第二 NAT 出口",
+    "paths": [
+      {"path": "LAN 192.168.0.109:22", "rc": 255, "dt_s": 6.09, "result": "ssh: connect to host 192.168.0.109 port 22: Operation timed out", "verdict": "当前三路不可达(unreachable)"},
+      {"path": "EasyTier 10.10.10.1:22", "rc": 255, "dt_s": 6.07, "result": "ssh: connect to host 10.10.10.1 port 22: Operation timed out", "verdict": "not in mesh"},
+      {"path": "public IPv6 win.kentonnie.top:22", "resolved_ipv6": "240e:3b3:26ff:f70::1000", "rc": 255, "dt_s": 6.07, "result": "ssh: connect to host win.kentonnie.top port 22: Operation timed out", "verdict": "当前三路不可达(unreachable)"}
+    ],
+    "all_paths_timed_out": true,
+    "easytier_peer_table": {
+      "observed": ["10.10.10.3/24 mac-workstation Local", "10.10.10.2/24 nas-z4 p2p"],
+      "win_laptop_10_10_10_1_present": false,
+      "note": "10.10.10.1 不在 mesh = 当前三路不可达 + mesh 未见 + Hub 报告 offline；不据此断言物理电源状态"
+    }
+  },
+  "dns": {
+    "win.kentonnie.top": {"AAAA": ["240e:3b3:26ff:f70::1000"], "A": "no-record (getaddrinfo AF_INET fails)"}
+  },
+  "same_nat_controls": [
+    {"name": "win-desktop", "host": "DESKTOP-10Q7AIV", "path": "ssh win-desktop 192.168.31.175:22", "rc": 255, "dt_s": 6.08, "result": "Connection timed out during banner exchange", "role": "同NAT，即使可达也不可当异网 peer；本轮 ARP incomplete 当前不可达"},
+    {"name": "mi-desktop", "host": "DESKTOP-ACQB7RR", "path": "ssh mi-desktop 192.168.31.183:22", "rc": 255, "dt_s": 0.06, "result": "No route to host", "role": "同NAT；ARP incomplete 当前不可达"},
+    {"name": "NAS", "path": "EasyTier 10.10.10.2", "role": "同NAT，mesh 正常(佐证)"}
+  ],
+  "phone": {
+    "serial": "55c86317",
+    "model": "OPPO PEDM00",
+    "airplane_mode_on": 0,
+    "mobile_data": 0,
+    "wifi_on": 1,
+    "dataRegState": "1(OUT_OF_SERVICE)",
+    "rmnet_ccmni_ipv4": "none",
+    "verdict": "蜂窝不可用（数据关/未注册/无IPv4），不能当异网出口；只读查 data/接口，未输入/唤醒/触 App/开 data/WiFi 切换"
+  },
+  "production_untouched": {
+    "dsh_pid_89699": {"alive": true, "lstart": "Sat Nov 14 14:26:39 2026", "unchanged": true},
+    "mobilegw_pid_67367": {"alive": true, "lstart": "Sat Nov 14 18:31:04 2026", "unchanged": true},
+    "tailcat_prod_43499": {"note": "43499 由主进程 89699 持有监听(node 89699 ... :43499 LISTEN)，非旧报告写的独立 PID 80750；本轮未重启", "listener_owner_pid": 89699},
+    "uu_2222": {"listener": false, "controlmaster": "no socket", "uu_daemon_processes": 4, "note": "2222 无 LISTEN，UU 守护在；未新建重连"},
+    "restarted_anything": false
+  },
+  "lead_mcp_crosscheck": {
+    "source_tool": "hub_memory__hub_nodes_list (lead 在 goal round2 只读调用，非本 agent 再 probe)",
+    "attribution": "lead 实时节点元数据交叉核验，用于补排 registry 里遗漏的 online 异网 node",
+    "count": 4,
+    "nodes": [
+      {"node": "mac-workstation", "online": true, "last_seen_at": "2026-11-14T17:53:08.902891Z"},
+      {"node": "mi-desktop", "online": false, "last_seen_at": "2026-09-26T09:16:01.735741Z"},
+      {"node": "win-desktop", "online": false, "last_seen_at": "2026-11-14T09:14:22.232353Z"},
+      {"node": "win-workstation(笔记本)", "online": false, "last_seen_at": "2026-11-13T23:01:40.269610Z"}
+    ],
+    "mac_dynamic": {"lan_ipv4": "192.168.31.127", "easytier": "10.10.10.3"},
+    "hub_ping": {"host": "192.168.31.152", "sent": 2, "recv": 2, "avg_ms": 2.644},
+    "global_ipv6_still": "2409:8a55:2236:2590::/64",
+    "conclusion": "4 节点中仅 mac-workstation online；笔记本(win-workstation)online=false，与本地三路不可达一致；无遗漏的在线异网 node。未改任何服务/配置。",
+    "note": "本块为 lead MCP 元数据，非本 agent 本地 probe；不冒称本 agent 再探测"
+  },
+  "negative_evidence_rules": {
+    "different_public_ip_or_ipv6_slash64_is_only_candidate": true,
+    "native_ipv6_direct_has_no_nat_so_not_holepunch": true,
+    "same_64_is_exclusion_evidence_only": true
+  },
+  "explicitly_not_done": [
+    "未把不同公网IP/IPv6 /64/native IPv6 direct 当 NAT 打洞通过",
+    "未重跑上个全 backend 测试",
+    "未改 classify 工具/任何业务 source",
+    "未改 Hub/NAS/部署/网络/路由/防火墙/VPN/WiFi",
+    "未唤醒其它主机、未开手机 data/SIM、未输入/触 App",
+    "未 git add/commit/push/stash/checkout/restore/reset",
+    "未 git 操作、未调用 start/ensure_gateway/pkill/killall/launchctl",
+    "未抢主机窗口焦点、未变手机配对/权限/屏幕设置",
+    "未读 SSH 密钥内容/完整 argv/凭据，未回显 secret"
+  ],
+  "missing_for_closeout": "一台与 Mac 不同 NAT 出口的对端（win-laptop 接入 TP-Link 出口 或 另一条宽带/热点让某机接入）；异网 peer 上线仅能收证(候选)，仍须已知拓扑/IPv4 NAT映射 或 明确跨网IPv6(标非NAT)+direct实证 才满足原条款"
+}

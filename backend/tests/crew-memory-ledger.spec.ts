@@ -161,3 +161,32 @@ describe('memory storage boundary (Step 2 / gap 3)', () => {
     expect(files.some(name => /memory|entry|bot-/.test(name))).toBe(false)
   })
 })
+
+describe('settle：同 dedupe_key 但 body 变更不延伸旧 opt-in（撤回旧 canonical）', () => {
+  it('旧 entry 曾显式 toHub:true，同 key body 变更后新 entry toHub:false，且 retired 标明旧条目', () => {
+    const first = ledger.settle({ bot_id: 'lead', fact: fact({ body: '旧内容 v1' }), origin: 'person:owner' }).written[0]!
+    ledger.edit(first.name, { toHub: true }) // 操作者显式分享
+    expect(store.get(KV.memory.entry(first.name))).toMatchObject({ toHub: true })
+    const second = ledger.settle({ bot_id: 'lead', fact: fact({ body: '新内容 v2（worker 生成）' }), origin: 'ticket:t1' })
+    expect(second.written[0]!.toHub).toBe(false)                 // 新内容默认 false，不延伸 optin
+    expect(second.retired).toEqual([{ name: first.name, botId: 'lead' }]) // 旧 canonical 需撤
+    // 持久兜底：撤回待办已记录（所有 settle 路径覆盖，非仅 runtime 读 retired）
+    expect(ledger.listRetractPending().map(p => p.name)).toContain(first.name)
+  })
+  it('相同 body no-op：保留现 explicit share，不产生 retired、不记撤回待办', () => {
+    const first = ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'person:owner' }).written[0]!
+    ledger.edit(first.name, { toHub: true })
+    const again = ledger.settle({ bot_id: 'lead', fact: fact(), origin: 'person:owner' })
+    expect(again.written).toEqual([])          // no-op
+    expect(again.retired).toEqual([])
+    expect(store.get(KV.memory.entry(first.name))).toMatchObject({ toHub: true }) // 现 share 保留
+    expect(ledger.listRetractPending()).toEqual([])
+  })
+  it('旧 entry 从未 share（toHub:false）时 body 变更不产生 retired', () => {
+    const first = ledger.settle({ bot_id: 'lead', fact: fact({ body: 'v1' }), origin: 'person:owner' }).written[0]!
+    expect(first.toHub).toBe(false)
+    const second = ledger.settle({ bot_id: 'lead', fact: fact({ body: 'v2' }), origin: 'ticket:t2' })
+    expect(second.retired).toEqual([])
+    expect(ledger.listRetractPending()).toEqual([])
+  })
+})

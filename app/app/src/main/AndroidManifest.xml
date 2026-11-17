@@ -8,35 +8,35 @@
     <!-- Android 13+ 把「发现附近的网络设备」单列成运行时权限；只声明不给，NSD 会静默找不到任何服务。 -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
-    <!-- 语音输入：录音后交给宿主本机识别，音频不出这台电脑。Android 6+ 需要运行时授权。 -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-
+    <!-- OTA：下载完成后把 APK 交给系统安装器，由系统弹确认。不静默安装、不自研安装器。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <application
         android:label="Bot 队伍"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.BotCrew">
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="Bot 队伍">
+            android:label="Bot 队伍"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-            <!--
-            播报：把念出来的 WAV 交给系统播放器。用 FileProvider 而不是 file:// URI ——
-            Android 7 起直接传文件路径会抛 FileUriExposedException。
-        -->
+
+        <!-- 只暴露 OTA 的 apk 目录给系统安装器；别把应用私有目录整体交出去。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.files"
+            android:authorities="${applicationId}.ota"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
+                android:resource="@xml/ota_paths" />
         </provider>
-</application>
+    </application>
 </manifest>

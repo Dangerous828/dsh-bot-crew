@@ -13,7 +13,7 @@ import org.junit.Test
  * 实际执行 resume，`paused` 一直不翻（#19 第 3 项实屏抓到）。
  *
  * 判据不是「调用了 onSetPaused」，而是：传出去的目标与按钮那一刻说的那句话一致 ——
- * 说「让它停一下」就必须传 true，说「继续执行」就必须传 false。
+ * 说「暂停全队」就必须传 true，说「恢复全队」就必须传 false。
  */
 class PausePressTest {
 
@@ -21,12 +21,12 @@ class PausePressTest {
     fun theButtonSendsTheOppositeOfTheCurrentStateNotTheStateItself() {
         // 现在没暂停 → 按钮写「让它停一下」→ 传出去的目标必须是 true（pause）。
         val idle = pausePress(paused = false, preview = null, ticket = null)
-        assertEquals("让它停一下", WorkspaceCopy.pauseLabel(paused = false))
+        assertEquals("暂停全队", WorkspaceCopy.pauseLabel(paused = false))
         assertEquals(true, idle.target)
 
         // 现在已暂停 → 按钮写「继续执行」→ 传出去的目标必须是 false（resume）。
         val paused = pausePress(paused = true, preview = null, ticket = null)
-        assertEquals("继续执行", WorkspaceCopy.pauseLabel(paused = true))
+        assertEquals("恢复全队", WorkspaceCopy.pauseLabel(paused = true))
         assertEquals(false, paused.target)
     }
 

@@ -227,7 +227,7 @@ afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
   const candidate = relays(runtime.masterId).find(item => item.kind === 'candidate')!
-  expect(candidate).toMatchObject({ strength: 'explicit', trigger_id: trigger.id, next_action: 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.' })
+  expect(candidate).toMatchObject({ strength: 'explicit', trigger_id: trigger.id, next_action: 'Route it with orchestrator_route as dispatch says: accept, attach, answer, stop or ignore.' })
   expect(ticket).toMatchObject({ title: '修复回归', mandate: { strength: 'explicit', basis: expect.objectContaining({ via: 'addressed', source: 'feishu', sender: 'Alice', addressed: 'mention', scope: expect.objectContaining({ chatId: CHAT }) }) },
     execution: expect.objectContaining({ name: expect.stringMatching(/^fix-regression-/) }), origin: expect.objectContaining({ triggerId: trigger.id }) })
   expect(ticket).not.toHaveProperty('ended')
@@ -2391,4 +2391,250 @@ it('puts every credential carrier in the prepare profile, not just the five dire
   for (const name of ['.git-credentials', '.gitconfig', '.netrc', '.kube', '.azure', '.npmrc', '.zsh_history', '.bash_history']) {
     expect(denied.some(path => path.endsWith(`/${name}`)), name).toBe(true)
   }
+})
+
+// P1-06：审批归属与可读确认。真实 guard（tools.guard 回调）+ 真实 store，不造第二套状态机。
+describe('approval attribution: 可选 bot_id 与"取消这一次"', () => {
+  let sequence = 0
+  /** 一条 team 形态的来源消息：main 会话、第 82 条、由 lead 接。每条新的来源消息都是一张新票。 */
+  const teamTicket = async () => {
+    sequence += 1
+    const { ticket, sessionId } = await acceptedTicket(feishu(`${100 + sequence}`, `@bot 修一下回归 ${sequence}`))
+    const origin = runtime.store.triggers.get(ticket.origin.triggerId)!
+    const message = '82'
+    runtime.store.triggers.save({ ...origin, source: 'team', human: true,
+      threads: [{ source: 'team', id: 'main:82' }],
+      channel: { source: 'team', thread: 'team:main:82',
+        address: { conversation: 'main', message, bot_id: 'lead' } },
+      meta: { ...origin.meta, conversation: 'main', messageId: message, bot_id: 'lead' } })
+    runtime.store.tickets.save({ ...runtime.store.tickets.get(ticket.id)!,
+      channels: [{ source: 'team', thread: 'team:main:82', address: { conversation: 'main', message, bot_id: 'lead' } }] })
+    return { ticketId: ticket.id, sessionId }
+  }
+  const connectMessages = () => {
+    const current = runtime.store.settings()
+    runtime.store.saveSettings({ ...current, connections: { readOnly: true,
+      connections: [{ kind: 'messages', server: 'messages', readTools: ['list_messages'], writeTools: ['send_message'] }] } })
+  }
+  const call = (over: Record<string, unknown> = {}) => ({ name: 'mcp__messages__send_message',
+    arguments: { channel: 'main', to: 'm82', text: '已经改好了', ...over } })
+
+  it('answers its own question without approval when the optional bot_id is omitted, and does not leave a pending card', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    expect(guard(call())).toBeUndefined()
+    // 没有出卡、没有遗留 pending：正常回报不是一次待批的写。
+    expect(runtime.store.tickets.get(ticketId)?.attention).toBeUndefined()
+    expect(runtime.store.tickets.get(ticketId)?.pendingApproval).toBeUndefined()
+  })
+
+  it('still asks when the reply is signed by another Bot, sent to another message, or on another conversation', async () => {
+    connectMessages()
+    // 每一条都单独一张票：第一次被问下之后，既有闸门会挡住同一张票的后续工具调用（那是「等人点头」本身，不是归属判定）。
+    for (const [what, over] of [['冒充别的 Bot', { bot_id: 'coder' }], ['回别的消息', { to: 'm83' }], ['在别的会话发', { channel: 'work' }]] as const) {
+      const { ticketId, sessionId } = await teamTicket()
+      const guard = guards.get(sessionId)!
+      expect(guard(call(over)), what).toContain('先问')
+      expect(runtime.store.tickets.get(ticketId)?.attention?.presentation).toMatchObject({ kind: 'connection' })
+    }
+  })
+
+  it('carries a readable presentation instead of serialized arguments', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    guard(call({ to: 'm83', text: '第一行\n第二行' }))
+    const attention = runtime.store.tickets.get(ticketId)!.attention!
+    // question 是人话，不是 JSON。
+    expect(attention.question).not.toContain('mcp__')
+    expect(attention.question).not.toContain('\\n')
+    expect(attention.presentation).toMatchObject({ kind: 'connection', action: '发送这条消息', target: '当前对话' })
+    // 正文完整保留真实换行 —— 人批的就是他要看到的全文。
+    expect(attention.presentation!.preview).toBe('第一行\n第二行')
+    expect(attention.options!.map(option => option.id)).toEqual(['go', 'stop', 'revise'])
+  })
+
+  it('cancels only this call, keeps the ticket alive, and hands the cancellation to the same worker', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    guard(call({ to: 'm83' }))
+    const pending = runtime.store.tickets.get(ticketId)!
+    const signature = pending.pendingApproval!.signature!
+    deliveries.mockClear()
+    const answered = runtime.answerTicket(ticketId, 'stop', pending.attention!.id, 'owner')
+    await runtime.idle()
+    expect(answered).toEqual({ ok: true, answer: 'stop' })
+    const after = runtime.store.tickets.get(ticketId)!
+    // 票没结束：取消的是一次调用，不是整张任务。
+    expect(after.ended).toBeUndefined()
+    expect(after.pendingApproval).toBeUndefined()
+    expect(after.attention).toBeUndefined()
+    expect(after.approvalDenied).toMatchObject({ signature })
+    // 原 worker 真收到这条事实（不是只把记录写进票里等人看）。
+    const handed = deliveries.mock.calls.map(([item]) => item).filter(item => item.sessionId === sessionId)
+    expect(handed.at(-1)!.text).toContain('取消了这一次外部调用')
+    expect(handed.at(-1)!.text).toContain('整张任务没有被停')
+    // 同一签名再调：直接拒绝，不再出一张新卡（不会无限审批），也不执行。
+    expect(guard(call({ to: 'm83' }))).toContain('取消了这一次调用')
+    expect(runtime.store.tickets.get(ticketId)!.attention).toBeUndefined()
+    // 改了参数就是新签名：重新问一次，而不是被这条拒绝记住。
+    expect(guard(call({ to: 'm84' }))).toContain('先问')
+  })
+
+  it('accepts an old card by its legacy words and approves that exact call once', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    guard(call({ to: 'm83' }))
+    const pending = runtime.store.tickets.get(ticketId)!
+    // 旧卡：只有老文案、没有新 presentation。
+    runtime.store.tickets.save({ ...pending, attention: { id: 'attention-old', question: '老问题', triggerId: pending.attention!.triggerId,
+      options: [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }] } })
+    expect(runtime.answerTicket(ticketId, '先别做', 'attention-old', 'owner')).toEqual({ ok: true, answer: 'stop' })
+    await runtime.idle()
+    expect(runtime.store.tickets.get(ticketId)!.ended).toBeUndefined()
+    // 旧卡「做吧」仍然批准这一次调用，且不留 approved 状态。
+    deliveries.mockClear()
+    const again = runtime.store.tickets.get(ticketId)!
+    guard(call({ to: 'm85' }))
+    const card = runtime.store.tickets.get(ticketId)!
+    runtime.store.tickets.save({ ...card, attention: { id: 'attention-old-2', question: '老问题', triggerId: card.attention!.triggerId,
+      options: [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }] } })
+    expect(runtime.answerTicket(ticketId, '做吧', 'attention-old-2', 'owner')).toEqual({ ok: true, answer: 'go' })
+    await runtime.idle()
+    expect(runtime.store.tickets.get(ticketId)!.pendingApproval).toMatchObject({ status: 'approved' })
+    // 这一次调用被放行，批准被消费掉。
+    expect(guard(call({ to: 'm85' }))).toBeUndefined()
+    expect(runtime.store.tickets.get(ticketId)!.pendingApproval).toBeUndefined()
+    expect(again.id).toBe(ticketId)
+  })
+
+  it('answers a worker question (not an approval) by handing the words to the same worker', async () => {
+    const { ticketId, sessionId } = await teamTicket()
+    const card = runtime.store.tickets.get(ticketId)!
+    // 一张 worker 自己的提问卡：没有 pendingApproval。
+    runtime.store.tickets.save({ ...card, attention: { id: 'attention-question', question: '要保留旧接口吗？',
+      triggerId: card.origin.triggerId, options: [{ id: 'keep', label: '保留' }, { id: 'drop', label: '删掉' }] } })
+    deliveries.mockClear()
+    expect(runtime.answerTicket(ticketId, 'keep', 'attention-question', 'owner')).toEqual({ ok: true, answer: 'reply' })
+    await runtime.idle()
+    const handed = deliveries.mock.calls.map(([item]) => item).filter(item => item.sessionId === sessionId)
+    // 按 option.id 认出选项，回传成那句人话。
+    expect(handed.at(-1)!.text).toContain('保留')
+    expect(handed.at(-1)!.text).toContain('要保留旧接口吗？')
+    // 不是审批：不读 go/stop/revise，也不停票。
+    const after = runtime.store.tickets.get(ticketId)!
+    expect(after.ended).toBeUndefined()
+    expect(after.pendingApproval).toBeUndefined()
+    expect(after.approvalDenied).toBeUndefined()
+  })
+
+  it('refuses a stale card id and an empty answer without touching the ticket', async () => {
+    const { ticketId } = await teamTicket()
+    const card = runtime.store.tickets.get(ticketId)!
+    runtime.store.tickets.save({ ...card, attention: { id: 'attention-live', question: '哪条路？', triggerId: card.origin.triggerId } })
+    const before = JSON.stringify(runtime.store.tickets.get(ticketId))
+    // 过期卡（客户端拿的不是当前这张）与空答复都不动状态；普通提问卡接受自由文本，所以这里不是「认不出的答复」。
+    expect(runtime.answerTicket(ticketId, '随便', 'attention-stale', 'owner')).toMatchObject({ ok: false })
+    expect(runtime.answerTicket(ticketId, '   ', 'attention-live', 'owner')).toMatchObject({ ok: false })
+    expect(JSON.stringify(runtime.store.tickets.get(ticketId)!)).toBe(before)
+  })
+})
+
+// 历史卡的签名是用**补 bot_id 之前**的原始参数算的（b27d050c 那一类）。guard 之后改成按补好署名的那份算，
+// 两套值不相等 —— 只认新的会让旧卡变成「谁答都不动」的死卡。这里用的是真的旧 raw hash，不是换个 label 的新 hash。
+describe('a card stored before the signing change still works end to end', () => {
+  const connectMessages = () => {
+    runtime.store.saveSettings({ ...runtime.store.settings(), connections: { readOnly: true,
+      connections: [{ kind: 'messages', server: 'messages', readTools: ['list_messages'], writeTools: ['send_message'] }] } })
+  }
+  /** 一张 team 票：main / 第 82 条 / 由 lead 接。 */
+  const teamTicket = async () => {
+    const { ticket, sessionId } = await acceptedTicket()
+    const origin = runtime.store.triggers.get(ticket.origin.triggerId)!
+    runtime.store.triggers.save({ ...origin, source: 'team', human: true,
+      threads: [{ source: 'team', id: 'main:82' }],
+      channel: { source: 'team', thread: 'team:main:82', address: { conversation: 'main', message: '82', bot_id: 'lead' } },
+      meta: { ...origin.meta, conversation: 'main', messageId: '82', bot_id: 'lead' } })
+    runtime.store.tickets.save({ ...runtime.store.tickets.get(ticket.id)!,
+      channels: [{ source: 'team', thread: 'team:main:82', address: { conversation: 'main', message: '82', bot_id: 'lead' } }] })
+    return { ticketId: ticket.id, sessionId }
+  }
+  const call = { name: 'mcp__messages__send_message', arguments: { channel: 'main', to: 'm83', text: '已经改好了' } }
+  /** 旧卡：签名按原始参数（没有 bot_id）算。 */
+  const legacySignature = () => {
+    const config = JSON.parse(JSON.stringify(runtime.store.settings().connections))
+    const stable = (value: unknown): string => {
+      if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+      if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']'
+      const obj = value as Record<string, unknown>
+      return '{' + Object.keys(obj).sort().map(name => JSON.stringify(name) + ':' + stable(obj[name])).join(',') + '}'
+    }
+    return key(call.name, stable(call.arguments), JSON.stringify(config))
+  }
+
+  it('approves the old raw signature once and executes that exact call', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    const raw = legacySignature()
+    // 造出历史卡的样子：pendingApproval 只有 kind/status/signature，attention 是无 presentation 的旧卡。
+    const ticket = runtime.store.tickets.get(ticketId)!
+    runtime.store.tickets.save({ ...ticket,
+      pendingApproval: { kind: 'connection', status: 'waiting', signature: raw },
+      attention: { id: 'attention-old-raw', question: '旧问题', triggerId: ticket.origin.triggerId,
+        options: [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }] } })
+    // 这张旧卡能被答：走旧词「做吧」→ 批准这一次。
+    expect(runtime.answerTicket(ticketId, '做吧', 'attention-old-raw', 'owner')).toEqual({ ok: true, answer: 'go' })
+    await runtime.idle()
+    expect(runtime.store.tickets.get(ticketId)!.pendingApproval).toMatchObject({ status: 'approved' })
+    // 真实重调（worker 会把 bot_id 补上）→ 签名对得上旧 raw，放行一次且清掉 pending。
+    expect(guard(call)).toBeUndefined()
+    expect(runtime.store.tickets.get(ticketId)!.pendingApproval).toBeUndefined()
+  })
+
+  it('cancels that exact call from an old card, keeps the ticket alive, and refuses the same call afterwards', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    const raw = legacySignature()
+    const ticket = runtime.store.tickets.get(ticketId)!
+    runtime.store.tickets.save({ ...ticket,
+      pendingApproval: { kind: 'connection', status: 'waiting', signature: raw },
+      attention: { id: 'attention-old-raw-stop', question: '旧问题', triggerId: ticket.origin.triggerId,
+        options: [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }] } })
+    deliveries.mockClear()
+    expect(runtime.answerTicket(ticketId, '先别做', 'attention-old-raw-stop', 'owner')).toEqual({ ok: true, answer: 'stop' })
+    await runtime.idle()
+    const after = runtime.store.tickets.get(ticketId)!
+    // 只取消这一次：票没结束，拒绝记的是**旧 raw 签名**。
+    expect(after.ended).toBeUndefined()
+    expect(after.approvalDenied).toEqual({ signature: raw, at: expect.any(String) })
+    expect(deliveries.mock.calls.some(([item]) => item.sessionId === sessionId && item.text.includes('取消了这一次外部调用'))).toBe(true)
+    // 同一调用（补上署名后）再调 → 认得这是被取消的那一次，不出卡也不再执行。
+    expect(guard(call)).toContain('取消了这一次调用')
+    expect(runtime.store.tickets.get(ticketId)!.attention).toBeUndefined()
+  })
+
+  it('does not let a cancelled call ride the reply exemption, and does not treat a changed call as cancelled', async () => {
+    connectMessages()
+    const { ticketId, sessionId } = await teamTicket()
+    const guard = guards.get(sessionId)!
+    // 被取消的正是**一次正常回报**（回本票的 m82）：取消要优先于「回复免审批」，不能因为长得像回报就悄悄放行。
+    const reply = { channel: 'main', to: 'm82', text: '回本票的消息' }
+    const config = JSON.parse(JSON.stringify(runtime.store.settings().connections))
+    const stable = (value: unknown): string => {
+      if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+      if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']'
+      const obj = value as Record<string, unknown>
+      return '{' + Object.keys(obj).sort().map(name => JSON.stringify(name) + ':' + stable(obj[name])).join(',') + '}'
+    }
+    runtime.store.tickets.save({ ...runtime.store.tickets.get(ticketId)!,
+      approvalDenied: { signature: key(call.name, stable(reply), JSON.stringify(config)), at: new Date().toISOString() } })
+    expect(guard({ name: call.name, arguments: reply })).toContain('取消了这一次调用')
+    // 但参数变了就是另一次调用：重新问一次，不被这条拒绝记住。
+    expect(guard({ name: call.name, arguments: { channel: 'main', to: 'm84', text: '另一件事' } })).toContain('要发送这条消息')
+  })
 })

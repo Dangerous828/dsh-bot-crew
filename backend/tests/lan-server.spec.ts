@@ -1,4 +1,6 @@
-import { networkInterfaces } from 'node:os'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { networkInterfaces, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { bindAddress, bindCandidates, createLanServer, lanPort } from '../src/app/lan-server.ts'
 
@@ -132,6 +134,33 @@ it('picks one concrete IPv4 to bind, never a wildcard', () => {
 it('never returns 0.0.0.0 or :: no matter what it is given', () => {
   for (const wildcard of ['0.0.0.0', '::', '::0']) {
     expect(bindAddress([{ address: wildcard, family: 'IPv4' }])).not.toBe(wildcard)
+  }
+})
+
+// 后台 OTA 是这条监听上唯一不带凭据的区域，所以它必须与消息面同时存在、且互不越界：
+// 公开的那几只地址不碰转发处理器，消息面照旧 401。
+it('adds the public upgrade area without loosening the message surface', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lan-ota-'))
+  const root = join(directory, 'android-updates')
+  mkdirSync(root, { recursive: true })
+  const seen: string[] = []
+  const server = createLanServer({
+    devices: { allows: () => true } as never,
+    forward: async request => { seen.push(request.url); return Response.json({ ok: true }) },
+    updatesRoot: root,
+  })
+  const port = await server.listen(0, '127.0.0.1')
+  try {
+    // 还没发布：公开区域说「没有」，而不是把请求转给消息面。
+    expect((await fetch(`http://127.0.0.1:${port}/updates/android/manifest.json`)).status).toBe(404)
+    expect(seen).toEqual([])
+    // 消息面仍然要凭据。
+    expect((await fetch(`http://127.0.0.1:${port}/api/mobile/timeline`)).status).toBe(401)
+    expect((await fetch(`http://127.0.0.1:${port}/api/mobile/timeline`, { headers: { 'x-crew-device': 'a', 'x-crew-credential': 'b' } })).status).toBe(200)
+    expect(seen).toEqual(['/api/mobile/timeline'])
+  } finally {
+    await server.close()
+    rmSync(directory, { recursive: true, force: true })
   }
 })
 

@@ -50,7 +50,7 @@ export interface ScreenSnapshot {
 /** 会话事件的形状（与 @deepseek-ai/dsh-session 一致，但只读我们认得的字段）。 */
 export interface ScreenEvent {
   type: string
-  time?: string
+  time?: number | string
   data?: unknown
 }
 
@@ -121,7 +121,8 @@ function commandOf(value: unknown): string {
 
 /** 一条事件最多产生一行；认不出的类型直接跳过。 */
 function readEvent(event: ScreenEvent): ScreenLine | undefined {
-  const at = typeof event.time === 'string' ? event.time : new Date().toISOString()
+  const time = typeof event.time === 'number' ? event.time : typeof event.time === 'string' ? Date.parse(event.time) : NaN
+  const at = Number.isFinite(time) && Math.abs(time) <= 8.64e15 ? new Date(time).toISOString() : ''
   const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : {}
   switch (event.type) {
     case 'tool/call': {

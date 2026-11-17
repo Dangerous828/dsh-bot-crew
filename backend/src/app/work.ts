@@ -2,15 +2,16 @@
  * What a phone asks beyond the timeline: how one ticket was worked, which agents ran under it, and what model
  * the crew is on. These read the store and the live session tree; they are not gateway traffic.
  */
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Settings } from '../policy.ts'
 import type { Ticket } from '../core/index.ts'
 import { ticketStage } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 
-/** The live session registry the tree is walked from: DSH's `ctx.agents`, which reads by id and lists every id. */
+/** The live session registry the tree is walked from: DSH's `ctx.agents`, whose list returns live Agent objects. */
 export interface AgentRegistry {
-  get(sessionId: string): { session: { header: { parentSession?: string }; id?: string } } | undefined
-  list?(): string[]
+  get(sessionId: string): Agent | undefined
+  list?(): Agent[]
 }
 
 export interface WorkStep { at: string; kind: 'said' | 'did' | 'checked'; text: string }
@@ -112,15 +113,15 @@ export function workOf(ticket: Ticket | undefined): WorkView | undefined {
  * The agents that ran under a ticket, as a tree. The worker session is the root; every session whose parent chain
  * reaches it is a descendant. The walk stops at `maxDepth` so a cycle in the headers cannot hang the request.
  */
-export function agentTree(agents: AgentRegistry, ticketId: string, maxDepth = 8, known: string[] = []): AgentNode[] {
+export function agentTree(agents: AgentRegistry, ticketId: string, maxDepth = 8, known: string[] = [], ticket?: Ticket): AgentNode[] {
   const root = workerSessionId(ticketId)
-  if (!agents.get(root)) return []
+  if (!agents.get(root) && !ticket) return []
   const children = new Map<string, string[]>()
   const attach = (parent: string, id: string): void => {
     const list = children.get(parent) ?? []
     if (!list.includes(id)) children.set(parent, [...list, id])
   }
-  // Only sessions the runtime still knows about can be walked; a disposed agent has no header to read.
+  // Only sessions the runtime still knows about can be walked; a disposed agent has no live session header to read.
   for (const id of known.length > 0 ? known : liveSessionIds(agents)) {
     if (id === root) continue
     // Follow the parent chain up. The session is attached under the parent that reached the tree FIRST, so a
@@ -133,11 +134,22 @@ export function agentTree(agents: AgentRegistry, ticketId: string, maxDepth = 8,
   }
   const build = (id: string, depth: number): AgentNode => ({
     id,
-    label: agents.get(id)?.session.header.parentSession ? '子代理' : '工单',
-    state: 'working',
+    label: id === root ? '工单' : '子代理',
+    state: stateOf(agents.get(id)?.status, id === root ? ticket : undefined),
     children: depth >= maxDepth ? [] : (children.get(id) ?? []).map(child => build(child, depth + 1)),
   })
   return [build(root, 0)]
+}
+
+function stateOf(sessionStatus?: string, ticket?: Ticket): string {
+  if (ticket) {
+    const stage = ticketStage(ticket)
+    if (stage.stage === 'ended') return ticket.ended?.outcome ?? 'ended'
+    if (stage.stage === 'person') return 'waiting_for_person'
+    if (stage.stage === 'idle') return 'waiting'
+    if (stage.action === 'queued') return 'queued'
+  }
+  return sessionStatus === 'running' ? 'working' : sessionStatus === 'idle' ? 'idle' : 'unknown'
 }
 
 /** True when `id` reaches `root` through its parent chain, which is what puts it in the tree. */
@@ -150,13 +162,9 @@ function under(id: string, root: string, agents: AgentRegistry, maxDepth: number
   return false
 }
 
-/**
- * Which session ids the runtime still has. `ctx.agents` only answers by id, so the ids come from the callers that
- * recorded them; a registry that also lists is used directly.
- */
+/** DSH lists live Agent objects; their `id` fields are the registry keys used by `get`. */
 function liveSessionIds(agents: AgentRegistry): string[] {
-  const listed = (agents as { list?: () => string[] }).list
-  return typeof listed === 'function' ? listed() : []
+  return agents.list?.().map(agent => agent.id) ?? []
 }
 
 /**

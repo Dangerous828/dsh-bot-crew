@@ -69,6 +69,8 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
     { path: '/api/mobile/notices', methods: ['GET'], requestBody: 'buffered' },
     { path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered' },
     { path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered' },
+    { path: '/api/mobile/diagnostics', methods: ['GET'], requestBody: 'buffered' },
+    { path: '/api/mobile/diagnostics', methods: ['POST'], requestBody: 'buffered' },
   ])
 })
 it('injects only the server credential and refuses malformed sends before enqueue', async () => {
@@ -151,6 +153,60 @@ it('sends a question with its options only while the ticket waits on an answer',
   ])
   expect(body.tasks[1]).not.toHaveProperty('question')
   expect(body.tasks[1]).not.toHaveProperty('options')
+})
+
+it('sends the human-readable approval of a new card, newlines and percent literals intact, with no raw arguments in the question', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  const preview = '第一行进度汇报\n路径片段保持 %2F。\n第二行是待确认项。\n\n' + '可读的消息预览。'.repeat(25)
+  const tickets = [{ id: 't1', title: 'Report', channels: [{ source: 'team' }],
+    createdAt: '2026-11-11T00:00:00Z', updatedAt: '2026-11-11T00:00:01Z',
+    pendingApproval: { kind: 'connection', status: 'waiting', signature: 'sig-1' },
+    attention: { id: 'att-1', question: '要发送这条消息给「发布频道」吗？',
+      options: [{ id: 'go', label: '确认执行这一次' }, { id: 'stop', label: '取消这一次（任务继续）' }, { id: 'revise', label: '修改内容' }],
+      presentation: { kind: 'connection', action: '发送这条消息', target: '发布频道', preview, details: '工具：send_message' } },
+    assignments: [], inputs: [] }]
+  const withCard = { ...host(), store: { settings: () => ({ paused: false }), tickets: { list: () => tickets } } } as unknown as HttpHost
+  const body = await (await phoneHandler(withCard, undefined, upstream as typeof fetch)(new Request('http://dsh/api/mobile/timeline'))).json() as { tasks: Record<string, any>[] }
+  const task = body.tasks[0]!
+  expect(task.attention_id).toBe('att-1')
+  // 正文完整：真实换行、`%2F` 字面量一个字符都没被改写，也没有被截断。
+  expect(task.approval).toMatchObject({ kind: 'connection', action: '发送这条消息', target: '发布频道' })
+  expect(task.approval.preview).toBe(preview)
+  expect(task.approval.preview).toContain('\n路径片段保持 %2F。\n')
+  // 主正文不是序列化参数。
+  expect(task.question).not.toContain('{')
+  expect(task.question).not.toContain('\\n')
+  expect(task.question).not.toContain('mcp__')
+  expect(task.options.map((option: { id: string }) => option.id)).toEqual(['go', 'stop', 'revise'])
+})
+
+it('shows a historical connection card as a person reads it, keeps its ids, and never puts the truncated JSON in the question', async () => {
+  const upstream = vi.fn(async () => Response.json({ items: [] }))
+  // b27d050c 那一类历史卡：旧 question 是 `JSON.stringify(args).slice(0, 500)`，被切在半句上。
+  const raw = 'send_message({"channel":"main","to":"m82","text":"第一行进度汇报\\n路径片段 %2F 保留\\n' + '很长的正文'.repeat(120)
+  const tickets = [{ id: 't-legacy', title: 'Report', channels: [{ source: 'team' }],
+    createdAt: '2026-11-11T00:00:00Z', updatedAt: '2026-11-11T00:00:01Z',
+    pendingApproval: { kind: 'connection', status: 'waiting', signature: 'old-raw-sig' },
+    attention: { id: 'attention-legacy-1', question: raw,
+      options: [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }] },
+    assignments: [], inputs: [] }]
+  const withOldCard = { ...host(), store: { settings: () => ({ paused: false }), tickets: { list: () => tickets } } } as unknown as HttpHost
+  const body = await (await phoneHandler(withOldCard, undefined, upstream as typeof fetch)(new Request('http://dsh/api/mobile/timeline'))).json() as { tasks: Record<string, any>[] }
+  const task = body.tasks[0]!
+  // id 与选项 id 一字不改：客户端答 /answer 时照旧对得上。
+  expect(task.attention_id).toBe('attention-legacy-1')
+  expect(task.options.map((option: { id: string }) => option.id)).toEqual(['go', 'stop', 'revise'])
+  // 按钮按 id 映射到新文案，不再把「做吧/先别做」发给新客户端。
+  expect(task.options.map((option: { label: string }) => option.label)).toEqual(['确认执行这一次', '取消这一次（任务继续）', '修改内容'])
+  // 主正文是人话，旧 JSON 不在里面。
+  expect(task.question).toContain('要发送这条消息')
+  expect(task.question).not.toContain('{')
+  expect(task.question).not.toContain('mcp__')
+  expect(task.approval).toMatchObject({ kind: 'connection', action: '发送这条消息' })
+  // 内容不全就不捏造 preview：原始片段移进折叠的 details，并标明不全。
+  expect(task.approval.preview).toBeUndefined()
+  expect(task.approval.details).toContain('内容不完整')
+  expect(task.approval.details).toContain(raw.slice(-20))
 })
 
 it('takes the phone channel state from the Source that actually carries it', async () => {
@@ -268,6 +324,28 @@ it('names the messages the crew read and left, so the phone can tell it apart fr
   expect(declined).toEqual([{ request_id: 'r1', reason: '只是寒暄，不必开票' }])
 })
 
+it('does not mark direct answers, replied messages, or unrelated source suffixes as declined', async () => {
+  const { declinedRequests } = await import('../src/app/mobile-http.ts')
+  const at = '2026-11-10T04:00:00.000Z'
+  const items = [
+    { id: 'm1', role: 'user', request_id: 'r1', at },
+    { id: 'm2', role: 'user', request_id: 'r2', at },
+    { id: 'm3', role: 'user', request_id: 'r3', at },
+    { id: 'm72', role: 'user', request_id: 'r72', at },
+    { id: 'a3', role: 'agent', reply_to: 'm3', reply_kind: 'reply', at: '2026-11-10T04:00:02.000Z' },
+  ]
+  const decisions = [
+    { kind: 'ignore', threadKey: 'team:main:1', at: '2026-11-10T04:00:01.000Z', reason: [{ code: 'said', values: { text: '闲聊' } }] },
+    { kind: 'ignore', threadKey: 'team:main:2', at: '2026-11-10T04:00:02.000Z', reason: [{ code: 'answeredDirectly' }] },
+    { kind: 'ignore', threadKey: 'team:main:2', at: '2026-11-10T04:00:01.000Z', reason: [{ code: 'said', values: { text: '旧拒收' } }] },
+    { kind: 'ignore', threadKey: 'team:main:3', at: '2026-11-10T04:00:01.000Z', reason: [{ code: 'said', values: { text: '已回复' } }] },
+    { kind: 'ignore', threadKey: 'github:72', at: '2026-11-10T04:00:01.000Z', reason: [{ code: 'said', values: { text: '不应串线' } }] },
+  ]
+
+  expect(declinedRequests(items as never, decisions as never, Date.parse('2026-11-10T04:00:45.000Z'), 90_000, 'main'))
+    .toEqual([{ request_id: 'r1', reason: '闲聊' }])
+})
+
 // 代码卡上的「看看改完的样子」要知道去看哪张票。网关只记「回哪条消息」（reply_to），
 // 工单在这一侧从最近的决定里对齐：threadKey 的尾号是队列行号，ticketId 是那张票。
 // 对不上就不补 —— 客户端据此如实说「这段改动没带工单号」，不拿别的票顶替。
@@ -297,6 +375,18 @@ it('points a code reply at its own ticket, and leaves it blank when it cannot te
   expect(out[3]).toMatchObject({ id: 'r11', ticket_ref: 'tk-3' })
   // 消息面的其余字段一格不改：只是把缺的那个补上。
   expect(out[0]).toEqual(items[0])
+})
+
+it('does not join a GitHub decision to a mobile reply by its numeric suffix', async () => {
+  const { ticketRefs } = await import('../src/app/mobile-http.ts')
+  const items = [{ id: 'm72', role: 'user', request_id: 'r72' },
+    { id: 'a72', role: 'agent', reply_to: 'm72', text: 'Done' }]
+  const decisions = [
+    { kind: 'accept', threadKey: 'github:72', ticketId: 'github-ticket', at: '2026-11-11T00:00:01.000Z' },
+    { kind: 'accept', threadKey: 'team:other:72', ticketId: 'other-session-ticket', at: '2026-11-11T00:00:02.000Z' },
+  ]
+
+  expect(ticketRefs(items as never, decisions as never, 'main')).toEqual(new Map())
 })
 
 // 老网关把「没有票号」写成空串而不是干脆不给字段。空串不是已有值，
@@ -973,10 +1063,11 @@ it('echoes the session capability bits and keeps a legacy timeline unchanged', a
   const legacy = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Record<string, unknown>
   expect(legacy).toMatchObject({ session_id: 'main', session_api: 1, sessions: ['main'], default_session_id: 'main' })
   // 除这四个能力位字段外，老响应逐字不变。groups 是 S4 加的只读投影（增量字段，
-  // 与会话无关），同样按白名单剔除后单独断言形状。
+  // 与会话无关），同样按白名单剔除后单独断言形状。server 是本批新增的可选只读元数据（增量字段，老 App 忽略），
+  // 一并剔除后断言其余逐字不变（见 tests/server-identity.spec.ts 单测其形状与同源）。
   const { session_id: _sid, session_api: _api, sessions: _list, default_session_id: _def,
-    groups, ...rest } = legacy
-  expect(rest).toEqual({ items: [], tasks: [], queued: [], declined: [], bots: [], default_bot_id: '',
+    groups, server: _server, ...rest } = legacy
+  expect(rest).toEqual({ items: [], tasks: [], queued: [], queued_state: 'live', declined: [], bots: [], default_bot_id: '',
     unread: { count: 0, state: 'live' },
     unread_replies: { count: null, state: 'unknown', reason: expect.any(String) },
     status: { runtime: 'ready', mobile: 'ready', paused: false } })

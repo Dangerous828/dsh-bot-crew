@@ -8,6 +8,7 @@ import type { SettingsView } from './views/settings.ts'
 import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
+import type { DiagRow } from './diagnostics.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -52,6 +53,9 @@ export interface Api {
   'POST remote/pairing': { body: { deviceId?: string }; response: { code: string; deviceId: string } }
   'GET remote/devices': { response: { devices: PairedDeviceView[] } }
   'DELETE remote/devices': { body: { deviceId?: string; all?: boolean }; response: { ok: true } }
+  /** App 故障上报的只读查看（管理面看所有设备）。导出下载原样 NDJSON 文本。 */
+  'GET diagnostics': { query?: { device?: string; session?: string; since?: string; errorsOnly?: string; limit?: string }; response: { rows: DiagRow[]; devices: string[] } }
+  'GET diagnostics/export': { query?: { device?: string; session?: string; since?: string; errorsOnly?: string; limit?: string }; response: { ndjson: string } }
 }
 type Path<K> = K extends `${string} ${infer P}` ? P : never
 type Params<P> = P extends `${string}:${infer Name}/${infer Rest}` ? Record<Name, string> & Params<Rest>

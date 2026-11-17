@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, liveTicket, reasonText, runningAssignment, threadKey, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
+import { Engine, key, liveTicket, reached, reasonText, runningAssignment, threadKey, ticketStage, type EngineForSettings, type OutboundMessage, type ReceiveResult,
   type Ticket, type Trigger, type AssessmentOutcome, type AttentionOption } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
@@ -25,8 +25,10 @@ import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
 import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
+import type { NativeActivity } from './native-activity.ts'
 import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
 import { buildRoutine, editRoutine, routinesView, routineItemOf, newRoutineId, type RoutineRecord, type RoutinesView } from './routines.ts'
+import { Diagnostics } from './diagnostics.ts'
 import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
 import { followupsOf, followupText, waitingWhere } from './followup.ts'
 import { spendOf, spendSteps, type Spend, type SpendEvent } from './spend.ts'
@@ -39,10 +41,12 @@ import { dailyDue, dailyNotice, dayLabel, localDay, morningDue, morningNotice, o
 import { CALENDAR_UNAVAILABLE } from './calendar.ts'
 import { configsFromEnv, runCalendarRound, runMailRound, type GraphWatchDeps } from './graph-watch.ts'
 import { MicrosoftGraphPort } from './graph.ts'
-import { approvalOf, approvalPrompt, readAnswer, type ApprovalDecision } from './approval.ts'
+import { answerOf, approvalOf, approvalPrompt, connectionPrompt, legacyAnswerId, presentCall,
+  type ApprovalDecision } from './approval.ts'
 import { QuotaSourceReader, quotaOf, quotaSourceLine, quotaSourceUrl, quotaWarning, replySpendOf, type Quota,
   type QuotaSourceReading, type ReplySpend } from './quota.ts'
-import { allowedTools, connectionsOf, judgeCall, KIND_NAME, type ConnectionVerdict } from './connections.ts'
+import { allowedTools, connectionOfCall, connectionsOf, judgeCall, KIND_NAME, signMessageCall,
+  type ConnectionVerdict } from './connections.ts'
 import { speak as speakText, systemSpeakHost, DEFAULT_VOICE, type SpeakOutcome, type SpeakHost } from './speech.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -138,12 +142,28 @@ function stableJson(value: unknown): string {
 }
 
 /**
+ * 一次外部调用可能对应的签名：规范化之后的那一份，以及**补 `bot_id` 之前**按模型原始参数算的那一份。
+ *
+ * 历史卡（`b27d050c` 那一类）的 `pendingApproval.signature` 是按原 args 算的，之后 guard 改为按补好署名的那份算，
+ * 两套值不相等 —— 只认新的会让旧卡变成「谁答都不动」的死卡。两套都认，`config` 与 `name` 保持一致：
+ * 换了连接配置或换了工具名，旧签名同样失效（那是另一次调用，该重新问）。
+ */
+function signatureOfCall(name: string, config: unknown, raw: unknown, signed: unknown): string[] {
+  const ones = [key(name, stableJson(signed ?? null), JSON.stringify(config))]
+  const legacy = key(name, stableJson(raw ?? null), JSON.stringify(config))
+  if (legacy !== ones[0]) ones.push(legacy)
+  return ones
+}
+
+/**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
  * Exposes the `SourceHost` service on the Cordis context for source plugins and coordinates startup, setup checks, HTTP route registration, and graceful shutdown.
  * Locks the state directory before opening SQLite so concurrent processes cannot corrupt or double-migrate state.
  */
 export class Runtime extends Service implements SourceHost {
   readonly store: Store
+  /** App 故障上报的落盘盒（在 store 就绪后构造）。手机面收、管理面读共用一份。 */
+  diagnostics!: Diagnostics
   readonly setup: Setup
   readonly prompts: Prompts
   readonly effects: Effects
@@ -237,6 +257,8 @@ export class Runtime extends Service implements SourceHost {
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      // App 故障上报的落盘盒：与 store 同生命周期，手机面收、管理面读共用一个实例。
+      this.diagnostics = new Diagnostics(store)
       // 待发件箱接真实持久层：Store 就绪后再建，明确依赖顺序，不靠字段初始化去猜 store 何时可用。
       // 一桶一键（KV.notice.pending），HMR/实例重建后靠这一族读回、不丢未 ACK 的件。只用新链以后
       // 入队的件才有来源；更早只活在旧进程内存里的件不在此列，不假装恢复。
@@ -272,6 +294,7 @@ export class Runtime extends Service implements SourceHost {
         lifetime: this.lifetime,
         closing: () => this.closing(), environment,
         guardConnection: (ticketId, name, args) => this.guardConnection(ticketId, name, args),
+        signConnectionCall: (ticketId, name, args) => this.signConnectionCall(ticketId, name, args),
         tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       // 记忆层要在执行器之前建：执行器的 launch 会问它要一小片召回。
       // 记忆中枢：按设置里的 memory.hub 探测决定走中枢版还是本机版；两版共用同一个本机账本。
@@ -519,6 +542,16 @@ export class Runtime extends Service implements SourceHost {
    *
    * 三样都读不到时，`screenOf` 会给出那句真实的 reason；这里不编。
    */
+  /** Small phone snapshot: lifecycle cache and ticket facts, without reading transcripts. */
+  async activity(ticketId: string): Promise<NativeActivity | undefined> {
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket) return undefined
+    if (ticket.ended) return { kind: 'ended', at: ticket.ended.at,
+      label: ticket.ended.outcome === 'stopped' ? '已停止' : ticket.ended.outcome === 'dropped' ? '已结束' : ticket.ended.outcome === 'completed' || ticket.ended.outcome === 'merged' ? '已完成' : '已结束' }
+    if (ticketStage(ticket).stage === 'person') return { kind: 'waiting_for_person', at: ticket.updatedAt, label: ticket.attention ? '等你决定' : '需要你处理' }
+    const assignment = runningAssignment(ticket)
+    return assignment ? this.sessions.activity(workerSessionId(ticket.id), assignment.startedAt) : undefined
+  }
   async screen(ticketId: string): Promise<ScreenSnapshot> {
     const id = ticketId.trim()
     if (!id) return screenOf({})
@@ -531,7 +564,14 @@ export class Runtime extends Service implements SourceHost {
     let events: ScreenEvent[]
     try { events = await this.screenEvents(id) }
     catch { return { state: 'unavailable', ticket_id: id, ...(stage ? { stage } : {}), reason: '这张工单的 worker 会话读不出来' } }
-    return screenOf({ ticketId: id, events, cwd: ticket.execution?.directory, stage, since })
+    const snapshot = screenOf({ ticketId: id, events, cwd: ticket.execution?.directory, stage, since })
+    const activity = await this.activity(id)
+    // Transcript lines describe history; only native lifecycle or ticket facts describe current execution.
+    snapshot.activity = activity?.kind === 'model' ? 'thinking' : activity?.kind === 'tool' ? 'running'
+      : activity?.kind === 'retrying' || activity?.kind === 'waiting_for_person' ? 'waiting'
+      : activity?.kind === 'idle' ? 'idle' : activity?.kind === 'ended' ? 'ended' : undefined
+    if (activity?.at) snapshot.at = activity.at
+    return snapshot
   }
   /**
    * 一张工单的 worker 会话事件：先问活着的会话，再退回磁盘上的存档。
@@ -887,23 +927,125 @@ export class Runtime extends Service implements SourceHost {
       const verdict = judgeCall(config, connection.server, tool)
       if (verdict.action === 'deny') return verdict.reason
       if (verdict.action === 'allow') return undefined
-      const signature = key(name, stableJson(args ?? null), JSON.stringify(config))
+      // 署名与签名共用同一份规范化参数：审批算的是「worker 真正会执行的那一次调用」，不是模型省了可选参数的那一次。
+      const signed = connection.kind === 'messages' && tool === 'send_message' ? signMessageCall(args, this.ticketBot(ticket)) : args
+      const signature = key(name, stableJson(signed ?? null), JSON.stringify(config))
+      // 补 `bot_id` 之前留下的卡（b27d050c 那一类）的签名是按**模型给的原始参数**算的，与现在这份规范化签名不等。
+      // 认两套：老卡照旧能用「做吧／先别做」消费掉，而不是因为签名换了就变成一张谁答都不动的死卡。
+      const signatures = signatureOfCall(name, config, args, signed)
+      // 这个人已经取消了这一次调用：不再出卡，也不再执行，只把拒绝原因交回 worker，让它换做法或收尾。
+      // 放在「正常回报免审批」**之前**：取消是对这一次调用的决定，不能被回复豁免悄悄放行。
+      if (ticket.approvalDenied && signatures.includes(ticket.approvalDenied.signature)) {
+        return '主人取消了这一次调用；不要用同样的参数重试，换别的做法或结束这个操作并说明结果。'
+      }
+      // A messages write that answers a human message this ticket received needs no approval: it is the ticket's own
+      // answer, sent by the Bot that received the question. A grant left over from the same call is consumed here so an
+      // approved card does not stay `approved` after the reply took this path.
+      if (connection.kind === 'messages' && tool === 'send_message' && this.isTicketMessageReply(ticket, signed)) {
+        if (ticket.pendingApproval?.kind === 'connection' && signatures.includes(ticket.pendingApproval.signature ?? '')) {
+          delete ticket.pendingApproval
+          this.store.tickets.save(ticket)
+        }
+        return undefined
+      }
       if (ticket.pendingApproval?.kind === 'connection' && ticket.pendingApproval.status === 'approved'
-        && ticket.pendingApproval.signature === signature) {
+        && signatures.includes(ticket.pendingApproval.signature ?? '')) {
         delete ticket.pendingApproval
         this.store.tickets.save(ticket)
         return undefined
       }
       ticket.pendingApproval = { kind: 'connection', status: 'waiting', signature }
-      const summary = JSON.stringify(args ?? null, (field, value) =>
-        /token|password|credential|authorization|secret|api_?key/i.test(field) ? '[redacted]' : value).slice(0, 500)
-      const prompt = approvalPrompt(`${name}（${summary}）`,
-        { ask: true, because: 'rule', reason: verdict.reason })
-      ticket.attention = { id: `attention-connection-${ticketId}-${signature}`, ...prompt, triggerId: ticket.origin.triggerId }
+      const view = presentCall({ kindName: KIND_NAME[connection.kind], tool, args,
+        ...this.conversationOf(ticket) ? { conversation: this.conversationOf(ticket)! } : {} })
+      const prompt = connectionPrompt({ ...view, reason: verdict.reason })
+      ticket.attention = { id: `attention-connection-${ticketId}-${signature}`, question: prompt.question,
+        options: prompt.options, presentation: prompt.presentation!, triggerId: ticket.origin.triggerId }
       ticket.updatedAt = new Date().toISOString()
       this.store.tickets.save(ticket)
       return `${prompt.question} 请结束本轮等待，批准后只重试同一参数的一次调用。`
     })
+  }
+
+  /**
+   * 这张票该以哪位 Bot 的身份对外说话；读不出来就是 undefined（此时不替它编一个署名）。
+   *
+   * 给 worker 作用域的同名工具 wrapper 用：SDK 在 dispatch 前把参数 `deepFreeze`，只能拿这份身份复制出一份新参数
+   * 再交给原工具执行 —— 这样「正常回报被放行」和「实际以谁的名义发出去」是同一个身份。
+   */
+  botOfTicket(ticketId: string): string | undefined {
+    const ticket = this.store.tickets.get(ticketId)
+    return ticket ? this.ticketBot(ticket) : undefined
+  }
+
+  /**
+   * 把一次外部调用规范化成真正要执行的那一份参数：`send_message` 缺 `bot_id` 时补上本票的 Bot，其余原样返回。
+   *
+   * wrapper 与 `guardConnection` 都用它，所以审批签名与真实 dispatch 参数一致 —— 不会出现「批的是 A、发的是 B」。
+   */
+  signConnectionCall(ticketId: string, name: string, args: unknown): unknown {
+    // 只对「消息」这一类连接上的 send_message 署名：别的服务也可能有同名工具，不该被塞一个它不认的字段。
+    const call = connectionOfCall(connectionsOf(this.store.settings().connections), name)
+    if (call?.connection.kind !== 'messages' || call.tool !== 'send_message') return args
+    return signMessageCall(args, this.botOfTicket(ticketId))
+  }
+
+  /** 本票来源的那个会话名；读不出来就不写，别编一个。 */
+  private conversationOf(ticket: Ticket): string | undefined {
+    const origin = this.store.triggers.get(ticket.origin.triggerId)
+    const conversation = origin?.channel?.address.conversation
+    if (typeof conversation === 'string' && conversation) return conversation
+    for (const channel of ticket.channels) {
+      const named = channel.address?.conversation
+      if (typeof named === 'string' && named) return named
+    }
+    return undefined
+  }
+
+  /**
+   * A messages write skips approval only when it replies to a human trigger this ticket actually received, as the Bot
+   * that received it. `bot_id` is optional in the tool's own schema, so an omitted one means "the Bot of this ticket"
+   * rather than "no Bot" — but an explicit one must match: that is what keeps a different Bot's reply from riding this
+   * ticket's exemption. Everything else (other recipient, other conversation, a Bot that is not this ticket's) is a
+   * separate judgement and still asks.
+   */
+  private isTicketMessageReply(ticket: Ticket, args: unknown): boolean {
+    if (!args || typeof args !== 'object') return false
+    const call = args as Record<string, unknown>
+    if (typeof call.channel !== 'string' || typeof call.to !== 'string'
+      || (call.bot_id !== undefined && typeof call.bot_id !== 'string')) return false
+    const targetId = /^(?:m)?([1-9]\d*)$/.exec(call.to)?.[1]
+    if (!targetId) return false
+    const origin = this.store.triggers.get(ticket.origin.triggerId)
+    if (!origin?.human || !['mobile', 'team'].includes(origin.source)) return false
+    const conversation = origin.channel?.address.conversation
+    if (!conversation || call.channel !== conversation) return false
+    // 票上没有 Bot 身份（mobile/feishu 这类）时保持老口径：调用也没署名才算同一次回话；
+    // 凭空写一个 Bot 名对一条本来没有 Bot 的消息回话，是冒充，要走审批。
+    const sender = typeof call.bot_id === 'string' && call.bot_id ? call.bot_id : this.ticketBot(ticket)
+    const messageId = (trigger: Trigger): string | undefined => {
+      const raw = trigger.channel?.address.message
+      return raw ? /^(?:m)?([1-9]\d*)$/.exec(raw)?.[1] : undefined
+    }
+    const matches = (trigger: Trigger): boolean => trigger.source === origin.source && trigger.human
+      && trigger.channel?.address.conversation === conversation && messageId(trigger) === targetId
+      && trigger.channel?.address.bot_id === sender
+    if (matches(origin)) return true
+    return ticket.inputs.some(input => {
+      if (input.kind !== 'trigger' || !input.human || input.context) return false
+      const trigger = this.store.triggers.get(input.triggerId)
+      return !!trigger && reached(ticket, trigger, key => this.store.threads.get(key), false) && matches(trigger)
+    })
+  }
+
+  /** Which Bot took this ticket: signed on its origin Trigger, else on its Channels (a ticket has no Bot field of its own). */
+  private ticketBot(ticket: Ticket): string | undefined {
+    const origin = this.store.triggers.get(ticket.origin.triggerId)?.channel?.address.bot_id
+    if (typeof origin === 'string' && origin) return origin
+    for (const channel of ticket.channels) {
+      const id = channel.address?.bot_id
+      if (typeof id === 'string' && id) return id
+    }
+    return undefined
   }
 
   /** 写操作被拦下时的那一句话，直接给人看。 */
@@ -1424,7 +1566,10 @@ export class Runtime extends Service implements SourceHost {
     if (matches.length !== 1) return undefined
     const ticket = matches[0]!
     const pending = ticket.pendingApproval!
+    // 卡上的选项（label 或 id），以及人照着旧文案逐字打进来的那三个词（映射到同 id 的选项）。
+    const wanted = legacyAnswerId(text)
     const option = ticket.attention?.options?.find(item => item.label === text || item.id === text)
+      ?? (wanted ? ticket.attention?.options?.find(item => item.id === wanted) : undefined)
     if (!option && pending.status !== 'revise') return undefined
     return this.store.atomic(() => {
       const at = new Date().toISOString()
@@ -1454,19 +1599,23 @@ export class Runtime extends Service implements SourceHost {
    * `actor` 来自**入口验过的内置 principal**（不信 body）：只用于审计，记进 input。
    */
   answerTicket(ticketId: string, text: string, attentionId?: string, actor?: string):
-    { ok: true; answer: 'go' | 'stop' | 'revise' } | { ok: false; reason: string } {
+    { ok: true; answer: 'go' | 'stop' | 'revise' | 'reply' } | { ok: false; reason: string } {
     const ticket = this.store.tickets.get(ticketId)
     if (!ticket) return { ok: false, reason: '没有这张票' }
     if (ticket.ended || !liveTicket(ticket)) return { ok: false, reason: '这张票已经结束' }
-    const pending = ticket.pendingApproval
-    if (!pending) return { ok: false, reason: '这张票没有在等审批' }
     // 旧咔不能批新请求：客户端必须带着它看到的当前问题卡 id；缺失或不等于当前 attention.id 一律不动。
     if (!attentionId) return { ok: false, reason: '缺少问题卡 id，不能确定你批的是哪一次请求' }
     if (ticket.attention?.id !== attentionId) return { ok: false, reason: '这张问题卡已经过期（票或请求已变），请刷新后再答' }
     const said = text.replace(/^@\S+\s+/, '').trim()
+    // 不是审批卡，而是 worker 自己的提问：答的是那句话本身，不走 go/stop/revise，也绝不把选项当成停票。
+    if (!ticket.pendingApproval) return this.answerQuestion(ticket, said, attentionId, actor)
+    const pending = ticket.pendingApproval
+    // 认卡上摆着的那个选项（label 或 id），也认照着旧文案逐字打进来的那三个词（映射到同 id 的选项）。
+    const wanted = legacyAnswerId(said)
     const option = ticket.attention?.options?.find(item => item.label === said || item.id === said)
+      ?? (wanted ? ticket.attention?.options?.find(item => item.id === wanted) : undefined)
     if (!option && pending.status !== 'revise') return { ok: false, reason: '这句不是一个可执行的答复' }
-    const answer = option ? readAnswer(option.label) : 'revise'
+    const answer = answerOf(option)
     return this.store.atomic(() => {
       const at = new Date().toISOString()
       ticket.updatedAt = at
@@ -1479,11 +1628,40 @@ export class Runtime extends Service implements SourceHost {
     })
   }
 
+  /**
+   * 答一张 worker 自己的提问卡（不是审批）。
+   *
+   * 之前这里没有分支：`pendingApproval` 为空就直接 409，于是普通问题在手机上是一条死路。
+   * 现在只做一件事 —— 把答案当**这位人的一句话**投给原来那个 worker（与审批批准后同一条 input/唤醒路径），
+   * 由 worker 自己的报告收掉问题卡；不读 go/stop/revise、不把任何选项解释成停票、不新造问答状态机。
+   * 选项按 id 或 label 认（客户端回传它看到的那个），认成该卡 label 的原话。
+   */
+  private answerQuestion(ticket: Ticket, said: string, attentionId: string, actor?: string):
+    { ok: true; answer: 'reply' } | { ok: false; reason: string } {
+    if (!said) return { ok: false, reason: '这句是空的' }
+    const option = ticket.attention?.options?.find(item => item.id === said || item.label === said)
+    const answer = option?.label ?? said
+    return this.store.atomic(() => {
+      const at = new Date().toISOString()
+      const input = { id: key('answer', ticket.id, attentionId, at), kind: 'text' as const, at,
+        text: `主人回答「${ticket.attention?.question ?? '这个问题'}」：${answer} · attention=${attentionId} · actor=${actor ?? 'unknown'}` }
+      ticket.inputs.push(input); ticket.undelivered.push(input.id)
+      ticket.updatedAt = at
+      this.store.tickets.save(ticket)
+      const latest = ticket.assignments.at(-1)
+      if (latest?.state === 'pending') this.executor.start(ticket, latest)
+      else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
+      return { ok: true as const, answer: 'reply' as const }
+    })
+  }
+
   /** 审批状态机的唯一应用点：feishu `approvalReply` 与手机 `answerTicket` 共用（审计在上面各自记）。 */
   private applyApprovalAnswer(ticket: Ticket, option: AttentionOption | undefined, text: string, at: string): void {
     const pending = ticket.pendingApproval!
-    const answer = option ? readAnswer(option.label) : 'revise'
+    const answer = answerOf(option)
     if (option && answer === 'stop') {
+      // 一次外部写的「取消这一次」不是停整票：票继续活着，worker 收到这条事实后换做法或收尾。
+      if (pending.kind === 'connection') { this.cancelCall(ticket, pending.signature, text, at); return }
       this.store.tickets.save(ticket)
       this.engine.stopTicket(ticket.id, '主人选择先别做')
     } else if (option && answer === 'revise') {
@@ -1508,6 +1686,28 @@ export class Runtime extends Service implements SourceHost {
       if (latest?.state === 'pending') this.executor.start(ticket, latest)
       else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
     }
+  }
+
+  /**
+   * 取消这一次外部调用，票不结束。
+   *
+   * 记下这条签名（同一调用不再出卡、也不执行），清掉这张卡，把「这一次被取消」当一句话交给原 worker，
+   * 走与批准后同一条 input/唤醒路径 —— 否则只清 pending 会让 worker 停在已结束的那一轮里永远 idle。
+   * 参数改了就是新签名，会重新问一次；人仍可以停整票（那是别的入口）。
+   */
+  private cancelCall(ticket: Ticket, signature: string | undefined, text: string, at: string): void {
+    delete ticket.pendingApproval
+    delete ticket.attention
+    if (signature) ticket.approvalDenied = { signature, at }
+    const input = { id: key('approval-stop', ticket.id, at), kind: 'text' as const, at,
+      text: `主人取消了这一次外部调用（${text}）：不要用同样的参数重试，也不要绕道执行同一件事；`
+        + '换别的做法，或者把这个操作停下并说明结果。整张任务没有被停。' }
+    ticket.inputs.push(input); ticket.undelivered.push(input.id)
+    ticket.updatedAt = at
+    this.store.tickets.save(ticket)
+    const latest = ticket.assignments.at(-1)
+    if (latest?.state === 'pending') this.executor.start(ticket, latest)
+    else if (latest?.state === 'running') this.executor.deliver(ticket, latest)
   }
 
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
@@ -1805,6 +2005,7 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+      diagnostics: this.diagnostics,
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),

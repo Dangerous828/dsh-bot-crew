@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { UserError } from '../src/core/index.ts'
+import { key, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -133,6 +133,98 @@ it('answers every routing tool in one shape: the decision it recorded, why, and 
   expect(TICKET_STATES).toContain(stopped.ticket.state)
 })
 
+it('answers ordinary chat through orchestrator_route and ends the candidate without a ticket or acknowledgement', async () => {
+  const trigger = feishu('2', '@bot 嗨')
+  h.runtime.receive(trigger); await h.runtime.idle()
+
+  const result = await h.route({ kind: 'answer', trigger_id: trigger.id, text: '嗨' })
+
+  expect(result).toEqual({ trigger_id: trigger.id, kind: 'answer', reason: '已直接回复', status: 'sent' })
+  const thread = trigger.threads[0]!
+  expect(h.runtime.store.decisions.byThread(`${thread.source}:${thread.id}`).at(-1)).toMatchObject({
+    kind: 'ignore', reason: [{ code: 'answeredDirectly' }],
+  })
+  expect(h.runtime.store.tickets.list()).toEqual([])
+  expect(h.runtime.engine.candidate(trigger.id)).toBeUndefined()
+  expect(h.runtime.store.replyStatus(key('reply', trigger.id, '嗨'))).toBe('sent')
+  expect(h.runtime.store.replyStatus(key('ack', trigger.id))).toBeUndefined()
+})
+
+it('sends direct-answer text literally even when it contains a handoff marker', async () => {
+  const trigger = feishu('2', '@bot 嗨'), text = '@handoff coder: 这只是回答里的字面文本'
+  h.runtime.receive(trigger); await h.runtime.idle()
+  const lark = vi.mocked(Commands.prototype.lark)
+  lark.mockClear()
+
+  const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
+    { kind: 'answer', trigger_id: trigger.id, text },
+  ] }) as { results: Record<string, unknown>[] }
+
+  expect(results[0]).toMatchObject({ trigger_id: trigger.id, kind: 'answer', status: 'sent' })
+  expect(JSON.stringify(lark.mock.calls)).toContain(text)
+  expect(h.runtime.store.tickets.list()).toEqual([])
+})
+
+it('reports reply status only on the answer item that queued it', async () => {
+  const trigger = feishu('2', '@bot 嗨')
+  h.runtime.receive(trigger); await h.runtime.idle()
+
+  const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
+    { kind: 'answer', trigger_id: trigger.id, text: '嗨' },
+    { kind: 'answer', trigger_id: trigger.id, text: '再见' },
+  ] }) as { results: Record<string, unknown>[] }
+
+  expect(results).toEqual([
+    { trigger_id: trigger.id, kind: 'answer', reason: expect.any(String), status: 'sent' },
+    { trigger_id: trigger.id, kind: 'answer', refused: expect.any(String) },
+  ])
+})
+
+it('prevents a later route item from creating a ticket after answering its candidate', async () => {
+  const trigger = feishu('2', '@bot 嗨')
+  h.runtime.receive(trigger); await h.runtime.idle()
+
+  const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
+    { kind: 'answer', trigger_id: trigger.id, text: '嗨' },
+    { kind: 'accept', trigger_id: trigger.id, title: 'A task', worktree_name: 'a-task', acknowledgement: '开始处理。' },
+  ] }) as { results: Record<string, unknown>[] }
+
+  expect(results[0]).toMatchObject({ trigger_id: trigger.id, kind: 'answer', status: 'sent' })
+  expect(results[1]).toMatchObject({ trigger_id: trigger.id, kind: 'accept', refused: expect.any(String) })
+  expect(h.runtime.store.tickets.list()).toEqual([])
+  expect(h.runtime.store.replyStatus(key('ack', trigger.id))).toBeUndefined()
+})
+
+it('keeps a worker-owned follow-up out of the direct-answer route', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const followup = feishu('2', '@bot 嗨', { root_id: 'om_1' })
+  h.runtime.receive(followup); await h.runtime.idle()
+
+  const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
+    { kind: 'answer', trigger_id: followup.id, text: '你好！' },
+  ] }) as { results: Record<string, unknown>[] }
+
+  expect(results[0]).toMatchObject({ trigger_id: followup.id, kind: 'answer', refused: expect.any(String) })
+  expect(String(results[0]?.refused)).toContain(ticket.id)
+  expect(h.runtime.store.tickets.get(ticket.id)).toBeDefined()
+  expect(h.runtime.store.replyStatus(key('reply', followup.id, '你好！'))).toBeUndefined()
+})
+
+it('rolls back the candidate disposition when a direct answer cannot be sent', async () => {
+  const trigger = { ...feishu('2', '@bot 嗨'), channel: undefined }
+  h.runtime.receive(trigger); await h.runtime.idle()
+  expect(h.runtime.engine.candidate(trigger.id)).toBeDefined()
+
+  const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
+    { kind: 'answer', trigger_id: trigger.id, text: '嗨' },
+  ] }) as { results: Record<string, unknown>[] }
+
+  expect(results[0]).toMatchObject({ trigger_id: trigger.id, kind: 'answer', refused: expect.any(String) })
+  expect(h.runtime.engine.candidate(trigger.id)).toBeDefined()
+  expect(h.runtime.store.replyStatus(key('reply', trigger.id, '嗨'))).toBeUndefined()
+  expect(h.runtime.store.replyStatus(key('ack', trigger.id))).toBeUndefined()
+})
+
 it('routes several triggers in one call, in order, and answers a refused or failed item without undoing the others', async () => {
   const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   const thanks = feishu('2', '@bot 谢谢'), request = feishu('3', '@bot 另一个问题'), other = feishu('4', '@bot 顺便看看这个'), more = feishu('6', '@bot 还有这个')
@@ -212,7 +304,7 @@ it('states each routing field\'s limit in its description, which the schema leav
   type Schema = { parameters: { properties: { decisions: { items: { properties: Record<string, { description?: string }> } } } } }
   const fields = (h.tools.get(h.runtime.masterId)!.get('orchestrator_route') as unknown as Schema).parameters.properties.decisions.items.properties
   const limits: Record<string, string[]> = { title: ['200 characters'], worktree_name: ['kebab-case', '32 characters'],
-    acknowledgement: [`${IM_WORDS} words`], note: [`${NOTE_WORDS} words`, 'Never add implementation instructions'], reason: ['500 characters'] }
+    acknowledgement: [`${IM_WORDS} words`], note: [`${NOTE_WORDS} words`, 'Never add implementation instructions'], reason: ['500 characters'], text: ['20,000 characters'] }
   for (const [field, phrases] of Object.entries(limits)) for (const phrase of phrases) expect(fields[field]!.description, field).toContain(phrase)
 })
 

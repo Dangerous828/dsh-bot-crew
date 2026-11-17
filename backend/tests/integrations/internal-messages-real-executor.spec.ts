@@ -165,6 +165,8 @@ describe('真执行器自动接线（真 Sessions.ensure + 真 agents factory + 
       closing: () => false, environment: () => [],
       tools: () => [], // worker custom tools: none for this test (MCP tools come from the real mcp-client)
       guardConnection,
+      // The real Runtime signs an omitted `bot_id` with the ticket's Bot; this fixture has no tickets, so nothing to add.
+      signConnectionCall: (_ticketId: string, _name: string, args: unknown) => args,
     })
     sessions.install()
     // Give Sessions a sessionController/presets via the real ctx services used by ensure/decorate.

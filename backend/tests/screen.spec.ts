@@ -54,6 +54,19 @@ describe('screenOf', () => {
       .lines?.[0]?.text).toBe('$ ls -la')
   })
 
+  it('uses actual SDK epoch-millisecond event time instead of stamping a historical log as now', () => {
+    const view = screenOf({ ticketId: 'tk1', events: [{ type: 'tool/call', time: Date.parse(at), data: { name: 'read' } }] })
+    expect(view.lines?.[0]?.at).toBe(at)
+    expect(view.at).toBe(at)
+  })
+
+  it('keeps missing or invalid event time unknown rather than inventing freshness', () => {
+    for (const time of [undefined, 'invalid', Infinity]) {
+      const view = screenOf({ ticketId: 'tk1', events: [{ type: 'tool/call', time, data: { name: 'read' } }] })
+      expect(view.lines?.[0]?.at).toBe('')
+    }
+  })
+
   it('caps one line instead of sending a whole build log', () => {
     const view = screenOf({ ticketId: 'tk1', events: [{
       type: 'tool/result', time: at, data: { message: { content: [{ type: 'text', text: 'x'.repeat(2000) }] } },

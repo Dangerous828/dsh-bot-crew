@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { allowedTools, connectionsOf, judgeCall, KIND_NAME, natureOf, type ConnectionConfig } from '../src/app/connections.ts'
+import { allowedTools, connectionOfCall, connectionsOf, judgeCall, KIND_NAME, natureOf, signMessageCall,
+  type ConnectionConfig } from '../src/app/connections.ts'
 
 const mail = { kind: 'mail' as const, server: 'mail', readTools: ['list_messages', 'get_message'] }
 const calendar = { kind: 'calendar' as const, server: 'cal', readTools: ['list_events'] }
@@ -166,5 +167,38 @@ describe('action-surface kinds (messages / shopping / payments / tickets)', () =
       { kind: 'bogus', server: 'x', readTools: [] },
     ] })
     expect(parsed.connections.map(c => c.kind)).toEqual(['payments'])
+  })
+})
+
+describe('signMessageCall: 可选 bot_id 落成真实署名，且不就地改 SDK 冻结的参数', () => {
+  it('adds the ticket Bot as a copy when the optional bot_id is omitted', () => {
+    const frozen = Object.freeze({ channel: 'main', to: 'm82', text: '好' })
+    const signed = signMessageCall(frozen, 'lead') as Record<string, unknown>
+    expect(signed).toEqual({ channel: 'main', to: 'm82', text: '好', bot_id: 'lead' })
+    // 原对象一个字段都不多（SDK 那份是冻结的快照）。
+    expect(frozen).toEqual({ channel: 'main', to: 'm82', text: '好' })
+    expect(signed).not.toBe(frozen)
+  })
+
+  it('keeps an explicit bot_id: a call that names another Bot is judged as that Bot', () => {
+    const call = { channel: 'main', to: 'm82', text: '好', bot_id: 'coder' }
+    expect(signMessageCall(call, 'lead')).toBe(call)
+  })
+
+  it('leaves the call alone when the ticket has no Bot to sign as', () => {
+    const call = { channel: 'main', to: 'm82', text: '好' }
+    expect(signMessageCall(call, undefined)).toBe(call)
+    expect(signMessageCall(call, '')).toBe(call)
+  })
+})
+
+describe('connectionOfCall: 只认真正属于某条连接的工具名', () => {
+  it('splits the server prefix from the tool name', () => {
+    expect(connectionOfCall(config, 'mcp__mail__send_message')).toEqual({ connection: mail, tool: 'send_message' })
+  })
+
+  it('reports nothing for a server this crew never connected', () => {
+    expect(connectionOfCall(config, 'mcp__other__send_message')).toBeUndefined()
+    expect(connectionOfCall(config, 'bash')).toBeUndefined()
   })
 })

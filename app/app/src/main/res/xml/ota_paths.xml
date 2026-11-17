@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OTA 专用：下载好的 APK 放在 filesDir/ota 下，只把这一层交给系统安装器读取。
+  不暴露其它私有目录（下载记录、配对信息都不在这里）。
+-->
+<paths>
+    <files-path name="ota" path="ota/" />
+</paths>

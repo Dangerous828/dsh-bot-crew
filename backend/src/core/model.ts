@@ -279,10 +279,38 @@ export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'sto
  */
 export interface AttentionOption { id: string; label: string }
 /**
+ * How an approval reads to a person, beyond the one-line `question`: what is about to happen, where, the content they
+ * are being asked to confirm, and the technical detail kept out of the way.
+ *
+ * Every field is optional so consumers keep working when a field is absent: `preview` keeps the real line breaks of the
+ * text being confirmed (never a serialized argument dump), `details` is the redacted tool and parameters for a folded
+ * view, and `target` names the recipient or place. A card without this block falls back to `question` alone.
+ */
+export interface ApprovalPresentation {
+  /** `connection` for one external write about to happen, `task` for whether a whole accepted ticket starts. */
+  kind: 'connection' | 'task'
+  /** What the crew is about to do, in the words a person uses. */
+  action?: string
+  /** Who or what it happens to. */
+  target?: string
+  /** The content a person must read before saying yes, with its own line breaks. */
+  preview?: string
+  /** Redacted tool name and parameters, for a folded view; never the main text. */
+  details?: string
+}
+
+/**
  * A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to, and
  * `options` the at most four answers it offered, in the order the person should read them.
  */
-export interface Attention { id: string; question: string; triggerId?: string; options?: AttentionOption[] }
+export interface Attention {
+  id: string
+  question: string
+  triggerId?: string
+  options?: AttentionOption[]
+  /** Readable projection of what is being approved; absent on tickets written before it existed. */
+  presentation?: ApprovalPresentation
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -297,6 +325,11 @@ export interface Ticket {
   attention?: Attention
   /** Approval belongs to this ticket; a connection grant covers one exact call under the same settings. */
   pendingApproval?: { kind: 'task' | 'connection'; status: 'waiting' | 'revise' | 'approved'; signature?: string }
+  /**
+   * The exact external call this ticket's person cancelled: its signature, so the same call is refused instead of asked
+   * again. A different call, or the same one after its arguments change, is a new signature and is asked once more.
+   */
+  approvalDenied?: { signature: string; at: string }
   assignments: Assignment[]
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */

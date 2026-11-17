@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Build, verify and atomically publish a same-signer BotCrew Android update."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+from datetime import datetime, timezone
+
+REPO = Path(__file__).resolve().parents[1]
+PACKAGE = 'com.dsh.botcrew'
+SIGNER = 'ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb'
+MAX_CODE = 2_100_000_000
+MAX_APK = 256 * 1024 * 1024
+HEX = re.compile(r'[0-9a-f]{64}')
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_latest(root):
+    path = Path(root) / 'manifest.json'
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    code = value.get('versionCode')
+    if value.get('schemaVersion') != 1 or value.get('packageName') != PACKAGE or type(code) is not int or not 1 <= code <= MAX_CODE:
+        raise ValueError('已有更新清单损坏，请先处理发布目录')
+    return value
+
+
+def next_code(latest, requested=None):
+    current = latest['versionCode'] if latest else 1
+    code = requested if requested is not None else current + 1
+    if type(code) is not int or not current < code <= MAX_CODE:
+        raise ValueError(f'versionCode 必须大于 {current} 且不超过 {MAX_CODE}')
+    return code
+
+
+def crew_fingerprint(state_dir):
+    value = 0
+    for character in str(state_dir):
+        number = ord(character)
+        if number > 0xffff:
+            number = 0xd800 + ((number - 0x10000) >> 10)
+        value = (value * 31 + number) % 0xffffffff
+    digits = ''
+    while value:
+        value, remainder = divmod(value, 36)
+        digits = '0123456789abcdefghijklmnopqrstuvwxyz'[remainder] + digits
+    return digits.rjust(7, '0')
+
+
+def public_origin(value):
+    u = urlsplit(value)
+    if (u.scheme != 'https' or not u.hostname or u.username or u.password or u.query or u.fragment
+            or u.path not in ('', '/') or not re.fullmatch(r'[A-Za-z0-9.-]+(?::[0-9]+)?', u.netloc)):
+        raise ValueError('公网入口必须是无凭据、无路径的 HTTPS origin')
+    if u.port is not None and not 1 <= u.port <= 65535:
+        raise ValueError('公网端口无效')
+    return 'https://' + u.netloc.lower()
+
+
+def atomic_json(path, value, mode=0o644):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def publish(root, apk, manifest):
+    root, apk = Path(root), Path(apk)
+    if next_code(read_latest(root), manifest['versionCode']) != manifest['versionCode']:
+        raise ValueError('发布版本无效')
+    code, digest = manifest['versionCode'], manifest['sha256']
+    if not HEX.fullmatch(digest) or manifest['apkPath'] != f'/updates/android/{code}/{digest}.apk':
+        raise ValueError('APK 路径与摘要不一致')
+    if apk.stat().st_size != manifest['size'] or sha256(apk) != digest:
+        raise ValueError('待发布 APK 已变化')
+    destination = root / str(code) / (digest + '.apk')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.stat().st_size != manifest['size'] or sha256(destination) != digest:
+            raise ValueError('不可变 APK 路径存在不同内容')
+    else:
+        fd, temporary = tempfile.mkstemp(prefix='.apk-', dir=destination.parent)
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, 'wb') as output, apk.open('rb') as source:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            if sha256(temporary) != digest:
+                raise ValueError('APK 复制校验失败')
+            os.replace(temporary, destination)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+    # Only expose the new pointer after the immutable file is complete.
+    atomic_json(root / 'manifest.json', manifest)
+    return destination
+
+
+def command(args, env, capture=False):
+    return subprocess.run([str(x) for x in args], env=env, check=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def signing_config(java, env):
+    home = Path.home() / '.config' / 'botcrew-ota'
+    config = home / 'signing.json'
+    if config.exists():
+        value = json.loads(config.read_text())
+    else:
+        seed = Path.home() / '.android' / 'debug.keystore'
+        if not seed.is_file():
+            raise ValueError('请迁入已有 BotCrew 签名目录 ~/.config/botcrew-ota；不会生成另一把钥匙')
+        probe_env = dict(env, BOTCREW_OTA_STORE_PASS='android')
+        certificate = command([java / 'bin/keytool', '-exportcert', '-keystore', seed,
+                               '-alias', 'androiddebugkey', '-storepass:env', 'BOTCREW_OTA_STORE_PASS'], probe_env, True).stdout
+        if hashlib.sha256(certificate).hexdigest() != SIGNER:
+            raise ValueError('现有 Android 钥匙与已安装 BotCrew 的签名不一致')
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(home, 0o700)
+        key = home / 'release.keystore'
+        if key.exists():
+            raise ValueError('签名目录已存在钥匙但缺配置，请先恢复配置')
+        shutil.copyfile(seed, key)
+        os.chmod(key, 0o600)
+        value = {'keystore': str(key), 'alias': 'androiddebugkey', 'storePassword': 'android', 'keyPassword': 'android'}
+        atomic_json(config, value, 0o600)
+    key = Path(value['keystore']).expanduser()
+    if not key.is_file():
+        raise ValueError('签名钥匙缺失，请恢复原签名目录')
+    child_env = dict(env, BOTCREW_OTA_STORE_PASS=value['storePassword'], BOTCREW_OTA_KEY_PASS=value['keyPassword'])
+    certificate = command([java / 'bin/keytool', '-exportcert', '-keystore', key, '-alias', value['alias'],
+                           '-storepass:env', 'BOTCREW_OTA_STORE_PASS'], child_env, True).stdout
+    if hashlib.sha256(certificate).hexdigest() != SIGNER:
+        raise ValueError('签名证书与既有 BotCrew 不匹配，已停止发布')
+    return value, child_env
+
+
+def verify_apk(apk, tools, env, code):
+    verified = command([tools / 'apksigner', 'verify', '--print-certs', apk], env, True).stdout.decode()
+    signers = re.findall(r'Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]+)', verified)
+    if [x.lower() for x in signers] != [SIGNER]:
+        raise ValueError('APK 不是既有 BotCrew 同签包')
+    info = command([tools / 'aapt', 'dump', 'badging', apk], env, True).stdout.decode()
+    package = re.search(r"^package: name='([^']+)' versionCode='(\d+)' versionName='([^']+)'", info, re.M)
+    minimum = re.search(r"^sdkVersion:'(\d+)'", info, re.M)
+    if not package or package[1] != PACKAGE or int(package[2]) != code or not minimum:
+        raise ValueError('APK 包名、版本或 SDK 元数据不匹配')
+    size = apk.stat().st_size
+    if not 0 < size <= MAX_APK:
+        raise ValueError('APK 大小超出发布上限')
+    return package[3], int(minimum[1]), size
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='构建、同签并原子发布 BotCrew Android OTA')
+    parser.add_argument('--state-dir', type=Path, default=Path(os.environ.get('DSH_HOME', str(Path.home() / '.dsh'))) / 'state/superagent')
+    parser.add_argument('--version-code', type=int, help='省略时按已发布版本递增')
+    parser.add_argument('--version-name', default='0.2.0')
+    parser.add_argument('--build-id', default='ota-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+    parser.add_argument('--public-base', default='https://crew.kentonnie.top')
+    parser.add_argument('--notes', default='')
+    parser.add_argument('--prepare-only', action='store_true', help='构建签名并校验，不改变线上清单')
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}', args.version_name):
+        raise ValueError('versionName 格式无效')
+    if not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z._-]{0,63}', args.build_id):
+        raise ValueError('buildId 格式无效')
+    if len(args.notes) > 2000:
+        raise ValueError('更新说明超过 2000 字符')
+    origin = public_origin(args.public_base)
+    root = args.state_dir.expanduser().resolve() / 'android-updates'
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / '.publish.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('另一个 Android 发布正在运行')
+        code = next_code(read_latest(root), args.version_code)
+        java = Path(os.environ.get('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home'))
+        sdk = Path(os.environ.get('ANDROID_HOME', str(Path.home() / 'Library/Android/sdk')))
+        tools = sdk / 'build-tools/35.0.0'
+        env = dict(os.environ, JAVA_HOME=str(java))
+        signing, child_env = signing_config(java, env)
+        props = [f'-PcrewVersionCode={code}', f'-PcrewVersionName={args.version_name}', f'-PcrewBuildId={args.build_id}',
+                 f'-PcrewGateway={origin}', f'-PcrewPublicBase={origin}', f'-PcrewExpectedCrew={crew_fingerprint(args.state_dir.expanduser().resolve())}',
+                 f'-PcrewUpdateUrl={origin}/updates/android/manifest.json',
+                 f'-PcrewAppId={PACKAGE}', '-PcrewDevice=', '-PcrewCredential=', '-PcrewToken=']
+        subprocess.run([str(REPO / 'app/gradlew'), ':app:assembleRelease'] + props, cwd=REPO / 'app', env=env, check=True)
+        unsigned = REPO / 'app/app/build/outputs/apk/release/app-release-unsigned.apk'
+        stage = REPO / 'app/build/ota' / f'{code}-{args.build_id}'
+        stage.mkdir(parents=True, exist_ok=False)
+        signed = stage / 'signed.apk'
+        command([tools / 'apksigner', 'sign', '--ks', signing['keystore'], '--ks-key-alias', signing['alias'],
+                 '--ks-pass', 'env:BOTCREW_OTA_STORE_PASS', '--key-pass', 'env:BOTCREW_OTA_KEY_PASS', '--out', signed, unsigned], child_env)
+        name, minimum, size = verify_apk(signed, tools, child_env, code)
+        if name != args.version_name:
+            raise ValueError('APK versionName 与请求不一致')
+        digest = sha256(signed)
+        apk = stage / (digest + '.apk')
+        signed.rename(apk)
+        manifest = {'schemaVersion': 1, 'packageName': PACKAGE, 'versionCode': code, 'versionName': name,
+                    'buildId': args.build_id, 'minSdk': minimum, 'sha256': digest, 'size': size,
+                    'signerSha256': SIGNER, 'apkPath': f'/updates/android/{code}/{digest}.apk'}
+        if args.notes:
+            manifest['notes'] = args.notes
+        atomic_json(stage / 'manifest.json', manifest)
+        destination = None if args.prepare_only else publish(root, apk, manifest)
+        receipt = {'published': not args.prepare_only, 'apk': str(apk), 'versionCode': code,
+                   'versionName': name, 'sha256': digest, 'signerSha256': SIGNER,
+                   'manifestUrl': origin + '/updates/android/manifest.json',
+                   'bootstrapUrl': origin + '/updates/android/latest.apk',
+                   'publishedFile': str(destination) if destination else None}
+        atomic_json(stage / 'receipt.json', receipt)
+        print(json.dumps(receipt, ensure_ascii=False, indent=2))
+        return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
+        print('android-ota-release: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)

@@ -24,6 +24,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
 import { feishu, startRuntime, type Host } from '../fixtures/host.ts'
+import { mobileTrigger } from '../../src/sources/mobile.ts'
 
 const DSH = process.env.DSH_NODE_MODULES ?? '/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai'
 const dsh = (name: string): Promise<any> => import(`${DSH}/${name}/lib/index.js`)
@@ -32,6 +33,21 @@ const MOBILEQ = '/Users/cpuser/Code/dsh-bot-crew/backend/tools/mobileq'
 
 const sqlv = (db: string, q: string): string => execFileSync('python3', ['-c', `import sqlite3,sys,json;c=sqlite3.connect(sys.argv[1]);print(json.dumps(c.execute(sys.argv[2]).fetchall()))`, db, q], { encoding: 'utf8' }).trim()
 const nreplies = (db: string): number => (JSON.parse(sqlv(db, 'SELECT count(*) FROM replies')) as number[][])[0]![0]!
+
+function queueMessage(db: string, text: string, conversation = 'main') {
+  execFileSync('python3', [MOBILEQ, '--db', db, 'inject', '--conversation', conversation, '--sender', 'owner', '--text', text])
+  const id = String((JSON.parse(sqlv(db, 'SELECT max(id) FROM messages')) as number[][])[0]![0]!)
+  return mobileTrigger({ id, conversation, sender: { id: 'owner', bot: false }, mentions_me: false, text, at: new Date().toISOString() }, 'crew')!
+}
+
+function attachTrigger(host: Host, ticketId: string, trigger: ReturnType<typeof mobileTrigger>, context = false) {
+  if (!trigger?.channel) throw new Error('expected a human mobile trigger')
+  host.runtime.store.triggers.save(trigger)
+  const ticket = host.runtime.store.tickets.get(ticketId)!
+  ticket.inputs.push({ id: `input-${trigger.id}`, kind: 'trigger', triggerId: trigger.id, at: trigger.at, human: true,
+    ...(context ? { context: true as const } : {}) })
+  host.runtime.store.tickets.save(ticket)
+}
 
 const dirs: string[] = []
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) })
@@ -185,6 +201,59 @@ describe('真 AgentLoop + 真 dsh-mcp-client stdio + 真 tools.guard + 真批准
       expect(r4[0]!.isError).toBe(true)
       await host.runtime.receive(feishu('6', '先别做'))
       expect(nreplies(db)).toBe(before2)                       // reject → zero writes
+
+      // 6) Exact source and same-ticket, same-conversation human follow-up may be answered without a routine approval.
+      const { ticket: sourceTicket } = await host.acceptedTicket(feishu('7', '@bot 只回源消息'))
+      const origin = queueMessage(db, '只回复嗨')
+      const storedSourceTicket = host.runtime.store.tickets.get(sourceTicket.id)!
+      host.runtime.store.triggers.save(origin)
+      storedSourceTicket.origin = { ...storedSourceTicket.origin, triggerId: origin.id, triggerIds: [origin.id] }
+      storedSourceTicket.channels = [origin.channel!]
+      host.runtime.store.tickets.save(storedSourceTicket)
+      const sourceBefore = nreplies(db)
+      const sourceReply = await runTurn(dshCtx, dshCtx.M, dshCtx.workdir, host, sourceTicket.id, 'mcp__messages__send_message',
+        { channel: 'main', to: `m${origin.channel!.address.message}`, text: '嗨！' })
+      expect(sourceReply[0]!.isError).toBe(false)
+      expect(nreplies(db)).toBe(sourceBefore + 1)
+      expect(host.runtime.store.tickets.get(sourceTicket.id)?.pendingApproval).toBeUndefined()
+
+      const followup = queueMessage(db, '同票合法后续')
+      attachTrigger(host, sourceTicket.id, followup)
+      const followupReply = await runTurn(dshCtx, dshCtx.M, dshCtx.workdir, host, sourceTicket.id, 'mcp__messages__send_message',
+        { channel: 'main', to: followup.channel!.address.message, text: '收到' })
+      expect(followupReply[0]!.isError).toBe(false)
+      expect(nreplies(db)).toBe(sourceBefore + 2)
+
+      const expectApproval = async (args: Record<string, unknown>) => {
+        const beforeDenied = nreplies(db)
+        const result = await runTurn(dshCtx, dshCtx.M, dshCtx.workdir, host, sourceTicket.id, 'mcp__messages__send_message', args)
+        expect(result[0]!.isError).toBe(true)
+        expect(nreplies(db)).toBe(beforeDenied)
+        expect(host.runtime.store.tickets.get(sourceTicket.id)?.pendingApproval).toMatchObject({ kind: 'connection', status: 'waiting' })
+        // 问题卡是人话，不是序列化参数：收件人在 presentation 里，正文不出现 JSON 片段。
+        const attention = host.runtime.store.tickets.get(sourceTicket.id)!.attention!
+        expect(attention.question).not.toContain('{')
+        expect(attention.question).not.toContain('mcp__')
+        expect(attention.presentation).toMatchObject({ kind: 'connection', action: '发送这条消息' })
+        expect(attention.presentation!.details).toContain(`to：${args.to}`)
+      }
+
+      const contextOnly = queueMessage(db, '只作上下文')
+      attachTrigger(host, sourceTicket.id, contextOnly, true)
+      await expectApproval({ channel: 'main', to: `m${contextOnly.channel!.address.message}`, text: '上下文不能直接回' })
+
+      const sibling = mobileTrigger({ id: '20', conversation: 'main', sender: { id: 'owner', bot: false }, mentions_me: false, text: '同会话旁支', at: new Date().toISOString() }, 'crew')!
+      host.runtime.store.triggers.save(sibling)
+      await expectApproval({ channel: 'main', to: 'm20', text: '旁支消息不能直回' })
+
+      const historical = mobileTrigger({ id: '19', conversation: 'main', sender: { id: 'owner', bot: false }, mentions_me: false, text: '旧消息', at: new Date().toISOString() }, 'crew')!
+      const { ticket: otherTicket } = await host.acceptedTicket(feishu('8', '@bot 另一张票'))
+      attachTrigger(host, otherTicket.id, historical)
+      await expectApproval({ channel: 'main', to: 'm19', text: '历史消息不能直回' })
+
+      const otherSession = queueMessage(db, '另一个会话', 'other')
+      attachTrigger(host, sourceTicket.id, otherSession)
+      await expectApproval({ channel: 'other', to: otherSession.channel!.address.message, text: '跨会话要审批' })
     } finally {
       await host.stop?.()
     }

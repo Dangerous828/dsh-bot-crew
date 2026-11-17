@@ -312,6 +312,8 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET records/export': { answer: async () => ({ kind: 'dsh-bot-crew-records', version: 11, exportedAt: '', stateDir: '',
     settings: { paused: false, policy: {}, eval: {}, executor: {} }, team: {}, tickets: [] }) },
   'DELETE remote/devices': { body: true, answer: async () => ({ ok: true as const }) },
+  'GET diagnostics': { query: ['device', 'session', 'since', 'errorsOnly', 'limit'], answer: async () => ({ rows: [], devices: [] }) },
+  'GET diagnostics/export': { query: ['device', 'session', 'since', 'errorsOnly', 'limit'], answer: async () => ({ ndjson: '' }) },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

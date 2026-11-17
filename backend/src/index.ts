@@ -20,7 +20,7 @@ import { networkInterfaces } from 'node:os'
 import { Config, machineOf, type DeploymentConfig } from './deployment.ts'
 
 export const name = 'dsh-superagent'
-export const inject = ['agents', 'sessionController', 'sessionPersistence', 'workspaceRegistry', 'permissionPresets', 'tools', 'systemPrompt', 'skills', 'webServer', 'llm', 'subprocess']
+export const inject = ['agents', 'sessionController', 'sessionPersistence', 'workspaceRegistry', 'permissionPresets', 'tools', 'systemPrompt', 'skills', 'llm', 'subprocess']
 export { Config }
 export async function apply(ctx: Context, config: DeploymentConfig): Promise<void> {
   const machine = machineOf(config)
@@ -92,16 +92,25 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   // 手机用系统 NSD 就能自己找到它。广播失败只是少一条捷径，手输地址照旧可用。
   /** tailcat 起来之后才有地址，所以广播取的是这个变量而不是一个定值。 */
   let p2pAddr: string | undefined
+  // 广播掉线是「手机找不到这台机器」，不是后端坏了 —— 面板上得能看见，否则只能从手机上猜。
+  const discoveryHealth = runtime.claimHealth('discovery', { state: 'starting', detail: 'Waiting for the phone listener' })
   const discovery = createDiscovery({
     stateDir: machine.stateDir,
     name: process.env.CREW_DISCOVERY_NAME?.trim() || undefined,
     publicUrl: publicEntry(machine.stateDir),
     p2pAddr: () => p2pAddr,
     onError: error => ctx.logger.warn('mDNS announce failed: %s', String(error)),
+    // 睡眠唤醒或换网之后组播会失效；广播会自己重建，但面板要说清它此刻到底在不在。
+    onState: (live, port) => discoveryHealth.set(live
+      ? { state: 'ready', detail: `Announcing on port ${port}`, at: new Date().toISOString() }
+      : { state: 'error', detail: 'mDNS announce is down; retrying until the network is back', at: new Date().toISOString() }),
   })
   const lan = createLanServer({
     devices,
     pairingAllowed: pairingThrottle,
+    // 后台 OTA 的包放在状态目录里：发布 CLI 原子写进去，手机不需要 USB 也不需要凭据
+    // 就能先装上新版本（凭据在包里，不在下载这条路上）。目录不存在时这条路只是 404。
+    updatesRoot: join(machine.stateDir, 'android-updates'),
     // 凭据已经验过了，直接交给消息面处理器：它不依赖 Connection，所以这条路上 Connection 那一关不参与。
     // 把**验过的设备号**作为 principal 交下去；配对那一跳还没有设备号（presentedDevice 为空）则不传。
     forward: request => ask(request, request.body, undefined, principalOf(request.headers)),

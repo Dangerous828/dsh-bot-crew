@@ -46,7 +46,7 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
  * runs (`FIELDS`), so an item that lacks one, or whose value breaks a limit, is refused alone.
  */
 const RouteItemSchema = z.object({
-  kind: z.enum(['accept', 'attach', 'ignore', 'stop']),
+  kind: z.enum(['accept', 'attach', 'answer', 'ignore', 'stop']),
   trigger_id: z.string().describe('The candidate card\'s trigger_id; deciding it decides its batch.'),
   ticket_id: z.string().nullish().describe('attach and stop: the ticket.'),
   title: z.string().nullish().describe('accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice.'),
@@ -54,6 +54,7 @@ const RouteItemSchema = z.object({
   acknowledgement: z.string().nullish().describe(`accept: one brief sentence of at most ${IM_WORDS} words naming the concrete change and intended result in the source language. It is posted as a reply to the original source on acceptance, so do not quote the source; quote an earlier proposal briefly only when the trigger merely confirms it and the sentence does not already state it. No generic I will handle it.`),
   note: z.string().nullish().describe(`accept and attach: ${RoutingNoteSchema.description ?? ''}`),
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
+  text: z.string().nullish().describe('answer: the concise direct reply in the source language, at most 20,000 characters.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
@@ -66,6 +67,7 @@ const FIELDS: Record<Field, { check: z.ZodType; reads: readonly Kind[]; needs: r
   acknowledgement: { check: AcknowledgementSchema, reads: ['accept'], needs: ['accept'] },
   note: { check: RoutingNoteSchema, reads: ['accept', 'attach'], needs: [] },
   reason: { check: z.string().max(500), reads: ['ignore', 'stop'], needs: ['ignore'] },
+  text: { check: z.string().max(20000), reads: ['answer'], needs: ['answer'] },
 }
 /** Why an item cannot run: a field its kind needs is missing, or one it reads breaks its limit. */
 function invalid(item: RouteItem): string | undefined {
@@ -81,17 +83,18 @@ function invalid(item: RouteItem): string | undefined {
   }
   return undefined
 }
-type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; triggerIds?: readonly string[] }
+type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; triggerIds?: readonly string[]; replyId?: string }
 /**
  * Carry out one routing decision as its Engine command, in a transaction of its own. `decided` holds the Triggers that this
  * call's earlier items decided, with their batches.
  */
-function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>): Routed | { refused: string } {
+function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>, answered: ReadonlySet<string>): Routed | { refused: string } {
   const note = item.note ? { note: item.note } : {}
+  if (answered.has(item.trigger_id)) return { refused: 'Answered in this call; this candidate cannot be routed again' }
   // A Trigger an earlier item decided went with that item's Decision, also as a member of its batch.
   // A stop of it for another ticket is the Engine's to judge.
   const earlier = decided.get(item.trigger_id)
-  if (earlier && item.kind === 'ignore') return { refused: `Decided in this call with ${earlier}, whose Decision took its batch` }
+  if (earlier && (item.kind === 'ignore' || item.kind === 'answer')) return { refused: `Decided in this call with ${earlier}, whose Decision took its batch` }
   switch (item.kind) {
     case 'accept': {
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
@@ -108,6 +111,18 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
       const ticket = host.quietly(() => host.engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined))
       return { reason: 'Attached: the ticket follows the trigger\'s thread and receives the trigger', ticketId: ticket.id }
     }
+    case 'answer': {
+      const trigger = host.store.triggers.get(item.trigger_id)
+      if (!trigger) throw new UserError('unknownTrigger')
+      const owners = followupOwners(trigger, host.store)
+      if (owners.length) throw new UserError('workerDecides', { tickets: owners.join(', ') })
+      const { decision, reply } = host.store.atomic(() => {
+        const decision = host.engine.decide(item.trigger_id, { kind: 'ignore', reason: { code: 'answeredDirectly' } })
+        const reply = host.engine.reply({ purpose: 'answer', triggerId: item.trigger_id, text: item.text!, allowHandoff: false })
+        return { decision, reply }
+      })
+      return { reason: reasonText(decision.reason), triggerIds: decision.triggerIds, replyId: reply.id }
+    }
     // Through `engine.decide`, so only a person's message the gate admits with explicit strength stops a ticket.
     case 'stop': {
       const decision = host.engine.decide(item.trigger_id, { kind: 'stop', ticketId: item.ticket_id!, reason: item.reason || { code: 'humanStop' } })
@@ -120,24 +135,28 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   }
 }
 /**
- * `orchestrator_route`: routing decisions for several triggers in one call, in order. Each runs as its own Engine command; one
- * that is refused, or fails, is answered so, and the others still run.
+ * `orchestrator_route`: routing decisions for several triggers in one call, in order. Each item is atomic; one that is refused,
+ * or fails, is answered so, and the others still run.
  */
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, answer ordinary chat directly without a ticket, worker or acceptance acknowledgement, stop a ticket on a person\'s stop message, or ignore a candidate that needs no response, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }) => {
-      const decided = new Map<string, string>()
-      const results = decisions.map(item => {
+      const decided = new Map<string, string>(), answered = new Set<string>(), replies = new Map<number, string>()
+      const results = decisions.map((item, index) => {
         const head = { trigger_id: item.trigger_id, kind: item.kind }
         const problem = invalid(item)
         if (problem) return { ...head, refused: problem }
         try {
-          const result = route(host, item, decided)
+          const result = route(host, item, decided, answered)
           if ('refused' in result) return { ...head, ...result }
           for (const id of result.triggerIds ?? []) if (!decided.has(id)) decided.set(id, item.trigger_id)
+          if (result.replyId) {
+            replies.set(index, result.replyId)
+            for (const id of result.triggerIds ?? [item.trigger_id]) answered.add(id)
+          }
           const ticket = result.ticketId ? host.store.tickets.get(result.ticketId) : undefined
           return { ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
             ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
@@ -148,7 +167,11 @@ function routeTool(host: MainToolsHost): Tool {
         }
       })
       host.requestPass()
-      return { results }
+      if (replies.size) await host.sendReplies()
+      return { results: results.map((result, index) => {
+        const replyId = replies.get(index)
+        return replyId ? { ...result, status: host.store.replyStatus(replyId) ?? 'pending' } : result
+      }) }
     },
   })
 }

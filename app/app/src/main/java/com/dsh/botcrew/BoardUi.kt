@@ -37,6 +37,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -218,90 +219,6 @@ fun SessionBar(
     }
 }
 
-/** 顶栏那一行：普通 segmented「聊天 / 分拣台」，聊天模式下多一个带未读数的「事务板」。 */
-@Composable
-fun ModeHeader(
-    mode: Mode,
-    palette: CrewPalette,
-    onModeChange: (Mode) -> Unit,
-    unread: Int,
-    onOpenBoard: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(palette.card)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(9.dp))
-                .background(palette.segment)
-                .border(1.dp, palette.line, RoundedCornerShape(9.dp)),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            ModeChip("聊天", mode == Mode.Chat, palette) { onModeChange(Mode.Chat) }
-            ModeChip("分拣台", mode == Mode.Triage, palette) { onModeChange(Mode.Triage) }
-        }
-        Spacer(Modifier.weight(1f))
-        if (mode == Mode.Chat) {
-            Box {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(palette.card)
-                        .border(1.dp, palette.line, RoundedCornerShape(8.dp))
-                        .clickable(onClick = onOpenBoard)
-                        .defaultMinSize(minWidth = 48.dp, minHeight = 40.dp)
-                        .padding(horizontal = 11.dp, vertical = 8.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("事务板", color = palette.muted, fontSize = 11.sp)
-                }
-                if (unread > 0) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .offset(x = 6.dp, y = (-6).dp)
-                            .defaultMinSize(minWidth = 16.dp, minHeight = 16.dp)
-                            .clip(CircleShape)
-                            .background(palette.warn)
-                            .padding(horizontal = 3.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            if (unread > 99) "99+" else unread.toString(),
-                            color = palette.onWarn,
-                            fontSize = 9.sp,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ModeChip(label: String, selected: Boolean, palette: CrewPalette, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (selected) palette.accent else Color.Transparent)
-            .clickable(onClick = onClick)
-            .defaultMinSize(minWidth = 56.dp, minHeight = 44.dp)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            label,
-            fontSize = 12.sp,
-            fontWeight = if (selected) FontWeight(600) else FontWeight.Normal,
-            color = if (selected) palette.surface else palette.faint,
-        )
-    }
-}
-
 /**
  * 聊天模式的事务板：从右侧滑入的抽屉，压在群聊上面。
  *
@@ -317,7 +234,7 @@ fun BoardDrawer(
     onJumpToMessage: (String) -> Unit,
     problem: String? = null,
     /** 点「等你拍板」的选项：把这句原样发回去，done(true/false) 用来解除这一格的发送态。 */
-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit = { _, _, _ -> },
+    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit = { _, _, _ -> },
 ) {
     Dialog(
         onDismissRequest = onDismiss,
@@ -327,10 +244,8 @@ fun BoardDrawer(
         LaunchedEffect(Unit) { shown = true }
         val slide by animateDpAsState(targetValue = if (shown) 0.dp else 306.dp)
         val groups = boardGroups(conversation)
-        val answerState = rememberBoardAnswerState(
-            resetKey = groups?.deciding?.firstOrNull()?.let { CrewWire.answerSignature(it) },
-            onAnswer = onAnswer,
-        )
+        var doneExpanded by remember { mutableStateOf(false) }
+        val answerState = rememberBoardAnswerState(onAnswer = onAnswer)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -367,7 +282,8 @@ fun BoardDrawer(
                     Spacer(Modifier.weight(1f))
                     Box(
                         modifier = Modifier
-                            .size(40.dp)
+                            // 关闭是这张抽屉唯一的点击目标：命中区 ≥48（视觉 × 仍 18sp）。
+                            .size(48.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .clickable(onClick = onDismiss),
                         contentAlignment = Alignment.Center,
@@ -387,8 +303,10 @@ fun BoardDrawer(
                         problem = problem,
                         palette = palette,
                         titles = BoardTitles("还没回的话", "在跑", "等你拍板", "办完"),
-                        answering = answerState.answering,
-                        note = answerState.note,
+                        phaseOf = answerState.phaseOf,
+                        noteFor = { ticket -> answerState.phaseOf(ticket.id).note },
+                        doneExpanded = doneExpanded,
+                        onToggleDone = { doneExpanded = !doneExpanded },
                         onAnswer = answerState.answer,
                         onJump = { messageId -> onDismiss(); onJumpToMessage(messageId) },
                     )
@@ -420,31 +338,15 @@ fun TriageScreen(
     enabled: Boolean,
     problem: String?,
     onDrop: (String) -> Unit,
-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit = { _, _, _ -> },
+    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit = { _, _, _ -> },
     onJumpToMessage: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val focus = remember { FocusRequester() }
     val groups = boardGroups(conversation)
-    val answerState = rememberBoardAnswerState(
-        resetKey = groups?.deciding?.firstOrNull()?.let { CrewWire.answerSignature(it) },
-        onAnswer = onAnswer,
-    )
+    var doneExpanded by remember { mutableStateOf(false) }
+    val answerState = rememberBoardAnswerState(onAnswer = onAnswer)
     Column(modifier = modifier.fillMaxSize().background(palette.surface)) {
-        // 大按钮不另做假的「图 / 语音」入口：输入框只发文本，点它就是把焦点交给输入行。
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 8.dp)
-                .height(58.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(palette.card)
-                .border(1.dp, palette.accent, RoundedCornerShape(10.dp))
-                .clickable { focus.requestFocus() },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text("＋ 丢一件进来", color = palette.accent, fontSize = 16.sp, fontWeight = FontWeight(600))
-        }
         LazyColumn(
             modifier = Modifier.weight(1f),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
@@ -456,8 +358,10 @@ fun TriageScreen(
                 problem = problem,
                 palette = palette,
                 titles = BoardTitles("刚丢进来的", "各人在跑", "等你拍板", "办完"),
-                answering = answerState.answering,
-                note = answerState.note,
+                phaseOf = answerState.phaseOf,
+                noteFor = { ticket -> answerState.phaseOf(ticket.id).note },
+                doneExpanded = doneExpanded,
+                onToggleDone = { doneExpanded = !doneExpanded },
                 onAnswer = answerState.answer,
                 onJump = onJumpToMessage,
             )
@@ -509,36 +413,51 @@ fun TriageScreen(
     }
 }
 
-/** 选项按钮的发送态与回执：一次只答一题，问题或选项换了旧的那一组随即作废。 */
+/**
+ * 选项按钮的发送态与回执。**按票**各持一份 gate（不是所有票共用一份，也不是按选项各自在途）：
+ * - 同一张票任一时刻只允许一个答复在途（同题互斥，A/B 不会同时发两次）；
+ * - 不同票各锁各的，答 A 不会锁住 B；第一张换题也不会重置别的票的锁；
+ * - 提交中画「提交中…」、受理后画「已受理，等待状态更新」，锁着直到**这一张票**的时间线收敛。
+ *
+ * 从前按「票号|选项」各自在途 → 同题并发；后来又差点变成所有票共用一份 state → 一张答了锁全部。
+ * 这里按 ticket.id 各建一个 [ApprovalGateHolder]，[phaseOf] 按票取、[answer] 按票发。
+ */
 private class BoardAnswerState(
-    val answering: Set<String>,
-    val note: Pair<String, String>?,
+    val phaseOf: (String) -> ApprovalGate.State,
     val answer: (WorkTicket, AttentionOption) -> Unit,
 )
 
 @Composable
 private fun rememberBoardAnswerState(
-    resetKey: String?,
-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit,
+    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit,
 ): BoardAnswerState {
-    var answering by remember { mutableStateOf(emptySet<String>()) }
-    var note by remember { mutableStateOf<Pair<String, String>?>(null) }
-    LaunchedEffect(resetKey) {
-        answering = emptySet()
-        note = null
+    // ticket.id → holder。只在第一次遇到这张票时建 holder；之后复用（同票的锁跨重组保留）。
+    val holders = remember { mutableStateMapOf<String, ApprovalGateHolder>() }
+    fun holderFor(ticket: WorkTicket): ApprovalGateHolder {
+        // 按 ticket.id keyed（attention 变化靠签名在 holder 内收敛，无需单独 key）。
+        return holders.getOrPut(ticket.id) {
+            // holder 的签名 = 这张票当前的问题签名（含 attention 范围）；切票/换题自然收敛。
+            ApprovalGateHolder { CrewWire.answerSignature(ticket) + "|" + ticket.attentionId }
+        }
     }
+    // 清掉已经不在时间线里的票的 holder（票消失 → 回收；旧请求回来只更新已被移除的旧 holder，
+    // 不再被渲染，也就不污染任何可见卡）。每次重组按当前持票集合收口。
     val answer: (WorkTicket, AttentionOption) -> Unit = { ticket, option ->
-        val slot = CrewWire.answerSlot(ticket.id, option.id)
-        if (slot !in answering) {
-            answering = answering + slot
-            note = null
-            onAnswer(ticket, option) { ok ->
-                answering = answering - slot
-                note = slot to if (ok) AnswerCopy.ANSWER_DONE else AnswerCopy.answerFailed(null)
+        val holder = holderFor(ticket)
+        if (holder.begin()) {
+            onAnswer(ticket, option) { outcome ->
+                when (outcome) {
+                    ApprovalGate.Outcome.Accepted -> holder.accepted()
+                    ApprovalGate.Outcome.Stale -> holder.stale()
+                    ApprovalGate.Outcome.Failed -> holder.failed(null)
+                }
             }
         }
     }
-    return BoardAnswerState(answering, note, answer)
+    return BoardAnswerState(
+        phaseOf = { id -> holders[id]?.state ?: ApprovalGate.State() },
+        answer = answer,
+    )
 }
 
 private data class BoardTitles(val waiting: String, val running: String, val deciding: String, val done: String)
@@ -553,8 +472,10 @@ private fun LazyListScope.boardSections(
     problem: String?,
     palette: CrewPalette,
     titles: BoardTitles,
-    answering: Set<String>,
-    note: Pair<String, String>?,
+    phaseOf: (String) -> ApprovalGate.State,
+    noteFor: (WorkTicket) -> String?,
+    doneExpanded: Boolean,
+    onToggleDone: () -> Unit,
     onAnswer: (WorkTicket, AttentionOption) -> Unit,
     onJump: (String) -> Unit,
 ) {
@@ -591,12 +512,23 @@ private fun LazyListScope.boardSections(
             )
         }
     }
-    if (groups.waiting.isNotEmpty()) {
-        item(key = "head-waiting") {
-            BoardGroupTitle("${titles.waiting} · ${groups.waiting.size}", palette)
+    // 顺序：待你处理（deciding）第一 —— 这是「现在只有这一件事等你」；再在跑、还没回的话、办完。
+    if (groups.deciding.isNotEmpty()) {
+        item(key = "head-deciding") {
+            BoardGroupTitle("${titles.deciding} · ${groups.deciding.size}", palette, tint = palette.warn)
         }
-        itemsIndexed(groups.waiting, key = { index, _ -> "waiting-$index" }) { _, waiting ->
-            BoardWaitingRow(waiting, palette, onClick = jumpFor(waiting.messageId, onJump))
+        itemsIndexed(groups.deciding, key = { index, ticket -> "deciding-$index-${ticket.id}" }) { _, ticket ->
+            BoardTicketRow(
+                ticket = ticket,
+                conversation = conversation,
+                palette = palette,
+                showProgress = false,
+                showOptions = true,
+                phase = phaseOf(ticket.id),
+                note = noteFor(ticket),
+                onAnswer = onAnswer,
+                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
+            )
         }
     }
     if (groups.running.isNotEmpty()) {
@@ -610,48 +542,68 @@ private fun LazyListScope.boardSections(
                 palette = palette,
                 showProgress = true,
                 showOptions = false,
-                answering = answering,
-                note = note,
+                phase = phaseOf(ticket.id),
+                note = null,
                 onAnswer = onAnswer,
                 onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
             )
         }
     }
-    if (groups.deciding.isNotEmpty()) {
-        item(key = "head-deciding") {
-            BoardGroupTitle("${titles.deciding} · ${groups.deciding.size}", palette, tint = palette.warn)
+    if (groups.waiting.isNotEmpty()) {
+        item(key = "head-waiting") {
+            BoardGroupTitle("${titles.waiting} · ${groups.waiting.size}", palette)
         }
-        itemsIndexed(groups.deciding, key = { index, ticket -> "deciding-$index-${ticket.id}" }) { _, ticket ->
-            BoardTicketRow(
-                ticket = ticket,
-                conversation = conversation,
-                palette = palette,
-                showProgress = false,
-                showOptions = true,
-                answering = answering,
-                note = note,
-                onAnswer = onAnswer,
-                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
-            )
+        itemsIndexed(groups.waiting, key = { index, _ -> "waiting-$index" }) { _, waiting ->
+            BoardWaitingRow(waiting, palette, onClick = jumpFor(waiting.messageId, onJump))
         }
     }
     if (groups.done.isNotEmpty()) {
+        // 已办默认折叠成一行：任务/审批优先级高于回看历史，22 条办完不该淹没首屏。
         item(key = "head-done") {
-            BoardGroupTitle("${titles.done} · ${groups.done.size}", palette)
-        }
-        itemsIndexed(groups.done, key = { index, ticket -> "done-$index-${ticket.id}" }) { _, ticket ->
-            BoardTicketRow(
-                ticket = ticket,
-                conversation = conversation,
+            DoneFoldRow(
+                count = groups.done.size,
+                expanded = doneExpanded,
                 palette = palette,
-                showProgress = false,
-                showOptions = false,
-                answering = answering,
-                note = note,
-                onAnswer = onAnswer,
-                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
+                onToggle = onToggleDone,
             )
         }
+        if (doneExpanded) {
+            itemsIndexed(groups.done, key = { index, ticket -> "done-$index-${ticket.id}" }) { _, ticket ->
+                BoardTicketRow(
+                    ticket = ticket,
+                    conversation = conversation,
+                    palette = palette,
+                    showProgress = false,
+                    showOptions = false,
+                    phase = phaseOf(ticket.id),
+                    note = null,
+                    onAnswer = onAnswer,
+                    onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
+                )
+            }
+        }
+    }
+}
+
+/** 已办那一行：默认收起，点开展开。数字来自后端分桶，前端不另数一份。 */
+@Composable
+private fun DoneFoldRow(count: Int, expanded: Boolean, palette: CrewPalette, onToggle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp, bottom = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(palette.card)
+            .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+            .clickable(onClick = onToggle)
+            .defaultMinSize(minHeight = 48.dp)
+            .padding(horizontal = 11.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("✓", color = palette.faint, fontSize = 12.sp)
+        Spacer(Modifier.width(8.dp))
+        Text("办完 · $count", color = palette.muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        Text(if (expanded) "收起" else "展开", color = palette.faint, fontSize = 11.sp)
     }
 }
 
@@ -708,8 +660,8 @@ private fun BoardTicketRow(
     palette: CrewPalette,
     showProgress: Boolean,
     showOptions: Boolean,
-    answering: Set<String>,
-    note: Pair<String, String>?,
+    phase: ApprovalGate.State,
+    note: String?,
     onAnswer: (WorkTicket, AttentionOption) -> Unit,
     onClick: (() -> Unit)?,
 ) {
@@ -744,8 +696,12 @@ private fun BoardTicketRow(
             // owner 与步数都只在后端给了才拼；bot_id 空、没有计划时这一行整行不画。
             val owner = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim()
                 ?: ticket.botId.trim()
-            // state=unknown 时后端这份计划说不清走到哪，步数文字也跟着不画。
-            val stepText = if (ticket.state == "unknown") "" else stepOf(ticket)
+            // state=unknown：后端这份计划说不清走到哪。如实说「进度未明」，不假造步数、
+            // 也不把它当成「在跑某一步」蒙混过去。
+            val stepText = when {
+                ticket.state == "unknown" -> "进度未明"
+                else -> stepOf(ticket)
+            }
             val parts = listOfNotNull(
                 owner.takeIf { it.isNotEmpty() },
                 stepText.takeIf { it.isNotEmpty() },
@@ -797,8 +753,8 @@ private fun BoardTicketRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     for (option in ticket.options) {
-                        val slot = CrewWire.answerSlot(ticket.id, option.id)
-                        val busy = slot in answering
+                        // 同题互斥：这张票一旦有答复在途/已受理，所有选项一起禁用。
+                        val busy = phase.busy
                         Box(
                             modifier = Modifier
                                 .weight(1f)
@@ -806,13 +762,15 @@ private fun BoardTicketRow(
                                 .background(palette.card)
                                 .border(1.dp, palette.warnEdge, RoundedCornerShape(6.dp))
                                 .clickable(enabled = !busy) { onAnswer(ticket, option) }
-                                .defaultMinSize(minHeight = 36.dp)
+                                .defaultMinSize(minHeight = 48.dp)
                                 .padding(horizontal = 7.dp, vertical = 8.dp),
                             contentAlignment = Alignment.Center,
                         ) {
+                            // 提交中 ≠ 答成：只在真正在途那一瞬说「提交中…」，不画 ✓。
+                            val label = if (busy && phase.submitting) "提交中…" else option.label
                             Text(
-                                if (busy) "✓" else option.label,
-                                color = palette.warn,
+                                label,
+                                color = if (busy) palette.faint else palette.warn,
                                 fontSize = 10.sp,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -821,8 +779,8 @@ private fun BoardTicketRow(
                     }
                 }
             }
-            if (note != null && note.first.startsWith(ticket.id + "|")) {
-                Text(note.second, color = palette.faint, fontSize = 10.sp,
+            note?.let {
+                Text(it, color = palette.faint, fontSize = 10.sp,
                     modifier = Modifier.padding(top = 6.dp))
             }
         }

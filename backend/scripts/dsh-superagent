@@ -58,22 +58,49 @@ def lan_address():
     return None
 
 
+def dsh_home():
+    return Path(os.environ.get('DSH_HOME') or (Path.home() / '.dsh')).expanduser()
+
+
+def profile_patch(profile: str):
+    return dsh_home() / 'profiles' / profile / 'cordis.patch.yml'
+
+
 def profile_state_dir(profile: str):
     """Return the stateDir this profile's dsh-superagent entry configures, if it names one.
 
     The gateway is launched from here, not by the plugin, so it cannot ask the backend where the queue lives. Reading the
     same patch the backend reads keeps the two in step: a profile with its own stateDir gets its own queue and token.
     """
-    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    patch = profile_patch(profile)
     if not patch.exists():
         return None
     text = patch.read_text()
     match = re.search(r'(?ms)^- id: dsh-superagent\n(?:.*?\n)*?\s+stateDir: (\S+)', text)
     return Path(match.group(1)).expanduser() if match else None
 
+
+def profile_plugin_disabled(profile: str, plugin: str) -> bool:
+    patch = profile_patch(profile)
+    if not patch.is_file():
+        return False
+    active = False
+    for line in patch.read_text().splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith('- id:'):
+            active = stripped[len('- id:'):].strip().strip("'\"") == plugin
+        elif active and re.fullmatch(r'\s+disabled:\s+true\s*(?:#.*)?', line):
+            return True
+    return False
+
+
+def profile_no_web(profile: str) -> bool:
+    return all(profile_plugin_disabled(profile, plugin) for plugin in ('webserver', 'web-runtime', 'modules', 'client-hmr'))
+
+
 def sync_bind_address(address: str, profile: str) -> None:
     """Point the profile's webserver host at `address`, leaving the file untouched when it already matches."""
-    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    patch = profile_patch(profile)
     if not patch.exists():
         return
     text = patch.read_text()
@@ -102,7 +129,7 @@ def configured_bind_address(profile: str):
     `sync_bind_address` 只在启动时改它。机器换了网络而进程还活着时，配置里留着的还是上一张网卡的地址 ——
     这时后端绑在一个本机已经没有的地址上，手机连过来是「拒绝连接」，而所有健康检查都是绿的。
     """
-    patch = Path.home() / '.dsh' / 'profiles' / profile / 'cordis.patch.yml'
+    patch = profile_patch(profile)
     if not patch.exists():
         return None
     in_webserver = False
@@ -139,7 +166,7 @@ PRODUCTION_GATEWAY_PORT = 8788
 
 def default_state_dir():
     """The historical default state directory, the one a profile without `stateDir` gets."""
-    return Path.home() / '.dsh' / 'state' / 'superagent'
+    return dsh_home() / 'state' / 'superagent'
 
 
 def owns_gateway(pid, port, state_dir):
@@ -210,19 +237,54 @@ def processes(profile):
     return found + [pid] if pid not in found and running(pid, profile) else found
 
 
-def state(url):
-    """Fetch health and setup status from the management API, or return None if unreachable."""
-    request = urllib.request.Request(url.rstrip('/') + '/orchestrator/api/state',
+def headless_descriptor(profile):
+    if not profile_no_web(profile):
+        return None
+    state_dir = profile_state_dir(profile) or default_state_dir()
+    descriptor_path = state_dir.resolve() / 'headless-health.json'
+    try:
+        metadata = descriptor_path.stat()
+        if metadata.st_mode & 0o077 or metadata.st_uid != os.getuid():
+            return None
+        descriptor = json.loads(descriptor_path.read_text())
+        if not isinstance(descriptor, dict):
+            return None
+    except (OSError, ValueError):
+        return None
+    pid = descriptor.get('pid')
+    expected_state = str(state_dir.resolve())
+    if (descriptor.get('version') != 1 or descriptor.get('profile') not in (profile, 'unknown')
+            or descriptor.get('stateDir') != expected_state or descriptor.get('host') != '127.0.0.1'
+            or not isinstance(descriptor.get('port'), int) or not (1 <= descriptor['port'] <= 65535)
+            or not isinstance(pid, int) or not running(pid, profile)):
+        return None
+    return descriptor
+
+
+def state(url, profile):
+    """Fetch profile-scoped health, never borrowing a Web listener for a no-Web profile."""
+    descriptor = headless_descriptor(profile)
+    if profile_no_web(profile) and descriptor is None:
+        return None
+    endpoint = f"http://127.0.0.1:{descriptor['port']}" if descriptor else url
+    request = urllib.request.Request(endpoint.rstrip('/') + '/orchestrator/api/state',
                                      headers={'x-orchestrator-request': '1'})
     try:
         with urllib.request.urlopen(request, timeout=2) as response:
             value = json.load(response)
+        if descriptor:
+            identity = value.get('headless') or {}
+            if (identity.get('profile') != descriptor.get('profile') or identity.get('pid') != descriptor.get('pid')
+                    or identity.get('stateDir') != descriptor.get('stateDir') or identity.get('port') != descriptor.get('port')):
+                return None
         # Keys omitted by another version read as empty so the service is not mistaken for unreachable.
         health, setup = value.get('health') or {}, value.get('setup') or {}
         entries = {name: entry if isinstance(entry, dict) else {} for name, entry in health.items()}
         return {'health': {name: entry.get('state') for name, entry in entries.items()},
                 'errors': {name: str(entry.get('detail', '')) for name, entry in entries.items() if entry.get('state') == 'error'},
-                'setup': setup.get('problem'), 'feishu': setup.get('feishuProblem')}
+                'setup': setup.get('problem'), 'feishu': setup.get('feishuProblem'),
+                'load': value.get('load'), 'paused': value.get('paused'), 'url': endpoint,
+                'mode': 'no-web' if descriptor else 'web'}
     except (OSError, ValueError, AttributeError):
         return None
 
@@ -253,14 +315,17 @@ def outcome(pids, current):
 
 def status(args):
     pids = processes(args.profile)
-    current = state(args.url) if pids else None
+    current = state(args.url, args.profile) if pids else None
+    no_web = profile_no_web(args.profile)
     # 进程活着但绑在旧网卡上时，手机连不上而所有健康项都是绿的。这里主动说出来。
     # Ask once and reuse: each call re-reads the patch file, so asking twice can even disagree with itself.
-    drift = bind_drift(args.profile)
-    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'url': args.url,
+    drift = None if no_web else bind_drift(args.profile)
+    print(json.dumps({'pids': pids, 'cwd': str(ROOT), 'mode': 'no-web' if no_web else 'web',
+                      'url': current and current['url'] or (None if no_web else args.url),
                       'manually_stopped': stopped(args.profile), 'health': current and current['health'],
                       'errors': current and current['errors'], 'setup': current and current['setup'],
-                      'feishu': current and current['feishu'],
+                      'feishu': current and current['feishu'], 'load': current and current['load'],
+                      'paused': current and current['paused'],
                       **({'bind_stale': drift} if drift else {})},
                      ensure_ascii=False, indent=2))
     return outcome(pids, current)
@@ -323,7 +388,7 @@ def state_dir_identity(state_dir):
     keeps it the same on every restart (so nothing has to remember it) while a second crew lands somewhere else.
     8788 stays what it has always been, so a profile on the default state directory does not move.
     """
-    if Path(state_dir).resolve() == (Path.home() / '.dsh' / 'state' / 'superagent').resolve():
+    if Path(state_dir).resolve() == (dsh_home() / 'state' / 'superagent').resolve():
         return 8788
     digest = sum(ord(character) for character in str(Path(state_dir).resolve()))
     return 18800 + digest % 100
@@ -444,13 +509,14 @@ def ensure_gateway(profile=None):
 
 def start(args):
     session = 'dsh-' + args.profile
+    no_web = profile_no_web(args.profile)
     pids = processes(args.profile)
     if len(pids) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to start another.')
     if pids:
         # 已经在跑：这时改不了它绑的地址（那要重启）。但地址漂了就得说出来 ——
         # 不说的话，人只会看到手机连不上，而 status 全绿，没有任何线索。
-        drift = bind_drift(args.profile)
+        drift = None if no_web else bind_drift(args.profile)
         if drift:
             print(f'note: this machine is now reachable at {drift}, but the running backend is bound elsewhere '
                   f'({configured_bind_address(args.profile)}). `restart` re-points it.', file=sys.stderr)
@@ -461,16 +527,14 @@ def start(args):
         # The backend binds one concrete address, which changes whenever this machine joins another network.
         # Re-point the profile at the current one before starting, so a moved laptop starts instead of failing
         # with EADDRNOTAVAIL against an address it no longer holds.
-        lan = lan_address()
+        lan = None if no_web else lan_address()
         if lan:
             sync_bind_address(lan, args.profile)
-            # 后端绑的是 LAN 地址，本机回环由 loopproxy 桥接。健康检查（默认 127.0.0.1:3082）
-            # 与模拟器都走回环，所以代理必须在启动之前就起来 —— 等健康检查成功再拉，
-            # 首次启动必然在回环上等满 60 秒后误报超时。
+            # Web mode binds a LAN address and uses loopproxy for local health checks; no-Web mode has no Web bind.
             ensure_loopproxy(lan)
         exists = subprocess.run(['tmux', 'has-session', '-t', '=' + session],
                                 capture_output=True).returncode == 0
-        if state(args.url) is not None:
+        if state(args.url, args.profile) is not None:
             raise RuntimeError('An existing orchestrator answers at this URL; refusing duplicate startup.')
         stamp = time.strftime('%Y%m%d-%H%M%S')
         log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
@@ -481,20 +545,23 @@ def start(args):
         # refused unless that exact `host:port` is named. Phones and the emulator both do, so every form the backend
         # can be reached under is listed here rather than only the bare address.
         fences = []
-        for port in (3082, 9082):
-            if lan:
-                fences += ['--trusted-host', f'{lan}:{port}']
-            fences += ['--trusted-host', f'127.0.0.1:{port}']
-            # The emulator reaches this machine's loopback as 10.0.2.2 and sends that name, so the fence has to
-            # know it too; without it every request from the emulator is refused after the connection succeeds.
-            fences += ['--trusted-host', f'10.0.2.2:{port}']
+        if not no_web:
+            for port in (3082, 9082):
+                if lan:
+                    fences += ['--trusted-host', f'{lan}:{port}']
+                fences += ['--trusted-host', f'127.0.0.1:{port}']
+                # The emulator reaches this machine's loopback as 10.0.2.2 and sends that name, so the fence has to
+                # know it too; without it every request from the emulator is refused after the connection succeeds.
+                fences += ['--trusted-host', f'10.0.2.2:{port}']
         # 中转的地址与密钥放在仓库外（`relay.env`，600）；启动前载入，隧道才知道往哪连。
         # 文件不存在就什么都不做：不是每台机器都需要出门。
         relay_env = Path.home() / '.config' / 'crew-desktop' / 'relay.env'
         load_relay = ('set -a; . ' + shlex.quote(str(relay_env)) + '; set +a; ') if relay_env.is_file() else ''
-        command = (load_relay + 'umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open',
-                 *([ '--trusted-host', lan ] if lan else []), *fences,
-                 '--trusted-host', 'muse.kentonnie.top'])
+        command_args = [dsh, '--profile', args.profile]
+        if not no_web:
+            command_args += ['--no-open', *(['--trusted-host', lan] if lan else []), *fences,
+                             '--trusted-host', 'muse.kentonnie.top']
+        command = (load_relay + 'umask 077; exec ' + shlex.join(command_args)
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
         # Reuse an existing tmux session without disturbing other windows.
         target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]
@@ -509,12 +576,15 @@ def start(args):
     (control(args.profile) / 'manually-stopped').unlink(missing_ok=True)
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
-        current = state(args.url)
+        current = state(args.url, args.profile)
         if processes(args.profile) and runtime_up(current):
             code = status(args)
             if current['setup']:
-                print('dsh-superagent is waiting for setup: ' + str(current['setup'].get('detail', '')))
-                print('Open the URL DSH printed in the log, then the dsh-superagent overview.')
+                print('dsh-superagent is waiting for profile setup: ' + str(current['setup'].get('detail', '')))
+                if no_web:
+                    print('Complete setup in the profile configuration; the Web UI is disabled.')
+                else:
+                    print('Open the URL DSH printed in the log, then the dsh-superagent overview.')
             if current['feishu']:
                 print('dsh-superagent runs without Feishu: ' + str(current['feishu'].get('detail', '')))
                 print('Fix it on the Feishu card of the Source settings.')

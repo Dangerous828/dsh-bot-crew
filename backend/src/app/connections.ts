@@ -134,6 +134,27 @@ export function judgeCall(config: ConnectionConfig, server: string, tool: string
  * 所以这里返回的是**这个服务器上所有属于这条连接的工具**。真正拦人的是 `judgeCall`，
  * 白名单只负责把不属于这三类的东西挡在门外。
  */
+/**
+ * 一次 `send_message` 的署名：调用自己给了 `bot_id` 就用它，没给就是**这张票的 Bot**。
+ *
+ * `bot_id` 在工具 schema 里是可选的，模型常常不填；不填不等于「没有身份」，而是「以接单的这位回话」。
+ * 返回的是一份**拷贝**：SDK 已在 dispatch 前把参数 `deepFreeze`，就地改不动也不该改；调用方（worker 作用域的
+ * 同名 wrapper）用这份拷贝去执行原工具，审批签名也用同一份 —— 两边算的是同一次调用。
+ */
+export function signMessageCall(args: unknown, bot: string | undefined): unknown {
+  if (!bot || !args || typeof args !== 'object' || Array.isArray(args)) return args
+  const call = args as Record<string, unknown>
+  if (typeof call.bot_id === 'string' && call.bot_id) return args
+  return { ...call, bot_id: bot }
+}
+
+/** 一条工具名属于哪个连接，以及剥掉前缀后的工具名；不属于任何连接时 undefined。 */
+export function connectionOfCall(config: ConnectionConfig, name: string): { connection: Connection; tool: string } | undefined {
+  const connection = config.connections.find(item => name.startsWith(`mcp__${item.server}__`))
+  if (!connection) return undefined
+  return { connection, tool: name.slice(`mcp__${connection.server}__`.length) }
+}
+
 export function allowedTools(config: ConnectionConfig): string[] {
   const names: string[] = []
   for (const connection of config.connections) {

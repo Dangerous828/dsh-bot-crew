@@ -2,11 +2,12 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { phoneHandler, queuedRequests, registerMobileHttp, unreadOf } from '../src/app/mobile-http.ts'
-import { planFrom, planOf, workOf } from '../src/app/work.ts'
+import { phoneHandler, queuedRequests, queuedStateOf, registerMobileHttp, unreadOf, withRequestStates } from '../src/app/mobile-http.ts'
+import { agentTree, planFrom, planOf, workOf, type AgentRegistry } from '../src/app/work.ts'
 import { DeviceStore, issuePairingCode } from '../src/app/remote.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
+import type { Ticket } from '../src/core/model.ts'
 
 const directories: string[] = []
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
@@ -15,7 +16,7 @@ afterEach(() => { for (const directory of directories.splice(0)) rmSync(director
 const ticket = (over: Record<string, unknown> = {}) => ({
   id: 'tk1', title: '调开登录页间距', createdAt: '2026-11-09T10:00:00.000Z', updatedAt: '2026-11-09T10:03:00.000Z',
   channels: [{ source: 'team' }], execution: { name: 'fix-spacing', session_id: 'worker-tk1' },
-  ended: undefined, ...over,
+  assignments: [], ended: undefined, ...over,
 })
 
 function host(over: { tickets?: { id?: string }[]; bots?: unknown[] } = {}) {
@@ -73,12 +74,40 @@ it('returns how one ticket was worked, in order', async () => {
   expect(upstream).not.toHaveBeenCalled()
   const got = await response.json() as { ticket_id?: string; title?: string; stage?: string; steps?: { kind: string; at: string }[] }
   expect(got.ticket_id).toBe('tk1')
-  // A live ticket's stage comes from the stage machine; this fixture has no assignments, so it reports `unknown`
-  // rather than failing. An ended ticket is checked below.
-  expect(got.stage).toBe('unknown')
+  // With no assignments, the stage machine reports the ticket as working through the queue.
+  // An ended ticket is checked below.
+  expect(got.stage).toBe('working')
   expect(got.title).toBe('调开登录页间距')
   // Steps are ordered by time. The store carries none yet, so the list is empty rather than invented.
   expect(got.steps).toEqual([])
+})
+
+it('projects the ticket root and child session states from current evidence', () => {
+  const root = 'worker-tree'
+  const sessions = new Map([
+    [root, { id: root, status: 'running', session: { id: root, header: {} } }],
+    ['child-running', { id: 'child-running', status: 'running', session: { id: 'child-running', header: { parentSession: root } } }],
+    ['child-idle', { id: 'child-idle', status: 'idle', session: { id: 'child-idle', header: { parentSession: root } } }],
+  ])
+  const agents = { get: (id: string) => sessions.get(id) } as unknown as AgentRegistry
+  const pending = ticket({ id: 'tree', attention: { id: 'q1', question: '确认一下' } }) as unknown as Ticket
+
+  expect(agentTree(agents, 'tree', 8, [root, 'child-running', 'child-idle'], pending)).toMatchObject([
+    { id: root, label: '工单', state: 'waiting_for_person', children: [
+      { id: 'child-running', label: '子代理', state: 'working' },
+      { id: 'child-idle', label: '子代理', state: 'idle' },
+    ] },
+  ])
+})
+
+it('keeps a live worker Agent as the tree root', () => {
+  const root = 'worker-root-ticket'
+  const agent = { id: root, status: 'running', session: { id: root, header: {} } }
+  const agents = { get: (id: string) => id === root ? agent : undefined, list: () => [agent] } as unknown as AgentRegistry
+
+  expect(agentTree(agents, 'root-ticket')).toEqual([
+    { id: root, label: '工单', state: 'working', children: [] },
+  ])
 })
 
 it('reports the outcome of a ticket that ended', async () => {
@@ -101,9 +130,12 @@ it('returns the subagent tree of a worker, however deep it goes', async () => {
   const headers: Record<string, string | undefined> = {
     'worker-tk1': undefined, 'sub-a': 'worker-tk1', 'sub-a-1': 'sub-a', 'sub-b': 'worker-tk1', unrelated: undefined,
   }
+  const liveAgents = Object.entries(headers).map(([id, parentSession]) => ({
+    id, status: 'running' as const, session: { id, header: { parentSession } },
+  }))
   const tree = {
-    get: (id: string) => id in headers ? { session: { header: { parentSession: headers[id] } } } : undefined,
-    list: () => Object.keys(headers),
+    get: (id: string) => liveAgents.find(agent => agent.id === id),
+    list: () => liveAgents,
   }
   const runtimeHost = { ...host(), agents: tree } as unknown as HttpHost
   const upstream = vi.fn(async () => Response.json({}))
@@ -162,18 +194,22 @@ it('refuses a model change with no model named', async () => {
   expect(upstream).not.toHaveBeenCalled()
 })
 
-it('reports a sent message with no reply yet as still queued', async () => {
+it('offers withdrawal only for unread user messages and keeps unknown queue completeness separate', async () => {
   const upstream = vi.fn(async () => Response.json({ items: [
-    { id: 'm1', role: 'user', text: '改一下间距', request_id: 'req-1', at: new Date().toISOString() },
+    { id: 'm1', role: 'user', text: '改一下间距', request_id: 'req-1', at: new Date().toISOString(), read_at: '' },
     { id: 'r1', role: 'agent', text: '好', bot_id: 'lin', reply_to: 'm1' },
-    { id: 'm3', role: 'user', text: '顺便看下 SE', request_id: 'req-2', at: new Date().toISOString() },
+    { id: 'm2', role: 'user', text: '继续看下', request_id: 'req-2', at: new Date().toISOString(), read_at: '2026-11-09T10:00:00Z' },
+    { id: 'm3', role: 'user', text: '顺便看下 SE', request_id: 'req-3', at: new Date().toISOString(), read_at: '' },
+    { id: 'r3', role: 'agent', text: '收到', bot_id: 'lin', reply_to: 'm3' },
+    { id: 'm4', role: 'user', text: '已撤回', request_id: 'req-4', at: new Date().toISOString(), read_at: '', withdrawn: true },
+    { id: 'm5', role: 'user', text: '旧网关字段缺失', request_id: 'req-5', at: new Date().toISOString() },
   ] }))
   const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
   const response = await handler(new Request('http://dsh/api/mobile/timeline'))
-  const body = await response.json() as { queued?: string[]; error?: string }
+  const body = await response.json() as { queued?: string[]; queued_state?: string; error?: string }
   expect({ status: response.status, error: body.error }).toEqual({ status: 200, error: undefined })
-  // m1 was answered, m3 was not: only m3 can still be withdrawn.
-  expect(body.queued).toEqual(['req-2'])
+  expect(body.queued).toEqual([])
+  expect(body.queued_state).toBe('unknown')
 })
 
 it('drops a request from queued once the gateway accepts its withdrawal', async () => {
@@ -184,7 +220,7 @@ it('drops a request from queued once the gateway accepts its withdrawal', async 
       return Response.json({ ok: true, id: 1, request_id: 'req-1' })
     }
     return Response.json({ items: withdrawn ? [] : [
-      { id: 'm1', role: 'user', text: '这条反悔了', request_id: 'req-1', at: new Date().toISOString() },
+      { id: 'm1', role: 'user', text: '这条反悔了', request_id: 'req-1', at: new Date().toISOString(), read_at: '' },
     ] })
   })
   const handler = phoneHandler(host(), 'http://127.0.0.1:8788', upstream as typeof fetch)
@@ -196,19 +232,66 @@ it('drops a request from queued once the gateway accepts its withdrawal', async 
   expect((await timeline()).queued).toEqual([])
 })
 
-it('stops offering a withdraw once the crew has had time to pick the message up', () => {
-  const now = Date.parse('2026-11-09T10:00:00.000Z')
+it('offers an old message only while the gateway reports it unread', () => {
   const items = [
-    { id: 'm1', role: 'user', request_id: 'fresh', at: '2026-11-09T09:59:30.000Z' },
-    // Older than the window: the crew is on it, so it can no longer be taken back.
-    { id: 'm2', role: 'user', request_id: 'stale', at: '2026-11-09T09:55:00.000Z' },
+    { id: 'm1', role: 'user', request_id: 'fresh', at: '2026-11-09T09:59:30.000Z', read_at: '' },
+    { id: 'm2', role: 'user', request_id: 'stale', at: '2026-11-09T09:55:00.000Z', read_at: '' },
+    { id: 'm3', role: 'user', request_id: 'read', at: '2026-11-09T09:59:30.000Z', read_at: '2026-11-09T09:59:45.000Z' },
   ]
-  expect(queuedRequests(items, now)).toEqual(['fresh'])
+  expect(queuedRequests(items)).toEqual(['fresh', 'stale'])
 })
 
-it('keeps a message whose time cannot be read rather than hiding it', () => {
-  // An unreadable timestamp is not evidence the crew picked it up.
-  expect(queuedRequests([{ id: 'm1', role: 'user', request_id: 'odd', at: 'not a time' }])).toEqual(['odd'])
+it('does not treat absent read evidence as an empty queue', () => {
+  const items = [{ id: 'm1', role: 'user', request_id: 'unknown', at: 'not a time' }]
+  expect(queuedRequests(items)).toEqual([])
+  expect(queuedStateOf(items)).toBe('unknown')
+  expect(queuedStateOf([{ id: 'm1', role: 'user', request_id: 'known', read_at: '' }])).toBe('live')
+})
+
+it('does not project an old read receipt without decision or ticket as active evaluation', () => {
+  const [item] = withRequestStates([
+    { id: 'm19', role: 'user', request_id: 'request-19', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T09:59:00Z' },
+  ], [], [])
+  expect(item?.request_state).toBe('unknown')
+})
+
+it('keeps a direct answer waiting until its outbox reply appears', () => {
+  const at = '2026-11-09T10:00:00Z'
+  const items = withRequestStates([
+    { id: 'm1', role: 'user', request_id: 'direct-pending', read_at: at, at },
+    { id: 'm2', role: 'user', request_id: 'direct-sent', read_at: at, at },
+    { id: 'a2', role: 'agent', reply_to: 'm2', at: '2026-11-09T10:00:03Z', reply_kind: 'reply' },
+    { id: 'm72', role: 'user', request_id: 'github-collision', read_at: at, at },
+  ], [], [
+    { kind: 'ignore', at: '2026-11-09T10:00:01Z', threadKey: 'team:main:1', reason: [{ code: 'answeredDirectly' }] },
+    { kind: 'ignore', at: '2026-11-09T10:00:02Z', threadKey: 'team:main:2', reason: [{ code: 'answeredDirectly' }] },
+    { kind: 'ignore', at: '2026-11-09T10:00:02Z', threadKey: 'github:72', reason: [{ code: 'said', values: { text: 'unrelated' } }] },
+  ] as never, 'main')
+
+  expect(items.filter(item => item.role === 'user').map(item => item.request_state)).toEqual(['waiting', 'replied', 'unknown'])
+})
+
+it('projects request lifecycle from replies, decisions, and ticket attention', () => {
+  const active = ticket({ id: 'active', assignments: [{ id: 'a1', state: 'running', createdAt: '2026-11-09T10:00:00Z', report: { state: 'progress', summary: 'doing', at: '2026-11-09T10:01:00Z' } }] }) as unknown as Ticket
+  const attention = ticket({ id: 'attention', attention: { id: 'q1', question: '确认' } }) as unknown as Ticket
+  const finished = ticket({ id: 'finished', ended: { at: '2026-11-09T10:02:00Z', by: 'executor', outcome: 'completed' } }) as unknown as Ticket
+  const items = withRequestStates([
+    { id: 'm1', role: 'user', request_id: 'a', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'm2', role: 'user', request_id: 'b', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'm3', role: 'user', request_id: 'c', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'm4', role: 'user', request_id: 'd', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'm5', role: 'user', request_id: 'e', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'm6', role: 'user', request_id: 'f', read_at: '2026-11-09T10:00:00Z', at: '2026-11-09T10:00:00Z' },
+    { id: 'r6', role: 'agent', reply_to: 'm6', at: '2026-11-09T10:00:02Z', reply_kind: 'reply' },
+  ], [active, attention, finished], [
+    { kind: 'accept', at: '2026-11-09T10:00:01Z', threadKey: 'mobile:main:1', ticketId: 'active' },
+    { kind: 'accept', at: '2026-11-09T10:00:02Z', threadKey: 'github:2', ticketId: 'active' },
+    { kind: 'accept', at: '2026-11-09T10:00:01Z', threadKey: 'mobile:main:3', ticketId: 'attention' },
+    { kind: 'accept', at: '2026-11-09T10:00:01Z', threadKey: 'mobile:main:4', ticketId: 'finished' },
+    { kind: 'accept', at: '2026-11-09T10:00:01Z', threadKey: 'mobile:main:6', ticketId: 'active' },
+    { kind: 'ignore', at: '2026-11-09T10:00:01Z', threadKey: 'mobile:main:5' },
+  ])
+  expect(items.filter(item => item.role === 'user').map(item => item.request_state)).toEqual(['processing', 'unknown', 'waiting_for_person', 'finished', 'declined', 'replied'])
 })
 
 // ── 未读（契约 §5.6）──────────────────────────────────────────────
@@ -264,21 +347,22 @@ it('passes unknown through the route instead of turning it into zero', async () 
   expect(body.unread?.reason).toContain('算不出未读')
 })
 
-it('finds subagents from the sessions the store recorded, since agents answers by id only', async () => {
-  // `ctx.agents` has no list, so the ids have to come from the store's session records.
+it('finds subagents from the sessions the store recorded', async () => {
+  // Stored worker ids remain the traversal input when present.
   const headers: Record<string, string | undefined> = {
     'worker-tk1': undefined, 'sub-x': 'worker-tk1',
   }
   const trees = {
-    get: (id: string) => id in headers ? { session: { header: { parentSession: headers[id] } } } : undefined,
-    // Deliberately no `list`: this is the shape DSH actually provides.
+    get: (id: string) => id in headers
+      ? { id, status: 'running' as const, session: { id, header: { parentSession: headers[id] } } }
+      : undefined,
   }
   const store = {
     settings: () => ({ paused: false }),
     keys: (family: string | { prefix: string }) =>
       (typeof family === 'string' ? family : family.prefix) === 'session-prompts:'
         ? ['session-prompts:worker-tk1', 'session-prompts:sub-x'] : [],
-    tickets: { list: () => [], get: () => undefined },
+    tickets: { list: () => [ticket()], get: (id: string) => id === 'tk1' ? ticket() : undefined },
   }
   const runtimeHost = { ...host(), agents: trees, store } as unknown as HttpHost
   const handler = phoneHandler(runtimeHost, 'http://127.0.0.1:8788', vi.fn(async () => Response.json({})) as typeof fetch)

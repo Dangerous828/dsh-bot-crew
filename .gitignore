@@ -28,3 +28,10 @@ state/
 
 # 手工验证脚本（要外网/要密钥，不进常规套件；放 scripts/ 下以免被 docs.spec 要求登记）
 backend/scripts/manual/
+
+# 二进制发布物、录屏与本地备份不进 git（仍留在各自 review 目录本地）
+*.apk
+*.idsig
+*.mp4
+__pycache__/
+backend/.backup-publish-*/

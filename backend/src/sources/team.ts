@@ -133,6 +133,8 @@ export function teamTrigger(message: QueueMessage, me: string, config: TeamConfi
       conversation: message.conversation,
       messageId: message.id,
       root: message.thread ?? message.id,
+      // 与 mobile Source 同一口径：关联键是客户端的 request_id，不是 Trigger id。
+      ...(typeof message.request_id === 'string' && message.request_id ? { request_id: message.request_id } : {}),
       bot_id: route.bot_id,
       mentions: message.mentions,
       ...(route.unknown_mentions ? { unknown_mentions: route.unknown_mentions } : {}),
@@ -320,6 +322,8 @@ export async function sendTeam(host: Pick<SourceContext, 'commands' | 'deploymen
     // crew's replies into the other crew's database.
     const at = host.deployment ?? host.commands.deployment
     await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text,
+      // 出站类型：回执/答复/通知三选一，网关落库后手机才分得清「收到」与「答完」。
+      '--kind', message.kind,
       ...queueFile(at), ...(typeof bot_id === 'string' && bot_id ? ['--bot', bot_id] : [])])
     return 'sent'
   } catch (error) {

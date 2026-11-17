@@ -1,5 +1,6 @@
 package com.dsh.botcrew
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -44,7 +45,7 @@ class CrewClient(
     @Volatile
     private var current: String = order.firstOrNull().orEmpty()
 
-    /** 现在在用的入口。语音与播报那两条直连的请求也走它。 */
+    /** 现在在用的入口。 */
     private val base: String get() = current.ifEmpty { order.firstOrNull().orEmpty() }
 
     /**
@@ -57,6 +58,95 @@ class CrewClient(
      * 用并发 Map 而不是普通 map：read() 跑在 IO 线程上，而界面会在主线程读它。
      */
     private val failures = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
+     * 路由健康证据（[RoutePolicy] 用）：每条入口最近成功/失败、连续失败数、所属网络代次。
+     * 与上面的 [failures]（给界面判「局域网地址失效」读）是两件事：那个只数「连不上几次」，
+     * 这个带时间戳与网络代次，用来算「这次该从哪条起手、要不要短超时跳过死 LAN」。
+     * 并发 Map：read() 在 IO 线程写，界面/上报线程可能读。
+     */
+    private val health = java.util.concurrent.ConcurrentHashMap<String, RoutePolicy.Health>()
+
+    /** 网络代次：网络变化时 +1，旧的成功/失败证据整体作废（换了网旧 LAN 是否可达要重判）。 */
+    @Volatile
+    private var netGen: Int = 0
+
+    /** 当前连接种类（"cellular"/"wifi"/"none"…），由上层网络回调更新；蜂窝时选路优先公网。 */
+    @Volatile
+    var networkKindProvider: String = ""
+
+    /** 时钟注入（毫秒），单测可替换。 */
+    @Volatile
+    private var clock: () -> Long = { System.currentTimeMillis() }
+
+    /** 诊断埋点回调（可选）：请求结果记一条。null 时不记。 */
+    @Volatile
+    var diagSink: ((path: String, method: String, status: Int?, ms: Long, err: String?, routeKind: String) -> Unit)? = null
+
+    /** 给单测注入时钟。 */
+    fun setClockForTest(fn: () -> Long) { clock = fn }
+
+    /**
+     * 测试 seam：记录每趟**真实 attempt 的入口顺序**（生产为 null，零开销）。
+     * 用来端到端断言「执行层按 plan.order 起手」，而不只是断言 RoutePolicy.plan 的返回。
+     */
+    @Volatile
+    internal var attemptSpy: ((entry: String) -> Unit)? = null
+
+    /**
+     * 测试 seam：替换单条入口的试连结果（生产为 null，走真实网络）。测试用它构造「P2P/LAN 黑洞、PUBLIC 通」
+     * 等场景并断言起手顺序；返回值语义同 [attempt]（成功返回正文，抛 IOException 表示这条失败）。
+     */
+    @Volatile
+    internal var attemptOverride: ((entry: String, path: String, method: String, body: String?) -> String)? = null
+
+    /**
+     * 网络变化：代次 +1，清空健康证据（[RoutePolicy.onNetworkChanged]）。由上层在网络回调里调。
+     * 这是「网络切换响应」的落点——换了网就不该再拿旧证据决定起手。
+     */
+    fun onNetworkChanged() {
+        synchronized(this) {
+            netGen += 1
+            val cleared = RoutePolicy.onNetworkChanged(health.values.toList(), netGen)
+            health.clear()
+            for (h in cleared) health[h.entry] = h
+        }
+    }
+
+    /** 一条入口现在是什么种类（给 RoutePolicy 排序/短档用）。 */
+    private fun kindFor(entry: String, paired: PairedCrew?, proxyPort: Int?): RoutePolicy.Kind {
+        if (entry.startsWith(CrewRoute.LOCAL_PROXY_PREFIX)) return RoutePolicy.Kind.P2P
+        if (paired == null) return RoutePolicy.Kind.UNKNOWN
+        return when (CrewRoute.kindOf(entry, paired, proxyPort)) {
+            CrewRoute.Way.P2P -> RoutePolicy.Kind.P2P
+            CrewRoute.Way.LAN -> RoutePolicy.Kind.LAN
+            CrewRoute.Way.PUBLIC -> RoutePolicy.Kind.PUBLIC
+            null -> RoutePolicy.Kind.UNKNOWN
+        }
+    }
+
+    /** 供 RoutePolicy 用的种类解析（配对记录在构造时已知；proxyPort 变化用 volatile 快照）。 */
+    @Volatile
+    private var pairedSnapshot: PairedCrew? = null
+    @Volatile
+    private var proxyPortSnapshot: Int? = null
+
+    /** 上层在建 client 后告知配对记录，供选路种类判定用（不动配对身份，只读）。 */
+    fun attachPairing(paired: PairedCrew?, proxyPort: Int?) {
+        pairedSnapshot = paired
+        proxyPortSnapshot = proxyPort
+    }
+
+    private fun healthOf(entry: String): RoutePolicy.Health =
+        health[entry] ?: RoutePolicy.Health(entry, kindFor(entry, pairedSnapshot, proxyPortSnapshot), netGen = netGen)
+
+    private fun noteSuccess(entry: String) {
+        health[entry] = RoutePolicy.onSuccess(healthOf(entry), clock(), netGen)
+    }
+
+    private fun notePolicyFailure(entry: String) {
+        health[entry] = RoutePolicy.onFailure(healthOf(entry), clock(), netGen)
+    }
 
     /**
      * 会话相关的路径统一在这里拼；非会话接口一律不调它（契约 §1 的接口白名单）。
@@ -121,6 +211,93 @@ class CrewClient(
     }
 
     /**
+     * **bootstrap 自愈**（仅在本地公网入口为空时补）：用一个 build 注入的部署域名，
+     * 经「带设备凭据请求 `/api/mobile/timeline`」读该后端的 `server:{crew, public_base}` 元数据，
+     * **精确比对 crew 指纹**确认「它就是同一台已配对后端」，验通则把可信公网入口补进表。
+     *
+     * 为什么需要它：出门后 App 只剩不可达的局域网入口 —— 配对那一刻 mDNS 没带 `pub`（或老记录没有）
+     * 时 `fallbackBase` 是空串，`CrewRoute.entries` 里就**没有公网入口**，于是整段用不了。
+     *
+     * ## 身份边界（lead 已批准口径）
+     *
+     * - **不用**「任意 2xx / `status.runtime==='ready'` / 同名 `dsh-crew-*`」当身份。身份只认服务端
+     *   自报的 `server.crew`，且必须与本地 [savedCrew] **逐字相等**。
+     * - **[savedCrew] 为空**（首次 / 老记录没登记）：**拒绝**，返回 null。首次身份只能来自
+     *   「现有可信已配置地址」或「本次 new-pair 响应」，不接受任意 bootstrap 200。
+     * - 候选必须是 **HTTPS**（明文 http 绝不在其上发配对凭据）；且返回 JSON 必须能被
+     *   [CrewWire.parseTimeline] 解析、属本协议、`server.crew` 与 [savedCrew] 相等。
+     *
+     * 采纳的入口优先用服务端自报的 `server.public_base`（真实 HTTPS），没有则用 [candidate] 本身。
+     *
+     * @param candidate 候选域名（来自 build 注入的部署域名）。空串直接跳过。
+     * @param savedCrew 本地已登记的可信服务器指纹（[PairedCrew.serverCrew]，可回退到 [PairedCrew.crew]）。空则不采。
+     * @return 采纳的入口；未采纳返回 null。
+     */
+    suspend fun bootstrapPublic(candidate: String, savedCrew: String): String? =
+        withContext(Dispatchers.IO) {
+            val url = CrewPairing.normalize(candidate)
+            val expect = savedCrew.trim()
+            // 首次 / 没登记身份：不接受任意 bootstrap。只在 savedCrew 非空时才允许比对。
+            if (url.isEmpty() || expect.isEmpty()) return@withContext null
+            // 只信 HTTPS：别在明文 http 上发配对凭据。
+            if (!url.startsWith("https://")) return@withContext null
+            val trusted = try {
+                val text = attempt(url, "/api/mobile/timeline", "GET", null, BOOTSTRAP_TIMEOUT_MS)
+                val conversation = CrewWire.parseTimeline(text)
+                val protocolOk = !text.contains("\"session_api\"") ||
+                    text.contains("\"session_api\":1") || text.contains("\"session_api\": 1")
+                val server = conversation.server
+                // 精确比对：服务端自报 crew 必须与已存指纹逐字相等，否则不是同一台。
+                val sameMachine = server != null && server.crew.isNotEmpty() && server.crew == expect
+                if (protocolOk && sameMachine) {
+                    // 优先用服务端自报的可信公网入口；没有就用候选本身（它已通过凭据+crew 校验）。
+                    CrewPairing.normalize(server!!.publicBase).takeIf { it.isNotEmpty() } ?: url
+                } else {
+                    null
+                }
+            } catch (error: CrewRejected) {
+                null // 401 = 这台设备没被它认，不是我们要的后端
+            } catch (error: IOException) {
+                null
+            } catch (error: Exception) {
+                null // parse 抛错（不是本协议 JSON）也不采纳
+            }
+            if (trusted == null) return@withContext null
+            // 验通：把可信入口补进入口表（不动 token/deviceId/crew 身份）。
+            synchronized(this) {
+                order = cleanEntries(order + trusted)
+            }
+            trusted
+        }
+
+    /**
+     * 从一个**已知可信**的入口（当前在用的、或配对里的局域网/隧道）读服务端自报的
+     * `server.public_base`，并在 `server.crew` 与 [savedCrew] 逐字相等时返回它。
+     *
+     * 用途：**非空旧域名也由同 crew 可信元数据更新**（不留已知旧值永不自愈）。与 [bootstrapPublic]
+     * 的区别是：这里的入口已经是可信的（用户已在用它），只需读它的元数据；而 bootstrap 是对
+     * **候选新域名**做验证。
+     *
+     * @return 可信的新公网入口；读不到 / crew 不符 / 没有 public_base 返回 null。
+     */
+    suspend fun trustedPublicBase(entry: String, savedCrew: String): String? =
+        withContext(Dispatchers.IO) {
+            val expect = savedCrew.trim()
+            val clean = CrewPairing.normalize(entry)
+            if (expect.isEmpty() || clean.isEmpty()) return@withContext null
+            try {
+                val text = attempt(clean, "/api/mobile/timeline", "GET", null, BOOTSTRAP_TIMEOUT_MS)
+                val server = CrewWire.parseTimeline(text).server
+                if (server != null && server.crew.isNotEmpty() && server.crew == expect) {
+                    CrewPairing.normalize(server.publicBase).takeIf { it.isEmpty() || it.startsWith("https://") }
+                        ?.takeIf { it.isNotEmpty() }
+                } else null
+            } catch (error: Exception) {
+                null
+            }
+        }
+
+    /**
      * 发一次请求并把正文读回来。每个接口只差路径、方法与 body，
      * 连接的开合收在这一处：漏一次 disconnect 就是一条泄漏的 socket。
      *
@@ -136,17 +313,50 @@ class CrewClient(
             // 这一趟用自己拿到的那份表：中途被 promote 换掉，它照旧按旧表跑完。
             val table = order
             if (table.isEmpty()) throw IOException("队伍地址不对：没有可用的入口")
-            // 从当前在用的那条开始绕一圈；current 不在表里（不该发生）就从第一条起。
-            val start = table.indexOf(current).coerceAtLeast(0)
+            val now = clock()
+            // 选路计划：healthy entry sticky + 失败冷却 + 已知健康公网时对死 LAN 用短超时。
+            // 这是「每请求先撞死 LAN 15s」的根因修复点：不再无条件从 current 起手、也不再给死 LAN 15s。
+            val plan = RoutePolicy.plan(
+                entries = table,
+                kindOf = { kindFor(it, pairedSnapshot, proxyPortSnapshot) },
+                healthOf = { healthOf(it) },
+                now = now,
+                networkKind = networkKindProvider,
+            )
             var failure: IOException? = null
-            for (step in table.indices) {
-                val entry = table[(start + step) % table.size]
+            var startEntry: String? = null
+            // 起手是（不健康）LAN/未知、且表里有公网入口时，先短探一次公网：探通就立刻从它起手，
+            // 不为一条大概率死的 LAN 等满 15s。探不通则按原计划从表头起。
+            if (plan.quickProbePublic) {
+                val publicEntry = plan.order.firstOrNull {
+                    kindFor(it, pairedSnapshot, proxyPortSnapshot) == RoutePolicy.Kind.PUBLIC &&
+                        (healthOf(it).consecutiveFailures < RoutePolicy.FAIL_TO_COOLDOWN)
+                }
+                if (publicEntry != null) {
+                    if (tryQuietProbe(publicEntry, RoutePolicy.QUICK_PROBE_MS)) startEntry = publicEntry
+                }
+            }
+            // 起手顺序：plan.order 的**第一个**才是本趟要试的第一个入口（policy 说了算）。
+            // 若短探命中了公网，则以它打头（也是 policy 意图：已知公网可用就先走它）。
+            // **绝不**再按旧 current 旋转 —— 那等于把 policy 排序撤销，让死旧 current 先阻塞。
+            // current 只记「最近成功的那条」用于显示/诊断，不隐式覆盖 plan。
+            val ordered = if (startEntry != null) listOf(startEntry) + plan.order.filter { it != startEntry } else plan.order
+            val t0 = clock()
+            var lastErr: String? = null
+            var lastStatus: Int? = null
+            for (step in ordered.indices) {
+                val entry = ordered[step]
+                val connectMs = plan.connectTimeoutFor[entry] ?: RoutePolicy.DEFAULT_CONNECT_MS
+                attemptSpy?.invoke(entry)
                 try {
-                    val text = attempt(entry, path, method, body)
-                    // 这一条通了：之前的失败计数作废，否则一次网络抖动会一直挂在界面上。
+                    val text = (attemptOverride?.invoke(entry, path, method, body)
+                        ?: attempt(entry, path, method, body, connectMs))
+                    // 这一条通了：之前的失败计数作废，健康证据刷新。
                     failures.remove(entry)
-                    // 表没被换过才把「现在用哪条」写回去。换过说明 P2P 刚升级上来，
-                    // 这一次成功走的是旧路，不该把「当前入口」改回旧的那条。
+                    noteSuccess(entry)
+                    val elapsed = clock() - t0
+                    diagSink?.invoke(ClientDiag.routeOf(path), method, 200, elapsed, null, kindName(entry))
+                    // current 只记最近成功那条（供显示/诊断），不参与本趟排序。
                     if (entry != current && table === order) {
                         current = entry
                         onRouteSwitched?.invoke(entry)
@@ -155,22 +365,54 @@ class CrewClient(
                 } catch (error: CrewRejected) {
                     // 凭据被拒说明这条地址**是通的**：能连上才可能被拒。不计失败。
                     failures.remove(entry)
+                    noteSuccess(entry) // 能答话也算这条入口健康
+                    diagSink?.invoke(ClientDiag.routeOf(path), method, 401, clock() - t0, "CrewRejected", kindName(entry))
                     throw error
                 } catch (error: IOException) {
-                    // 只有「压根没连上」才算这条入口失败。带 HTTP 状态码的说明对端答了话，
-                    // 地址本身没错 —— 把 404/503 记成地址失效会让人白改一次配对。
-                    if (error is CrewHttpStatus) failures.remove(entry) else noteFailure(entry)
-                    // 报出去的仍是第一条路的错：那才是人最先遇到的那个现象。
-                    // 唯一例外：后续入口明确回了 HTTP 状态（例如老后端的 404）——
-                    // 「对端明确拒绝」比「第一条路连不上」更能说明后端是什么，
-                    // 能力位先验据此才不会把老后端误报成链路故障。
+                    // 只有「压根没连上」才算这条入口失败。
+                    if (error is CrewHttpStatus) {
+                        failures.remove(entry)
+                        noteSuccess(entry) // 对端答了话，地址健康
+                        lastStatus = error.status
+                        lastErr = "CrewHttpStatus"
+                    } else {
+                        noteFailure(entry)
+                        notePolicyFailure(entry)
+                        lastErr = ClientDiag.errOf(error)
+                    }
                     if (failure == null || (error is CrewHttpStatus && failure !is CrewHttpStatus)) {
                         failure = error
                     }
                 }
             }
+            // 整圈没成：记一条失败事件。
+            diagSink?.invoke(ClientDiag.routeOf(path), method, lastStatus, clock() - t0, lastErr ?: "CrewUnavailable", kindName(current))
             throw failure ?: IOException("队伍地址不对：没有可用的入口")
         }
+
+    /** 入口 → 给诊断的 routeKind 短词。 */
+    private fun kindName(entry: String): String = when (kindFor(entry, pairedSnapshot, proxyPortSnapshot)) {
+        RoutePolicy.Kind.P2P -> "p2p"
+        RoutePolicy.Kind.LAN -> "lan"
+        RoutePolicy.Kind.PUBLIC -> "public"
+        RoutePolicy.Kind.UNKNOWN -> ""
+    }
+
+    /**
+     * 短探一条入口能不能连上（带当前凭据敲 [PROBE_PATH]，只看「有没有答话」）。
+     * 与 [probeEntry] 不同：**不改**失败计数与健康证据，只用于「起手前快速确认公网可用」。
+     * 复用 [attempt]，超时短，失败静默返回 false。
+     */
+    private fun tryQuietProbe(entry: String, connectTimeoutMs: Int): Boolean = try {
+        attempt(entry, PROBE_PATH, "GET", null, connectTimeoutMs)
+        true
+    } catch (error: CrewRejected) {
+        true // 401 也证明地址活着
+    } catch (error: CrewHttpStatus) {
+        true // 404/其它状态码也证明对端答了话
+    } catch (error: IOException) {
+        false
+    }
 
     /**
      * 只探一条入口通不通，**不换路、不改「现在用哪条」**，只把结果记进失败计数。
@@ -192,17 +434,21 @@ class CrewClient(
             try {
                 attempt(clean, PROBE_PATH, "GET", null, connectTimeoutMs)
                 failures.remove(clean)
+                noteSuccess(clean)
                 true
             } catch (error: CrewRejected) {
                 // 凭据被拒：能连上才可能被拒，地址是活的。
                 failures.remove(clean)
+                noteSuccess(clean)
                 true
             } catch (error: CrewHttpStatus) {
                 // 对端明确回了一个状态码：地址是活的，只是这条路径不对。
                 failures.remove(clean)
+                noteSuccess(clean)
                 true
             } catch (error: IOException) {
                 noteFailure(clean)
+                notePolicyFailure(clean)
                 false
             }
         }
@@ -307,6 +553,30 @@ class CrewClient(
     /** 拉整段对话。失败时抛出带人话的异常，界面直接显示。 */
     suspend fun timeline(sessionId: String? = null): Conversation =
         parse(read(sessionPath("/api/mobile/timeline", sessionId), "GET"), CrewWire::parseTimeline)
+
+    /**
+     * 轻量活动快照（契约 `GET /api/mobile/activity?session_id=…`）。
+     *
+     * 三条结局分得很清，调用方据此决定「继续/停掉/标陈旧」，不需要再看异常类型：
+     * - [ActivityResult.Live]：拿到一份可用的快照；
+     * - [ActivityResult.Unsupported]：这台后端没有这项能力 → 停轮询、退回旧节奏；
+     * - [ActivityResult.Unavailable]：这一次没读到 → 保留上次事实并标「状态暂未同步」。
+     *
+     * 401 仍按 [CrewRejected] 抛出：凭据不对跟「暂时读不到」不是一回事，不能当成可重试。
+     */
+    suspend fun activity(sessionId: String? = null): ActivityResult = try {
+        val body = read(sessionPath("/api/mobile/activity", sessionId), "GET")
+        val snapshot = ActivityWire.parse(body)
+        if (snapshot == null) ActivityResult.Unsupported else ActivityResult.Live(snapshot)
+    } catch (error: CrewRejected) {
+        throw error
+    } catch (error: CrewHttpStatus) {
+        ActivityWire.outcomeOf(error.status, error.message.orEmpty())
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        ActivityResult.Unavailable(error.message ?: "队伍没回话")
+    }
 
     /**
      * 设备接收链（#23）：看一眼这台设备还欠哪些推送（peek，不删）。断链时抛出 IOException，
@@ -469,73 +739,6 @@ class CrewClient(
         return parse(read("/api/mobile/memory$query", "GET"), MemoryWire::parse)
     }
 
-    /**
-     * 语音输入：把一段 WAV 交给后端，换回一句话。
-     *
-     * body 就是录音本身，不 base64、不包 JSON —— 多一层编码就多一次「为什么是乱码」的机会。
-     * 识别不了时后端回一个带 `available: false` 的 JSON，这里原样读成 VoiceResult。
-     */
-    suspend fun voice(wav: ByteArray): VoiceResult = withContext(Dispatchers.IO) {
-        val connection = (URL(base + "/api/mobile/voice").openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            // 录一分钟要认一会儿：读超时比别处长。
-            connectTimeout = 15_000
-            readTimeout = 60_000
-            setRequestProperty("Content-Type", "audio/wav")
-            setRequestProperty("X-GW-Token", token)
-            deviceId?.let { setRequestProperty("x-crew-device", it) }
-            if (deviceId != null) setRequestProperty("x-crew-credential", token)
-        }
-        try {
-            connection.outputStream.use { it.write(wav) }
-            val text = connection.inputStream.bufferedReader().use { it.readText() }
-            VoiceWire.parse(text)
-        } catch (error: Exception) {
-            VoiceResult(available = false, text = "", reason = error.message ?: "语音没发出去")
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    /**
-     * 播报：把一句话念成 WAV。
-     *
-     * 念不出来时后端回的是 JSON（带 `reason`），念出来时回的是音频字节 ——
-     * 所以先看响应头，别把一段 JSON 当 WAV 交给播放器。
-     */
-    suspend fun speak(text: String): SpeechResult = withContext(Dispatchers.IO) {
-        val connection = URL(base + "/api/mobile/speak").openConnection() as HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 8_000
-            // 念一段话可能要几秒；`say` 本身很快，但要把转码算进去。
-            connection.readTimeout = 60_000
-            connection.doOutput = true
-            connection.setRequestProperty("content-type", "application/json")
-            connection.setRequestProperty("authorization", "Bearer " + token)
-            val payload = JSONObject().put("text", text).toString().toByteArray()
-            connection.setFixedLengthStreamingMode(payload.size)
-            connection.outputStream.use { it.write(payload) }
-            val code = connection.responseCode
-            val type = connection.contentType ?: ""
-            if (code !in 200..299 || !type.startsWith("audio/")) {
-                val body = (connection.errorStream ?: connection.inputStream)?.bufferedReader()?.use { it.readText() } ?: ""
-                return@withContext SpeechWire.parseFailure(body)
-            }
-            val bytes = connection.inputStream.use { it.readBytes() }
-            SpeechResult(
-                available = true,
-                wav = bytes,
-                seconds = connection.getHeaderField("x-speech-seconds")?.toDoubleOrNull() ?: 0.0,
-                truncated = connection.getHeaderField("x-speech-truncated") == "1",
-                reason = "",
-            )
-        } finally {
-            connection.disconnect()
-        }
-    }
-
     /** 逐条用量：这张票每一步用的谁、多少、上下文还剩多少。 */
     suspend fun replySpends(ticketId: String): ReplySpends =
         parse(read("/api/mobile/reply-spend?ticket=" + URLEncoder.encode(ticketId, "UTF-8"), "GET"), ReplySpendWire::parse)
@@ -667,6 +870,9 @@ class AnswerStale(message: String) : IOException(message)
  * 不带凭据也照样会被路由拦下来，401 与 404 都证明「这条地址是活的」。
  */
 private const val PROBE_PATH = "/api/mobile/__latency"
+
+/** bootstrap 自愈验域名身份用的超时：这是出门兜底路径，给足握手时间，但不能无限等。 */
+private const val BOOTSTRAP_TIMEOUT_MS = 8_000
 
 /** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码。 */
 private class CrewHttpStatus(val status: Int, message: String) : IOException(message)

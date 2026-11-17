@@ -4,9 +4,11 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { HttpHost } from './http.ts'
-import { canRetry, liveTicket, ticketStage } from '../core/index.ts'
+import { canRetry, latestAssignment, liveTicket, ticketStage, type Ticket } from '../core/index.ts'
 import { SettingsConflict } from './settings.ts'
+import { legacyConnectionCard } from './approval.ts'
 import type { Settings } from '../policy.ts'
+import type { Decision } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
 import type { NoticeDelivery } from './push.ts'
@@ -24,6 +26,11 @@ import type { MemoryLayer } from './memory-layer.ts'
 import type { DeviceStore } from './remote.ts'
 import { BOT_ID } from '../crew/directory.ts'
 import { groupsOf, type GroupsView } from './groups.ts'
+import { MAX_BODY_BYTES, parseBatch, type Diagnostics } from './diagnostics.ts'
+import { crewFingerprint } from './discovery.ts'
+import { publicEntry } from './public-entry.ts'
+import type { Activity } from './activity.ts'
+import { wireActivity } from './activity.ts'
 
 // Structural contract keeps compatibility with the bundle's alpha development
 // peers; installed rc.2 Connection supplies this authenticated exact-route API.
@@ -76,7 +83,9 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
    * 认不出、票不匹配、不在等审批都如实回 `{ ok: false, reason }`，绝不猜、绝不动。
    */
   answer?: (ticketId: string, text: string, attentionId: string, actor: string | undefined) =>
-    { ok: true; answer: 'go' | 'stop' | 'revise' } | { ok: false; reason: string }
+    // `reply` 是普通 worker 待答（human_action / human_options）的答复，与审批同一入口。
+    // 旧客户端只读 `ok`，多一个取值不影响它。
+    { ok: true; answer: 'go' | 'stop' | 'revise' | 'reply' } | { ok: false; reason: string }
   /** 一条模型路由支持哪些推理档位；不支持的宿主可以不给。 */
   efforts?: (provider: string, model: string) => Promise<{ efforts: { id: string; name: string; description?: string }[]; default?: string }>
   /** 工单控制：停下一张票，以及全局暂停。真实 Runtime 两个都有；测试里的假宿主可以只给需要的那个。 */
@@ -90,6 +99,13 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
   ackNotices?: (deviceId: string, ids: readonly string[]) => number
   noticeSeen?: (deviceId: string) => string[]
   markNoticeSeen?: (deviceId: string, ids: readonly string[]) => string[]
+  /** App 故障上报的落盘盒（有界 KV）。宿主没接时手机那条 POST 回 503。 */
+  diagnostics?: Diagnostics
+  /**
+   * 轻量活动：只读一张票 worker 会话的原生事件投影（Root 的 `Runtime.activity`）。
+   * 宿主没接时 `/activity` 回 501（客户端据此记 capability=unsupported，退回慢速时间线）。
+   */
+  activity?: (ticketId: string) => Promise<Activity | undefined>
 }
 /**
  * 手机看得懂的那句人话。
@@ -179,34 +195,32 @@ function earliestTicketAt(data: Record<string, unknown>, botId: string): string 
  * "never going to answer". This names the ones that were looked at and left, so the surface can say so.
  */
 export function declinedRequests(items: TimelineItem[], decisions: readonly { kind?: string; at?: string; threadKey?: string;
-  reason?: readonly { code?: string; values?: Record<string, unknown> }[] }[], now = Date.now(), windowMs = QUEUE_WINDOW_MS): {
-  request_id: string; reason: string
-}[] {
-  // A Trigger's Thread key carries the queue row it came from (`team:main:6`), which is how a decision points back
-  // at a message. Only the newest decision per thread counts: a follow-up can turn an earlier refusal into work.
-  const latest = new Map<string, { reason: string; at: number }>()
+  reason?: readonly { code?: string; values?: Record<string, unknown> }[] }[], now = Date.now(), windowMs = QUEUE_WINDOW_MS,
+  sessionId = DEFAULT_SESSION_ID): { request_id: string; reason: string }[] {
+  // Only team/mobile decisions from this session can point to a mobile queue row. Keep a marker for the newest
+  // decision even when it isn't a decline, so an older ignore cannot reappear later in the newest-first list.
+  const latest = new Map<string, { reason?: string; at: number }>()
   for (const decision of decisions) {
-    if (typeof decision.threadKey !== 'string') continue
-    const row = /:(\d+)$/.exec(decision.threadKey)?.[1]
+    const row = requestDecisionRow(decision.threadKey, sessionId)
     if (!row) continue
     const at = Date.parse(decision.at ?? '')
     if (!Number.isFinite(at)) continue
     const seen = latest.get(row)
     if (seen && at <= seen.at) continue
-    // Anything other than a refusal is the crew taking the message, which supersedes an earlier refusal on the
-    // same thread: the newest decision is the one that describes what happened.
-    if (decision.kind !== 'ignore') { latest.delete(row); continue }
-    const said = decision.reason?.find(entry => typeof entry.values?.text === 'string')?.values?.text
-    latest.set(row, { reason: typeof said === 'string' && said ? said : '这条被判定不需要动手', at })
+    const decline = decision.kind === 'ignore' && !decision.reason?.some(entry => entry.code === 'answeredDirectly')
+    const said = decline ? decision.reason?.find(entry => typeof entry.values?.text === 'string')?.values?.text : undefined
+    latest.set(row, { at, ...(decline ? { reason: typeof said === 'string' && said ? said : '这条被判定不需要动手' } : {}) })
   }
+  const answered = new Set(items.filter(item => item.role === 'agent' && isFinalReply(item))
+    .map(item => item.reply_to).filter((id): id is string => typeof id === 'string'))
   return items.flatMap(item => {
-    if (item.role !== 'user' || typeof item.request_id !== 'string' || !item.request_id) return []
+    if (item.role !== 'user' || typeof item.request_id !== 'string' || !item.request_id
+      || (typeof item.id === 'string' && answered.has(item.id))) return []
     const at = Date.parse(item.at ?? '')
     if (!Number.isFinite(at) || now - at > windowMs) return []
     const row = typeof item.id === 'string' ? /^m(\d+)$/.exec(item.id)?.[1] : undefined
     const found = row ? latest.get(row) : undefined
-    // A decision older than the message describes a different one: the thread key is not enough on its own.
-    if (!found || found.at < at) return []
+    if (!found?.reason || found.at < at) return []
     return [{ request_id: item.request_id, reason: found.reason }]
   })
 }
@@ -218,15 +232,15 @@ export function declinedRequests(items: TimelineItem[], decisions: readonly { ki
  * （契约 §5），消息结果条要知道这段话的产出在哪张票里（契约 §5.4）。
  *
  * 网关写出的回话只记「挂在哪条消息下」（`reply_to: m6`），不记工单 —— 它本来就不该持有任务账。
- * 工单号在这一侧是现成的：最近的决定里，threadKey 的尾号就是队列行号，`ticketId` 就是那张票。
- * 所以这里只做一次对齐，不做推断：行号对不上、决定是被忽略的、票号为空，一律不补。
+ * 工单号在这一侧是现成的：当前 team/mobile session 的 Thread key 指向队列行号，`ticketId` 就是那张票。
+ * 所以这里只做一次对齐，不做推断：来源或会话不匹配、行号对不上、决定是被忽略的、票号为空，一律不补。
  * 补不上就让它缺着 —— 客户端据此如实说「这段改动没带工单号」/ 不画结果条，而不是拿别的票顶替。
  */
 export function ticketRefs(items: TimelineItem[], decisions: readonly { kind?: string; at?: string; threadKey?: string;
-  ticketId?: string }[]): Map<string, string> {
+  ticketId?: string }[], sessionId = DEFAULT_SESSION_ID): Map<string, string> {
   const byRow = new Map<string, { ticket: string; at: number }>()
   for (const decision of decisions) {
-    const row = typeof decision.threadKey === 'string' ? /:(\d+)$/.exec(decision.threadKey)?.[1] : undefined
+    const row = requestDecisionRow(decision.threadKey, sessionId)
     if (!row || typeof decision.ticketId !== 'string' || !decision.ticketId) continue
     // 被忽略的决定没有票；同一行上后来接受过，就以接受的那次为准（取最新一次带票的）。
     if (decision.kind === 'ignore') continue
@@ -352,6 +366,36 @@ function gatewayOrigin(stateDir?: string): string {
   const host = process.env.MOBILEGW_HOST?.trim() || '127.0.0.1'
   const port = process.env.MOBILEGW_PORT?.trim() || gatewayPortFor(stateDir) || '8788'
   return `${process.env.MOBILEGW_SECURE === '1' ? 'https' : 'http'}://${host}:${port}`
+}
+
+/**
+ * 给已配对 timeline 的**可选只读** server 元数据（不新增路由、不放开 auth、旧 App 忽略即兼容）。
+ *
+ * 身份口径是「**同实例指纹**」，不是 crypto 证明：`crew` 与 mDNS TXT 同源，复用 discovery 的
+ * `crewFingerprint(stateDir)`（不是临时 masterId / dsh session id），由服务端**实际计算**得到，
+ * 绝不取自 request host 或 body 自报。`public_base` 复用 `publicEntry(stateDir)`，只接受**HTTPS、
+ * 无 userinfo/query/fragment** 的域名；不合格或没有就是空串 —— 不擅自推 LAN/明文 URL。
+ * 计算失败（读文件异常等）时整块返回 undefined：宁可不给，也不给半真。
+ */
+function serverIdentity(stateDir: string): { crew: string; public_base: string } | undefined {
+  try {
+    const crew = crewFingerprint(stateDir)
+    const raw = publicEntry(stateDir)
+    let publicBase = ''
+    if (raw) {
+      try {
+        const url = new URL(raw)
+        // 只认 HTTPS、无 userinfo/query/fragment —— 其余（含明文 http、带凭据/参数的 URL）一律视为不可信，给空串。
+        if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash) {
+          // 保留校验后的**合法 base 子路径**（如 https://host/crew-prefix 不能退化成 https://host）；
+          // 去尾斜杠；root 仍是 https://host。绝不改成另一地址。
+          const path = url.pathname.replace(/\/+$/, '')
+          publicBase = `${url.origin}${path}`
+        }
+      } catch { publicBase = '' }
+    }
+    return { crew, public_base: publicBase }
+  } catch { return undefined }
 }
 
 /**
@@ -502,6 +546,10 @@ const OPERATIONS = {
   // 审批答复：手机把「做吧/先别做」这类对 ticket.attention 选项的回答交给宿主，走与 feishu
   // `approvalReply` 同一套审批状态机（见 runtime.answerTicket）。宿主侧直答，不转发网关。
   answer: { methods: ['POST'] },
+  // App 故障上报：POST 收一批（白名单/幂等/有界），GET 看自己那台的最近日志。宿主侧直答，不转发网关。
+  diagnostics: { methods: ['GET', 'POST'] },
+  // 轻量活动快照：按会话读「哪几条请求此刻在干什么」。宿主侧直答，不转发网关、不拉全量时间线。
+  activity: { methods: ['GET'] },
 } as const
 type Operation = keyof typeof OPERATIONS
 
@@ -591,6 +639,43 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       return reply(200, { id, sessions: sessionIds(runtime.store),
         default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
     }
+    // App 故障上报（域名端接收）：宿主侧直接答，不转发网关。设备号只认入口验过凭据后注入的
+    // 内部 principal 头，不信客户端 x-crew-device / body 里的自报 device。POST 收一批、GET 看自己那台的
+    // 最近日志（不含他人设备的）。落盘白名单、幂等、有界都在 diagnostics.ts 里。
+    if (operation === 'diagnostics') {
+      await runtime.ready
+      const deviceId = principalOf(incoming)
+      if (!deviceId) return reply(401, { error: 'Not paired' })
+      const box = runtime.diagnostics
+      if (!box) return reply(503, { error: 'Diagnostics is unavailable' })
+      if (incoming.method === 'GET') {
+        const items = box.list({
+          device: deviceId,
+          session: url.searchParams.get('session') ?? undefined,
+          since: url.searchParams.get('since') ?? undefined,
+          errorsOnly: url.searchParams.get('errorsOnly') === '1',
+          limit: Number(url.searchParams.get('limit')) || undefined,
+        })
+        return reply(200, { device: deviceId, rows: items.rows })
+      }
+      // POST：batch 上报。先限大小，再限流（429 带 Retry-After），再解析白名单。
+      const raw = await incoming.text()
+      if (Buffer.byteLength(raw) > MAX_BODY_BYTES) return reply(413, { error: 'Request too large' })
+      const rate = box.rateAllowed(deviceId)
+      if (!rate.allowed) {
+        return Response.json({ error: say('Too many diagnostic batches') }, {
+          status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(rate.retryAfterSec) },
+        })
+      }
+      let parsed: unknown
+      try { parsed = JSON.parse(raw) } catch { return reply(400, { error: 'Invalid JSON' }) }
+      const batch = parseBatch(parsed)
+      if (!batch.ok) return reply(400, { error: batch.error, rejectedIds: batch.rejected?.map(r => r.id).filter(Boolean) ?? [],
+        reasonCodes: Array.from(new Set(batch.rejected?.map(r => r.reason) ?? [])) })
+      const result = box.report(deviceId, batch.app, batch.build, batch.outcome)
+      // 成功 ACK 严格 application/json + {ok:true, acceptedIds}（含幂等命中），只在报告 durable 落盘后发出。
+      return reply(200, { ok: true, acceptedIds: result.acceptedIds, rejectedIds: result.rejectedIds, reasonCodes: result.reasonCodes })
+    }
     // 设备接收链（#23）：宿主侧直接答，不转发网关。设备号只认入口验过凭据后注入的内部 principal 头，
     // 不信客户端 x-crew-device。GET=peek（不删），POST=ack（只删点名）+ 记 seen（device-persisted）。
     if (operation === 'notices') {
@@ -621,6 +706,113 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       let seen: string[] = []
       try { seen = runtime.markNoticeSeen?.(deviceId, seenIds.length ? seenIds : ackIds) ?? [] } catch { seen = [] }
       return reply(200, { ok: true, device: deviceId, acked: removed, seen: seen.length })
+    }
+    // 轻量活动快照（契约「状态协议」）：按会话读「哪几条请求此刻在干什么」。
+    // 不拉全量时间线：网关那边只读 `/meta`（id / request_id / read_at / 有没有最终答复），
+    // 宿主这边只读「本会话活跃票 + 正在评估的线程」，活动来自 Sessions 的原生事件投影（不是末条日志）。
+    if (operation === 'activity') {
+      await runtime.ready
+      if (!runtime.activity) {
+        // 宿主没接活动投影：明说能力不在（客户端据此记 unsupported，退回慢速时间线），不编状态。
+        return reply(501, { error: 'Activity is unavailable', code: 'activity_unsupported' })
+      }
+      let token: string
+      try { token = (await readFile(join(runtime.machine.stateDir, 'mobilegw.token'), 'utf8')).trim() } catch { token = '' }
+      if (!token) return reply(503, { error: 'Mobile transport is not configured' })
+      // 活跃集合先行：本会话的活跃票（索引投影，不扫全表）与正在评估的线程。
+      // 这两样决定要向网关点名要哪些行，老活跃任务才不会因为「不在最近 N 条里」而消失。
+      let activeTickets: Ticket[] = []
+      try {
+        const rows = [...runtime.store.tickets.active(), ...runtime.store.tickets.open()]
+        activeTickets = ticketsForSession(rows.filter((ticket, index) => rows.indexOf(ticket) === index), sessionId)
+      } catch { activeTickets = [] }
+      let activeThreads: { key?: string; ref?: { source?: string; id?: string }; evaluating?: { startedAt?: string; delivered?: string } }[] = []
+      try { activeThreads = runtime.store.threads.active() } catch { activeThreads = [] }
+      const evaluating = evaluatingRows(activeThreads, sessionId)
+      // 要向网关点名的行：活跃票的队列行 + 正在评估的行。两处都是「当前还活着」的集合。
+      const named = new Set<string>(evaluating.keys())
+      for (const ticket of activeTickets) {
+        const message = ticket.channels.find(channel => channel.source === 'team' || channel.source === 'mobile')?.address?.message
+        if (typeof message === 'string' && /^\d+$/.test(message)) named.add(message)
+      }
+      // 与其它 operation 同一套会话转发：显式会话拼 query 并透传 header。老调用逐字不变（但这里要严格判会话）。
+      const metaQuery = `session_id=${encodeURIComponent(sessionId)}${[...named].sort().map(row => `&row=${encodeURIComponent(row)}`).join('')}`
+      const metaHeaders: Record<string, string> = { 'X-GW-Token': token }
+      if (forwardHeader) metaHeaders[SESSION_HEADER] = sessionId
+      let meta: unknown
+      try {
+        const upstream = await request(`${gateway}/meta?${metaQuery}`, { method: 'GET', headers: metaHeaders,
+          signal: AbortSignal.any([incoming.signal, AbortSignal.timeout(10_000)]), redirect: 'error' })
+        if (!upstream.ok) return reply(upstream.status === 404 ? 501 : 502, upstream.status === 404
+          ? { error: 'Activity is unavailable', code: 'activity_unsupported' }
+          : { error: 'Activity is temporarily unavailable' })
+        meta = await upstream.json()
+      } catch { return reply(502, { error: 'Activity is temporarily unavailable' }) }
+      // 严格会话校验与 timeline 同口径：显式非 main 却没拿到能力位 = 对端未升级，会把这段会话
+      // 当 main 读写 → 409 unsupported_session，绝不静默接受错会话；回来会话值对不上同样拒。
+      const upstreamMeta = meta && typeof meta === 'object' ? meta as Record<string, unknown> : undefined
+      if (explicitSession && sessionId !== DEFAULT_SESSION_ID && upstreamMeta?.session_api !== SESSION_API) {
+        return reply(409, { error: 'unsupported_session' })
+      }
+      if (typeof upstreamMeta?.session_id === 'string' && upstreamMeta.session_id !== sessionId) {
+        return reply(502, { error: 'Activity is temporarily unavailable', code: 'session_mismatch' })
+      }
+      if (!Array.isArray(upstreamMeta?.items)) {
+        // 形状坏掉不能当成「活跃集合为空」：那会让客户端把还活着的 overlay 一起清掉。
+        return reply(502, { error: 'Activity is temporarily unavailable', code: 'malformed_meta' })
+      }
+      const rows = upstreamMeta.items as MetaRow[]
+      // 决定按行**精确查**（decision_thread 索引），不截「最近 200 条」：更早但仍活跃的任务不该消失。
+      // 查到的原样喂给 withRequestStates，让它用自己的「最新有效决定」选择 —— 两处不允许出现两套口径。
+      const looked: Decision[] = []
+      for (const row of rows) {
+        if (typeof row.id !== 'string') continue
+        const number = /^m(\d+)$/.exec(row.id)?.[1]
+        if (!number) continue
+        for (const source of ['team', 'mobile'] as const) {
+          try { looked.push(...runtime.store.decisions.byThread(`${source}:${sessionId}:${number}`)) } catch { /* 读不到就是没有 */ }
+          if (sessionId === DEFAULT_SESSION_ID) {
+            // main 还认历史的两段 key（`team:<row>`），与 requestDecisionRow 的兼容口径一致。
+            try { looked.push(...runtime.store.decisions.byThread(`${source}:${number}`)) } catch { /* 旧形态读不到就是没有 */ }
+          }
+        }
+      }
+      const byRow = latestDecisions(looked, sessionId)
+      // 决定引用的票可能已经结束（`active()` / `open()` 都不含它），但它的 `request_state` 仍要与
+      // timeline 同源：按 id 精确补进来（一票一次 get，数量受 meta 行数约束），不靠 accept 兜底成
+      // `accepted` —— 那会把「已完成」显示成「已接手」。
+      const known = new Map(activeTickets.map(ticket => [ticket.id, ticket]))
+      for (const decision of byRow.values()) {
+        const id = decision.ticketId
+        if (!id || known.has(id)) continue
+        try { const found = runtime.store.tickets.get(id); if (found) known.set(id, found) } catch { /* 读不到就按缺票处理 */ }
+      }
+      const tickets = [...known.values()]
+      const items = withRequestStates(activityItems(rows), tickets, looked, sessionId, new Set(evaluating.keys()))
+      const ticketsById = known
+      const at = new Date().toISOString()
+      const out: ActivityItem[] = []
+      for (const item of items) {
+        if (item.role !== 'user' || typeof item.request_id !== 'string' || !item.request_id) continue
+        const row = /^m(\d+)$/.exec(item.id ?? '')?.[1]
+        const decision = row ? byRow.get(row) : undefined
+        const ticket = decision?.ticketId ? ticketsById.get(decision.ticketId) : undefined
+        let stage: string | undefined
+        try { stage = ticket ? ticketStage(ticket).stage : undefined } catch { stage = undefined }
+        const evaluation = row ? evaluating.get(row) : undefined
+        let activity: Activity | undefined
+        if (ticket) {
+          let native: Activity | undefined
+          // 读活动失败不该让这一条静默消失：如实说读不到，且不造时间。
+          try { native = await runtime.activity(ticket.id) } catch { native = { kind: 'unknown', label: '执行状态读取失败' } }
+          activity = wireActivity({ ...(stage ? { stage } : {}), ...(native ? { native } : {}) })
+        } else if (evaluation) {
+          activity = wireActivity({ evaluating: evaluation })
+        }
+        out.push({ request_id: item.request_id, request_state: item.request_state ?? 'unknown',
+          ...(ticket ? { ticket_ref: ticket.id } : {}), ...(activity ? { activity } : {}) })
+      }
+      return reply(200, { session_id: sessionId, session_api: SESSION_API, state: 'live', at, items: out })
     }
     // A work or agent lookup without a ticket would ask the gateway to guess; refuse it here instead.
     const ticketId = url.searchParams.get('ticket') ?? ''
@@ -1127,10 +1319,12 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
       }
       const agents = (runtime as unknown as { agents?: Parameters<typeof agentTree>[0] }).agents
       if (!agents) return reply(503, { error: 'Session tree is unavailable' })
+      const ticket = runtime.store.tickets.get(ticketId)
+      if (!ticket) return reply(404, { error: 'No such ticket' })
       // `ctx.agents` answers by id only, so the ids that may be subagents come from the sessions the store recorded.
       // `keys` takes the family itself, not a prefix string; the id is what follows the family's prefix.
       const known = runtime.store.keys?.(KV.sessions.prompts)?.map(name => name.slice(KV.sessions.prompts.prefix.length)) ?? []
-      return reply(200, { ticket_id: ticketId, agents: agentTree(agents, ticketId, 8, known) })
+      return reply(200, { ticket_id: ticketId, agents: agentTree(agents, ticketId, 8, known, ticket) })
     }
     try {
       await runtime.ready
@@ -1184,7 +1378,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         const sessionItems = itemsForSession(gatewayItems, otherSessionRows(decisions, sessionId))
         // 代码卡上「看看改完的样子」要知道看哪张票：网关只记「回哪条消息」，
         // 工单号在这一侧对齐一次再下发。对不上就让它缺着，客户端会如实说。
-        const items = withTicketRefs(sessionItems, ticketRefs(sessionItems, sessionDecisions))
+        const itemRefs = withTicketRefs(sessionItems, ticketRefs(sessionItems, sessionDecisions, sessionId))
         // The crew Source answers on the same queue as mobile, so its tickets belong on the phone too.
         // 群组只读投影（#10 第 4 项 / 契约 §10）用未按会话过滤、未截断的全量票：
         // 投影只数不写、不含工单对象；若传下面那份 `tickets`，别的会话的组会恒显示「0 张」
@@ -1198,7 +1392,9 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             return { reason: `工单读不出来：${String(error)}` }
           }
         })()
-        const tickets = 'rows' in crewTickets ? ticketsForSession(crewTickets.rows, sessionId).slice(0, 30) : []
+        const sessionTickets = 'rows' in crewTickets ? ticketsForSession(crewTickets.rows, sessionId) : []
+        const items = withRequestStates(itemRefs, sessionTickets, sessionDecisions, sessionId)
+        const tickets = sessionTickets.slice(0, 30)
         // The phone names a Bot on send; the roster tells it who exists and who answers by default.
         const roster = crewRoster(runtime.store.settings(), bot => earliestTicketAt(data, bot))
         // sessions 恒含 main，所以「只有 main、无 bot、无票」是 live 而不是 empty：
@@ -1211,12 +1407,17 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             return { groups: [], state: 'unavailable', reason: `群组投影读不出来：${String(error)}` }
           }
         })()
+        // 可选只读 server 元数据：算一次复用；算不出（undefined）就整块不加，保持老响应逐字兼容。
+        const serverMeta = serverIdentity(runtime.machine.stateDir)
         return reply(200, { ...data, ...roster,
           // 能力位（S1 契约第 2 节）：老调用也回显 session_id: "main"，内容其余部分逐字不变。
           // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
           session_id: sessionId, session_api: SESSION_API,
           sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID,
           groups,
+          // 可选只读 server 元数据（同实例指纹 + 真实 HTTPS public_base）：只增不改，老 App 忽略即兼容；
+          // 算不出就整块不出现（不编半真）。身份是「同实例指纹」非 crypto 证明。
+          ...(serverMeta ? { server: serverMeta } : {}),
           // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
           items,
           tasks: tickets.map(ticket => {
@@ -1249,14 +1450,25 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
             ...plan,
             ...(stage.stage === 'person' && stage.action ? { needs_person: stage.action } : {}),
             // 问题和选项成对下发，见 docs/00-contract §5：没有 options 就是只有一个自写框。
-            ...(asking ? { question: ticket.attention!.question,
-              // 问题卡 id：客户端答 `/answer` 时原样带回，防「旧卡批新请求」（见 §3）。
-              attention_id: ticket.attention!.id,
-              ...ticket.attention!.options?.length ? { options: ticket.attention!.options } : {} } : {}) }
+            ...(asking ? ((): Record<string, unknown> => {
+              const card = ticket.attention!
+              // 历史卡：问题正文是截断过的 `JSON.stringify(args)`，不能当主正文下发。它被投影成人读的一套，
+              // 旧问题移进折叠的 details；**id 与选项 id 一字不改**，客户端答 `/answer` 时照旧能对上。
+              const legacy = !card.presentation && ticket.pendingApproval?.kind === 'connection'
+                ? legacyConnectionCard(card) : undefined
+              const attention = legacy ?? card
+              return { question: attention.question,
+                // 问题卡 id：客户端答 `/answer` 时原样带回，防「旧卡批新请求」（见 §3）。
+                attention_id: card.id,
+                ...attention.options?.length ? { options: attention.options } : {},
+                // 人读投影：待确认正文（完整换行）与折叠的脱敏细节。旧卡按同一形状给，缺正文就不给 preview。
+                ...attention.presentation ? { approval: attention.presentation } : {} }
+            })() : {}) }
         }),
-        // A message the crew has not answered yet is still queued: it was accepted, but no reply hangs off it.
-        // Withdrawing it means the crew has not read it, which is what the phone needs to offer.
+        // `queued` 是网关当前确实可撤回的 request_id 集合：必须有消息 id、未撤回、无回复且 read_at 明确为空。
+        // 集合完整性单独用 queued_state 表示；缺字段时不把 unknown 说成空队列。
         queued: queuedRequests(sessionItems),
+        queued_state: queuedStateOf(sessionItems),
         // 「未读」：人发出去、队伍还没读走的有几条（契约 §5.6）。和 `queued` 读的是同一份时间线，
         // 但判据不同：`queued` 是「还没回复、还能撤回」，未读是「还没被读走」。一条消息可以先被读走
         // 再慢慢回，那时它已经不算未读了。
@@ -1267,7 +1479,7 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
         // The messages read and left on purpose. Without these the phone cannot tell a thought in progress from
         // one that will never be answered.
         // Older hosts predate this read; a missing history leaves the list empty rather than failing the timeline.
-        declined: declinedRequests(sessionItems, sessionDecisions),
+        declined: declinedRequests(sessionItems, sessionDecisions, Date.now(), QUEUE_WINDOW_MS, sessionId),
         // 手机消息由已安装的那个 Source 承载：独立部署是 `mobile`，Bot 队伍里是 `team`。
         // 两个都不在时如实说 missing；兜底写 starting 会让人以为服务一直没起来。
         status: { runtime: runtime.health.runtime?.state ?? 'starting',
@@ -1282,11 +1494,92 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
   }
 }
 
+/**
+ * 轻量活动端点的一条请求（契约「状态协议」）。
+ *
+ * `request_id` 恒为用户消息自己的 request_id（客户端的幂等键），不是 Trigger id、不是消息 id：
+ * 客户端拿它把活动挂回那条消息。`request_state` 是收据（与任务活动正交），`ticket_ref` 是这张票。
+ */
+export interface ActivityItem {
+  request_id: string
+  request_state: RequestState
+  ticket_ref?: string
+  activity?: Activity
+}
+
+/**
+ * 网关 `/meta` 的行：只有 id、request_id、读状态、有没有最终答复/别的出站。
+ * 不含正文 —— 轻量端点不得为了活动去读消息与回话的全文。
+ */
+export interface MetaRow { id?: string; request_id?: string; read_at?: string; root?: boolean; answered?: boolean; acknowledged?: boolean }
+
+/**
+ * 把 `/meta` 行拼成 `withRequestStates` 认的最小条目。
+ *
+ * 只造它判据真正要用的两样：`id`（`m<N>`）与 `read_at`；再加一条合成的 agent 条目表示
+ * 「这条已经被**最终答复**接住」。回执（acknowledged）**不**制造 agent 条目 —— 它不该终结状态。
+ */
+export function activityItems(rows: readonly MetaRow[]): TimelineItem[] {
+  const items: TimelineItem[] = []
+  for (const row of rows) {
+    if (typeof row.id !== 'string' || !/^m\d+$/.test(row.id)) continue
+    if (typeof row.request_id !== 'string' || !row.request_id) continue
+    items.push({ id: row.id, role: 'user', request_id: row.request_id,
+      ...(typeof row.read_at === 'string' ? { read_at: row.read_at } : {}) })
+    if (row.answered) items.push({ id: `r:${row.id}`, role: 'agent', reply_to: row.id, reply_kind: 'reply' })
+  }
+  return items
+}
+
+/**
+ * 本会话里**正在评估**的队列行号 → 评估的真实时间。
+ *
+ * `thread.evaluating` 是持久事实（`Evaluation.startedAt` / `delivered`），来自 thread 记录本身，
+ * 不靠 Trigger id 猜。threadKey 形如 `team:<会话>:<行号>`（与 `SESSION_THREAD` 同一形状）；
+ * 尾号不是数字、会话不匹配、或没有 evaluating 的一律不出现在结果里。
+ */
+export function evaluatingRows(threads: readonly { key?: string; ref?: { source?: string; id?: string }; evaluating?: { startedAt?: string; delivered?: string } }[],
+  sessionId = DEFAULT_SESSION_ID): Map<string, { since?: string; at?: string }> {
+  const found = new Map<string, { since?: string; at?: string }>()
+  for (const thread of threads) {
+    if (!thread.evaluating) continue
+    const key = typeof thread.key === 'string' ? thread.key : thread.ref ? `${thread.ref.source}:${thread.ref.id}` : ''
+    const row = requestDecisionRow(key, sessionId)
+    if (!row) continue
+    found.set(row, { ...(thread.evaluating.startedAt ? { since: thread.evaluating.startedAt } : {}),
+      ...(thread.evaluating.delivered ?? thread.evaluating.startedAt
+        ? { at: thread.evaluating.delivered ?? thread.evaluating.startedAt! } : {}) })
+  }
+  return found
+}
+
+/** 出站类型，与 `core/ports.ts` 的 `OutboundMessage.kind` 同名同域。 */
+export type ReplyKind = 'acknowledgement' | 'reply' | 'notice'
+
+/**
+ * 这条回话能不能当「最终答复」。
+ *
+ * 只有**明确标了 `reply`** 的才算。历史行没有 kind → 不猜：一条 `acknowledgement` / `notice`
+ * 与一条答复在没有类型时长得一模一样，按「大概是答复」处理正是 P0-1 的根因（接手回执被显示成
+ * 已回复）。这类条目仍原样出现在时间线上（正文照常可读），只是不把消息收据推向 `replied`。
+ * 存量行由部署期按 `outbox.id` == `replies.rkey` 精确补齐；补不上的继续表示「类型未知」。
+ */
+function isFinalReply(item: TimelineItem): boolean {
+  return item.reply_kind === 'reply'
+}
+
+/** 类型未知的历史回话（本列出现之前写的，或写入方没标）：正文可读，但不宣称已答复。 */
+export function isLegacyReply(item: TimelineItem): boolean {
+  return item.role === 'agent' && item.reply_kind === undefined
+}
+
 /** How long a sent message may still be withdrawn. Past this the crew has picked it up and withdrawing it lies. */
 export const QUEUE_WINDOW_MS = 90_000
 
 /** The parts of a gateway timeline entry this module reads. */
-export interface TimelineItem { id?: string; role?: string; request_id?: string; reply_to?: string; text?: string; at?: string; bot_id?: string
+export type RequestState = 'accepted' | 'queued' | 'evaluating' | 'waiting' | 'processing' | 'waiting_for_person' | 'replied' | 'finished' | 'declined' | 'unknown'
+
+export interface TimelineItem { id?: string; role?: string; request_id?: string; request_state?: RequestState; reply_to?: string; text?: string; at?: string; bot_id?: string
   /**
    * 队伍读走这条消息的时刻；空串是「还没读走」，**字段缺席是「这份时间线说不清」**。
    * 只有人的消息带它（网关 `messages.read_at`），回话没有这个字段 —— 队伍没有「读没读自己的话」这回事。
@@ -1297,7 +1590,14 @@ export interface TimelineItem { id?: string; role?: string; request_id?: string;
   /** 这条回话带的改动代码（契约 §5「代码卡」）；字段名 `code` 与 `diff` 同形，两个都认。 */
   code?: unknown; diff?: unknown
   /** 这段改动属于哪张工单；只读引用，前台不得据此维护任务账。 */
-  ticket_ref?: string }
+  ticket_ref?: string
+  /**
+   * 这条回话的出站类型（网关 `replies.kind`）。`acknowledgement` / `notice` **不是**最终答复；
+   * 字段缺席 = 本列出现之前写的历史行，按老行为当作答复（不猜、不改写历史）。
+   */
+  reply_kind?: ReplyKind
+  /** 这条人的消息所属请求此刻在干什么（易失，见 activity.ts）；已结束/说不出来就缺席。 */
+  activity?: Activity }
 
 /** 「未读」的两种说法。`unknown` 是「网关没报告读走状态」，与「确实是 0 条」不是一件事。 */
 export interface UnreadView {
@@ -1349,22 +1649,107 @@ export function unreadRepliesOf(items: readonly TimelineItem[], lastReadId: stri
   return { count: items.slice(anchor + 1).filter(item => item.role === 'agent').length, state: 'live' }
 }
 
+/** Whether the gateway supplied enough read evidence to treat `queued` as a complete withdrawable set. */
+export function queuedStateOf(items: readonly TimelineItem[]): 'live' | 'unknown' {
+  const requests = items.filter(item => item.role === 'user' && typeof item.request_id === 'string' && item.request_id && !item.withdrawn)
+  return requests.some(item => typeof item.id !== 'string' || !item.id || typeof item.read_at !== 'string') ? 'unknown' : 'live'
+}
+
 /**
- * The request ids the crew has not answered yet. A reply hangs under the message it answers, so a sent message with
- * no reply on it is the one still queued. Unreadable entries are skipped rather than failing the whole timeline.
+ * The request ids the gateway currently permits withdrawing: it reports read_at as empty, the message is present and
+ * unwithdrawn, and no reply points back to it. Message age is not evidence of whether the queue consumed it.
  */
-export function queuedRequests(items: TimelineItem[], now = Date.now(), windowMs = QUEUE_WINDOW_MS): string[] {
-  // A reply names the message it answers, so the answered set holds the ids replies hang UNDER, not the reply ids.
-  const answered = new Set(items.filter(item => item.role === 'agent').map(item => item.reply_to).filter(Boolean))
-  return items
-    .filter(item => item.role === 'user' && typeof item.request_id === 'string' && item.request_id && !answered.has(item.id))
-    // A message the crew is already working on has no reply yet either, so age is what tells the two apart.
-    // Past the window the crew has plainly picked it up; offering a withdraw there would be a button that does nothing.
-    .filter(item => {
-      const at = Date.parse(item.at ?? '')
-      return Number.isNaN(at) || now - at <= windowMs
-    })
-    .map(item => item.request_id as string)
+export function queuedRequests(items: readonly TimelineItem[]): string[] {
+  // 回执也一样占住「已被队伍接住」：一条已经回执过的消息不该还能撤回（撤回会与真实执行对不上）。
+  const answered = new Set(items.filter(item => item.role === 'agent')
+    .map(item => item.reply_to).filter((id): id is string => typeof id === 'string'))
+  return [...new Set(items
+    .filter(item => item.role === 'user' && typeof item.id === 'string' && item.id
+      && typeof item.request_id === 'string' && item.request_id && item.read_at === ''
+      && item.withdrawn !== true && !answered.has(item.id))
+    .map(item => item.request_id!))]
+}
+
+/** Resolve only a team/mobile queue thread from this session; main also accepts the historic two-part key. */
+function requestDecisionRow(key: string | undefined, sessionId: string): string | undefined {
+  if (!key) return undefined
+  const current = SESSION_THREAD.exec(key)
+  if (current) return current[1] === sessionId ? current[2] : undefined
+  if (sessionId !== DEFAULT_SESSION_ID) return undefined
+  return /^(?:team|mobile):(\d+)$/.exec(key)?.[1]
+}
+
+/** Project each app request from its reply, the decision that reached its ticket, and the ticket's live stage. */
+/**
+ * 每一行队列消息的**最新有效决定**。
+ *
+ * 时间线条目与轻量活动端点共用这一份选择：两处都取「同一行上时间最靠后的那条决定」，
+ * 不允许一边拿 accept、一边拿后来盖过它的 ignore/stop（那会把活跃票挂到已经作废的决定上）。
+ */
+export function latestDecisions(decisions: readonly {
+  kind?: string; at?: string; threadKey?: string; ticketId?: string; reason?: readonly { code?: string }[]
+}[], sessionId = DEFAULT_SESSION_ID): Map<string, { kind?: string; at: number; ticketId?: string; answeredDirectly?: boolean }> {
+  const byRow = new Map<string, { kind?: string; at: number; ticketId?: string; answeredDirectly?: boolean }>()
+  for (const decision of decisions) {
+    const row = requestDecisionRow(decision.threadKey, sessionId)
+    const at = Date.parse(decision.at ?? '')
+    if (!row || !Number.isFinite(at) || (byRow.get(row)?.at ?? -Infinity) >= at) continue
+    byRow.set(row, { kind: decision.kind, at, ...(decision.ticketId ? { ticketId: decision.ticketId } : {}),
+      ...(decision.reason?.some(reason => reason.code === 'answeredDirectly') ? { answeredDirectly: true } : {}) })
+  }
+  return byRow
+}
+
+export function withRequestStates<T extends Ticket>(items: readonly TimelineItem[], tickets: readonly T[], decisions: readonly {
+  kind?: string; at?: string; threadKey?: string; ticketId?: string; reason?: readonly { code?: string }[]
+}[], sessionId = DEFAULT_SESSION_ID, evaluating: ReadonlySet<string> = new Set()): TimelineItem[] {
+  // 只有**最终答复**才算答过：一句回执（acknowledgement）或通知（notice）不终结这条消息的状态，
+  // 否则「收到」会被显示成「已回复」，中间那段执行活动永远没有展示窗口（P0-1）。
+  const replies = new Set(items.filter(item => item.role === 'agent' && isFinalReply(item))
+    .map(item => item.reply_to).filter((id): id is string => typeof id === 'string'))
+  const byRow = latestDecisions(decisions, sessionId)
+  const byTicket = new Map(tickets.map(ticket => [ticket.id, ticket]))
+  return items.map(item => {
+    if (item.role !== 'user' || typeof item.request_id !== 'string' || !item.request_id) return item
+    if (item.withdrawn) return { ...item, request_state: 'declined' }
+    if (typeof item.id !== 'string' || !item.id) return { ...item, request_state: 'unknown' }
+    if (replies.has(item.id)) return { ...item, request_state: 'replied' }
+    const row = /^m(\d+)$/.exec(item.id)?.[1]
+    const decision = row ? byRow.get(row) : undefined
+    const messageAt = Date.parse(item.at ?? '')
+    const currentDecision = decision && (!Number.isFinite(messageAt) || decision.at >= messageAt) ? decision : undefined
+    if (currentDecision?.kind === 'ignore') return { ...item, request_state: currentDecision.answeredDirectly ? 'waiting' : 'declined' }
+    if (currentDecision?.kind === 'stop') return { ...item, request_state: 'finished' }
+    const ticket = currentDecision?.ticketId ? byTicket.get(currentDecision.ticketId) : undefined
+    if (ticket) return { ...item, request_state: requestStateForTicket(ticket) }
+    if (currentDecision?.kind === 'accept' || currentDecision?.kind === 'reopen') return { ...item, request_state: 'accepted' }
+    if (typeof item.read_at !== 'string') return { ...item, request_state: 'unknown' }
+    // 队伍读走了、还没形成决定，而线程正在评估：这是真实可达的 `evaluating`，不是编出来的词。
+    if (item.read_at && row && evaluating.has(row)) return { ...item, request_state: 'evaluating' }
+    return { ...item, request_state: item.read_at ? 'unknown' : 'queued' }
+  })
+}
+
+function requestStateForTicket(ticket: Ticket): RequestState {
+  if (ticket.ended) return 'finished'
+  try {
+    const stage = ticketStage(ticket)
+    if (stage.stage === 'person') return 'waiting_for_person'
+    if (stage.stage === 'ended') return 'finished'
+    if (stage.stage === 'idle') return 'waiting'
+    const assignment = latestAssignment(ticket)
+    if (!assignment) return 'accepted'
+    if (assignment.state === 'pending') return 'queued'
+    if (assignment.state === 'ended') return 'waiting'
+    if (assignment.report?.state === 'waiting') return 'waiting'
+    if (assignment.report?.state === 'ready' || assignment.report?.state === 'blocked' || assignment.report?.state === 'failed') {
+      return 'waiting_for_person'
+    }
+    if (assignment.idleAt && (!assignment.deliveredAt || assignment.deliveredAt <= assignment.idleAt)) return 'waiting'
+    return assignment.state === 'running' ? 'processing' : 'unknown'
+  } catch {
+    return 'unknown'
+  }
 }
 
 export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
@@ -1420,6 +1805,9 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
       connection.fetch.register({ path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
       // 审批答复：把「做吧/先别做」交给与 feishu `approvalReply` 同源的审批状态机。宿主侧直答，不转发网关。
       connection.fetch.register({ path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+      // App 故障上报：POST 收一批、GET 看自己那台。两条 exact route，宿主侧直接答，不转发网关。
+      connection.fetch.register({ path: '/api/mobile/diagnostics', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
+      connection.fetch.register({ path: '/api/mobile/diagnostics', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
     ]
     child.effect(() => async () => { await Promise.all(disposers.map(dispose => dispose())) })
   })

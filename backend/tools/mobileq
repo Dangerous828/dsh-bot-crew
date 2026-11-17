@@ -57,7 +57,8 @@ def conn(p):
             rkey TEXT UNIQUE,
             text TEXT NOT NULL,
             at TEXT NOT NULL,
-            bot_id TEXT
+            bot_id TEXT,
+            kind TEXT
         )"""
     )
     columns = {row[1] for row in c.execute('PRAGMA table_info(messages)')}
@@ -73,6 +74,10 @@ def conn(p):
         c.execute('ALTER TABLE messages ADD COLUMN withdrawn_at TEXT')
     if 'bot_id' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
         c.execute('ALTER TABLE replies ADD COLUMN bot_id TEXT')
+    # 出站类型（acknowledgement / reply / notice）。NULL = 本列出现之前写的历史行：
+    # 不猜、不回填推断值，消费方按 legacy 处理（见 docs/review/product-fixes-20261117/CONTRACT.md）。
+    if 'kind' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
+        c.execute('ALTER TABLE replies ADD COLUMN kind TEXT')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS messages_request_id ON messages(conversation, request_id)')
     c.commit()
     return c
@@ -94,6 +99,9 @@ def msg_json(r):
         "at": r["at"],
         "url": r["url"] or "",
         "reply_to": r["reply_to"],
+        # 客户端的幂等键。消息面 /timeline 早就在发它；Source 也要能把它带进 Trigger.meta，
+        # 轻量活动端点才不用为了一个 request_id 去拉整份时间线。
+        "request_id": r["request_id"],
     }
 
 
@@ -171,9 +179,17 @@ def reply_target(value, conversation, c):
     return mid
 
 
+REPLY_KINDS = ("acknowledgement", "reply", "notice")
+
+
 def cmd_reply(c, args):
     if not args.conversation or not args.to or not args.key or args.text is None:
         print("missing reply target", file=sys.stderr)
+        return 2
+    kind = getattr(args, "kind", None)
+    if kind is not None and kind not in REPLY_KINDS:
+        # 未知类型不是「随便存一个」：它会让消费方把回执当最终答复。写之前就拒。
+        print("reply --kind must be one of %s; got %r" % (", ".join(REPLY_KINDS), kind), file=sys.stderr)
         return 2
     try:
         to_msg = reply_target(args.to, args.conversation, c)
@@ -187,8 +203,8 @@ def cmd_reply(c, args):
     replayed = False
     try:
         c.execute(
-            "INSERT INTO replies(conversation,to_msg,rkey,text,at,bot_id) VALUES(?,?,?,?,?,?)",
-            (args.conversation, to_msg, args.key, args.text, now(), getattr(args, 'bot', None)),
+            "INSERT INTO replies(conversation,to_msg,rkey,text,at,bot_id,kind) VALUES(?,?,?,?,?,?,?)",
+            (args.conversation, to_msg, args.key, args.text, now(), getattr(args, 'bot', None), kind),
         )
         c.commit()
     except sqlite3.IntegrityError:
@@ -224,6 +240,7 @@ def cmd_thread(c, args):
         'sender': {'id': ME, 'bot': True}, 'mentions_me': False,
         'text': r['text'], 'at': r['at'],
         **({'bot_id': r['bot_id']} if r['bot_id'] else {}),
+        **({'reply_kind': r['kind']} if r['kind'] else {}),
     }) for r in replies if r['to_msg'] in ids]
     entries.sort(key=lambda item: item[:3])
     items = [item[3] for item in entries]
@@ -284,7 +301,7 @@ def cmd_timeline(c, args):
         (conv,),
     ).fetchall()
     reps = c.execute(
-        "SELECT id,to_msg,rkey,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id", (conv,)
+        "SELECT id,to_msg,rkey,text,at,bot_id,kind FROM replies WHERE conversation=? ORDER BY id", (conv,)
     ).fetchall()
     entries = [(m["at"], 0, m["id"], {
         "id": "m%d" % m["id"], "role": "user", "sender": m["sender"], "text": m["text"], "at": m["at"],
@@ -293,6 +310,7 @@ def cmd_timeline(c, args):
     entries += [(r["at"], 1, r["id"], {
         "id": "r%d" % r["id"], "role": "agent", "text": r["text"], "at": r["at"], "rkey": r["rkey"],
         "to_msg": r["to_msg"], **({"bot_id": r["bot_id"]} if r["bot_id"] else {}),
+        **({"reply_kind": r["kind"]} if r["kind"] else {}),
     }) for r in reps]
     entries.sort(key=lambda item: (item[0], item[1], item[2]))
     items = [item[3] for item in entries]
@@ -327,14 +345,15 @@ def cmd_get(c, args):
         return 0
     if rid:
         r = c.execute(
-            "SELECT id,to_msg,rkey,text,at,bot_id FROM replies WHERE id=? AND conversation=?",
+            "SELECT id,to_msg,rkey,text,at,bot_id,kind FROM replies WHERE id=? AND conversation=?",
             (int(rid.group(1)), conv),
         ).fetchone()
         if not r:
             print(json.dumps({"item": None}, ensure_ascii=False))
             return 0
         item = {"id": "r%d" % r["id"], "role": "agent", "text": r["text"], "at": r["at"], "rkey": r["rkey"],
-                "to_msg": r["to_msg"], **({"bot_id": r["bot_id"]} if r["bot_id"] else {})}
+                "to_msg": r["to_msg"], **({"bot_id": r["bot_id"]} if r["bot_id"] else {}),
+                **({"reply_kind": r["kind"]} if r["kind"] else {})}
         print(json.dumps({"item": item}, ensure_ascii=False))
         return 0
     print("bad id (expect m<N> or r<N>)", file=sys.stderr)
@@ -353,7 +372,8 @@ def cmd_outbox(c, args):
     items = [
         {"id": r["id"], "conversation": r["conversation"], "to_msg": r["to_msg"],
          "key": r["rkey"], "text": r["text"], "at": r["at"],
-         **({"bot_id": r["bot_id"]} if r["bot_id"] else {})}
+         **({"bot_id": r["bot_id"]} if r["bot_id"] else {}),
+         **({"reply_kind": r["kind"]} if r["kind"] else {})}
         for r in rows
     ]
     nxt = items[-1]["id"] if items else after
@@ -379,6 +399,8 @@ def main():
     p.add_argument("--key", required=True)
     p.add_argument("--text", required=True)
     p.add_argument("--bot", default=None, help="bot id that signs this reply (team Source)")
+    p.add_argument("--kind", default=None, choices=REPLY_KINDS,
+                   help="outbound type; omitted stays NULL (legacy row, never guessed)")
     p.set_defaults(func=cmd_reply)
 
     p = sub.add_parser("thread")

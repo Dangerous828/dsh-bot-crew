@@ -7,13 +7,14 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
-import { allowedTools, connectionsOf } from './connections.ts'
+import { allowedTools, connectionOfCall, connectionsOf } from './connections.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
+import { NativeActivityTracker, type NativeActivity } from './native-activity.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
@@ -38,6 +39,7 @@ export interface SessionsHost {
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
   guardConnection?(ticketId: string, name: string, args: unknown): string | undefined
+  signConnectionCall(ticketId: string, name: string, args: unknown): unknown
 }
 
 /**
@@ -104,6 +106,7 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  private readonly activities = new Map<string, { agent: Agent; tracker: NativeActivityTracker; statusAt?: string }>()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -125,6 +128,7 @@ export class Sessions {
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
+      this.activities.get(agent.id)?.tracker.observe(event)
       this.updateModelHealth()
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
@@ -140,6 +144,11 @@ export class Sessions {
       })
     })
     ctx.on('agent/status', ({ agent, status }) => {
+      const activity = this.activities.get(agent.id)
+      if (activity?.agent === agent) {
+        activity.statusAt = new Date().toISOString()
+        if (status === 'idle') activity.tracker.settle(activity.statusAt)
+      }
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
@@ -247,6 +256,17 @@ export class Sessions {
     const retry = sessionId ? this.retryHealth.get(sessionId) : undefined
     return retry ? { model_retry: retry } : {}
   }
+  /** Current native activity; historical open calls never override an idle or missing live agent. */
+  activity(sessionId: string, since?: string): NativeActivity | undefined {
+    const entry = this.activities.get(sessionId)
+    if (!entry) return undefined
+    const snapshot = entry.tracker.snapshot({ since })
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (agent !== entry.agent || !this.bindings.has(agent)) return snapshot
+      ? { kind: 'unknown', at: snapshot.at, label: '执行状态待同步' } : undefined
+    if (agent.status === 'idle') return { kind: 'idle', at: entry.statusAt ?? snapshot?.at, label: '暂未执行' }
+    return snapshot
+  }
   private updateModelHealth(): void {
     const retries = this.retryHealth.list()
     this.host.health.set(retries.length
@@ -265,7 +285,12 @@ export class Sessions {
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
-    this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+    const events = agent.session.snapshotEvents()
+    this.retryHealth.restore(agent.id, events)
+    const tracker = new NativeActivityTracker()
+    tracker.replay(events)
+    if (agent.status === 'idle') tracker.settle()
+    this.activities.set(agent.id, { agent, tracker })
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
     this.updateModelHealth()
     // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
@@ -327,9 +352,24 @@ export class Sessions {
     const parent = scopeParentOf(agent)
     // 对外连接的工具由设置决定：配了什么，worker 就多拿那几个。
     // 只放行宿主真的注册了的（`tools.get` 为假说明那个 MCP 服务器没连上）。
-    const configured = allowedTools(connectionsOf((store.settings() as { connections?: unknown }).connections))
+    const config = connectionsOf((store.settings() as { connections?: unknown }).connections)
+    const configured = allowedTools(config)
     const allow = [...WORK_TOOLS, ...configured].filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(execution => {
+    // Restrict inherited names before adding scoped definitions: the SDK rejects local names in restrictions.
+    const disposers = [agent.ctx.tools.restrict({ allow })]
+    for (const name of configured) {
+      const call = connectionOfCall(config, name)
+      if (call?.connection.kind !== 'messages' || call.tool !== 'send_message') continue
+      const original = agent.ctx.tools.get(name, parent)
+      if (!original) continue
+      disposers.push(agent.ctx.tools.register({ ...original, execute: (args, execution) => {
+        // Resolve again after MCP reconnects; never mutate the SDK's frozen execution arguments.
+        const current = agent.ctx.tools.get(name, parent)
+        if (!current) throw new Error('消息连接已断开，请恢复连接后重试')
+        return current.execute(this.host.signConnectionCall(ticketId, name, args), execution)
+      } }))
+    }
+    disposers.push(agent.ctx.tools.guard(execution => {
       const current = store.tickets.get(ticketId)
       if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
       if (current.pendingApproval && current.pendingApproval.status !== 'approved') return '这张票在等主人审批，请结束本轮等待，不要改用其他工具。'
@@ -337,7 +377,8 @@ export class Sessions {
         return this.host.guardConnection?.(ticketId, execution.name, execution.arguments) ?? undefined
       }
       return undefined
-    })]
+    }))
+    return disposers
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
@@ -386,6 +427,7 @@ export class Sessions {
     const binding = this.bindings.get(agent)
     if (!binding) return
     this.bindings.delete(agent)
+    if (this.activities.get(agent.id)?.agent === agent) this.activities.delete(agent.id)
     binding.skills?.dispose()
     for (const dispose of binding.disposers.splice(0).reverse()) {
       try { dispose() } catch (error) { this.ctx.logger.warn('dsh-superagent could not release what it registered for a Session: %s', String(error)) }

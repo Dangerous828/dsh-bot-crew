@@ -1,7 +1,10 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
+import { randomUUID } from 'node:crypto'
+import { chmodSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { join } from 'node:path'
 import { recordsExport } from './views/records.ts'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
@@ -42,6 +45,8 @@ export interface HttpHost {
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
+  /** App 故障上报的落盘盒（只读查看用，管理面看所有设备）。宿主没接时诊断路由回 503。 */
+  readonly diagnostics?: import('./diagnostics.ts').Diagnostics
   /** Resolves once startup finishes or setup determines what is still missing. */
   readonly ready: Promise<void>
   /** Resolved deployment; throws if read while waiting for setup (`!configured()`). */
@@ -238,6 +243,20 @@ function routes(runtime: HttpHost): Routes {
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
+    // App 故障上报的只读查看（管理面看所有设备，本机同源才能进）。导出下载 NDJSON。
+    'GET diagnostics': ({ query }) => {
+      const box = runtime.diagnostics
+      if (!box) throw new RouteError(400, 'Diagnostics is unavailable')
+      return box.list({ device: query.device || undefined, session: query.session || undefined,
+        since: query.since || undefined, errorsOnly: query.errorsOnly === '1', limit: query.limit ? Number(query.limit) : undefined })
+    },
+    'GET diagnostics/export': ({ query }) => {
+      const box = runtime.diagnostics
+      if (!box) throw new RouteError(400, 'Diagnostics is unavailable')
+      // 直接返回 NDJSON 文本：管理面的 json() 会把对象 JSON 化，这里用字符串原样下发。
+      return { ndjson: box.exportNdjson({ device: query.device || undefined, session: query.session || undefined,
+        since: query.since || undefined, errorsOnly: query.errorsOnly === '1', limit: query.limit ? Number(query.limit) : undefined }) }
+    },
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
@@ -269,7 +288,78 @@ function devicesOf(runtime: HttpHost) {
   return deviceStoreOf(runtime.machine.stateDir, settings.remote?.pairing ?? 'code')
 }
 
+interface HeadlessHealthDescriptor {
+  version: 1
+  instance: string
+  pid: number
+  profile: string
+  stateDir: string
+  host: '127.0.0.1'
+  port: number
+  startedAt: string
+}
+
+function registerHeadlessHealth(ctx: Context, runtime: HttpHost): () => void {
+  const context = ctx as unknown as { profileContext?: { name?: string }; logger: Context['logger'] }
+  const profileArg = process.argv.findIndex(value => value === '--profile')
+  const profile = context.profileContext?.name ?? (profileArg >= 0 ? process.argv[profileArg + 1] : undefined) ?? 'unknown'
+  mkdirSync(runtime.machine.stateDir, { recursive: true, mode: 0o700 })
+  const stateDir = realpathSync(runtime.machine.stateDir)
+  const descriptorPath = join(stateDir, 'headless-health.json')
+  const instance = randomUUID()
+  let closing = false
+  const server = createServer((req, res) => {
+    if (req.method !== 'GET' || req.url !== '/orchestrator/api/state') { res.writeHead(404); res.end(); return }
+    const address = server.address()
+    if (!address || typeof address === 'string' || req.socket.remoteAddress !== '127.0.0.1' || !sameOrigin(req, address.port)) {
+      json(res, 403, { error: 'Loopback health request required' }); return
+    }
+    try {
+      const state = stateView(runtime)
+      json(res, 200, { headless: { profile, pid: process.pid, stateDir, port: address.port },
+        health: state.health, setup: { problem: state.setup.problem, feishuProblem: state.setup.feishuProblem },
+        load: state.load, paused: state.paused })
+    } catch {
+      json(res, 500, { error: 'Headless health state unavailable' })
+    }
+  })
+  server.on('error', error => { context.logger.error('dsh-superagent headless health listener failed: %s', String(error)) })
+  queueMicrotask(() => {
+    if (closing) return
+    server.listen(0, '127.0.0.1', () => {
+      if (closing) { server.close(); return }
+      const address = server.address()
+      if (!address || typeof address === 'string') return
+      const descriptor: HeadlessHealthDescriptor = { version: 1, instance, pid: process.pid, profile, stateDir,
+        host: '127.0.0.1', port: address.port, startedAt: new Date().toISOString() }
+      const temporary = `${descriptorPath}.${instance}.tmp`
+      try {
+        writeFileSync(temporary, JSON.stringify(descriptor), { flag: 'wx', mode: 0o600 })
+        chmodSync(temporary, 0o600)
+        renameSync(temporary, descriptorPath)
+      } catch (error) {
+        closing = true
+        try { unlinkSync(temporary) } catch { /* The atomic rename may already have consumed it. */ }
+        context.logger.error('dsh-superagent headless health descriptor failed: %s', String(error))
+        server.close()
+      }
+    })
+  })
+  return () => {
+    if (closing) return
+    closing = true
+    if (server.listening) server.close()
+    try {
+      const current = JSON.parse(readFileSync(descriptorPath, 'utf8')) as Partial<HeadlessHealthDescriptor>
+      if (current.instance === instance && current.pid === process.pid) unlinkSync(descriptorPath)
+    } catch { /* A missing or replaced descriptor belongs to no running instance here. */ }
+  }
+}
+
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
+  const context = ctx as unknown as { webServer?: Context['webServer']; get?: (name: string) => unknown }
+  const webServer = (typeof context.get === 'function' ? context.get('webServer') : context.webServer) as Context['webServer'] | undefined
+  if (!webServer) return registerHeadlessHealth(ctx, runtime)
   // The fence is per request, not per bind address: sameOrigin below accepts only a loopback Host header,
   // so a Web server bound to a LAN address for the phone still refuses management calls from the network.
   // Nothing here depends on the bind address on purpose; the check lives at the request.
@@ -280,7 +370,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
     // 这是配对唯一的防线，删掉它等于把「谁都能给这台机器配一台设备」放到局域网上。
     // 手机带凭据进来的入口。它必须挂在配对面之外：配对面只认本机，而这条路正是给局域网用的。
     // 它自己的门是凭据本身（lanGate），不看 Host。
-    ctx.webServer.register({ kind: 'prefix', path: '/api/remote/enter', handler: async (req, res) => {
+    webServer.register({ kind: 'prefix', path: '/api/remote/enter', handler: async (req, res) => {
       if (req.method !== 'POST') { json(res, 405, { error: 'POST required' }); return }
       const payload = await readBody(req, 8 * 1024).catch(() => ({}))
       const { deviceId, token } = (payload ?? {}) as { deviceId?: unknown; token?: unknown }
@@ -289,9 +379,9 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       // 不说清是设备不对还是凭据不对：那是在帮尝试者筛选。
       json(res, allowed ? 200 : 401, allowed ? { ok: true } : { error: 'Not paired' })
     } }),
-    ctx.webServer.register({ kind: 'prefix', path: '/api/remote', handler: async (req, res) => {
+    webServer.register({ kind: 'prefix', path: '/api/remote', handler: async (req, res) => {
       // 配对面有自己的一道门：它不能要求管理面那个 x-orchestrator-request 头，那等于把配对锁死。
-      if (!pairingFence(req, ctx.webServer.port)) { json(res, 403, { error: 'Local origin required' }); return }
+      if (!pairingFence(req, webServer.port)) { json(res, 403, { error: 'Local origin required' }); return }
       // 策略从这里读，配对面才不会变成一个永远放行的假开关。
       const remote = pairingHandler(devicesOf(runtime))
       // readBody 解出来的是对象，不是字符串。原先只在 payload 是字符串时才放 body，
@@ -305,10 +395,10 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       const reply = await remote(new Request(`http://dsh${req.url}`, { method: req.method, ...body }))
       json(res, reply.status, await reply.json())
     } }),
-    ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
+    webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      if (!sameOrigin(req, webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))

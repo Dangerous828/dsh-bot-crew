@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Restore legacy reply kinds from exact persisted outbox receipts; dry-run unless --apply."""
+import argparse
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+
+KINDS = {'acknowledgement', 'reply', 'notice'}
+
+
+def content_digest(connection):
+    columns = [row[1] for row in connection.execute('PRAGMA table_info(replies)') if row[1] != 'kind']
+    if not columns:
+        raise ValueError('replies table is missing')
+    quoted = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
+    digest = hashlib.sha256()
+    for row in connection.execute('SELECT ' + quoted + ' FROM replies ORDER BY id'):
+        digest.update(json.dumps(row, ensure_ascii=False, separators=(',', ':')).encode())
+        digest.update(b'\n')
+    return digest.hexdigest()
+
+
+def backfill(state_dir, apply=False):
+    state = Path(state_dir).resolve()
+    source = sqlite3.connect((state / 'orchestrator.sqlite').as_uri() + '?mode=ro', uri=True)
+    try:
+        source.execute('BEGIN')
+        receipts = {row[0]: row[1] for row in source.execute("SELECT id,json_extract(value,'$.kind') FROM outbox") if row[1] in KINDS}
+    finally:
+        source.close()
+    queue = sqlite3.connect((state / 'mobileq.db').as_uri() + ('?mode=rw' if apply else '?mode=ro'), uri=True)
+    try:
+        if 'kind' not in {row[1] for row in queue.execute('PRAGMA table_info(replies)')}:
+            raise ValueError('replies.kind is missing; initialize the updated mobileq schema first')
+        queue.execute('BEGIN IMMEDIATE' if apply else 'BEGIN')
+        before = content_digest(queue)
+        rows = queue.execute('SELECT id,rkey FROM replies WHERE kind IS NULL ORDER BY id').fetchall()
+        changes = [(receipts[rkey], row_id, rkey) for row_id, rkey in rows if rkey in receipts]
+        if apply:
+            queue.executemany('UPDATE replies SET kind=? WHERE id=? AND rkey=? AND kind IS NULL', changes)
+            if queue.total_changes != len(changes):
+                raise RuntimeError('reply kind update count changed inside the transaction')
+        after = content_digest(queue)
+        if before != after:
+            raise RuntimeError('reply content changed; rolling back')
+        if apply:
+            queue.commit()
+        else:
+            queue.rollback()
+        counts = {kind: sum(1 for change in changes if change[0] == kind) for kind in sorted(KINDS)}
+        return {'applied': apply, 'matched': len(changes), 'remainingLegacy': len(rows) - len(changes), 'kinds': counts,
+                'contentSha256': before, 'contentPreserved': before == after}
+    except BaseException:
+        queue.rollback()
+        raise
+    finally:
+        queue.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state-dir', type=Path, required=True)
+    parser.add_argument('--apply', action='store_true')
+    args = parser.parse_args()
+    print(json.dumps(backfill(args.state_dir, args.apply), ensure_ascii=False, indent=2))
+
+
+if __name__ == '__main__':
+    main()

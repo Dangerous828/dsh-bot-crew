@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createPairingThrottle } from './pairing-throttle.ts'
 import { presentedDevice } from './phone-gate.ts'
+import { serveAndroidUpdate, UPDATE_PREFIX } from './updates.ts'
 import { MAX_WAV_BYTES } from './voice.ts'
 
 /**
@@ -28,6 +29,12 @@ export interface LanServerOptions {
    * 各自 new 一个的话，同一台机器在两条路上各拿一份额度。
    */
   pairingAllowed?: (address: string | undefined) => boolean
+  /**
+   * 后台 OTA 的分发根（`<stateDir>/android-updates`）。给了就多开一片**不验凭据**的区域，
+   * 范围由 `updates.ts` 的契约钉死：只有 manifest 与两个形状固定的 APK 地址。
+   * 不给就是没有这个功能，这条路上仍然只有验过凭据的消息面。
+   */
+  updatesRoot?: string
 }
 
 export interface LanServer {
@@ -54,7 +61,7 @@ async function readBody(request: IncomingMessage): Promise<Buffer<ArrayBuffer>> 
 }
 
 export function createLanServer(options: LanServerOptions): LanServer {
-  const { devices, forward } = options
+  const { devices, forward, updatesRoot } = options
   // 一个地址一个监听：每个地址有独立的句柄与 socket 集合。
   const servers = new Map<string, Server>()
   const socketsFor = new Map<Server, Set<import('node:net').Socket>>()
@@ -72,6 +79,12 @@ export function createLanServer(options: LanServerOptions): LanServer {
     // 这条路只服务手机消息面。别的路径一律不接：将来消息面若长了非手机用途的接口，
     // 这里不会因为它们存在就自动放出去。
     const path = (request.url ?? '/').split('?')[0] ?? '/'
+    // 升级包是唯一不带凭据的区域，所以它必须在下面那道凭据判定**之前**认领，
+    // 而认领范围只到这条前缀为止 —— 它不是一个静态文件服务器。
+    if (updatesRoot && (path === UPDATE_PREFIX || path.startsWith(`${UPDATE_PREFIX}/`))) {
+      await serveAndroidUpdate(request, response, updatesRoot)
+      return
+    }
     if (!path.startsWith('/api/mobile/')) {
       response.writeHead(404, { 'content-type': 'application/json' })
       response.end(JSON.stringify({ error: 'Not found' }))

@@ -26,6 +26,18 @@ class PairingStore(context: Context) {
     /** 本机真的存过的那份；内置的那份不算，它在 load 里作为回落。 */
     fun stored(): PairedCrew? = PairingRecord.read(store.all)
 
+    /**
+     * 启动诊断用：区分 prefs 的三种真实状态，**不**用「读到 null 就当没配对」掩盖 parse 错误。
+     *
+     * - [PairingRecord.ReadState.MISSING]：三个必填键（device/token/base）一个都没有 —— 真没存过。
+     * - [PairingRecord.ReadState.LOADED]：三键齐全且形状合法 —— 读到了一份配对。
+     * - [PairingRecord.ReadState.PARSE_ERROR]：三键有残留但形状不合法（缺 base、值不是字符串、base 归一后为空等）。
+     *
+     * 只读不改盘：parse_error 时**保留原始损坏 prefs**，绝不自动配对覆盖，留待人修。
+     * 汇报里带 [PairingRecord.ReadState.detail]（键名层面，不含凭据值）。
+     */
+    fun probeReadState(): PairingRecord.ReadState = PairingRecord.probeState(store.all)
+
     fun save(paired: PairedCrew) {
         // 先清再写：字段是一组固定的键，逐条 put 会把上次残留的、这次不该有的值留在盘上。
         // SESSION 是唯一例外 —— 当前会话只有一个写入口 [saveSession]。
@@ -129,11 +141,46 @@ object PairingRecord {
     const val CREW = "crew"
     /** 当前会话。老装机没有这一格：读成 main，行为与旧版逐字一致。 */
     const val SESSION = "session"
+    /** 服务器自报身份指纹（timeline `server.crew`）与可信公网入口（`server.public_base`）。老记录没有这两格。 */
+    const val SERVER_CREW = "serverCrew"
+    const val SERVER_PUBLIC_BASE = "serverPublicBase"
 
     /** 当前会话单独读：缺键、空串、形状不对都回落 main。 */
     fun session(values: Map<String, Any?>): String {
         val saved = values[SESSION] as? String ?: return SessionRoute.MAIN
         return saved.trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
+    }
+
+    /** 启动诊断状态。detail 只描述键名层面的问题，绝不带凭据值。 */
+    data class ReadState(val state: String, val detail: String = "") {
+        companion object {
+            const val MISSING = "missing"
+            const val LOADED = "loaded"
+            const val PARSE_ERROR = "parse_error"
+        }
+    }
+
+    /**
+     * 判定盘上那份配对的真实状态（纯函数，可单测）。
+     *
+     * 区分三态是为了让「启动快照」真实可观测：旧代码读不到就一律回 null，把「prefs 损坏」伪装成
+     * 「没配对」。这里分开：三键全无=MISSING；三键齐全且形状合法=LOADED；有残留但形状不合法=PARSE_ERROR。
+     * 解析用与 [read] 同一套门槛（device/token/base 必须是非空字符串，base 归一后非空）。
+     */
+    fun probeState(values: Map<String, Any?>): ReadState {
+        val hasDevice = values.containsKey(DEVICE)
+        val hasToken = values.containsKey(TOKEN)
+        val hasBase = values.containsKey(BASE)
+        if (!hasDevice && !hasToken && !hasBase) return ReadState(ReadState.MISSING)
+        val device = values[DEVICE] as? String
+        val token = values[TOKEN] as? String
+        val base = values[BASE] as? String
+        val problems = ArrayList<String>()
+        if (device.isNullOrBlank()) problems.add("deviceId 缺失或非文本")
+        if (token.isNullOrBlank()) problems.add("token 缺失或非文本")
+        if (base.isNullOrBlank() || CrewPairing.normalize(base).isEmpty()) problems.add("base 缺失/非法")
+        return if (problems.isEmpty()) ReadState(ReadState.LOADED)
+        else ReadState(ReadState.PARSE_ERROR, problems.joinToString("；"))
     }
 
     /** 缺前三格就不算一份配对；其余几格缺了读成空串，那是「这台电脑没有这项」。 */
@@ -149,6 +196,8 @@ object PairingRecord {
             p2pAddr = values[P2P] as? String ?: "",
             crew = values[CREW] as? String ?: "",
             session = session(values),
+            serverCrew = values[SERVER_CREW] as? String ?: "",
+            serverPublicBase = values[SERVER_PUBLIC_BASE] as? String ?: "",
         )
     }
 
@@ -160,6 +209,8 @@ object PairingRecord {
         P2P to paired.p2pAddr,
         CREW to paired.crew,
         SESSION to paired.session,
+        SERVER_CREW to paired.serverCrew,
+        SERVER_PUBLIC_BASE to paired.serverPublicBase,
     )
 
     /**

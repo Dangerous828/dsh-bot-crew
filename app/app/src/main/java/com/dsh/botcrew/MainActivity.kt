@@ -1,11 +1,20 @@
 package com.dsh.botcrew
 
 import android.os.Bundle
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.view.WindowCompat
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -18,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -40,9 +50,30 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         // 配好的电脑存在本机，重启后不用再念一次码。
         val pairing = PairingStore(this)
         val thisDevice = deviceId(this)
+
+        // 诊断子系统：先拿实例、装崩溃处理器、开上报循环。release 也开（这是给用户看的 App 自身诊断），
+        // 但只记白名单字段、可关可清。版本信息从 BuildConfig 灌进去（纯逻辑层不依赖 BuildConfig）。
+        BuildInfo.VERSION_NAME = BuildConfig.VERSION_NAME
+        BuildInfo.VERSION_CODE = BuildConfig.VERSION_CODE
+        BuildInfo.BUILD_ID = BuildConfig.CREW_BUILD_ID
+        val diag = DiagRuntime.get(this)
+        diag.installCrashHandler()
+        diag.startUploadLoop()
+        // 启动先记一条配置快照（不 dump 凭据）：prefs 是否读到配对、host/routeKind、pairing 解析是否异常。
+        recordStartupSnapshot(pairing, diag)
+        // 网络回调：更新连接种类、断网/恢复、网络切换时清路由冷却。
+        val cm = getSystemService(ConnectivityManager::class.java)
+        cm?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) { diag.updateNetwork(network) }
+            override fun onLost(network: android.net.Network) { diag.updateNetwork(null) }
+            override fun onCapabilitiesChanged(network: android.net.Network, caps: NetworkCapabilities) { diag.updateNetwork(network) }
+        })
+        // 前后台事件。
+        diag.recordLifecycle(true)
 
         // 调试口：debug 构建默认开，release 永远不开（见 CrewDebug 的注释）。
         // 起不来只记一行日志，界面照常 —— 调试口是外挂，不是界面的一部分。
@@ -119,6 +150,86 @@ class MainActivity : ComponentActivity() {
                 // 建好就判一次：刚启动时局域网那条的失败计数是 0，这时结论必然是 OK，
                 // 但它让「有没有可判的地址」这件事在快照里一开始就有个明确的答案。
                 lanReport = judgeLan(fresh)
+
+                // 诊断：给 client 挂配对快照（选路种类要用）、请求埋点、绑定上报器。
+                fresh.attachPairing(current, proxyPort)
+                fresh.networkKindProvider = diag.networkKind
+                // 上传入口只从可信来源取（serverPublicBase / HTTPS fallback / 注入且 crew 精确匹配的 DIAG_BASE）；
+                // 无有效凭据或无可信 HTTPS 入口 → 不 bind、不上报、不发 token。绝不硬编码 crew 域名。
+                fun rebindUploader(p: PairedCrew) {
+                    val savedCrew = p.serverCrew.ifBlank { p.crew }
+                    val chosen = UploadEndpoint.decide(
+                        serverPublicBase = p.serverPublicBase,
+                        fallbackBase = p.fallbackBase,
+                        savedCrew = savedCrew,
+                        diagBase = BuildConfig.CREW_DIAG_BASE,
+                        expectedCrew = BuildConfig.CREW_EXPECTED_CREW,
+                    )
+                    if (chosen.url.isNotBlank()) {
+                        diag.bindUploader(p.deviceId, p.token, chosen.url)
+                    } else {
+                        diag.unbindUploader()
+                    }
+                }
+                rebindUploader(current)
+                fresh.diagSink = { path, method, status, ms, err, routeKind ->
+                    diag.noteRouteKind(routeKind)
+                    diag.record(
+                        type = when {
+                            routeKind.isNotEmpty() && err == null && (status ?: 0) in 200..299 -> ClientDiag.EventType.OTHER
+                            err != null -> ClientDiag.EventType.NET_FAIL
+                            else -> ClientDiag.EventType.HTTP_ERROR
+                        },
+                        route = path, method = method, status = status, ms = ms, err = err,
+                        extra = mapOf("phase" to "receive", "routeKind" to routeKind),
+                    )
+                }
+                // 网络变化：清路由冷却、按新网络重判、更新连接的 networkKind（蜂窝优先公网）。
+                diag.onNetworkChanged = {
+                    fresh.onNetworkChanged()
+                    fresh.networkKindProvider = diag.networkKind
+                }
+
+                // 可信公网入口自愈（不动 token/deviceId/crew 身份，不重配对）：
+                // ① 非空旧域名也由同 crew 可信元数据更新；② 空 fallback 才 bootstrap，
+                //    且准入由纯函数 BootstrapGate 判定（空 savedCrew / 预期不符 / 配置空 → 0 请求），
+                //    bootstrap 内部再对 server.crew 做精确比对。绝不用 build 预期值伪装成已登记身份。
+                val savedCrew = current.serverCrew.ifBlank { current.crew }
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    try {
+                        // ① 从已知可信当前入口读 server 元数据，crew 相同时更新（含非空旧 fallback）。
+                        if (current.fallbackBase.isNotBlank() || current.base.isNotBlank()) {
+                            val trusted = fresh.trustedPublicBase(
+                                current.fallbackBase.ifBlank { current.base },
+                                savedCrew,
+                            )
+                            if (!trusted.isNullOrBlank() && trusted != current.fallbackBase) {
+                                val updated = current.copy(fallbackBase = trusted)
+                                pairing.save(updated)
+                                fresh.replaceEntries(CrewRoute.entries(updated, proxyPort))
+                                rebindUploader(updated)
+                            }
+                        }
+                        // ② 空 fallback 的 bootstrap：准入纯函数判定，全绿才请求。
+                        val decision = BootstrapGate.decide(
+                            savedCrew = savedCrew,
+                            injectedBase = BuildConfig.CREW_PUBLIC_BASE,
+                            expectedCrew = BuildConfig.CREW_EXPECTED_CREW,
+                            savedFallback = current.fallbackBase,
+                        )
+                        if (decision.allowed) {
+                            val got = fresh.bootstrapPublic(decision.base, decision.expectCrew)
+                            if (!got.isNullOrBlank()) {
+                                val updated = current.copy(fallbackBase = got)
+                                pairing.save(updated)
+                                fresh.replaceEntries(CrewRoute.entries(updated, proxyPort))
+                                rebindUploader(updated)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        android.util.Log.w("CrewDiag", "公网入口自愈失败（忽略，不影响连接）", t)
+                    }
+                }
 
                 // 句柄只建一次：start 内部先 stop 再新建隧道客户端，反复 start 等于每次探测都重建句柄。
                 // 换网络后隧道在库内部自己重连，重试只复用这个端口去探，不再碰句柄。
@@ -273,6 +384,9 @@ class MainActivity : ComponentActivity() {
                             onSessionChange = { session -> pairing.saveSession(session) },
                             // 调试口：只在开关开启时挂上去（null 时 CrewRoot 连一个对象都不建）。
                             debug = bridge,
+                            // 本地存储的命名空间（草稿 / 未确认发送）按这台已配对的 crew 分隔。
+                            // 只用于算 namespace，不参与请求。
+                            paired = current,
                         )
                     }
                 }
@@ -287,10 +401,65 @@ class MainActivity : ComponentActivity() {
      * 那正是真机上「转屏后空响应到杀进程」的成因。socket 随进程一起消失，不需要谁去 close。
      */
     override fun onDestroy() {
+        DiagRuntime.get(this).recordLifecycle(false)
         if (debugBridge != null) CrewDebugPorts.process.detach(debugToken)
         debugBridge?.screen = null
         debugBridge = null
         super.onDestroy()
+    }
+
+    /**
+     * 启动配置快照：让验证员能**真实看到**旧 prefs 的状态，而不是被「读到 null 就当没配对」掩盖。
+     *
+     * 只把服务端白名单字段写进事件（phase/routeKind/version/networkKind）；**不**把 host 或 paired 布尔
+     * 塞进 extra（服务端会丢未知键，塞了反而给人「已上报」的假象）。prefs 三态用 phase 表示：
+     * `prefs_missing` / `prefs_loaded` / `prefs_parse_error`；parse_error 的 detail（键名层面）与提取出的
+     * hostname（不含 userinfo/query）只写本地 logcat + 诊断页，不进上报。
+     *
+     * parse_error 时**保留**原始损坏 prefs、不自动配对覆盖，留待人工修。
+     */
+    private fun recordStartupSnapshot(pairing: PairingStore, diag: DiagRuntime) {
+        val readState = try {
+            pairing.probeReadState()
+        } catch (t: Throwable) {
+            // 读 prefs 本身抛（极端）：如实记一条 parse_error，别伪装成 missing。
+            PairingRecord.ReadState(PairingRecord.ReadState.PARSE_ERROR, ClientDiag.errOf(t))
+        }
+        val phase = when (readState.state) {
+            PairingRecord.ReadState.MISSING -> "prefs_missing"
+            PairingRecord.ReadState.LOADED -> "prefs_loaded"
+            else -> "prefs_parse_error"
+        }
+        // 提取 hostname 仅用于本地可观测（不含 userinfo/query），绝不进上报 extra。
+        val storedHost = try {
+            pairing.stored()?.base?.let { hostnameOf(it) }.orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        android.util.Log.i("CrewDiag", "startup prefs=${readState.state} detail=${readState.detail} host=$storedHost")
+        // 上报：只用白名单字段。version/networkKind 由 diag 自动带；这里补 phase。
+        diag.record(
+            type = ClientDiag.EventType.OTHER,
+            route = "/app/startup",
+            extra = mapOf("phase" to phase, "version" to BuildConfig.VERSION_NAME),
+        )
+        if (readState.state == PairingRecord.ReadState.PARSE_ERROR) {
+            // 再补一条独立的 parse_error 事件（err 只放短词 errorClass 语义，不塞 message）。
+            diag.record(
+                type = ClientDiag.EventType.OTHER,
+                route = "/app/startup",
+                err = "PrefsParseError",
+                extra = mapOf("phase" to "prefs_parse_error"),
+            )
+        }
+    }
+
+    /** 从地址里提取纯 hostname（不含 scheme/userinfo/query/port）。取不到返回空串。 */
+    private fun hostnameOf(url: String): String = try {
+        val u = java.net.URI(url.trim())
+        u.host?.substringBefore(':').orEmpty()
+    } catch (_: Throwable) {
+        ""
     }
 
     private companion object {
@@ -301,10 +470,44 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** 建连接那一瞬间看到的一句话。它不是错误提示，所以不用告警色。 */
+/**
+ * 建连接那一瞬间看到的一句话。它不是错误提示，所以不用告警色。
+ *
+ * 只在这一句下面挂一个可点的「连接/使用说明」小字：点开的是同一个
+ * [CrewConnectionStatus] 详情 Dialog（日常开机联网不睡眠、无需桌面 App、
+ * 仅服务停止时才跑 start 命令）。**不动这里的连接初始化**：仍然是在连上队伍的过程中，
+ * 所以 loading=true —— 详情里不会说「已连接」。
+ */
 @Composable
 private fun WaitingLine(palette: CrewPalette) {
+    var helpOpen by remember { mutableStateOf(false) }
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text("正在连上队伍…", fontSize = 13.sp, color = palette.muted)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("正在连上队伍…", fontSize = 13.sp, color = palette.muted)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "使用说明",
+                fontSize = 12.sp,
+                color = palette.accent,
+                // 可点区 >=48dp：虽是「小字」，触控命中高度仍按统一规格来，不留例外。
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .clickable { helpOpen = true }
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+            )
+        }
+        if (helpOpen) {
+            // 复用连接组件的详情 Dialog（折叠成 0 高度、只借它的详情内容）：
+            // 不重做一套说明，文案/命令只有一处真理源。
+            CrewConnectionStatus(
+                route = "",
+                loading = true,
+                problem = null,
+                palette = palette,
+                onRefresh = {},
+                startExpanded = true,
+                onExpandedConsumed = { helpOpen = false },
+            )
+        }
     }
 }

@@ -121,4 +121,14 @@ data class PairedCrew(
     val p2pAddr: String = "",
     val crew: String = "",
     val session: String = SessionRoute.MAIN,
+    /**
+     * 服务器身份指纹（来自 timeline/pair 的 `server.crew`，与 mDNS TXT `crew` 同源）。
+     *
+     * 空串表示「还没登记过可信身份」——首次配对或老记录。用来**精确比对**「这个公网入口是不是
+     * 同一台后端」，而不是拿任意 200 当身份。它和 [crew]（mDNS 广播给的指纹）语义相同，
+     * 但 [crew] 可能因为老记录/未发现而为空；这里存的是**服务端自己报的**，更可靠。
+     */
+    val serverCrew: String = "",
+    /** 服务端自报的**可信**公网入口（timeline `server.public_base`，真实 HTTPS 或空）。 */
+    val serverPublicBase: String = "",
 )

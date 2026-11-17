@@ -39,7 +39,11 @@ if changed backend || changed scripts; then
   echo "pre-commit: backend 检查（typecheck + 测试 + 构建）"
   # tests/runtime.spec.ts 断言 worker 的环境被完整还原，前提是宿主本身没带这些变量。
   # 在 dsh 会话里 GIT_CONFIG_GLOBAL 是设着的，不摘掉会让这两项假失败。
-  if ! ( cd backend && env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM pnpm check ); then
+  # GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE 是 git 跑钩子时塞进来的，会漏进
+  # tests/environment*.spec.ts 自己临时仓库里的 `git worktree add`（表现为
+  # `.git/index: index file open failed: Not a directory`），同样必须摘掉。
+  if ! ( cd backend && env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM \
+         -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX pnpm check ); then
     failed="$failed backend"
   fi
 fi

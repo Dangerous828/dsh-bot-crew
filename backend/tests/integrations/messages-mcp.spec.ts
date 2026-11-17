@@ -153,8 +153,8 @@ describe('内部消息 adapter：真实 mobileq.db 读 / 写 / 审批 / 拒后�
     } finally { client.close() }
 
     // 独立真值：replies 表真的新增一行；messages 表一行没多（写 reply 不碰 messages）。
-    const replies = JSON.parse(sql(db, 'SELECT text,to_msg FROM replies ORDER BY id DESC LIMIT 1')) as [string, number][]
-    expect(replies[0]).toEqual(['这是队伍的回话', msgId])
+    const replies = JSON.parse(sql(db, 'SELECT text,to_msg,kind FROM replies ORDER BY id DESC LIMIT 1')) as [string, number, string | null][]
+    expect(replies[0]).toEqual(['这是队伍的回话', msgId, 'reply'])
     expect(replyId).toBeTruthy()
     expect((JSON.parse(sql(db, 'SELECT count(*) FROM messages')) as number[][])[0]![0]).toBe(messagesBefore)
     // 关键：未读（read_at IS NULL）条数不变 —— 没有把回话塞进 messages 队列、不制造新 Trigger。

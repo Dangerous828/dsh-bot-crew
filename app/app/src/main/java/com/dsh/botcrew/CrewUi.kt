@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.defaultMinSize
@@ -14,18 +16,22 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -39,6 +45,14 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
+import androidx.activity.compose.BackHandler
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -46,11 +60,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
@@ -64,13 +81,23 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onLongClick
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -201,6 +228,13 @@ private class RefreshGuard {
     var again = false
 }
 
+/** 一条已发文本的短指认（与 [UncertainSend.excerpt] 同一口径，供没有落盘记录时兜底）。 */
+private fun excerptOf(text: String): String {
+    val head = text.lineSequence().firstOrNull()?.trim().orEmpty()
+    if (head.isEmpty()) return "（空白内容）"
+    return if (head.length <= 24) head else head.take(23) + "…"
+}
+
 @Composable
 fun CrewRoot(
     client: CrewClient,
@@ -217,6 +251,11 @@ fun CrewRoot(
      * 界面这一层与没有这套东西时逐字相同。
      */
     debug: DebugBridge? = null,
+    /**
+     * 已配对的 crew。只用来算本地存储的命名空间（草稿 / 未确认发送按 crew + 会话隔离），
+     * 不参与任何请求：凭据与入口仍由 [client] 持有。
+     */
+    paired: PairedCrew? = null,
 ) {
     // 设备接收链（#23）：推送落本地、按 id 去重、持久化后 ACK。用应用私有存储（SharedPreferences），
     // 不是 rememberSaveable —— force-stop / 冷启动之后仍要在，那是「不丢件」的底线。
@@ -233,11 +272,35 @@ fun CrewRoot(
         mutableStateOf(SessionState(current = initialSession.takeIf(SessionRoute::validId) ?: SessionRoute.MAIN))
     }
     val conversation: Conversation? = sessionState.shown
+    // 诊断事件要带 session 短词：会话变了就同步给 DiagRuntime（只读，不写盘、不弹键盘）。
+    androidx.compose.runtime.LaunchedEffect(sessionState.current) {
+        DiagRuntime.get(appContext).currentSession = sessionState.current
+    }
+    // problem 只由「时间线读取失败」写入 → 喂顶部连接状态、也是「连不上就别发」的唯一依据。
     var problem by remember { mutableStateOf<String?>(null) }
-    var draft by remember { mutableStateOf("") }
-    var sending by remember { mutableStateOf(false) }
-    // 同一条草稿重发要沿用同一个 request_id：超时后其实已经进了队，换一个键会重复入队。
-    var pendingSend by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // 草稿与未确认发送都落盘（按 crew + 会话隔离）：切会话、进程被系统回收都不丢。
+    val draftStore = remember(paired) { DraftStore(appContext, paired) }
+    val sendStore = remember(paired) { SendRecoveryStore(appContext, paired) }
+    // 每会话一份草稿正文。启动时从盘上读回来 —— 这就是「重建后草稿还在」。
+    var draftBySession by remember { mutableStateOf(draftStore.all().associate { it.sessionKey to it.text }) }
+    // 在途请求按会话隔离，旧会话的回调只更新自己的条目。
+    var sendingBySession by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    // 未确认发送：盘上那份是唯一真源，内存这份只是它的投影（重启后从盘上重建）。
+    var uncertain by remember { mutableStateOf(sendStore.all()) }
+    // 失败/待确认提示按 requestId 记账，同会话可以有多条（A 的失败不能被 B 的成功抹掉）。
+    var sendNotes by remember { mutableStateOf<Map<String, List<SendNote>>>(emptyMap()) }
+    // 盘上记录读坏时的提示：一条可见的话，不静默当空、不覆盖、并且拦住发送。
+    var storeTrouble by remember { mutableStateOf<String?>(null) }
+    val activeSessionKey = sessionState.requestSession ?: SessionRoute.MAIN
+    val draft = draftBySession[activeSessionKey].orEmpty()
+    val sessionNotes = SendNoteBook.of(sendNotes, activeSessionKey)
+    val sending = sendingBySession[activeSessionKey].orEmpty().isNotEmpty()
+    // 轻量活动：只挂到消息上，不当成工单状态机。
+    var activityCapability by remember { mutableStateOf(ActivityCapability.UNKNOWN) }
+    var activityItems by remember { mutableStateOf<Map<String, RequestActivity>>(emptyMap()) }
+    var activityStale by remember { mutableStateOf(false) }
+    var activityGeneration by remember { mutableStateOf(0L) }
+    var foreground by remember { mutableStateOf(true) }
     var screen by remember { mutableStateOf(Screen.Crew) }
     // 两个模式共一本时间线：这里只存镜头，不另拉一次账（契约 §1）。默认日常群聊。
     var mode by remember { mutableStateOf(Mode.Chat) }
@@ -251,6 +314,8 @@ fun CrewRoot(
     // 第几次把时间线读回来。结果条按票的缓存跟着它清：桌面端也是每读回一次对话就把
     // perTicket 清空重读 —— worker 可能只写了个文件，一句话也没多说。
     var timelineEpoch by remember { mutableStateOf(0) }
+    // 展开态只保存界面选择，按会话与工单归属，不保存任务状态。
+    var expandedSubagent by remember { mutableStateOf<Pair<String, String>?>(null) }
     val scope = rememberCoroutineScope()
     // 时间线刷新的单飞记号（见下面 refresh）。
     val refreshGuard = remember { RefreshGuard() }
@@ -263,6 +328,20 @@ fun CrewRoot(
     // 名单先验失败后，人点「重试」就再问一次；不改变锁 main 的结论。
     var sessionRetry by remember { mutableStateOf(0) }
 
+    fun navigateScreenBack() {
+        when (screen) {
+            Screen.Workspace -> {
+                screen = Screen.Crew
+                onScreen = null
+                previewTicket = null
+                previewView = null
+            }
+            Screen.Models, Screen.Backend -> screen = Screen.Crew
+            Screen.Routine, Screen.Memory -> screen = Screen.Backend
+            Screen.Crew -> Unit
+        }
+    }
+
     // 消息结果条按票读产出（契约 §5.4）。挂在 CrewRoot 上、不挂在队伍页里：
     // 去后台/工作区/模型页再回来时，队伍页会整段重新组合，缓存要是跟着它一起没了，
     // 每张票都会在切屏后的第一帧重新发一遍请求 —— 那正是「切屏掉帧」的一半来源。
@@ -273,6 +352,23 @@ fun CrewRoot(
     // 子代理树（第一张工单派了谁）。同样挂在这一层：它画在消息列表末尾，
     // 从后台/工作区回来时人第一眼就看那一块，缓存跟着页面走的话每次都要等一趟网络。
     val agents = remember(sessionState.current) { AgentsCache() }
+
+    /**
+     * 一条发送「已经确认到达」之后，输入框该不该收起。
+     *
+     * **对账成功与直接 200 成功共用这一句**：两条路都只是「这条意图已经送出」，
+     * 没有理由一边收一边不收 —— 实机上就漏在旁边这半边：ledger 对上了、提示也清了，
+     * 输入框还留着原文，用户看见就再点一次，于是同一句话发了第二遍（新的 UUID）。
+     *
+     * 只清「当前草稿仍等于当时发出去那一版」的那一格：用户后来改的字、别的会话，一律不动。
+     */
+    fun settleDraft(sessionKey: String, requestId: String, text: String) {
+        val owner = SendOwner(sessionKey, requestId, text)
+        val current = draftBySession[owner.sessionKey].orEmpty()
+        if (!SendOwnership.shouldClearDraft(owner.sessionKey, current, owner)) return
+        draftBySession = draftBySession - owner.sessionKey
+        if (!draftStore.clearIfText(owner.sessionKey, owner.text)) storeTrouble = SendCopy.corruptRecord()
+    }
 
     fun refresh() {
         // 同一时刻只跑一趟。两趟叠在一起时，先发出去的那趟可能带着更旧的时间线后回来，
@@ -317,6 +413,21 @@ fun CrewRoot(
                             "queued=${next.queued.size} last=${next.messages.lastOrNull()?.id}")
                     }
                     if (requestedPauseRevision == pauseRevision) executorPaused = next.status.paused
+                    // 对账：盘上未确认的发送若已出现在时间线里，说明服务端收到了 ——
+                    // 清掉本机记录、不再提示也不再重发。没有证据的一律保留（不确定 ≠ 失败）。
+                    val knownRequests = next.messages.mapNotNullTo(HashSet()) {
+                        it.requestId.takeIf(String::isNotEmpty)
+                    }
+                    val settled = uncertain.filter { it.requestId in knownRequests }
+                    if (settled.isNotEmpty()) {
+                        for (send in settled) {
+                            sendStore.done(send.requestId)
+                            sendNotes = SendNoteBook.clear(sendNotes, send.sessionKey, send.requestId)
+                            // 与直接成功同一条收尾：原文对得上才清，改过字就留着。
+                            settleDraft(send.sessionKey, send.requestId, send.text)
+                        }
+                        uncertain = sendStore.all()
+                    }
                     problem = null
                 } while (refreshGuard.again)
             } catch (error: Exception) {
@@ -325,6 +436,127 @@ fun CrewRoot(
                 refreshGuard.running = false
             }
         }
+    }
+
+    fun setSendInFlight(owner: SendOwner, inFlight: Boolean) {
+        val current = sendingBySession[owner.sessionKey].orEmpty()
+        val next = if (inFlight) current + owner.requestId else current - owner.requestId
+        sendingBySession = if (next.isEmpty()) sendingBySession - owner.sessionKey
+            else sendingBySession + (owner.sessionKey to next)
+    }
+
+    /**
+     * 改一格草稿：内存与盘同时更新。空正文 = 用户自己清空（不算丢内容）。
+     *
+     * [recipientId] 是「这句话现在会发给谁」的快照。收件人真源仍是正文里的 @（见 [Recipient]）；
+     * 存一份是为了冷启动时花名册还没拉回来，输入区仍说得清发给谁。
+     */
+    fun setDraft(sessionKey: String, text: String, recipientId: String = "") {
+        draftBySession = draftBySession + (sessionKey to text)
+        if (!draftStore.save(Draft(sessionKey, text, recipientId, System.currentTimeMillis()))) {
+            storeTrouble = SendCopy.corruptRecord()
+        }
+    }
+
+    /** 明确发送成功：只清「发出去的那一版」正文；用户之后又打的新字不动。 */
+    /** 旧的入口名保留给既有调用点；做的事与对账那一侧完全同一份。 */
+    fun clearSentDraft(owner: SendOwner) = settleDraft(owner.sessionKey, owner.requestId, owner.text)
+
+    fun completeSend(owner: SendOwner) {
+        setSendInFlight(owner, false)
+        // 明确成功：盘上那一条未确认记录清掉，只清 requestId 相等的这一条。
+        sendStore.done(owner.requestId)
+        uncertain = sendStore.all()
+        sendNotes = SendNoteBook.clear(sendNotes, owner.sessionKey, owner.requestId)
+        settleDraft(owner.sessionKey, owner.requestId, owner.text)
+        if ((sessionState.requestSession ?: SessionRoute.MAIN) == owner.sessionKey) refresh()
+    }
+
+    /**
+     * 一次没成功。**必须说清请求有没有真的发出去**：
+     * [posted] 为真 = 已经发出、结果未知（超时、断连、读到半个响应都算）→「结果待确认」；
+     * 为假 = 请求根本没离开这台手机（落盘失败、本地校验没过）→ 确定性失败。
+     */
+    fun failSend(owner: SendOwner, message: String?, posted: Boolean) {
+        setSendInFlight(owner, false)
+        val excerpt = uncertain.firstOrNull { it.requestId == owner.requestId }?.excerpt() ?: excerptOf(owner.text)
+        sendNotes = SendNoteBook.put(
+            sendNotes, owner.sessionKey,
+            SendNote(owner.requestId, SendCopy.noteFor(excerpt, message, posted)),
+        )
+    }
+
+    /** 这条草稿这次的幂等键：同一段文字沿用同一个 id，改字则换一个（旧的不确定记录不删）。 */
+    fun claimSend(
+        sessionKey: String,
+        text: String,
+        mentions: List<String> = emptyList(),
+        recipientId: String = "",
+    ): UncertainSend {
+        // 复用只认**完整意图**：同字换了收件人/`@` 名单是另一件事，必须拿新 id。
+        // 只比正文会让旧 id 被拿来落盘，put 判冲突 → 一条正常的新发送被旧记录挡住。
+        val replay = SendRecoveryRecord.reuse(uncertain, sessionKey, text, mentions, recipientId)
+        if (replay != null) return replay
+        return UncertainSend(
+            requestId = java.util.UUID.randomUUID().toString(),
+            sessionKey = sessionKey,
+            text = text,
+            mentions = mentions,
+            recipientId = recipientId,
+            at = System.currentTimeMillis(),
+        )
+    }
+
+    /**
+     * 发一次 `/send`。**先落盘再发**：记不住就不发（否则重启后再也无法对账）；
+     * 落盘成功之后 POST 已经离开手机，任何异常都只说明「结果未知」，不是「没发出去」。
+     */
+    suspend fun sendWithRecovery(send: UncertainSend): Boolean {
+        // 原样用调用方给的 envelope：mentions/recipient 是意图的一部分，这里再覆盖一次
+        // 就等于允许「同一个 id 换 payload」，而盘上那条会被判冲突。
+        val envelope = send
+        if (!sendStore.record(envelope)) {
+            storeTrouble = SendCopy.corruptRecord()
+            failSend(SendOwner(envelope.sessionKey, envelope.requestId, envelope.text), null, posted = false)
+            return false
+        }
+        uncertain = sendStore.all()
+        val owner = SendOwner(envelope.sessionKey, envelope.requestId, envelope.text)
+        setSendInFlight(owner, true)
+        return try {
+            client.send(
+                envelope.text, envelope.mentions, envelope.requestId,
+                envelope.sessionKey.takeIf { it != SessionRoute.MAIN },
+            )
+            completeSend(owner)
+            true
+        } catch (error: CancellationException) {
+            // 协程被取消：POST 可能已经在路上，记录留着，下次对账/重试用同一个 id。
+            setSendInFlight(owner, false)
+            throw error
+        } catch (error: Exception) {
+            failSend(owner, error.message, posted = true)
+            false
+        } finally {
+            setSendInFlight(owner, false)
+        }
+    }
+
+    /**
+     * 恢复：用盘上那份原样重发（同一个 request_id），成功后清掉这一条。
+     * 换 crew 之后**不自动重发**：那只在同一个会话会被误当成新交代，见 [uncertainOfActive]。
+     */
+    fun retryRecovered(send: UncertainSend) {
+        scope.launch { sendWithRecovery(send) }
+    }
+
+    /** 行内「不再重试，移除本机记录」：只删这一条，同会话别的未确认发送不动。 */
+    fun forgetRecovered(requestId: String) {
+        val send = uncertain.firstOrNull { it.requestId == requestId }
+        sendStore.forget(requestId)
+        uncertain = sendStore.all()
+        // 提示按这条自己的会话清（它可能不属于当前正在看的那一格）。
+        sendNotes = SendNoteBook.clear(sendNotes, send?.sessionKey ?: activeSessionKey, requestId)
     }
 
     /**
@@ -359,9 +591,9 @@ fun CrewRoot(
      */
     fun enterSession(next: SessionState) {
         sessionState = next
+        expandedSubagent = null
         onSessionChange(next.current)
-        draft = ""
-        pendingSend = null
+        // 草稿不是「切会话就清」的东西：每个会话各有一格，切回去原样还在（见 DraftStore）。
         timelineEpoch += 1
         refresh()
     }
@@ -393,27 +625,11 @@ fun CrewRoot(
                 // 切会话走 enterSession：落盘、清草稿、重拉时间线一次做完，与点切换条同一条路。
                 onEnterSession = { next -> enterSession(next) },
                 onSend = { text, requestId ->
-                    // 与输入框那条路逐字一致：mentions 从当前时间线的花名册算，
-                    // 会话 id 取「这一刻该发到哪一格」，发完让时间线重读一遍。
-                    sending = true
-                    scope.launch {
-                        try {
-                            client.send(
-                                text,
-                                CrewWire.mentionsIn(text, conversation?.bots.orEmpty()),
-                                requestId,
-                                sessionState.requestSession,
-                            )
-                            draft = ""
-                            refresh()
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (error: Exception) {
-                            problem = error.message ?: "发送失败"
-                        } finally {
-                            sending = false
-                        }
-                    }
+                    // 调试口也走同一条「先落盘再发」的路：请求 id 由调用方给定，便于脚本重放同一意图。
+                    val key = sessionState.requestSession ?: SessionRoute.MAIN
+                    val mentions = CrewWire.mentionsIn(text, conversation?.bots.orEmpty())
+                    val envelope = claimSend(key, text, mentions).copy(requestId = requestId)
+                    scope.launch { sendWithRecovery(envelope) }
                 },
                 onTab = { name -> screenFromName(name)?.let { screen = it } },
                 onMode = { name -> mode = if (name == "triage") Mode.Triage else Mode.Chat },
@@ -460,6 +676,67 @@ fun CrewRoot(
         refresh()
     }
 
+    // 前台/后台：活动轮询只在人真看着屏幕时才跑（后台由系统冻结，不该继续打请求）。
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) foreground = true
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) foreground = false
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        foreground = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    /**
+     * 轻量活动轮询：有活跃活动 / 有未确认发送时约 1 秒一次，否则 4 秒；后台或后端没这项能力时不发。
+     *
+     * 与 6 秒的完整时间线是两条独立的节奏 —— 轻量这条只回答「现在还在干什么」，
+     * 不重拉消息、不重拉产出，所以可以快。
+     *
+     * 迟到响应靠代际 guard 丢弃：每次真正发出前取一次 `activityGeneration`，
+     * 回来时对不上（切了会话/又发了一轮）就整份丢掉，不写进当前会话。
+     */
+    LaunchedEffect(sessionState.requestSession, foreground, activityCapability, uncertain.size, activityItems) {
+        val session = sessionState.requestSession
+        val active = ActivityPoll.anyActive(activityItems.values) || uncertain.isNotEmpty()
+        val wait = ActivityPoll.intervalMs(activityCapability, foreground, active) ?: return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(wait)
+            if (!foreground) break
+            val generation = activityGeneration
+            val key = sessionState.requestSession
+            if (key != session) break
+            try {
+                when (val result = client.activity(key)) {
+                    is ActivityResult.Unsupported -> {
+                        // 后端没这项能力：停掉这条轮询，退回旧时间线节奏，不刷错误、不伪造活动。
+                        activityCapability = ActivityCapability.UNSUPPORTED
+                        return@LaunchedEffect
+                    }
+                    is ActivityResult.Unavailable -> {
+                        // 读不到 ≠ 没有活动：保留上一次事实，只标陈旧，不当成「已结束」。
+                        activityStale = true
+                    }
+                    is ActivityResult.Live -> {
+                        activityCapability = ActivityCapability.SUPPORTED
+                        if (generation == activityGeneration && sessionState.requestSession == session) {
+                            // 成功 200：以本次 items 为全活跃集合，不在其中的 overlay 清掉。
+                            // 收据（request_state）仍以 timeline 为准，不在这里改。
+                            activityItems = result.snapshot.items.associateBy { it.requestId }
+                            activityStale = false
+                            activityGeneration += 1
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                activityStale = true
+            }
+        }
+    }
+
     // 队伍回话可能要几分钟。只读一次的话，屏幕会永远停在「已发出去」那一格；
     // 前台时每几秒重读一次，离开页面由 Compose 取消这个协程。
     LaunchedEffect(Unit) {
@@ -492,8 +769,12 @@ fun CrewRoot(
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = palette.surface) {
-        // 让出状态栏与导航栏：断连横幅排在最前，不加的话会顶到系统时间上去。
-        Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
+        // edge-to-edge 下由根容器统一消费系统栏与 IME Insets，避免页面各自重复扣边距。
+        Column(modifier = Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
+          // 队伍这一屏的顶部信息（连接/会话/模式/成员/更多）由 CrewScreen 内的紧凑顶栏统一承载，
+          // 不再在这里叠加 route 小字 + 常驻 SessionBar（那正是顶部占 40% 的根因：两层各画一段）。
+          // 其余各屏（后台/工作区/模型…）仍沿用原有的常驻 route + 会话切换条。
+          if (screen != Screen.Crew) {
             // 走的是哪条路：一行小字常驻。它不是装饰 —— 连不上时人最先要问的就是
             // 「现在是不是在绕公网」，这一行直接回答，不必让人去猜。
             if (route.isNotEmpty()) {
@@ -566,7 +847,8 @@ fun CrewRoot(
                     TextButton(onClick = { sessionRetry += 1 }) { Text("重试", color = palette.accent) }
                 }
             }
-            // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
+          }
+          // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
             problem?.let {
                 Text(
                     text = "连不上队伍：$it",
@@ -581,11 +863,14 @@ fun CrewRoot(
                 }
             }
 
+            val renderedSessionKey = sessionState.requestSession ?: SessionRoute.MAIN
+            // 此处理器先于下面的页面组合；页面内的 drawer/modal BackHandler 后注册，可优先消费返回键。
+            BackHandler(enabled = screen != Screen.Crew) { navigateScreenBack() }
             when (screen) {
-                Screen.Backend -> BackendScreen(client, conversation, palette, { screen = Screen.Crew },
+                Screen.Backend -> BackendScreen(client, conversation, palette, { navigateScreenBack() },
                     { refresh() }, onRoutines = { screen = Screen.Routine }, onMemory = { screen = Screen.Memory })
-                Screen.Routine -> RoutineScreen(client, conversation, palette, onBack = { screen = Screen.Backend })
-                Screen.Memory -> MemoryScreen(client, palette, onBack = { screen = Screen.Backend })
+                Screen.Routine -> RoutineScreen(client, conversation, palette, onBack = { navigateScreenBack() })
+                Screen.Memory -> MemoryScreen(client, palette, onBack = { navigateScreenBack() })
                 Screen.Workspace -> WorkspaceScreen(
                     client = client,
                     bot = onScreen ?: conversation?.bots?.firstOrNull { it.id == conversation?.defaultBotId },
@@ -596,28 +881,52 @@ fun CrewRoot(
                     palette = palette,
                     preview = previewTicket,
                     previewView = previewView,
-                    onBack = {
-                        // 回到哪一屏由进来的人决定：名片进的就回队伍，后台进的就回后台。
-                        // 代码卡进的是从队伍点出来的，所以也回队伍。
-                        screen = if (onScreen != null || previewTicket != null) Screen.Crew else Screen.Backend
-                        onScreen = null
-                        previewTicket = null
-                        previewView = null
-                    },
+                    onBack = { navigateScreenBack() },
                 )
-                Screen.Models -> ModelScreen(client, conversation, palette, onBack = { screen = Screen.Crew })
+                Screen.Models -> ModelScreen(client, conversation, palette, onBack = { navigateScreenBack() })
                 Screen.Crew -> CrewScreen(client, conversation, outputs, agents, palette, problem, draft, sending,
                     // 结果条按票的缓存每读回一次时间线就清空重读一次（见 CrewScreen）。
                     timelineEpoch = timelineEpoch,
+                    expandedSubagentTicketId = expandedSubagent?.takeIf { it.first == sessionState.current }?.second,
+                    onExpandedSubagentChange = { ticketId ->
+                        expandedSubagent = ticketId?.let { sessionState.current to it }
+                    },
+                    noticesWarning = noticesHealth.line().ifEmpty { null },
                     requestIdFor = { text ->
-                        if (pendingSend?.first == text) {
-                            pendingSend!!.second
-                        } else {
-                            java.util.UUID.randomUUID().toString().also { pendingSend = text to it }
+                        val key = sessionState.requestSession ?: SessionRoute.MAIN
+                        val mentions = CrewWire.mentionsIn(text, conversation?.bots.orEmpty())
+                        claimSend(key, text, mentions, currentRecipientId(text, conversation?.bots.orEmpty()).orEmpty()).requestId
+                    },
+                    // 每个请求回执按 session + request id 更新自己的发送状态。
+                    onDraft = { text ->
+                        if ((sessionState.requestSession ?: SessionRoute.MAIN) == renderedSessionKey) {
+                            setDraft(
+                                renderedSessionKey, text,
+                                currentRecipientId(text, conversation?.bots.orEmpty()).orEmpty(),
+                            )
                         }
                     },
-                    // 发出去了才丢掉幂等键：失败重发必须还在。
-                    { draft = it }, { sending = it }, { pendingSend = null; refresh() }, { problem = it },
+                    onSending = { owner, inFlight -> setSendInFlight(owner, inFlight) },
+                    onSendSucceeded = { completeSend(it) },
+                    onSendFailed = { owner, message, posted -> failSend(owner, message, posted) },
+                    // 普通发消息的唯一入口：先落盘（commit）再 POST，异常一律「结果待确认」。
+                    onSendNow = { text, mentions ->
+                        val key = sessionState.requestSession ?: SessionRoute.MAIN
+                        // 意图在 claim 时一次定全：正文 + @ 名单 + 收件人，一起参与「是不是同一条」。
+                        val envelope = claimSend(
+                            key, text, mentions,
+                            currentRecipientId(text, conversation?.bots.orEmpty()).orEmpty(),
+                        )
+                        scope.launch { sendWithRecovery(envelope) }
+                    },
+                    sendRecoveries = uncertain.filter { it.sessionKey == activeSessionKey },
+                    onRetryRecovered = { retryRecovered(it) },
+                    onForgetRecovered = { forgetRecovered(it) },
+                    sendNotes = sessionNotes,
+                    storeTrouble = storeTrouble,
+                    activityByRequest = activityItems,
+                    activityStale = activityStale,
+                    onSent = { if ((sessionState.requestSession ?: SessionRoute.MAIN) == renderedSessionKey) refresh() },
                     // 代码卡上「看看改完的样子」真读到了画面：整屏去看它的屏幕，看的是
                     // 这段改动所属的那张票 —— 票号由代码卡带过来，这里不再猜。
                     onPreview = { ticketId, botId, view ->
@@ -641,6 +950,41 @@ fun CrewRoot(
                     sessionId = sessionState.requestSession,
                     // 设备推送落本地那份：顶部一条紧凑提示，复用列表区，不新开屏。
                     notices = notices,
+                    // 紧凑顶栏要用的连接/会话真源（都来自 CrewRoot，唯一一份；CrewScreen 只读不建）。
+                    route = route,
+                    connLoading = conversation == null && problem == null,
+                    onRefresh = { refresh() },
+                    sessionCurrent = sessionState.current,
+                    sessionLabel = sessionState.sessions.firstOrNull { it.id == sessionState.current }?.let { if (it.name.isBlank()) it.id else it.name } ?: sessionState.current,
+                    sessionSwitchable = sessionState.switchable,
+                    sessionState = sessionState,
+                    onSwitchSession = { id ->
+                        val next = SessionFlow.switch(sessionState, id)
+                        if (next.current != sessionState.current) enterSession(next)
+                    },
+                    onCreateSession = { id ->
+                        val check = SessionFlow.create(sessionState, id)
+                        sessionState = check.state
+                        if (check.accepted) {
+                            scope.launch {
+                                try {
+                                    val view = client.createSession(id)
+                                    val next = SessionFlow.applyCreated(sessionState, view, id)
+                                    if (next.current != sessionState.current) enterSession(next) else sessionState = next
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (error: Exception) {
+                                    android.util.Log.w("CrewSessions", "新建会话失败", error)
+                                    sessionState = SessionFlow.createFailed(
+                                        sessionState, error.message?.takeIf(String::isNotBlank) ?: error.toString(),
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    // 未 @ 时的默认收件人真源：后端该会话的 default_bot_id（全表唯一 role=default）。
+                    // 读不到就是空串，输入区如实报「未指定」，不硬编码第一位。
+                    defaultBotId = conversation?.defaultBotId.orEmpty(),
                 )
             }
 
@@ -890,14 +1234,38 @@ private fun CrewScreen(
     problem: String?,
     draft: String,
     sending: Boolean,
-    /** 第几次把时间线读回来。变了就按这一轮重读结果条（上一轮的结果不再算数）。 */
+    /** 推送拉取失败的健康信息：非空才显示一行，不常驻成功态、不吞错误。 */
+    noticesWarning: String? = null,
+    /** 第几次把时间线读回来。变了就按这一轮重读结果条。 */
     timelineEpoch: Int,
+    /** 当前会话里用户展开的工单；跨刷新与列表回收保留，切会话后清空。 */
+    expandedSubagentTicketId: String? = null,
+    onExpandedSubagentChange: (String?) -> Unit = {},
     /** 同一段草稿重发要沿用同一个幂等键；新草稿换一个。 */
     requestIdFor: (String) -> String,
     onDraft: (String) -> Unit,
-    onSending: (Boolean) -> Unit,
+    onSending: (SendOwner, Boolean) -> Unit,
+    onSendSucceeded: (SendOwner) -> Unit = {},
+    /** [posted] = 请求是否已经离开手机；失败文案据此分「结果待确认 / 没有发出」。 */
+    onSendFailed: (SendOwner, String?, Boolean) -> Unit = { _, _, _ -> },
+    /**
+     * 普通发消息：把「发什么」交给上层 —— 落盘与 POST 的先后由 CrewRoot 的 `sendWithRecovery` 保证。
+     * 这一层不自己调 `client.send`，否则「先落盘再发」会被绕过。
+     */
+    onSendNow: (String, List<String>) -> Unit = { _, _ -> },
+    /** 盘上还没确认的发送（当前会话）。有就画一条可恢复的记录，不静默留在盘上不可见。 */
+    sendRecoveries: List<UncertainSend> = emptyList(),
+    onRetryRecovered: (UncertainSend) -> Unit = {},
+    onForgetRecovered: (String) -> Unit = {},
+    /** 失败/待确认提示，按请求归属，可多条。 */
+    sendNotes: List<SendNote> = emptyList(),
+    /** 本机记录读坏了的一条可见提示；非空即拦住发送。 */
+    storeTrouble: String? = null,
+    /** 轻量活动快照：按 request_id 挂到消息上。空 = 后端没给这项能力。 */
+    activityByRequest: Map<String, RequestActivity> = emptyMap(),
+    /** 上一次活动读取失败：保留上次事实，只标陈旧。 */
+    activityStale: Boolean = false,
     onSent: () -> Unit,
-    onFailed: (String) -> Unit,
     /** 代码卡上的「看看改完的样子」读到了画面：由上层决定怎么显示（手机上是整屏去看它的屏幕）。 */
     onPreview: (String, String?, ScreenView) -> Unit,
     onBackend: () -> Unit,
@@ -914,36 +1282,58 @@ private fun CrewScreen(
     sessionId: String? = null,
     /** 设备接收链（#23）落本地、已持久化的推送，最新在前。空表示没有。复用在列表区顶部，不新开一屏。 */
     notices: List<CrewNotice> = emptyList(),
+    // 紧凑顶栏：连接/会话真源都来自 CrewRoot，这一层只读不改。
+    route: String = "",
+    connLoading: Boolean = false,
+    onRefresh: () -> Unit = {},
+    sessionCurrent: String = SessionRoute.MAIN,
+    sessionLabel: String = SessionRoute.MAIN,
+    sessionSwitchable: Boolean = false,
+    sessionState: SessionState? = null,
+    onSwitchSession: (String) -> Unit = {},
+    onCreateSession: (String) -> Unit = {},
+    /** 当前会话后端的 `default_bot_id`（全表唯一 role=default）。空串=后端没给，输入区据此如实报「未指定」。 */
+    defaultBotId: String = "",
 ) {
     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
     var profile by remember { mutableStateOf<BotCard?>(null) }
     // 正在改人设的那一位。null 表示编辑层没开。
     var editing by remember { mutableStateOf<BotCard?>(null) }
-    // 撤回失败要在这条消息旁边说，不冒充发送失败。
-    var withdrawNote by remember { mutableStateOf<String?>(null) }
+    var steerTextNote by remember(sessionId) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+    var timelineTailRevision by remember(sessionId) { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
+    // 「跟他说话」把输入框聚焦到草稿（只在 App 内请求焦点，不碰系统输入）。
+    val composerFocus = remember { FocusRequester() }
     // 事务板抽屉与模式切换都归这一页：切镜头时群聊的滚动位置还在（listState 留在组合里）。
     var boardOpen by remember { mutableStateOf(false) }
     var pendingJump by remember { mutableStateOf<String?>(null) }
+    // 会话弹层（SessionBar）开合：CrewScreen 单一真源。顶栏点会话与 drawer「会话管理」共用它，
+    // 两页（聊天/任务）都走同一份；不再由 CrewTopBar 各持一份内部 state。
+    var showSessions by remember { mutableStateOf(false) }
+    // 通知跳转（一次性）：drawer「通知」点下后置要跳的目标 index，等聊天列表挂载后滚过去再清标记。
+    var pendingNoticeJump by remember { mutableStateOf(false) }
+    // 侧边栏开合状态。点遮罩由 ModalNavigationDrawer 自身处理；系统 Back 在抽屉打开/开启动画期间显式拦截。
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    BackHandler(
+        enabled = CrewNavigation.shouldConsumeDrawerBack(
+            currentOpen = drawerState.currentValue == DrawerValue.Open,
+            targetOpen = drawerState.targetValue == DrawerValue.Open,
+        ),
+    ) { scope.launch { drawerState.close() } }
+    // 「资料」打开名片后，onTalk 要聚焦输入框 —— 但只在名片浮层撤掉、输入框重新挂上组合之后才请求，
+    // 否则 FocusRequester 尚未附着会抛 "not initialized"。用一次性标记，在 LaunchedEffect 里消费。
+    var focusComposerAfterTalk by remember { mutableStateOf(false) }
+    // 诊断页开合：侧栏「工具 · 诊断」的唯一开关。诊断页是覆盖层，不常驻、不入顶部。
+    var diagOpen by remember { mutableStateOf(false) }
+    // 检查更新页开合：同样只从侧栏「工具」进来，覆盖层，不常驻。
+    var otaOpen by remember { mutableStateOf(false) }
 
     // 分拣台的「丢」走和群聊同一条 POST /send，不另造一套发送。
+    // 落盘与 POST 的顺序在上层（onSendNow → sendWithRecovery），这里只表达意图。
     fun sendBoardText(text: String, done: (Boolean) -> Unit) {
-        onSending(true)
-        scope.launch {
-            val ok = try {
-                client.send(text, CrewWire.mentionsIn(text, conversation?.bots.orEmpty()), requestIdFor(text), sessionId)
-                onDraft("")
-                onSent()
-                true
-            } catch (error: Exception) {
-                onFailed(error.message ?: "发送失败")
-                false
-            } finally {
-                onSending(false)
-            }
-            done(ok)
-        }
+        onSendNow(text, CrewWire.mentionsIn(text, conversation?.bots.orEmpty()))
+        done(true)
     }
     /**
      * 答复一张待决问题卡：**明确 ticket + attention_id 的票**走审批通道 POST /api/mobile/answer，
@@ -955,25 +1345,30 @@ private fun CrewScreen(
      * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
      * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
      */
-    fun answerByTicket(ticket: WorkTicket, text: String, done: (Boolean) -> Unit) {
-        onSending(true)
+    fun answerByTicket(ticket: WorkTicket, text: String, done: (ApprovalGate.Outcome) -> Unit) {
+        val owner = SendOwner(
+            sessionId ?: SessionRoute.MAIN,
+            "answer:${ticket.attentionId.ifBlank { ticket.id }}",
+            text,
+        )
+        onSending(owner, true)
         scope.launch {
-            val ok = try {
+            val outcome = try {
                 client.answer(ticket.id, text, ticket.attentionId, sessionId)
                 onSent()
-                true
+                ApprovalGate.Outcome.Accepted
             } catch (error: AnswerStale) {
                 // 旧卡已过期：刷新时间线把卡换成最新一张，明说「已更新」不冒充成功。
                 onSent()
-                onFailed("这张问题卡已更新，请按最新的那张再答")
-                false
+                onSendFailed(owner, "这张问题卡已更新，请按最新的那张再答", true)
+                ApprovalGate.Outcome.Stale
             } catch (error: Exception) {
-                onFailed(error.message ?: "答复没发出去")
-                false
+                onSendFailed(owner, error.message ?: "答复没发出去", true)
+                ApprovalGate.Outcome.Failed
             } finally {
-                onSending(false)
+                onSending(owner, false)
             }
-            done(ok)
+            done(outcome)
         }
     }
     /**
@@ -984,15 +1379,15 @@ private fun CrewScreen(
      * - 选明确选项：text 传选项 label（后端 label/id 都认）。
      * - 自写 revise：由队伍消息区的待决卡（TicketStrip）内联输入框直接发 /answer，text 是用户原文。
      * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
-     * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
+     * - 请求中禁重入由 [ApprovalGate] / 桌面 answers[slot] 保证；这里只做一次发射。
      */
-    fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (Boolean) -> Unit) {
+    fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (ApprovalGate.Outcome) -> Unit) {
         // 没有 attention_id 的票不是审批卡：保持既有 /send 行为，不引入审批语义。
         if (ticket.attentionId.isEmpty()) {
             val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
             val address = name.ifEmpty { ticket.botId.trim() }
             val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
-            sendBoardText(text, done)
+            sendBoardText(text) { ok -> done(if (ok) ApprovalGate.Outcome.Accepted else ApprovalGate.Outcome.Failed) }
             return
         }
         answerByTicket(ticket, option.label, done)
@@ -1007,10 +1402,62 @@ private fun CrewScreen(
         onModeChange(next)
     }
 
+    // 顶栏会话弹层与 drawer「会话管理」共用同一份真源：由 CrewScreen 的 showSessions 统一控制，
+    // 两页（聊天 / 任务）都走这同一个 state 和同一个弹层，不各写一份、不出现「启用了却点了没反应」。
+    val openSessions = { showSessions = true }
+    // 打开名片：两页共用。任务页（Triage）没有自己的名片渲染层，这里统一切到聊天页再开名片，
+    // 保证「资料」在两页都真实可达；切页不动 draft（草稿归 CrewRoot，mode 只切渲染）。
+    val openProfile: (BotCard) -> Unit = { bot ->
+        profile = bot
+        if (mode != Mode.Chat) switchMode(Mode.Chat)
+        scope.launch { drawerState.close() }
+        Unit
+    }
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            CrewDrawerSheet(
+                palette = if (mode == Mode.Triage) TriagePalette else palette,
+                mode = mode, bots = conversation?.bots.orEmpty(),
+                recipientId = currentRecipientId(draft, conversation?.bots.orEmpty()),
+                defaultBotId = defaultBotId,
+                noticeCount = notices.size,
+                // 通知行：关 drawer + 切聊天 + 置跳转标记（实际滚动在聊天分支列表挂载后执行）。
+                onOpenNotices = {
+                    switchMode(Mode.Chat)
+                    pendingNoticeJump = true
+                    scope.launch { drawerState.close() }
+                },
+                onPickRecipient = { bot ->
+                    onDraft(Recipient.select(draft, bot, conversation?.bots.orEmpty()))
+                    scope.launch { drawerState.close() }
+                },
+                onOpenProfile = openProfile,
+                onNavChat = { switchMode(Mode.Chat); scope.launch { drawerState.close() } },
+                onNavTasks = { switchMode(Mode.Triage); scope.launch { drawerState.close() } },
+                // 「会话管理」打开真实 SessionBar 弹层（与顶栏点会话同一真源），不再只是关 drawer。
+                onSessions = { openSessions(); scope.launch { drawerState.close() } },
+                canSessions = sessionSwitchable && sessionState != null,
+                onModels = { onModels(); scope.launch { drawerState.close() } },
+                onBackend = { onBackend(); scope.launch { drawerState.close() } },
+                onWorkspace = { onWorkspace(null); scope.launch { drawerState.close() } },
+                hasWorkspace = conversation != null,
+                // 诊断：关 drawer + 开诊断页（覆盖层）。放侧栏工具，不加常驻排。
+                onDiag = { diagOpen = true; scope.launch { drawerState.close() } },
+                onUpdate = { otaOpen = true; scope.launch { drawerState.close() } },
+            )
+        },
+    ) {
     if (mode == Mode.Triage) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // 分拣台整屏用纸感（含顶栏），聊天模式仍是暗色：两个镜头各自的视觉语言不混着用。
-            ModeHeader(mode, TriagePalette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = {})
+            CrewTopBar(
+                route = route, connLoading = connLoading, problem = problem, palette = TriagePalette,
+                onRefresh = onRefresh,
+                title = CrewNavigation.topBarTitle(mode, sessionLabel), sessionSwitchable = sessionSwitchable,
+                sessionState = sessionState, onSwitchSession = onSwitchSession, onCreateSession = onCreateSession,
+                onOpenDrawer = { scope.launch { drawerState.open() } },
+                sessionsOpen = showSessions, onOpenSessions = { openSessions() }, onCloseSessions = { showSessions = false },
+            )
             TriageScreen(
                 conversation = conversation,
                 palette = TriagePalette,
@@ -1024,55 +1471,81 @@ private fun CrewScreen(
                 onJumpToMessage = { messageId -> jump(messageId) },
                 modifier = Modifier.weight(1f),
             )
+            // 名片 overlay 在两页共用：任务页点「资料」切到聊天页后，这里同一层渲染名片（见下）。
+            ProfileOverlay(profile, conversation, palette, draft,
+                onDismiss = { profile = null },
+                onTalk = { shownProfile, bots ->
+                    profile = null
+                    onDraft(Recipient.select(draft, shownProfile, bots))
+                    focusComposerAfterTalk = true
+                },
+                onEdit = { shownProfile -> profile = null; editing = shownProfile },
+                onWorkspace = { profile = null; onWorkspace(it) })
         }
-        return
-    }
+    } else {
     Column(modifier = Modifier.fillMaxSize()) {
-        ModeHeader(mode, palette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = { boardOpen = true })
+        var followIntent by remember(sessionId) { mutableStateOf(TimelineFollowIntent()) }
+        var userDragPending by remember(sessionId) { mutableStateOf(false) }
+        val timelineDragState = listState.interactionSource.collectIsDraggedAsState()
+        val timelineDragged by timelineDragState
+        fun isTimelineAtBottom(): Boolean {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull() ?: return true
+            return timelineIsAtBottom(
+                lastItemIndex = last.index,
+                totalItemsCount = info.totalItemsCount,
+                viewportEndOffset = info.viewportEndOffset,
+                lastItemEndOffset = last.offset + last.size,
+            )
+        }
+
+        LaunchedEffect(sessionId, timelineDragged) {
+            if (timelineDragged) {
+                userDragPending = true
+            } else if (userDragPending) {
+                snapshotFlow { listState.isScrollInProgress }.first { !it }
+                followIntent = followIntent.onUserScrollSettled(isTimelineAtBottom())
+                userDragPending = false
+            }
+        }
+
+        // 单行顶栏 56：menu · 当前会话 · 连接状态。无模式行 / 成员横条 / 更多⋯。
+        CrewTopBar(
+            route = route, connLoading = connLoading, problem = problem, palette = palette,
+            onRefresh = onRefresh,
+            title = CrewNavigation.topBarTitle(mode, sessionLabel), sessionSwitchable = sessionSwitchable,
+            sessionState = sessionState, onSwitchSession = onSwitchSession, onCreateSession = onCreateSession,
+            onOpenDrawer = { scope.launch { drawerState.open() } },
+            sessionsOpen = showSessions, onOpenSessions = { openSessions() }, onCloseSessions = { showSessions = false },
+        )
         // 事务板/分拣台点一条：切回群聊并滚到那句话（ticket_ref 对不上的行不会走到这里）。
+        // 通知现在作为 LazyColumn 首项插入：消息的列表索引 = 消息在 messages 里的索引 + 偏移。
         LaunchedEffect(pendingJump) {
             val messageId = pendingJump ?: return@LaunchedEffect
             val index = conversation?.messages?.indexOfFirst { it.id == messageId } ?: -1
-            if (index >= 0) listState.animateScrollToItem(index)
+            val offset = if (notices.isNotEmpty()) messagesListOffsetIfNotice else 0
+            if (index >= 0) {
+                followIntent = followIntent.stopFollowing()
+                listState.animateScrollToItem(index + offset)
+            }
             pendingJump = null
         }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(palette.card)
-                // 画板页头：padding 10 18 14，白底 + 下边线 1。边线就是这一层底的最下面一条。
-                .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // 画板第 6 张（手机花名册）的页头标题是 20sp / 660 / 字距 -0.02em。
-            Text(
-                "我的队伍",
-                fontSize = 20.sp,
-                fontWeight = FontWeight(660),
-                letterSpacing = (-0.02f).em,
-                color = palette.ink,
-            )
-            Spacer(Modifier.weight(1f))
-            // 画板 Mobile 的顶栏在这里放的是「看它的屏幕」那个小方块。后端还没这条接口，
-            // 所以按下去说一句实话，不跳到一个空页面 —— 空页面比没反应更像出了故障。
-            GlassIconButton(
-                glyph = "屏幕",
-                tint = if (conversation != null) palette.accent else palette.hint,
-                palette = palette,
-                onClick = { onWorkspace(null) },
-            )
-            TextButton(onClick = onModels) { Text("模型", color = palette.accent) }
-            // 「后台」入口本来就该在最常去的地方；画板还给它挂了一枚未读角标（契约 §5.6）。
-            // 算不出来时角标不出现（见 BackendIconButton），入口本身照常在。
-            BackendIconButton(
-                tint = palette.accent,
-                count = conversation?.unread,
-                palette = palette,
-                onClick = onBackend,
-            )
+        // 通知行点了：等列表挂载后滚到首项通知摘要（index 来自纯函数，不伪造 message id、不发请求）。
+        // 等一帧确保列表已量出高度；滚完清标记，不重复触发。
+        LaunchedEffect(pendingNoticeJump) {
+            if (!pendingNoticeJump) return@LaunchedEffect
+            val target = CrewNavigation.noticeItemIndex(notices.isNotEmpty())
+            if (target >= 0) {
+                followIntent = followIntent.stopFollowing()
+                withFrameNanos { }
+                listState.scrollToItem(target)
+            }
+            pendingNoticeJump = false
         }
-        // 页头那 1 的下边线。画板把它画在页头这一块上，不画在内容上。
-        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
+        // 名片「跟他说话」后的聚焦：**不在固定帧数后盲 requestFocus**（那时 TextField 可能还没挂上，
+        // requestFocus 会抛「not initialized」）。改为把 armed 标记传给 ComposerRow，由 TextField 自身
+        // 的 onGloballyPositioned 在真正挂上后一次性 requestFocus + keyboard.show，成功后回调清标记。
+        // 只由显式 onTalk 置位，不在导航/进页时自动弹键盘、不抢系统焦点。
         val shown = conversation
         if (shown != null) {
             when {
@@ -1081,51 +1554,16 @@ private fun CrewScreen(
                 shown.bots.isEmpty() ->
                     EmptyState(client, palette, onBackend, onCreated = onSent)
                 else -> {
-                    // 花名册横排：头像块 + 名字。设计稿里头像 32dp、圆角 10。
-                    // 裸文字按钮看不出「这是一个人」，头像块才看得出来。
-                    Row(
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 14.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    ) {
-                        for ((index, bot) in shown.bots.withIndex()) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                modifier = Modifier.clickable { profile = bot }
-                                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(if (index == 0) palette.accentSoft else palette.card),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Text(
-                                        bot.name.take(1),
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = palette.accent,
-                                    )
-                                }
-                                Spacer(Modifier.height(3.dp))
-                                Text(bot.name, fontSize = 11.sp, color = palette.muted)
-                            }
-                        }
-                    }
-                    val shownProfile = profile
-                    if (shownProfile != null) {
-                        BotCardSheet(shownProfile, shown, palette, onTalk = { profile = null },
-                            onClose = { profile = null }, onEdit = {
-                                // 名片让位给编辑层：两个都是铺满整屏的浮层，同时画会互相压住。
-                                profile = null
-                                editing = shownProfile
-                            }) {
-                            // 进工作区前先把名片收起来：否则从屏幕页退回来时还压着一张卡。
+                    // 名片 overlay：两页共用同一渲染（聊天/任务都在这层之上，切到聊天再开也不丢 draft）。
+                    ProfileOverlay(profile, shown, palette, draft,
+                        onDismiss = { profile = null },
+                        onTalk = { shownProfile, bots ->
                             profile = null
-                            onWorkspace(it)
-                        }
-                    }
+                            onDraft(Recipient.select(draft, shownProfile, bots))
+                            focusComposerAfterTalk = true
+                        },
+                        onEdit = { shownProfile -> profile = null; editing = shownProfile },
+                        onWorkspace = { profile = null; onWorkspace(it) })
                     val shownEditor = editing
                     if (shownEditor != null) {
                         BotEditorSheet(client, shownEditor, palette,
@@ -1142,34 +1580,62 @@ private fun CrewScreen(
                     val resultEnds = remember(shown.messages) {
                         OutputsCopy.takeLastOfTicket(shown.messages)
                     }
-                    // 滚动中先不挂结果条：它每条都要查一次缓存、必要时发一次读请求，
-                    // 挂在滚动帧里就是每帧多一份活。120Hz 上一帧只有 8ms，这点活足够掉帧。
-                    // 手一停，它立刻回来 —— 停手的那一帧重算一次，人看不到「刚才没有」。
-                    val scrolling = listState.isScrollInProgress
-                    // 设备推送（#23）：复用列表区，不新开屏。只列最新几条，点一条不进别的页 ——
-                    // 这是「有事要你知道」的账，不是又一次消息流。条数与正文都来自已持久化的本地那份。
-                    if (notices.isNotEmpty()) {
-                        Column(
-                            modifier = Modifier.fillMaxWidth()
-                                .background(palette.accentSoft)
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
-                        ) {
+                    val queuedRequestIds = remember(sessionId, shown.queued) { shown.queued.toSet() }
+                    val steerTicketId = shown.tickets.firstOrNull { it.open }?.id
+                    val subagentTicket = SubagentCardSelection.ticket(shown.tickets, expandedSubagentTicketId)
+                    // 业务动作失败/待确认：**按请求归属**，各自带原文片段与自己的操作。
+                    // 从前这里只有一格、只读 message，于是「A 失败、改字发 B 成功」之后
+                    // A 的失败还挂在那儿冒充刚才那条的结果。
+                    storeTrouble?.let {
+                        Text(
+                            it, color = palette.danger, fontSize = 12.sp,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+                        )
+                    }
+                    sendNotes.forEach { note ->
+                        Text(
+                            note.message, color = palette.danger, fontSize = 12.sp,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                        )
+                    }
+                    // 盘上还没确认的发送：给总数与逐条入口，不只留一行看不清归属的提示。
+                    if (sendRecoveries.isNotEmpty()) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp)) {
                             Text(
-                                "有事记得看一下 · ${notices.size}",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = palette.accent,
+                                "另有 ${sendRecoveries.size} 条发送结果待确认",
+                                color = palette.warn, fontSize = 12.sp,
                             )
-                            for (notice in notices.take(3)) {
-                                Text(
-                                    text = if (notice.title.isNotBlank()) "${notice.title}：${notice.body}" else notice.body,
-                                    fontSize = 12.sp,
-                                    color = palette.ink,
-                                    maxLines = 2,
-                                )
+                            sendRecoveries.forEach { send ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "· ${send.excerpt()}",
+                                        color = palette.muted, fontSize = 11.5.sp,
+                                        maxLines = 1,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(onClick = { onRetryRecovered(send) }) {
+                                        Text(SendCopy.RETRY, color = palette.accent, fontSize = 11.sp)
+                                    }
+                                    TextButton(onClick = { onForgetRecovered(send.requestId) }) {
+                                        Text(SendCopy.FORGET, color = palette.faint, fontSize = 11.sp)
+                                    }
+                                }
                             }
                         }
+                    }
+                    // 活动这一层读不到时如实标一句，但不覆盖上一次事实（不清空已有活动行）。
+                    if (activityStale) {
+                        Text(
+                            ActivityCopy.STALE, color = palette.faint, fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                        )
+                    }
+                    // notices 拉取失败的健康信息也单独一行（不吞错误、不常驻成功态）。
+                    noticesWarning?.let {
+                        Text(
+                            "推送拉取：$it", color = palette.accent, fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                        )
                     }
                     LazyColumn(
                         state = listState,
@@ -1182,6 +1648,10 @@ private fun CrewScreen(
                         // 硬生生切掉半行，最下面那条又贴着输入框消失。
                         contentPadding = PaddingValues(top = 10.dp, bottom = 10.dp),
                     ) {
+                        // 通知：列表内首项，随消息一起滚；默认一行摘要可展开，不常驻、不固定挤高度。
+                        if (notices.isNotEmpty()) {
+                            item(key = "notice") { NoticeSummary(notices, palette) }
+                        }
                         // 网关的 item 不保证带 id：缺 id 时 optString 给空串，几条缺 id 的消息
                         // 就会共用同一个 key，Compose 直接抛 "Key was already used"。
                         itemsIndexed(shown.messages, key = { index, m -> m.id.ifEmpty { "missing-$index" } }) { index, message ->
@@ -1204,39 +1674,53 @@ private fun CrewScreen(
                                 // 同一张票的票号会挂在「收到」和「报结果」两条回复上：只让这张票
                                 // 在时间线上的最后一条回复挂结果条，见 OutputsCopy.lastOfTicket。
                                 // 这份判断整列只算一次，见上面的 resultEnds。
-                                showResult = !scrolling && resultEnds.getOrElse(index) { false },
+                                showResult = resultEnds.getOrElse(index) { false },
                                 sessionId = sessionId,
+                                queuedRequestIds = queuedRequestIds,
+                                steerTicketId = steerTicketId,
+                                onActionCompleted = onSent,
+                                onContentChanged = { timelineTailRevision += 1 },
+                                // 活动按 request_id 挂到那条用户消息上；回话条目不挂。
+                                activity = if (message.fromBot) null else activityByRequest[message.requestId]?.activity,
+                                // 只有这条请求自己的票在等问题卡时，收据才说「等你答复」。
+                                awaitingAnswer = shown.tickets.any { ticket ->
+                                    ticket.open && ticket.needsPerson.isNotEmpty() && ticket.question.isNotBlank() &&
+                                        (message.ticketRef.isEmpty() || message.ticketRef == ticket.id)
+                                },
                             )
                         }
-                        if (shown.tickets.isNotEmpty()) {
-                            // 「等你决定」：后端随问题下发了 options 就画成能点的 A/B，
-                            // 点一下直接把那句话发回去（走同一条 POST /send）。
-                            // 显式给 key：消息用的是消息 id，这两块若用默认自增 key，
-                            // 一旦消息 id 是数字串就会撞上，Compose 会复用错误的 item，
-                            // 那一格的高度按上一条算 —— 表现为最后那张卡被裁掉半截、列表也滚不到位。
+                        if (shown.tickets.any { it.open && it.needsPerson.isNotEmpty() }) {
+                            // 「等你决定」只显示当前仍在等人的工单。
                             item(key = "tickets") {
                                 TicketStrip(
                                     shown, palette, client,
                                     sessionId = sessionId,
-                                    // 草稿空着才补一句 `@名字 `；已经写了一半的不动它 ——
-                                    // 点一下就把人写了一半的话冲掉，比什么都不做更糟。
                                     onPrefill = { name ->
                                         if (draft.isEmpty()) onDraft(if (name.isEmpty()) "" else "@$name ")
                                     },
                                     onSent = onSent,
+                                    onOpenAllPending = { boardOpen = true },
                                 )
                             }
-                            // 第一张工单的子代理能在这里展开，就是「他派了谁」。
-                            // 树按票号缓存（agents），切屏回来时不用再等一次网络。
-                            item(key = "subagents") {
-                                SubagentCard(client, shown.tickets.first().id, agents, timelineEpoch, palette)
+                        }
+                        if (subagentTicket != null) {
+                            item(key = "subagents-${subagentTicket.id}") {
+                                SubagentCard(
+                                    client = client,
+                                    ticket = subagentTicket,
+                                    cache = agents,
+                                    generation = timelineEpoch,
+                                    palette = palette,
+                                    open = expandedSubagentTicketId == subagentTicket.id,
+                                    onExpandedChange = { open ->
+                                        onExpandedSubagentChange(if (open) subagentTicket.id else null)
+                                    },
+                                    onContentChanged = { timelineTailRevision += 1 },
+                                )
                             }
                         }
                     }
-                    // 列表要不要自己滚，只由两件事决定：是不是真的多了一句，以及人是不是本来就贴着底。
-                    //
-                    // 从前这里用「消息条数」当 key，而时间线每 6 秒读一次、把整份换成新对象，
-                    // 条数在排队、回复、撤回之间来回变，每变一次就滚一次 —— 没人碰它，屏幕自己在跳。
+                    // 消息变更只用稳定 id 触发；是否继续跟随由用户滚动结束时保存的意图决定。
                     val lastMessageId = shown.messages.lastOrNull()?.id ?: ""
                     // 进对话屏 / 有新回话时，把主人读到的最后一条回话 id 报上去（契约 §5.6）。
                     // 只报队伍回的最后一条；还没收到任何回话就不报 —— 报了等于替主人说「都看过了」。
@@ -1244,99 +1728,72 @@ private fun CrewScreen(
                     LaunchedEffect(lastAgentId) {
                         if (lastAgentId.isNotEmpty()) client.reportRead(lastAgentId, sessionId)
                     }
-                    // 第一次拿到消息时要落到底（打开就该看到最新一句）；之后只跟着新消息走。
-                    var settled by remember { mutableStateOf(false) }
-                    LaunchedEffect(lastMessageId) {
-                        if (lastMessageId.isEmpty()) return@LaunchedEffect
-                        // 手指正按在列表上（甩动或拖动中）：这一下不去动它。
-                        //
-                        // 从前这里不看这个：新消息一到就 scrollToItem，手指还压着也照滚，
-                        // 列表和手指抢同一个位置 —— 手感上就是"滑到一半被拽回去、顿一下"。
-                        // 内容、顺序、什么时候该落底都没改，只是把"人正滑着"这一种情况让给人。
-                        // 让开之后不补滚：人松手时停在哪儿就是哪儿（这本来就是他自己选的），
-                        // 下一次新消息来它照旧跟着走。
-                        if (listState.isScrollInProgress) return@LaunchedEffect
-                        val info = listState.layoutInfo
-                        val last = info.visibleItemsInfo.lastOrNull()
-                        // 离底不足 48px 才算贴着底。用像素而不是索引：一条撑满整屏的长消息也算在底部；
-                        // 停在离底十来个像素时不算 —— 那种位置通常是人正看着最后一句话，不该被拽走。
-                        val gap = if (last == null) 0 else (info.viewportEndOffset - (last.offset + last.size))
-                        val atBottom = last == null || (last.index >= info.totalItemsCount - 1 && gap <= 48)
-                        // scrollToItem(末项) 只能把它顶到视口顶部；末项比视口矮时列表会停在半途。
-                        // 给一个很大的 offset，才是滚到真正的尽头。
-                        suspend fun bottom() { listState.scrollToItem(shown.messages.lastIndex, Int.MAX_VALUE) }
-                        // 真正动手之前再看一眼：上面这几行读布局、再等一帧，中间隔着十几毫秒，
-                        // 人完全可能在这期间把手指按下来。按下去之后再滚，等于把上面那条让开的规矩
-                        // 白写了 —— 而且这一下会打断他自己刚甩起来的惯性。
-                        if (!settled) {
-                            settled = true
-                            // 这一帧排完再滚：消息还没量出高度时滚，落点按估算算，会差一截。
-                            withFrameNanos { }
-                            if (!listState.isScrollInProgress) bottom()
-                        } else if (atBottom) {
-                            // 结果条、子代理卡是异步读回来的，滚完这句它们才把高度撑开。补一帧再落一次。
-                            withFrameNanos { }
-                            if (!listState.isScrollInProgress) bottom()
+                    // IME 改变视口时沿用阅读意图；消息 id 没变也要把正在跟随的尾部留在屏内。
+                    LaunchedEffect(sessionId) {
+                        snapshotFlow { listState.layoutInfo.viewportSize }.collect {
+                            if (!timelineDragState.value && !userDragPending &&
+                                !listState.isScrollInProgress &&
+                                followIntent.shouldAutoScroll(isScrollInProgress = false)) {
+                                val lastIdx = listState.layoutInfo.totalItemsCount - 1
+                                if (lastIdx >= 0) listState.scrollToItem(lastIdx, Int.MAX_VALUE)
+                            }
                         }
                     }
-                    // 排队中的消息要能撤回：按 request_id 把正文找回来，读不到就显示占位，不编内容。
-                    val queued = shown.queued.map { requestId ->
-                        requestId to (shown.messages.firstOrNull { it.requestId == requestId }?.text ?: "这条消息")
+                    LaunchedEffect(
+                        sessionId, lastMessageId, shown.tickets, notices.size,
+                        subagentTicket?.id, expandedSubagentTicketId, timelineTailRevision,
+                        timelineDragged, userDragPending,
+                    ) {
+                        if (timelineDragged || userDragPending || listState.isScrollInProgress) {
+                            return@LaunchedEffect
+                        }
+                        if (!followIntent.shouldAutoScroll(isScrollInProgress = false)) return@LaunchedEffect
+                        withFrameNanos { }
+                        if (!timelineDragState.value && !userDragPending && !listState.isScrollInProgress &&
+                            followIntent.shouldAutoScroll(isScrollInProgress = listState.isScrollInProgress)) {
+                            val lastIdx = listState.layoutInfo.totalItemsCount - 1
+                            if (lastIdx >= 0) listState.scrollToItem(lastIdx, Int.MAX_VALUE)
+                        }
                     }
                     // 连不上就别让人发：发出去也到不了，还让人以为发了。
-                    Composer(client, draft, queued, shown.declined.lastOrNull()?.reason, withdrawNote, sending, palette,
-                        enabled = problem == null, onChange = onDraft,
-                        steerTicketId = shown.tickets.firstOrNull { it.open }?.id,
-                        onSteer = { requestId, ticketId ->
-                            scope.launch {
-                                withdrawNote = try {
-                                    client.steer(ticketId, requestId, sessionId)
-                                    "已插话，队伍做完当前这一步会先处理这句"
-                                } catch (error: Exception) {
-                                    error.message ?: "插队没成功"
-                                }
-                            }
-                        },
-                        onWithdraw = { requestId ->
-                            scope.launch {
-                                withdrawNote = try {
-                                    client.withdraw(requestId, sessionId)
-                                    onSent()
-                                    null
-                                } catch (error: Exception) {
-                                    error.message ?: "撤回没成功"
-                                }
-                            }
-                        },
+                    Composer(
+                        draft = draft,
+                        declinedReason = shown.declined.lastOrNull()?.reason,
+                        steerTextNote = steerTextNote,
+                        sending = sending,
+                        palette = palette,
+                        enabled = problem == null,
+                        onChange = onDraft,
+                        focusRequester = composerFocus,
+                        focusWhenPlaced = focusComposerAfterTalk,
+                        onFocusHandled = { focusComposerAfterTalk = false },
+                        recipientLabel = CrewNavigation.recipientLabel(draft, shown.bots, defaultBotId),
+                        onOpenRecipient = { scope.launch { drawerState.open() } },
+                        steerTicketId = steerTicketId,
                         onSteerText = { ticketId ->
                             val text = draft
                             val requestId = requestIdFor(text)
+                            val owner = SendOwner(sessionId ?: SessionRoute.MAIN, requestId, text)
+                            steerTextNote = null
+                            onSending(owner, true)
                             scope.launch {
-                                withdrawNote = try {
+                                try {
                                     client.steerText(ticketId, requestId, text, sessionId)
-                                    onDraft("")
-                                    onSent()
-                                    "已插话，队伍做完当前这一步会先处理这句"
+                                    onSendSucceeded(owner)
+                                    steerTextNote = "已插话，队伍做完当前这一步会先处理这句"
+                                } catch (error: CancellationException) {
+                                    throw error
                                 } catch (error: Exception) {
-                                    error.message ?: "插队没成功"
+                                    // 插话也走 POST：异常时同样只是「结果待确认」。
+                                    onSendFailed(owner, error.message ?: "插队没成功", true)
+                                } finally {
+                                    onSending(owner, false)
                                 }
                             }
-                        }) {
-                        val text = draft
-                        val requestId = requestIdFor(text)
-                        onSending(true)
-                        scope.launch {
-                            try {
-                                client.send(text, CrewWire.mentionsIn(text, shown.bots), requestId, sessionId)
-                                onDraft("")
-                                onSent()
-                            } catch (error: Exception) {
-                                // 失败也要让上层知道：它负责显示那句话。
-                                onFailed(error.message ?: "发送失败")
-                            } finally {
-                                onSending(false)
-                            }
-                        }
+                        },
+                    ) {
+                        // 发送的唯一入口：落盘 → POST → 按结局收口，都在 CrewRoot 里。
+                        onSendNow(draft, CrewWire.mentionsIn(draft, shown.bots))
                     }
                 }
             }
@@ -1358,7 +1815,394 @@ private fun CrewScreen(
             onAnswer = { ticket, option, done -> answerTicket(ticket, option, done) },
         )
     }
+    // 诊断页：覆盖层，从侧栏工具进来，不常驻。压在内容之上，关掉即回。
+    if (diagOpen) {
+        DiagPage(
+            palette = palette,
+            diag = DiagRuntime.get(androidx.compose.ui.platform.LocalContext.current.applicationContext),
+            onClose = { diagOpen = false },
+        )
+    }
+    // 检查更新页：覆盖层，与诊断同一层做法；关掉即回原页，不留常驻状态。
+    if (otaOpen) {
+        OtaPage(palette = palette, onClose = { otaOpen = false })
+    }
+    }
+    }
 }
+
+/**
+ * 当前收件人的显式 id：正文里 @ 了已知成员就是第一位；没点名返回 null（由调用方再落到后端默认）。
+ * 与 [CrewNavigation.recipientLabel] 同口径，只把「名字」换回「id」给成员行高亮用。
+ */
+private fun currentRecipientId(draft: String, bots: List<BotCard>): String? {
+    val name = Recipient.primaryRecipient(draft, bots) ?: return null
+    return bots.firstOrNull { Recipient.label(it) == name }?.id
+}
+
+/**
+ * 单行顶栏（56dp）：汉堡 menu(48) · 当前会话名(可点切换会话，占可用宽) · 连接状态(短词≤76dp，48命中，点开详情)。
+ *
+ * 不再常驻模式行 / 成员横条 / 「更多⋯」/ 独立通知块 —— 它们的入口全部下沉到 [CrewDrawerSheet]。
+ * 会话胶囊是**唯一**会话入口的外层触发：点它弹出现有 [SessionBar] 管理面板（切/建/错误），
+ * 真源仍是 CrewRoot 的 sessionState —— 这里不建第二份会话状态。
+ * 连接状态复用 task-2 的 [CrewConnectionStatus]（compact），只画传入的 route/loading/problem。
+ */
+@Composable
+private fun CrewTopBar(
+    route: String,
+    connLoading: Boolean,
+    problem: String?,
+    palette: CrewPalette,
+    onRefresh: () -> Unit,
+    title: String,
+    sessionSwitchable: Boolean,
+    sessionState: SessionState?,
+    onSwitchSession: (String) -> Unit,
+    onCreateSession: (String) -> Unit,
+    onOpenDrawer: () -> Unit,
+    /** 会话弹层是否展开（由 CrewScreen 单一真源控制，drawer「会话管理」也开同一个）。 */
+    sessionsOpen: Boolean,
+    onOpenSessions: () -> Unit,
+    onCloseSessions: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .background(palette.card)
+            .padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        // 汉堡：48×48 命中，打开原生侧边栏。
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(onClick = onOpenDrawer)
+                .semantics { contentDescription = "打开侧边栏" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("☰", fontSize = 18.sp, color = palette.ink)
+        }
+        // 当前会话名：占可用宽、单行 ellipsis；可切换时才可点（老后端锁 main 就只读显示）。
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(48.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .clickable(enabled = sessionSwitchable && sessionState != null) { onOpenSessions() }
+                .padding(horizontal = 8.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Text(
+                text = if (sessionSwitchable) "$title ▾" else title,
+                fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = palette.ink,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        // 右：连接状态，单短词限宽 76dp、48 命中，点开连接详情。
+        CrewConnectionStatus(
+            route = route, loading = connLoading, problem = problem, palette = palette,
+            onRefresh = onRefresh, compact = true,
+            modifier = Modifier.widthIn(max = 76.dp).heightIn(min = 48.dp),
+        )
+    }
+    // 会话管理弹层：复用现有 SessionBar（切/建/错误），真源不变；由 CrewScreen 单一真源 sessionsOpen 控制。
+    if (sessionsOpen && sessionState != null) {
+        AlertDialog(
+            onDismissRequest = onCloseSessions,
+            confirmButton = { TextButton(onClick = onCloseSessions) { Text("关闭", color = palette.accent) } },
+            title = { Text("会话", color = palette.ink, fontSize = 15.sp) },
+            text = {
+                SessionBar(
+                    state = sessionState,
+                    palette = palette,
+                    onSwitch = { id -> onSwitchSession(id); onCloseSessions() },
+                    onCreate = { id -> onCreateSession(id) },
+                    onDismissError = onCloseSessions,
+                )
+            },
+        )
+    }
+}
+
+/**
+ * 侧边栏（原生 [ModalNavigationDrawer] 的 sheet，约 300dp、可滚、系统 back / 点遮罩关、右圆角 16）。
+ *
+ * 三段，按冻结设计自上而下：
+ *  1. 导航：聊天 / 任务。选中态 = 当前页（[CrewNavigation.selectedNav]）。
+ *  2. 成员·选收件人：花名册，行主体点=把该成员设为收件人（[Recipient.select] 落 @名字）；
+ *     行尾独立「资料」48 按钮 = 名片/人设/屏幕的显式入口（不再只靠长按藏起来）。
+ *     成员选中态 = 实际主收件人，与导航选中态各自独立。
+ *  3. 工具：事务板 / 会话管理 / 模型 / 后台 / 屏幕（全部落到既有入口，不新造）。
+ *
+ * 所有交互 ≥48dp 命中。成员是「收件人」选择，不是在线状态；没有在线语义、不编造数据。
+ */
+/**
+ * LazyColumn 里消息项相对列表顶部的偏移：通知存在时它占首项（key="notice"），消息从第 1 项开始；
+ * 没通知时为 0。pendingJump / 滚到底等「按消息索引定位」的地方统一加这个偏移，
+ * 避免「跳一条」落到通知项、或滚到底落错一格。
+ */
+private const val messagesListOffsetIfNotice = 1
+
+/**
+ * 通知摘要：列表内首项（可随消息滚走）。默认一行摘要，点整行（≥48 命中）展开看全部，
+ * 不删除任何一条历史、不常驻挤高度。
+ */
+@Composable
+private fun NoticeSummary(notices: List<CrewNotice>, palette: CrewPalette) {
+    var open by remember { mutableStateOf(false) }
+    val first = notices.first()
+    Column(
+        modifier = Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(palette.accentSoft),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 48.dp)
+                .clickable { open = !open }
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                "有事记得看一下 · ${notices.size}",
+                fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accent,
+            )
+            Text(
+                if (first.title.isNotBlank()) "${first.title}：${first.body}" else first.body,
+                fontSize = 12.sp, color = palette.ink,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(if (open) "收起" else "展开", fontSize = 11.sp, color = palette.accent)
+        }
+        if (open) {
+            for (notice in notices) {
+                Text(
+                    text = if (notice.title.isNotBlank()) "${notice.title}：${notice.body}" else notice.body,
+                    fontSize = 12.sp, color = palette.ink, maxLines = 4,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 名片 overlay：聊天页与任务页共用同一份渲染与回调。
+ *
+ * profile 为 null 时什么都不画（其余时刻整屏铺开 [BotCardSheet]）。四个回调都落到 CrewScreen 的
+ * 同一套状态上：onTalk=关名片+@这位落草稿+延迟聚焦（不丢 draft）；onEdit=让位给编辑层；
+ * onWorkspace=关名片进工作区；onDismiss=关名片。两页因此不各写一份、也不出现「点了没反应」。
+ */
+@Composable
+private fun ProfileOverlay(
+    profile: BotCard?,
+    conversation: Conversation?,
+    palette: CrewPalette,
+    draft: String,
+    onDismiss: () -> Unit,
+    onTalk: (BotCard, List<BotCard>) -> Unit,
+    onEdit: (BotCard) -> Unit,
+    onWorkspace: (BotCard) -> Unit,
+) {
+    if (profile == null || conversation == null) return
+    BotCardSheet(profile, conversation, palette,
+        onTalk = { onTalk(profile, conversation.bots) },
+        onClose = onDismiss,
+        onEdit = { onEdit(profile) },
+    ) { onWorkspace(it) }
+}
+
+@Composable
+private fun CrewDrawerSheet(    palette: CrewPalette,
+    mode: Mode,
+    bots: List<BotCard>,
+    recipientId: String?,
+    defaultBotId: String,
+    noticeCount: Int,
+    onOpenNotices: () -> Unit,
+    onPickRecipient: (BotCard) -> Unit,
+    onOpenProfile: (BotCard) -> Unit,
+    onNavChat: () -> Unit,
+    onNavTasks: () -> Unit,
+    onSessions: () -> Unit,
+    canSessions: Boolean,
+    onModels: () -> Unit,
+    onBackend: () -> Unit,
+    onWorkspace: () -> Unit,
+    hasWorkspace: Boolean,
+    onDiag: () -> Unit,
+    onUpdate: () -> Unit,
+) {
+    ModalDrawerSheet(
+        modifier = Modifier.widthIn(max = 300.dp),
+        drawerShape = RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp),
+        drawerContainerColor = palette.surface,
+    ) {
+        // 头：品牌 + 当前会话（示例态，不编造）。可滚内容从导航开始。
+        Column(modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 12.dp)) {
+            Text("Bot Crew", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = palette.ink)
+        }
+        Column(
+            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
+        ) {
+            DrawerSectionLabel("导航", palette)
+            val nav = CrewNavigation.selectedNav(mode)
+            DrawerNavItem(NavEntry.Chat.label, selected = nav == NavEntry.Chat, palette) { onNavChat() }
+            DrawerNavItem(NavEntry.Tasks.label, selected = nav == NavEntry.Tasks, palette) { onNavTasks() }
+            // 通知：仅有通知时才画，计数真实 noticeCount。点它回聊天并把列表滚到首项摘要（不伪造消息、不发请求）。
+            val noticeLabel = CrewNavigation.noticeRowLabel(noticeCount)
+            if (noticeLabel.isNotEmpty()) {
+                DrawerNavItem(noticeLabel, selected = false, palette) { onOpenNotices() }
+            }
+
+            DrawerSectionLabel("成员 · 选收件人", palette)
+            for (bot in bots) {
+                DrawerMemberRow(
+                    bot = bot,
+                    selected = bot.id == effectiveRecipientId(recipientId, bots, defaultBotId),
+                    palette = palette,
+                    onSelect = { onPickRecipient(bot) },
+                    onProfile = { onOpenProfile(bot) },
+                )
+            }
+
+            DrawerSectionLabel("工具", palette)
+            if (canSessions) DrawerToolItem("会话管理", palette) { onSessions() }
+            DrawerToolItem("模型", palette) { onModels() }
+            DrawerToolItem("后台", palette) { onBackend() }
+            DrawerToolItem("屏幕", palette = palette, enabled = hasWorkspace) { onWorkspace() }
+            // 诊断：App 自身诊断的查看/复制/导出/补传/开关。放侧栏工具，不加顶部常驻排。
+            DrawerToolItem("诊断", palette) { onDiag() }
+            // 更新：检查/下载/校验/交系统安装器。入口只在这里，不常驻、不弹窗、不自动装。
+            DrawerToolItem("检查更新", palette) { onUpdate() }
+        }
+    }
+}
+
+/** 成员行该亮哪一格：显式收件人优先，没点名就用后端默认（与 [CrewNavigation.recipientLabel] 同口径）。 */
+private fun effectiveRecipientId(recipientId: String?, bots: List<BotCard>, defaultBotId: String): String? {
+    if (recipientId != null) return recipientId
+    val id = defaultBotId.trim()
+    return if (id.isNotEmpty() && bots.any { it.id == id }) id else null
+}
+
+@Composable
+private fun DrawerSectionLabel(text: String, palette: CrewPalette) {
+    Text(
+        text, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = palette.faint,
+        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
+    )
+}
+
+/** 导航项：48dp 命中，选中态用 accentSoft 底 + accent 字。 */
+@Composable
+private fun DrawerNavItem(label: String, selected: Boolean, palette: CrewPalette, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 10.dp, vertical = 2.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (selected) palette.accentSoft else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Text(
+            label, fontSize = 14.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) palette.accent else palette.ink,
+        )
+    }
+}
+
+/** 成员行：行主体（点=选收件人）+ 行尾「资料」48 按钮（开名片）。两者命中各自 ≥48。 */
+@Composable
+private fun DrawerMemberRow(
+    bot: BotCard,
+    selected: Boolean,
+    palette: CrewPalette,
+    onSelect: () -> Unit,
+    onProfile: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // 行主体：点=选收件人。48 命中高度；选中态用语义色彩，不冒充在线。
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 48.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .background(if (selected) palette.accentSoft else Color.Transparent)
+                .clickable(onClick = onSelect)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(
+                modifier = Modifier.size(28.dp).clip(RoundedCornerShape(8.dp)).background(palette.accent),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(bot.name.take(1), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = palette.surface)
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    bot.name.ifBlank { bot.id }, fontSize = 14.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    color = if (selected) palette.accent else palette.ink,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                val roleText = CrewNavigation.roleLabel(bot.role)
+                if (roleText.isNotEmpty()) {
+                    Text(
+                        roleText, fontSize = 11.sp, color = palette.faint,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+        // 行尾「资料」：独立的 48 命中按钮（名片/人设/屏幕显式入口，不藏在长按里）。
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(RoundedCornerShape(9.dp))
+                .clickable(onClick = onProfile)
+                .semantics { contentDescription = "查看${bot.name.ifBlank { bot.id }}的资料" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("资料", fontSize = 12.sp, color = palette.accent)
+        }
+    }
+}
+
+/** 工具项：48dp 命中；不可用时灰显（如没有对话就没有「屏幕」）。 */
+@Composable
+private fun DrawerToolItem(label: String, palette: CrewPalette, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 10.dp, vertical = 2.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Text(label, fontSize = 14.sp, color = if (enabled) palette.ink else palette.hint)
+    }
+}
+
 
 /* 名片：照着画板「Personal Agent · 名片」做的一张卡。
  *
@@ -1885,67 +2729,7 @@ private fun RowScope.WorkspaceButton(
     }
 }
 
-/** 队伍页顶栏上的小方块按钮。画板里是 32dp、圆角 9、细边、强调色字形。 */
-@Composable
-private fun GlassIconButton(glyph: String, tint: Color, palette: CrewPalette, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .size(48.dp)
-            .background(palette.card, RoundedCornerShape(9.dp))
-            .border(1.dp, palette.line, RoundedCornerShape(9.dp))
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(glyph, fontSize = 13.sp, color = tint)
-    }
-}
-
-/**
- * 「后台」入口，右上角带未读角标（契约 §5.6）。
- *
- * 画板 Mobile.dc.html 第 39-41 行的原样：32dp、圆角 9、细边；角标是绝对定位在 `top:-4 right:-4`、
- * 最小 15 高、圆角 8、字号 9.5、赭色底（暗色下是更亮的赭 `#E0A574` 配深字）、左右 3 的内衬。
- * 这里按同一套数值换算成 dp/sp：15→15.dp、9.5sp、1dp 内衬，8.dp 圆角 —— 手机屏窄，
- * 角标挂在外面也不会把页头挤开，因为它画在按钮之上而不是排进 Row。
- *
- * `count` 为 null 表示算不出来，这时**不画角标**。画一个 0 就是在说「都读过了」，
- * 那是替网关说话；这一格只画有证据的数。
- */
-@Composable
-private fun BackendIconButton(tint: Color, count: Int?, palette: CrewPalette, onClick: () -> Unit) {
-    Box(modifier = Modifier.size(48.dp)) {
-        GlassIconButton(glyph = "后台", tint = tint, palette = palette, onClick = onClick)
-        if (count != null && count > 0) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .offset(x = 4.dp, y = (-4).dp)
-                    // 两颗角的胶囊：画板是 min-width 15 / height 15 / radius 8。
-                    .defaultMinSize(minWidth = 15.dp, minHeight = 15.dp)
-                    .background(palette.warn, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 3.dp, vertical = 1.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    unreadBadge(count),
-                    fontSize = 9.5.sp,
-                    fontWeight = FontWeight(600),
-                    // 赭色底上的字。画板亮色给的是白（#96603A 底 + #FFFFFF），暗色给的是深字
-                    // （#E0A574 底 + #232228）：亮暗两套的赭不是一个明度档，字也不能共用一个值。
-                    // onWarn 就是这个「压在赭色上当字」的颜色，见 CrewPalette。
-                    color = palette.onWarn,
-                )
-            }
-        }
-    }
-}
-
-/**
- * 角标上的那点字：超过 99 说「99+」，不让徽标跟着条数一起变宽。
- *
- * 用 ASCII 的加号而不是中文「以上」：15dp 的胶囊里放不下三个字，
- * 而把胶囊撑开又会顶到旁边的按钮上。
- */
+/** 角标文字：超过 99 说「99+」，不让徽标跟着条数一起变宽（15dp 胶囊放不下三位数）。 */
 internal fun unreadBadge(count: Int): String = if (count > 99) "99+" else count.toString()
 
 @Composable
@@ -2635,16 +3419,19 @@ private fun TicketStrip(
     onSent: () -> Unit,
     /** 这张卡上的回答发到哪一格；发起时固定，不跟着切会话变。 */
     sessionId: String? = null,
+    /** 还有别的待决定时，去那边逐项看（事务板的「待你」那一栏）。 */
+    onOpenAllPending: () -> Unit = {},
 ) {
-    // 对话里只露一张「等你决定」，其余在后台里看。
-    val waiting = conversation.tickets.firstOrNull { it.needsPerson.isNotEmpty() } ?: return
+    // 聊天里只**详细**展开一张，但要把「还有几项」说清并给出逐项入口 ——
+    // 从前只画 firstOrNull，第一张没处理时其余几项在聊天里一点影子都没有。
+    val pending = conversation.tickets.filter { it.open && it.needsPerson.isNotEmpty() }
+    val waiting = pending.firstOrNull() ?: return
     // 这一组问题就是这张卡的身份：换了问题或换了选项，下面两行状态一起作废
     // （契约 §5：后台重新下发整组 options，旧的一组随即作废，前端不缓存旧选项）。
     val signature = CrewWire.answerSignature(waiting)
-    // 正在发的那几个选项，键是「票号|选项 id」：挡住连点，也让那一行在发着的时候换成 ✓。
-    var answering by remember(waiting.id, signature) { mutableStateOf(emptySet<String>()) }
-    // 这张卡自己的结果。答的是上一道题，就不写在新问题下面。
-    var note by remember(waiting.id, signature) { mutableStateOf<String?>(null) }
+    // 同题互斥闸门：任一时刻这张卡只允许一个答复在途；HTTP 成功=已受理继续锁，等时间线收敛才解锁。
+    // ticketKey 含 attention_id：换票/换卡即换 holder，旧请求回来只更新旧 holder，不污染新卡。
+    val gate = rememberApprovalGate("${waiting.id}|${waiting.attentionId}", signature)
     val scope = rememberCoroutineScope()
     val botName = conversation.bots.firstOrNull { it.id == waiting.botId }?.name?.trim().orEmpty()
     // 点名用名字：手机上人认的是名片上那两个字。这一位不在花名册上（或名字空着）时退回 id ——
@@ -2654,15 +3441,33 @@ private fun TicketStrip(
     // 这张卡是不是审批卡：后端下发了 attention_id 的才是。是就**必须**走审批通道 /answer，
     // 拼 @label 发 /send 会让引擎起一段新活而不是回这张卡。老后端没这字段 → 退回 /send，逐字不变。
     val isApproval = waiting.attentionId.isNotEmpty()
-    /** 一次答复的发射：审批卡走 /answer，否则走既有 /send（普通聊天/老卡）。 */
-    suspend fun fire(label: String) {
-        if (isApproval) {
-            client.answer(waiting.id, label, waiting.attentionId, sessionId)
-        } else {
-            val text = addressed(label)
-            client.send(text, CrewWire.mentionsIn(text, conversation.bots),
-                java.util.UUID.randomUUID().toString(), sessionId)
+    /** 一次答复的发射，返回结局（Accepted / Stale / Failed）。审批卡走 /answer，否则走既有 /send。 */
+    suspend fun fire(label: String): ApprovalGate.Outcome {
+        return try {
+            if (isApproval) {
+                client.answer(waiting.id, label, waiting.attentionId, sessionId)
+            } else {
+                val text = addressed(label)
+                client.send(text, CrewWire.mentionsIn(text, conversation.bots),
+                    java.util.UUID.randomUUID().toString(), sessionId)
+            }
+            gate.accepted()
+            onSent()
+            ApprovalGate.Outcome.Accepted
+        } catch (error: AnswerStale) {
+            // 旧卡已过期：锁住并刷新，明说「已更新」，不冒充成功、不重复提交。
+            gate.stale()
+            onSent()
+            ApprovalGate.Outcome.Stale
+        } catch (error: Exception) {
+            gate.failed(error.message)
+            ApprovalGate.Outcome.Failed
         }
+    }
+    /** 点某一格：准入 → 置提交中 → 发 → 按结局落状态（同题互斥靠 gate.begin）。 */
+    fun answerOption(label: String) {
+        if (!gate.begin()) return
+        scope.launch { fire(label) }
     }
 
     // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
@@ -2680,57 +3485,60 @@ private fun TicketStrip(
             Text("◷", color = palette.warn, fontSize = 11.sp)
             Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight(620))
         }
-        // 有 question 就读 question；没有（delivery / review / blocked / failed 这几种「等你」）
-        // 才退回 needs_person 的人话 —— 绝不补一个空问题。
+        // 有 approval 用它的预览（真实换行）；没有就读 question；都没有才退回 needs_person 的人话。
+        // 结构化/超长的原文不进正文，见 ApiQuestionCopy 与下面的「详情」折叠。
         Text(AnswerCopy.body(waiting), color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+        // 这张卡要做什么、对谁做。没有就整行不画。
+        AnswerCopy.actionLine(waiting)?.let {
+            Text(it, color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp)
+        }
+        // 细节默认折叠：工具名、参数、路径这些不该占正文，但真的要看时必须在。
+        val folded = AnswerCopy.details(waiting)
+        if (folded != null) {
+            var openDetails by remember(waiting.id, signature) { mutableStateOf(false) }
+            TextButton(onClick = { openDetails = !openDetails }, contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
+                Text(
+                    if (openDetails) AnswerCopy.DETAILS_HIDE else AnswerCopy.DETAILS_SHOW,
+                    color = palette.accent, fontSize = 11.sp,
+                )
+            }
+            if (openDetails) {
+                Text(folded, color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp)
+            }
+        }
         // A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
+        val g = gate.state
         waiting.options.forEachIndexed { index, option ->
-            val slot = CrewWire.answerSlot(waiting.id, option.id)
-            val sending = slot in answering
+            // 同题互斥：任一答复在途/已受理，所有选项一起禁用。
+            val busy = g.busy
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(palette.card, RoundedCornerShape(8.dp))
                     .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
-                    // 发着的那一格不再接第二下：按下去没反应比按了有效果更让人以为坏了，
-                    // 所以它的样子会换成 ✓，而不是装作还能点。
-                    .clickable(enabled = !sending) {
-                        answering = answering + slot
-                        note = null
-                        scope.launch {
-                            try {
-                                fire(option.label)
-                                note = AnswerCopy.ANSWER_DONE
-                                // 重读时间线：答完之后这张卡要么消失，要么换成下一道题。
-                                onSent()
-                            } catch (error: AnswerStale) {
-                                // 旧卡已过期：刷新换成最新一张，明说「已更新」，不冒充成功、不重复提交。
-                                note = "这张问题卡已更新，请按最新的那张再答"
-                                onSent()
-                            } catch (error: Exception) {
-                                // 失败写在这张卡自己的结果行里，不冒充断连横幅。
-                                note = AnswerCopy.answerFailed(error.message)
-                            } finally {
-                                answering = answering - slot
-                            }
-                        }
-                    }
+                    // 发着的那一格不再接第二下：提交中说「提交中…」，不画 ✓（还没答成）。
+                    .clickable(enabled = !busy) { answerOption(option.label) }
                     .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                     .padding(horizontal = 11.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    if (sending) "✓" else AnswerCopy.optionMark(index),
-                    color = palette.accent,
+                    if (busy && g.submitting) "…" else AnswerCopy.optionMark(index),
+                    color = if (busy) palette.faint else palette.accent,
                     fontSize = 13.sp,
                     fontWeight = FontWeight(620),
                 )
-                Text(option.label, color = palette.ink, fontSize = 13.sp, lineHeight = 19.sp)
+                Text(
+                    if (busy && g.submitting) "提交中…" else option.label,
+                    color = if (busy) palette.faint else palette.ink,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                )
             }
         }
-        // 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
-        note?.let {
+        // 这张卡自己的结果：提交中/已受理/stale/失败，只有这一张卡会显示。
+        g.note?.let {
             Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 16.sp)
         }
         // 自由输入（revise）：审批卡在本卡内就有一格，typed 原文带 attention_id 走 /answer，
@@ -2738,8 +3546,8 @@ private fun TicketStrip(
         // 老后端没 attention_id 的卡保持原样：点一下把在等的人带进输入框，仍走普通 /send。
         if (isApproval) {
             var revise by remember(waiting.id, signature) { mutableStateOf("") }
-            var busy by remember(waiting.id, signature) { mutableStateOf(false) }
             val trimmed = revise.trim()
+            val busy = gate.state.busy
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 Box(
                     modifier = Modifier
@@ -2770,22 +3578,10 @@ private fun TicketStrip(
                         .size(48.dp)
                         .background(if (busy || trimmed.isEmpty()) palette.track else palette.warn, RoundedCornerShape(8.dp))
                         .clickable(enabled = !busy && trimmed.isNotEmpty()) {
-                            busy = true
-                            note = null
+                            if (!gate.begin()) return@clickable
                             scope.launch {
-                                try {
-                                    fire(trimmed)
-                                    note = AnswerCopy.ANSWER_DONE
-                                    revise = ""
-                                    onSent()
-                                } catch (error: AnswerStale) {
-                                    note = "这张问题卡已更新，请按最新的那张再答"
-                                    onSent()
-                                } catch (error: Exception) {
-                                    note = AnswerCopy.answerFailed(error.message)
-                                } finally {
-                                    busy = false
-                                }
+                                val outcome = fire(trimmed)
+                                if (outcome == ApprovalGate.Outcome.Accepted) revise = ""
                             }
                         },
                     contentAlignment = Alignment.Center,
@@ -2817,6 +3613,24 @@ private fun TicketStrip(
                 ) {
                     Text("回", color = palette.onWarn, fontSize = 11.5.sp)
                 }
+            }
+        }
+        // 另有几项在等：给总数与逐项入口，不把每一张的长正文都铺进聊天。
+        if (pending.size > 1) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "另有 ${pending.size - 1} 项待决定",
+                    color = palette.warn, fontSize = 11.sp, modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onOpenAllPending) {
+                    Text("逐项看", color = palette.accent, fontSize = 11.sp)
+                }
+            }
+            pending.drop(1).forEach { ticket ->
+                Text(
+                    "· ${ticket.approval?.action?.takeIf { it.isNotEmpty() } ?: ticket.title}",
+                    color = palette.muted, fontSize = 11.sp, maxLines = 1,
+                )
             }
         }
     }
@@ -2890,34 +3704,47 @@ private fun stateWord(state: String): String = when (state) {
     else -> "在做"
 }
 
-/** 子代理卡：一出现就去读树（表头要报数），点开只是把明细放出来。子代理还能再分子代理，所以按层缩进展开。 */
+/** 子代理树在组件出现时读取；只有真实后代到达后才画摘要卡。点开只展开明细。 */
 @Composable
 private fun SubagentCard(
     client: CrewClient,
-    ticketId: String,
+    ticket: WorkTicket,
     /** 按票的树缓存（见 AgentsCache）。由上层持有，切屏回来时那一份还在。 */
     cache: AgentsCache,
     /** 这一轮时间线的代号：变了就重读一次，队伍派了新的人也看得见。 */
     generation: Int,
     palette: CrewPalette,
+    open: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onContentChanged: () -> Unit,
 ) {
-    var open by remember(ticketId) { mutableStateOf(false) }
-    var trouble by remember(ticketId) { mutableStateOf<String?>(null) }
+    val ticketId = ticket.id
+    var trouble by rememberSaveable(ticketId) { mutableStateOf<String?>(null) }
     // 重试：读不到的那一轮记在缓存里、不会自己再发请求，得有人把这一轮的记号清掉。
     var retry by remember(ticketId) { mutableStateOf(0) }
-    // 树本身从缓存来。它不是 Compose 的状态，读回来之后靠这枚记号重画这一格。
-    // 表头那两行（「N 个子代理」/「x 在跑 · y 已完成」）从头到尾都是同一档字号的两行，
-    // 有没有数据都不变高，所以读回来不会推动列表。
+    // 树从缓存读取；tick 在请求结束时只重画当前这张卡。
     var tick by remember(ticketId) { mutableStateOf(0) }
-    val nodes = remember(ticketId, generation, tick, retry) { cache.get(ticketId, generation) }
+    // 展开着的时候再慢一档刷新：只在人真的展开这一张时才重读，不做全树/全列无差别重拉。
+    var idleTick by remember(ticketId) { mutableStateOf(0) }
+    val nodes = remember(ticketId, generation, tick, retry, idleTick) { cache.get(ticketId, generation) }
+    val descendants = AgentCopy.visibleSubagents(nodes)
 
-    // 表头要显示「2 个子代理 · 1 在跑」，所以一出现就得去读，不用等点开。
-    // 收起只是收起明细，摘要一直在。
+    // 组件出现时启动读取；只有非空后代到达后才生成摘要卡。
     //
     // 这里只留这一处读取：从前点开时还抄了一份一模一样的请求，两边各发一遍
     // —— 表头那趟还没回来就点开，会同时飞出去两个 /agents。
-    // 点开时要做的只是等这一趟：它回来时 tick 变了，卡自己会重画。
-    LaunchedEffect(ticketId, generation, retry) {
+    // 点开只切换展开状态，不会重复发起读取。
+    // 展开时低频重读：票还在跑，人正看着这一块 —— 每 12 秒补一次，别等下一次时间线换代。
+    // 收起时这个循环根本不启动，所以不会因为它在屏上就一直在打请求。
+    LaunchedEffect(ticketId, open, generation) {
+        if (!open) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(12_000)
+            idleTick += 1
+        }
+    }
+
+    LaunchedEffect(ticketId, generation, retry, idleTick) {
         // start 同时挡住并发：同一张票在这一轮里已经有人发了请求，就不再发第二个。
         // 按过「重试」时先放掉上一轮「读不到」的记号，再照常走一遍。
         if (retry > 0) cache.forget(ticketId)
@@ -2926,6 +3753,7 @@ private fun SubagentCard(
         try {
             cache.finish(ticketId, client.agents(ticketId), generation)
             tick += 1
+            onContentChanged()
         } catch (error: CancellationException) {
             // 这一格被组合带走了：不是「读不到」，别把取消写成一句错误。
             // 交还给缓存，切回来时还会再读一次。
@@ -2935,85 +3763,85 @@ private fun SubagentCard(
             // 读不到也记一笔：同一轮里不再重发。trouble 只写在这一张卡上。
             cache.finish(ticketId, null, generation)
             tick += 1
-            trouble = error.message
+            onContentChanged()
+            trouble = AgentCopy.failureNote(error.message)
         }
     }
+
+    // 只有真实非空后代才创建可展开卡；读取效果已在上方启动。
+    if (descendants == null && trouble == null) return
 
     // 与消息同一列：消息行左边距 14 + 头像 25 + 间距 8 = 47，右边 14。
     // 卡自己不再加内边距式的 Padding(13)，那会让表头比正文还缩进 —— 画板里
     // 表头与正文同一条左基线。
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 47.dp, end = 14.dp)
-            .background(palette.card, RoundedCornerShape(10.dp))
-            .border(1.dp, palette.line, RoundedCornerShape(10.dp)),
+        modifier = Modifier.fillMaxWidth().padding(start = 47.dp, end = 14.dp),
     ) {
-        // 表头：左「N 个子代理」，右「x 在跑 · y 已完成」。
-        // 收起时也显示 —— 空的按钮块占着一大片白，比没有更难看。
-        // 点开只改这一枚 open：读取是上面那趟 LaunchedEffect 的事，这里不再发第二个请求。
-        Row(
-            modifier = Modifier.fillMaxWidth().clickable {
-                open = !open
-            }.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            val total = nodes?.let { countAgents(it) }
-            // 后端目前只发 working；终态集合留给以后。递归数，否则嵌套节点会被算成已完成。
-            val running = nodes?.let { countRunning(it) } ?: 0
-            // 画板：左边一个 22×22 的淡绿方块图标，再是「N 个子代理 / x 在跑 · y 已完成」两行。
-            // 一行文字块看不出「这里能点开」，方块图标给了它一个可点的形状。
-            Box(
+        if (descendants != null) {
+            Column(
                 modifier = Modifier
-                    .size(22.dp)
-                    .background(palette.accentSoft, RoundedCornerShape(7.dp)),
-                contentAlignment = Alignment.Center,
+                    .fillMaxWidth()
+                    .background(palette.card, RoundedCornerShape(10.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(10.dp)),
             ) {
-                Text("⑂", fontSize = 11.sp, color = palette.accent)
+                // 表头：左「N 个子代理」，右「x 在跑 · y 已完成」。
+                // 真实后代到达后才显示摘要入口；刷新期间继续显示缓存中的上次成功树。
+                // 点开只改这一枚 open：读取是上面那趟 LaunchedEffect 的事，这里不再发第二个请求。
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        onExpandedChange(!open)
+                    }.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val total = AgentCopy.count(descendants)
+                    val summary = AgentCopy.summary(descendants)
+                    // 画板：左边一个 22×22 的淡绿方块图标，再是「N 个子代理 / x 在跑 · y 已完成」两行。
+                    // 一行文字块看不出「这里能点开」，方块图标给了它一个可点的形状。
+                    Box(
+                        modifier = Modifier
+                            .size(22.dp)
+                            .background(palette.accentSoft, RoundedCornerShape(7.dp)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("⑂", fontSize = 11.sp, color = palette.accent)
+                    }
+                    Spacer(Modifier.width(9.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "%d 个子代理".format(total),
+                            fontSize = 12.5.sp, fontWeight = FontWeight(550), color = palette.ink,
+                        )
+                        Text(
+                            summary,
+                            fontSize = 11.sp, color = palette.faint,
+                        )
+                    }
+                    Text(
+                        stateWord(ticket.state),
+                        fontSize = 10.5.sp,
+                        color = if (ticket.open) palette.faint else palette.accent,
+                    )
+                    Spacer(Modifier.width(7.dp))
+                    Text(if (open) "‹" else "›", fontSize = 13.sp, color = palette.faint)
+                }
+                if (open) {
+                    // 展开后只呈现已读取的真实树；未知与空树不创建卡片。
+                    nodes.orEmpty().forEach { AgentBranch(it, 0, palette) }
+                }
             }
-            Spacer(Modifier.width(9.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    if (total == null) "子代理" else "%d 个子代理".format(total),
-                    fontSize = 12.5.sp, fontWeight = FontWeight(550), color = palette.ink,
-                )
-                Text(
-                    when {
-                        total == null -> if (open) "读着…" else "点开看"
-                        else -> "%d 在跑 · %d 已完成".format(running, total - running)
-                    },
-                    fontSize = 11.sp, color = palette.faint,
-                )
-            }
-            Text(if (open) "‹" else "›", fontSize = 13.sp, color = palette.faint)
         }
-        trouble?.let {
-            Spacer(Modifier.height(6.dp))
-            Text(it, color = palette.danger, fontSize = 11.sp)
-            // 读不到得有一条出路：按一下，重读一次这一张票的树。
-            // 缓存里「这一轮读不到」的记号先清掉，否则下面那趟 LaunchedEffect 会当它已经读过。
-            TextButton(onClick = { retry += 1 }) {
-                Text("重试", color = palette.accent, fontSize = 11.sp)
+        trouble?.let { note ->
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = if (descendants == null) 0.dp else 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(note, color = palette.danger, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                TextButton(onClick = { retry += 1 }) {
+                    Text("重试", color = palette.accent, fontSize = 11.sp)
+                }
             }
         }
-        if (open) {
-            // 树还没回来：先按一行分支的高度占住（与 AgentBranch 同字号、同 2dp 上边距），
-            // 回来时只是把这一处换成真名，卡的上沿不再爬 —— 它挂在消息列表末尾，
-            // 一变高就把上面所有东西顶走一下，正滑着就是一次顿挫。
-            // 真有几行是读回来才知道的，那一下的增高属于数据本身；靠「出现就去读」
-            // 把它压在人还没滑到这里的时候（见上面那趟 LaunchedEffect）。
-            if (nodes == null) {
-                // 和 AgentBranch 同一档字号、同一处内衬：读回来只是把这一行换成真名。
-                Text("· 读着…", fontSize = 11.sp, color = palette.faint,
-                    modifier = Modifier.padding(start = 12.dp, top = 2.dp))
-            }
-            nodes?.forEach { AgentBranch(it, 0, palette) }
-        }
-        // 收起时不占位，也不做动画：表头那两行（「N 个子代理」/「点开看」或
-        // 「x 在跑 · y 已完成」）无论读没读回来都是同一档字号的两行，读回来不会
-        // 让这张卡变高或变矮，本来就不会推动列表。真有变动的是点开之后树长出来，
-        // 那一下是人自己点的，跟着动是对的 —— 不拿动画把用户的点击拖慢。
     }
 }
 
@@ -3258,31 +4086,31 @@ private fun CodeCard(
     }
 }
 
-/** 数整棵树有多少个分身。 */
-private fun countAgents(nodes: List<AgentNode>): Int =
-    nodes.sumOf { 1 + countAgents(it.children) }
-
-/** 一个子代理是不是已经收工。后端目前只发 working，这个集合为将来的终态留位置。 */
-private fun agentDone(state: String): Boolean =
-    state in setOf("done", "ended", "completed", "failed", "stopped")
-
-/** 还在跑的分身数，递归整棵树。 */
-private fun countRunning(nodes: List<AgentNode>): Int =
-    nodes.sumOf { if (agentDone(it.state)) 0 else 1 + countRunning(it.children) }
-
 @Composable
 private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
-    val done = agentDone(node.state)
+    val running = AgentCopy.isRunning(node.state)
+    val done = AgentCopy.isTerminal(node.state)
+    val waiting = node.state.trim() in setOf("waiting", "waiting_for_person", "processing")
+    val mark = when {
+        done -> "✓"
+        running -> "·"
+        AgentCopy.isIdle(node.state) -> "○"
+        else -> "?"
+    }
+    val stateColor = when {
+        running -> palette.accent
+        waiting -> palette.warn
+        else -> palette.faint
+    }
     // 缩进就是层级：不压平，也不额外画线。
     Row(
         modifier = Modifier.padding(start = (depth * 12).dp, top = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            // 有标签就显示标签：`a1-1` 这种内部编号对人没有意义。记号与桌面端 subagentRow 同一套：
-            // 在跑是 ○、收工是 ✓（这里沿用手机上原来那颗 ·，颜色跟着状态走）。
-            "${if (done) "✓" else "·"} ${node.label.ifBlank { node.id }}",
-            color = if (done) palette.faint else palette.ink,
+            // 后端 label 是呈现名；worker root 仍显示为「工单」，便于看懂子代理归属。
+            "$mark ${node.label.ifBlank { node.id }}",
+            color = if (running) palette.ink else palette.faint,
             fontSize = 11.sp,
         )
         // 右侧那截话：状态词 +（真有耗时时的）耗时。与桌面端 agentStatus 同一句，
@@ -3291,77 +4119,13 @@ private fun AgentBranch(node: AgentNode, depth: Int, palette: CrewPalette) {
         // 没数据就不画那一截，绝不补一个假数。
         Box(Modifier.weight(1f))
         Text(
-            AgentCopy.status(node, working = !done),
-            // 在跑的那一行是强调绿，收工的退成弱灰 —— 与桌面端同一处配色，扫一眼就知道谁还在动。
-            color = if (done) palette.faint else palette.accent,
+            AgentCopy.status(node, working = running),
+            // 仅明确的 working 用强调绿；等待、空闲、未知都不会被画成在跑。
+            color = stateColor,
             fontSize = 10.5.sp,
         )
     }
     node.children.forEach { AgentBranch(it, depth + 1, palette) }
-}
-
-/**
- * 「听」那一小行：按一下把这句话念出来。
- *
- * 念不出来时说的是为什么（这台机器没有那个声音 / 转换失败），
- * 不是一句通用的「播报不可用」—— 那三个原因的处置完全不同。
- */
-@Composable
-private fun SpeakButton(client: CrewClient, palette: CrewPalette, text: String) {
-    val scope = rememberCoroutineScope()
-    var playing by remember { mutableStateOf(false) }
-    var note by remember { mutableStateOf("") }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    Row(
-        modifier = Modifier.padding(top = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        TextButton(
-            enabled = !playing,
-            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
-            modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
-            onClick = {
-                playing = true
-                note = SpeechCopy.PLAYING
-                scope.launch {
-                    try {
-                        val result = client.speak(text)
-                        val wav = result.wav
-                        if (!result.available || wav == null) {
-                            note = result.reason
-                            return@launch
-                        }
-                        // 交给系统播放器念：不在应用里自己解码 PCM。
-                        val file = java.io.File(context.cacheDir, "speech-${System.currentTimeMillis()}.wav")
-                        java.io.FileOutputStream(file).use { it.write(wav) }
-                        note = SpeechCopy.done(result.seconds, result.truncated)
-                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                            setDataAndType(
-                                androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file),
-                                "audio/wav",
-                            )
-                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(intent)
-                    } catch (error: Exception) {
-                        note = error.message ?: SpeechCopy.FAILED
-                    } finally {
-                        playing = false
-                    }
-                }
-            },
-        ) {
-            Text(
-                if (playing) SpeechCopy.PLAYING else SpeechCopy.LISTEN,
-                fontSize = 10.5.sp,
-                color = if (playing) palette.faint else palette.accent,
-            )
-        }
-        if (note.isNotEmpty()) {
-            Text(note, fontSize = 10.sp, color = palette.faint, maxLines = 1)
-        }
-    }
 }
 
 @Composable
@@ -3384,6 +4148,17 @@ private fun MessageRow(
     topGap: Dp = 0.dp,
     /** 代码卡的「采用」发到哪一格；由队伍屏在发起那一刻传下来。 */
     sessionId: String? = null,
+    queuedRequestIds: Set<String> = emptySet(),
+    steerTicketId: String? = null,
+    onActionCompleted: () -> Unit = {},
+    onContentChanged: () -> Unit = {},
+    /**
+     * 这条请求此刻的执行活动（来自轻量快照，按 request_id 关联）。
+     * null = 后端没给 / 这一条没有活动 —— 那时不画活动行，不编一句「正在思考」。
+     */
+    activity: ExecutionActivity? = null,
+    /** 这条的收据是否带问题卡（决定 waiting_for_person 说「等你答复」还是「需要你处理」）。 */
+    awaitingAnswer: Boolean = false,
 ) {
     // 这一条自己的「结果读回来了」记号。它是每条消息各记各的：某张票的产出读回来时，
     // 只有挂着它的那一条重画（见下面 remember 的键）。
@@ -3399,6 +4174,35 @@ private fun MessageRow(
     }
     // 分色按 Bot ID 判，不按显示名：名字是花名册里可改的呈现，ID 才是身份。
     val warn = isWarnBot(message.botId)
+    val requestActionScope = rememberCoroutineScope()
+    var requestActionBusy by remember(sessionId, message.id, message.requestId) { mutableStateOf(false) }
+    var requestActionDone by remember(sessionId, message.id, message.requestId) { mutableStateOf(false) }
+    var requestActionNote by remember(sessionId, message.id, message.requestId) { mutableStateOf<String?>(null) }
+    var requestActionsExpanded by remember(sessionId, message.id, message.requestId) { mutableStateOf(false) }
+    val canWithdraw = RequestStateCopy.canWithdraw(message, queuedRequestIds)
+    val canShowRequestActions = canWithdraw && !requestActionDone
+    val requestStateLabel = RequestStateCopy.label(message.requestState, awaitingAnswer)
+    LaunchedEffect(canShowRequestActions) {
+        if (!canShowRequestActions) requestActionsExpanded = false
+    }
+    fun runRequestAction(action: suspend () -> Unit) {
+        if (requestActionBusy) return
+        requestActionBusy = true
+        requestActionNote = null
+        requestActionScope.launch {
+            try {
+                action()
+                requestActionDone = true
+                onActionCompleted()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                requestActionNote = error.message ?: "操作没成功"
+            } finally {
+                requestActionBusy = false
+            }
+        }
+    }
     // 手机上一行就是一条消息：左对齐的是 Bot（带 25×25 头像），右对齐的是自己。
     // 画板里 Bot 那条是「头像 + 正文」两列，不是一整块气泡 ——
     // 少了头像，一屏连排的 Bot 发言会糊成一大段没有主人的字。
@@ -3445,10 +4249,6 @@ private fun MessageRow(
                     lineHeight = 22.4.sp,
                     color = palette.ink,
                 )
-                // 念出来：只有机器人说的话才值得听，自己打的不用念回来。
-                if (fromBot && message.text.isNotBlank()) {
-                    SpeakButton(client, palette, message.text)
-                }
                 message.code?.let { block ->
                     Spacer(Modifier.height(9.dp))
                     // 署名带下去：卡上的「采用」要点名写这段的那位，不能猜成默认 Bot。
@@ -3481,21 +4281,8 @@ private fun MessageRow(
                 val line = remember(generation, showResult, ticket, outputsTick) {
                     if (showResult) outputs.line(ticket, generation) else null
                 }
-                // 结果条是异步读回来的。读回来之前这块地方的高度必须和读到之后一样，
-                // 否则读完那一刻这条消息长高、列表里下面的东西全被顶走一下 ——
-                // 正滑着就是一次顿挫。
-                //
-                // 占位直接画同一行的空白（同样的上下间距、同样的边框底、同样的一句话），
-                // 只是把字与对勾换成看不见的白：量出来的高度就是真那一行的高度，
-                // 不靠「9 + 9 + 16 ≈ 34dp」这种手算去对（11.5sp 的行高不是字号的 1.4 倍，
-                // 手算出来的数一差，占位就等于没占）。
-                //
-                // 只在「还没读到」的时候占：读过了、确实没有产出，就一点都不留 ——
-                // 那种情况留一块空白是永久的，比读回来时动一下难看得多。
-                if (showResult && line == null && outputs.pending(ticket, generation)) {
-                    Spacer(Modifier.height(9.dp))
-                    ResultBar(" ", palette, hidden = true)
-                }
+                // 没有真实可见结果时不占位置；异步读回非空产出后再自然插入一行。
+                // 已知非空的上次成功结果由 OutputsCache.line 在刷新期间继续提供。
                 line?.let {
                     Spacer(Modifier.height(9.dp))
                     ResultBar(it, palette)
@@ -3507,6 +4294,7 @@ private fun MessageRow(
                 if (showResult && ticket.isNotEmpty()) {
                     LaunchedEffect(ticket, generation) {
                         if (!outputs.start(ticket, generation)) return@LaunchedEffect
+                        val previousLine = outputs.line(ticket, generation)
                         var view: OutputsView? = null
                         try {
                             view = client.outputs(ticket)
@@ -3516,10 +4304,11 @@ private fun MessageRow(
                             outputs.abandon(ticket, generation)
                             throw error
                         } catch (_: Exception) {
-                            // 读失败就是「这张没有可画的产出」：不画，也不冒充断连。
+                            // 失败单独记本轮尝试，已有成功结果仍由缓存提供，不把失败当成空产出。
                             view = null
                         }
                         outputs.finish(ticket, view, generation)
+                        if (outputs.line(ticket, generation) != previousLine) onContentChanged()
                         // 读回来要重画：缓存是普通表，界面不会自己知道它变了。
                         // 只碰这一条自己的 tick —— 整页共享的那个已经从这一格里拿掉了，
                         // 否则一次读取会让每一行消息都重组一遍。
@@ -3540,6 +4329,20 @@ private fun MessageRow(
                 .fillMaxWidth(0.84f)
                 .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
                 .background(palette.userBubble)
+                .then(
+                    if (canShowRequestActions) {
+                        Modifier
+                            .pointerInput(message.requestId) {
+                                detectTapGestures(onLongPress = { requestActionsExpanded = true })
+                            }
+                            .semantics {
+                                onLongClick(label = "显示消息操作") {
+                                    requestActionsExpanded = true
+                                    true
+                                }
+                            }
+                    } else Modifier
+                )
                 .padding(horizontal = 13.dp, vertical = 10.dp),
         ) {
             Text(
@@ -3547,6 +4350,68 @@ private fun MessageRow(
                 fontSize = 14.sp,
                 lineHeight = 21.75.sp,
                 color = palette.userInk,
+            )
+            DropdownMenu(
+                expanded = requestActionsExpanded && canShowRequestActions,
+                onDismissRequest = { requestActionsExpanded = false },
+            ) {
+                if (steerTicketId != null) {
+                    DropdownMenuItem(
+                        text = { Text(if (requestActionBusy) "处理中" else "插话") },
+                        enabled = !requestActionBusy,
+                        onClick = {
+                            requestActionsExpanded = false
+                            runRequestAction {
+                                client.steer(steerTicketId, message.requestId, sessionId)
+                            }
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text(if (requestActionBusy) "处理中" else "撤回") },
+                    enabled = !requestActionBusy,
+                    onClick = {
+                        requestActionsExpanded = false
+                        runRequestAction {
+                            client.withdraw(message.requestId, sessionId)
+                        }
+                    },
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(0.84f).padding(top = 2.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            Text(
+                requestStateLabel,
+                fontSize = 10.5.sp,
+                lineHeight = 13.sp,
+                color = palette.faint,
+                maxLines = 1,
+                softWrap = false,
+            )
+        }
+        requestActionNote?.let {
+            Text(
+                it,
+                fontSize = 10.5.sp,
+                color = palette.danger,
+                modifier = Modifier.fillMaxWidth(0.84f).padding(top = 1.dp),
+                textAlign = TextAlign.End,
+            )
+        }
+        // 执行活动：与收据分开一行。收据说「到没到」，这条说「此刻在干什么」。
+        ActivityCopy.line(activity)?.let { line ->
+            Text(
+                line,
+                fontSize = 10.5.sp,
+                lineHeight = 13.sp,
+                color = palette.muted,
+                maxLines = 1,
+                softWrap = false,
+                modifier = Modifier.fillMaxWidth(0.84f).padding(top = 1.dp),
+                textAlign = TextAlign.End,
             )
         }
     }
@@ -3558,12 +4423,10 @@ private fun MessageRow(
  * 与桌面端 resultBar 同一套画法：一行、细边、卡片底，对勾用强调色。
  * 它只在有结果时被调用 —— 空态、读不到、请求失败都不画这条，见 OutputsCopy.barLine。
  *
- * `hidden = true` 是同一个框、同一句话、同一处间距，只是字与对勾透明：用来在读回来之前
- * 把这一行的高度占住。量出来的是真那一行的高度，不是猜的 —— 见 MessageRow 里那一处。
- * 对无障碍树也不留字：它是占位，不该被读屏念出来。
+ * 只展示真实可见的产出。
  */
 @Composable
-private fun ResultBar(line: String, palette: CrewPalette, hidden: Boolean = false) {
+private fun ResultBar(line: String, palette: CrewPalette) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -3573,8 +4436,8 @@ private fun ResultBar(line: String, palette: CrewPalette, hidden: Boolean = fals
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("✓", fontSize = 13.sp, color = if (hidden) Color.Transparent else palette.accent)
-        Text(line, fontSize = 11.5.sp, color = if (hidden) Color.Transparent else palette.muted)
+        Text("✓", fontSize = 13.sp, color = palette.accent)
+        Text(line, fontSize = 11.5.sp, color = palette.muted)
     }
 }
 
@@ -3590,56 +4453,26 @@ private fun isWarnBot(botId: String?): Boolean = when (botId) {
 
 @Composable
 private fun Composer(
-    client: CrewClient,
     draft: String,
-    queued: List<Pair<String, String>>,
     declinedReason: String?,
-    withdrawNote: String?,
+    steerTextNote: String?,
     sending: Boolean,
     palette: CrewPalette,
     enabled: Boolean,
     onChange: (String) -> Unit,
+    focusRequester: FocusRequester? = null,
+    /** true = 显式 onTalk 请求聚焦，等输入框挂上后一次性聚焦+弹键盘；成功后经 onFocusHandled 清标记。 */
+    focusWhenPlaced: Boolean = false,
+    onFocusHandled: () -> Unit = {},
+    /** 输入区左侧收件人按钮的文案（如「发给 大哥（按队伍默认）」）。点它开 drawer 选成员。 */
+    recipientLabel: String,
+    onOpenRecipient: () -> Unit,
     steerTicketId: String?,
-    onSteer: (String, String) -> Unit,
-    onWithdraw: (String) -> Unit,
     onSteerText: (String) -> Unit,
     onSend: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        if (queued.isNotEmpty()) {
-            // 排队的消息要看得见，否则发出去像石沉大海；还要能撤回。
-            Text(
-                "${queued.size} 条排队中，等队伍读完手上这一步",
-                fontSize = 11.sp,
-                color = palette.faint,
-                modifier = Modifier.padding(start = 16.dp, top = 8.dp),
-            )
-            queued.take(3).forEach { (requestId, text) ->
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text.lineSequence().first().take(24),
-                        fontSize = 11.sp,
-                        color = palette.muted,
-                        maxLines = 1,
-                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                    // 有工单在跑时才能插队：它把话交给那张票的 worker 下一步。
-                    if (steerTicketId != null) {
-                        TextButton(onClick = { onSteer(requestId, steerTicketId) }) {
-                            Text("插队", color = palette.accent, fontSize = 11.sp)
-                        }
-                    }
-                    TextButton(onClick = { onWithdraw(requestId) }) {
-                        Text("撤回", color = palette.accent, fontSize = 11.sp)
-                    }
-                }
-            }
-        }
-        withdrawNote?.let {
+        steerTextNote?.let {
             Text(it, fontSize = 11.sp, color = palette.danger, modifier = Modifier.padding(start = 16.dp, top = 2.dp))
         }
         if (!declinedReason.isNullOrBlank()) {
@@ -3651,144 +4484,69 @@ private fun Composer(
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp),
             )
         }
-        ComposerRow(client, draft, sending, palette, enabled, onChange, onSend,
-            steerTicketId = steerTicketId, onSteerText = onSteerText)
+        ComposerRow(draft, sending, palette, enabled, onChange, onSend,
+            focusRequester = focusRequester, steerTicketId = steerTicketId, onSteerText = onSteerText,
+            recipientLabel = recipientLabel, onOpenRecipient = onOpenRecipient,
+            focusWhenPlaced = focusWhenPlaced, onFocusHandled = onFocusHandled)
     }
 }
 
 /**
- * 输入区最左边那枚麦克风：按一下开始录，再按一下结束并认字。
+ * 输入那一行：收件人按钮 · 输入框 · 可选的「插队」· 发送。
  *
- * 认出来的话**追加**到草稿，不直接发出去 —— 认错一个字是常事，
- * 直接发出去就是把错的当成你说的。
+ * 收件人在左侧一颗 48×48 按钮里（视觉像「大哥 ⌄」，最大 64dp 宽、名字单行 ellipsis），
+ * 正文 TextField 吃剩余宽（按剩余宽自适应，360dp 下窄屏也保留完整可编辑宽度，不会缩成几字）。点击按钮开 drawer 选成员；
+ * 「发给X」放 contentDescription，不占视觉宽度，也不替代正文里用户自己打的 @。
  *
- * 没有麦克风时这枚键不画：画一个按不动的按钮，比不画更像坏了。
- */
-@Composable
-private fun VoiceButton(
-    client: CrewClient,
-    palette: CrewPalette,
-    enabled: Boolean,
-    onText: (String) -> Unit,
-    onBusy: (Boolean) -> Unit,
-) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
-    val recorder = remember { VoiceRecorder() }
-    var recording by remember { mutableStateOf(false) }
-    var busy by remember { mutableStateOf(false) }
-    var startedAt by remember { mutableStateOf(0L) }
-    var note by remember { mutableStateOf<String?>(null) }
-    val canRecord = remember { recorder.available() }
-
-    // Android 6+ 录音一律运行时授权；没有捷径。
-    val permission = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
-    ) { granted -> note = if (granted) null else VoiceCopy.NEED_PERMISSION }
-
-    if (!canRecord) {
-        Text(VoiceCopy.NO_MIC, fontSize = 11.sp, color = palette.faint)
-        return
-    }
-
-    TextButton(
-        enabled = enabled && !busy,
-        onClick = {
-            if (recording) {
-                // 停：把采到的字节包成 WAV 交给后端认字。
-                recording = false
-                busy = true
-                onBusy(true)
-                val elapsed = System.currentTimeMillis() - startedAt
-                val wav = recorder.stop()
-                note = VoiceCopy.TRANSCRIBING
-                scope.launch {
-                    try {
-                        if (VoiceCopy.tooShort(elapsed)) {
-                            note = VoiceCopy.TOO_SHORT
-                        } else {
-                            val result = client.voice(wav)
-                            if (result.available) {
-                                onText(result.text)
-                                note = VoiceCopy.INSERTED
-                            } else {
-                                note = result.reason
-                            }
-                        }
-                    } finally {
-                        busy = false
-                        onBusy(false)
-                    }
-                }
-                return@TextButton
-            }
-            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
-                context, android.Manifest.permission.RECORD_AUDIO,
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                permission.launch(android.Manifest.permission.RECORD_AUDIO)
-                return@TextButton
-            }
-            if (recorder.start()) {
-                startedAt = System.currentTimeMillis()
-                recording = true
-                note = VoiceCopy.LISTENING
-            } else {
-                note = VoiceCopy.NO_MIC
-            }
-        },
-    ) {
-        Text(
-            when {
-                busy -> "…"
-                recording -> "■"
-                else -> "●"
-            },
-            fontSize = 13.sp,
-            color = when {
-                recording -> palette.danger
-                busy -> palette.faint
-                else -> palette.accent
-            },
-        )
-    }
-    note?.let {
-        Text(it, fontSize = 11.sp, color = if (recording) palette.accent else palette.faint, maxLines = 1)
-    }
-}
-
-/**
- * 输入那一行：麦克风 · 输入框 · 可选的「插队」· 发送。
- *
- * 语音与发送共用同一份草稿：认出来的字先落进草稿，让人看一眼再发。
  */
 @Composable
 private fun ComposerRow(
-    client: CrewClient,
     draft: String,
     sending: Boolean,
     palette: CrewPalette,
     enabled: Boolean,
     onChange: (String) -> Unit,
     onSend: () -> Unit,
+    focusRequester: FocusRequester? = null,
     steerTicketId: String?,
     onSteerText: (String) -> Unit,
+    recipientLabel: String,
+    onOpenRecipient: () -> Unit,
+    focusWhenPlaced: Boolean = false,
+    onFocusHandled: () -> Unit = {},
 ) {
-    var listening by remember { mutableStateOf(false) }
-    // 输入区：画板里圆角 13、白底细边、上下留白。默认的 OutlinedTextField
-    // 是直角加厚边框，和整页的圆润调子对不上，所以自己给形状和颜色。
+    // 一次性聚焦守卫：本次 armed 只处理一次，避免 onGloballyPositioned 每帧重复 requestFocus。
+    var focusFired by remember { mutableStateOf(false) }
+    if (!focusWhenPlaced) focusFired = false
+    val keyboard = LocalSoftwareKeyboardController.current
+    // 收件人短名：从「发给 X（按队伍默认）」里剥出 X，只显示 1–3 字 + ⌄，不占满一行。
+    val shortName = recipientLabel.removePrefix("发给 ")
+        .substringBefore("（").substringBefore("·").trim().ifEmpty { "未指定" }
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // 麦克风在最左边：输入框右边已经是发送键，语音再挤进去会让人按错。
-        VoiceButton(client, palette, enabled = enabled && !sending && !listening,
-            onText = { said ->
-                // 追加而不是替换：人可能已经打了一半，语音只补后半句。
-                val joined = if (draft.isBlank()) said else draft.trimEnd() + " " + said
-                onChange(joined)
-            },
-            onBusy = { listening = it })
+        // 收件人按钮：48×48 命中，最大 64dp 宽，视觉是短名 + ⌄。点开侧边栏选成员。
+        Box(
+            modifier = Modifier
+                .height(48.dp)
+                .widthIn(min = 48.dp, max = 64.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(palette.accentSoft)
+                .clickable(onClick = onOpenRecipient)
+                .semantics { contentDescription = "$recipientLabel，点按换成员" }
+                .padding(horizontal = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    shortName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accent,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+                )
+                Text("⌄", fontSize = 11.sp, color = palette.accent)
+            }
+        }
+        Spacer(Modifier.width(6.dp))
         // 画板：输入框是**浅灰底、无边框**（#F3F0EA / 暗色 #2A2830），圆角 12；
         // 发送键是框内右侧 30×30 的绿方块。之前做成了白底 + 细边，
         // 在这张暖白页面上等于没有分界，看不出哪里能打字。
@@ -3814,7 +4572,22 @@ private fun ComposerRow(
                 disabledBorderColor = Color.Transparent,
                 cursorColor = palette.accent,
             ),
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f)
+                .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+                // 显式 onTalk 请求聚焦：**输入框真正挂上后**（onGloballyPositioned 回调、isAttached）才一次性
+                // requestFocus + 弹键盘；不盲睡、不无界重试。失败写日志（不静默吞），成功后清 armed 标记。
+                .onGloballyPositioned { coords ->
+                    if (focusWhenPlaced && !focusFired && coords.isAttached && focusRequester != null) {
+                        focusFired = true
+                        try {
+                            focusRequester.requestFocus()
+                            keyboard?.show()
+                            onFocusHandled()
+                        } catch (error: Exception) {
+                            android.util.Log.w("CrewComposer", "onTalk 聚焦失败（输入框未就绪）", error)
+                        }
+                    }
+                },
         )
         if (steerTicketId != null && draft.isNotBlank() && enabled && !sending) {
             // 有工单在跑时，这句可以不经排队、直接交给它的下一步。

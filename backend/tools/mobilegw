@@ -110,7 +110,7 @@ def db():
         thread INTEGER,sender TEXT NOT NULL,bot INTEGER DEFAULT 0,mentions_me INTEGER DEFAULT 0,
         mentions TEXT,text TEXT NOT NULL,at TEXT NOT NULL,url TEXT,reply_to INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY AUTOINCREMENT,conversation TEXT NOT NULL,
-        to_msg INTEGER,rkey TEXT UNIQUE,text TEXT NOT NULL,at TEXT NOT NULL,bot_id TEXT)''')
+        to_msg INTEGER,rkey TEXT UNIQUE,text TEXT NOT NULL,at TEXT NOT NULL,bot_id TEXT,kind TEXT)''')
     columns = {row[1] for row in c.execute('PRAGMA table_info(messages)')}
     if 'request_id' not in columns:
         c.execute('ALTER TABLE messages ADD COLUMN request_id TEXT')
@@ -124,6 +124,10 @@ def db():
         c.execute('ALTER TABLE messages ADD COLUMN withdrawn_at TEXT')
     if 'bot_id' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
         c.execute('ALTER TABLE replies ADD COLUMN bot_id TEXT')
+    # 出站类型：'acknowledgement' / 'reply' / 'notice'，NULL = 本列之前写的历史行。
+    # 网关只转述这一列，绝不由正文猜类型（回执与最终答复必须能分开）。
+    if 'kind' not in {row[1] for row in c.execute('PRAGMA table_info(replies)')}:
+        c.execute('ALTER TABLE replies ADD COLUMN kind TEXT')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS messages_request_id ON messages(conversation, request_id)')
     c.commit()
     return c
@@ -244,6 +248,8 @@ class H(BaseHTTPRequestHandler):
         session = session_of(self)
         if session is None:
             return
+        if path == '/meta':
+            return self._meta(session)
         if path != '/timeline':
             return self._send(404, {'error': 'not found'})
         c = db()
@@ -253,7 +259,7 @@ class H(BaseHTTPRequestHandler):
             # `read_at` 一起读出来：它是「队伍已经读走」的唯一持久记录。手机面靠它算
             # 「发出去还没被读走」的条数（契约 §5.6）。撤回只看它有没有值，这里不改那套判定。
             msgs = c.execute('SELECT id,text,sender,at,request_id,mentions,read_at FROM messages WHERE conversation=? AND withdrawn_at IS NULL ORDER BY id', (session,)).fetchall()
-            reps = c.execute('SELECT id,to_msg,text,at,bot_id FROM replies WHERE conversation=? ORDER BY id', (session,)).fetchall()
+            reps = c.execute('SELECT id,to_msg,text,at,bot_id,kind FROM replies WHERE conversation=? ORDER BY id', (session,)).fetchall()
         finally:
             c.close()
         entries = [(m['id'], 0, m['id'], {'role': 'user', 'text': m['text'], 'at': m['at'],
@@ -267,6 +273,8 @@ class H(BaseHTTPRequestHandler):
                      # 回复挂在哪条消息下要交给客户端：没有它，界面分不清哪句在回哪句，
                      # `queued` 也没法判断一条消息是不是已经被答过了。
                      **({'bot_id': r['bot_id']} if r['bot_id'] else {}),
+                     # 回执 / 最终答复 / 通知三选一；历史缺失就**缺着**，客户端不据此显示「已回复」。
+                     **({'reply_kind': r['kind']} if r['kind'] else {}),
                      **({'reply_to': 'm%d' % r['to_msg']} if isinstance(r['to_msg'], int) else
                         ({'reply_to': r['to_msg']} if r['to_msg'] else {}))})
                     for r in reps]
@@ -276,6 +284,63 @@ class H(BaseHTTPRequestHandler):
         entries.sort(key=lambda item: (item[3]['at'], item[1], tie_key(item[2])))
         return self._send(200, {'items': [item[3] for item in entries],
                                 'session_id': session, 'session_api': 1})
+
+    def _meta(self, session):
+        """Lightweight request metadata: ids, request_ids, read state, answer kinds.
+
+        The live-activity snapshot must key items by the client's own `request_id`, and must not
+        pull message/reply bodies to do it. This is that bounded read: two EXISTS probes per row
+        instead of the full text of every message and reply in the conversation.
+
+        `answered` counts only a **final reply** (`kind` IS NULL, i.e. a legacy row, or `'reply'`).
+        `acknowledged` says a non-final outbound message (acknowledgement/notice) hangs under it.
+        """
+        # 点名行（活跃票 / 正在评估的队列行）保证老活跃任务不会因为「不在最近 N 条里」而消失；
+        # 其余补最近若干条已结束的，供客户端清掉过期 overlay。总量有界，不是全历史扫描。
+        named = []
+        for value in parse_qs(urlsplit(self.path).query).get('row', []):
+            if value.isdigit() and int(value) > 0:
+                named.append(int(value))
+        named = sorted(set(named))[:200]
+        c = db()
+        try:
+            recent = c.execute(
+                """SELECT m.id AS id, m.request_id AS request_id, m.read_at AS read_at,
+                   (m.thread IS NULL OR m.thread = m.id) AS is_root,
+                   EXISTS(SELECT 1 FROM replies r WHERE r.conversation=m.conversation AND r.to_msg=m.id
+                          AND (r.kind IS NULL OR r.kind = 'reply')) AS answered,
+                   EXISTS(SELECT 1 FROM replies r WHERE r.conversation=m.conversation AND r.to_msg=m.id
+                          AND r.kind IS NOT NULL AND r.kind <> 'reply') AS acknowledged
+                   FROM messages m
+                   WHERE m.conversation=? AND m.withdrawn_at IS NULL AND m.request_id IS NOT NULL
+                   ORDER BY m.id DESC LIMIT 50""", (session,)
+            ).fetchall()
+            if named:
+                placeholders = ','.join('?' * len(named))
+                extra = c.execute(
+                    """SELECT m.id AS id, m.request_id AS request_id, m.read_at AS read_at,
+                       (m.thread IS NULL OR m.thread = m.id) AS is_root,
+                       EXISTS(SELECT 1 FROM replies r WHERE r.conversation=m.conversation AND r.to_msg=m.id
+                              AND (r.kind IS NULL OR r.kind = 'reply')) AS answered,
+                       EXISTS(SELECT 1 FROM replies r WHERE r.conversation=m.conversation AND r.to_msg=m.id
+                              AND r.kind IS NOT NULL AND r.kind <> 'reply') AS acknowledged
+                       FROM messages m
+                       WHERE m.conversation=? AND m.withdrawn_at IS NULL AND m.request_id IS NOT NULL
+                         AND m.id IN (%s)""" % placeholders, (session, *named)
+                ).fetchall()
+                merged = {row['id']: row for row in recent}
+                for row in extra:
+                    merged[row['id']] = row
+                rows = [merged[key] for key in sorted(merged)]
+            else:
+                rows = list(recent)
+        finally:
+            c.close()
+        items = [{'id': 'm%d' % row['id'], 'request_id': row['request_id'],
+                  'read_at': row['read_at'] or '', 'root': bool(row['is_root']),
+                  'answered': bool(row['answered']), 'acknowledged': bool(row['acknowledged'])}
+                 for row in reversed(rows)]
+        return self._send(200, {'items': items, 'session_id': session, 'session_api': 1})
 
     def _claim(self, session):
         """Take a message out of the queue for a steer without answering it.

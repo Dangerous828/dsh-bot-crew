@@ -232,7 +232,10 @@ async function dispatch(name: string, args: Record<string, unknown>): Promise<un
       const explicitKey = typeof args.key === 'string' && args.key ? args.key : undefined
       const key = explicitKey ?? derivedKey(channel, to, text)
       const bot = typeof args.bot_id === 'string' && args.bot_id ? ['--bot', args.bot_id] : []
-      const reply = JSON.parse(await runCli(['reply', '--conversation', channel, '--to', to, '--key', key, '--text', text, ...bot])) as
+      // This adapter does not go through the core Outbox, so the kind has to be written explicitly here:
+      // a `send_message` is the crew's answer, never an acknowledgement or a notice.
+      const reply = JSON.parse(await runCli(['reply', '--conversation', channel, '--to', to, '--key', key,
+        '--text', text, '--kind', 'reply', ...bot])) as
         { ok: boolean; key: string; id: string | null; replayed?: boolean }
       // 显式 rkey 是幂等键：同 key 不同正文**不得**暗示「新正文已送达」。reply 会在同 key 已存在时标
       // replayed 并回原有行（正文仍是旧的），这里把 replayed 一并交回，让调用方看得见「这是重放、不是新的」。

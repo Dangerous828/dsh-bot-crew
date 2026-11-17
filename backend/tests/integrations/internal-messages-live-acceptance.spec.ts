@@ -200,7 +200,7 @@ describe('内部消息 MCP：真 ticket 上读放行/写审批/批准一次/拒�
   // 复用上面同一套真 ticket + canary DB + 真 guardConnection，证明「手机这条通道用现有 source 消息就能
   // 完成连接写审批」，且与 feishu `approvalReply` 走同一套状态机（不是造第二个审批 UI）。
   describe('手机 answer 入口：走与 feishu approvalReply 同一套审批状态机', () => {
-    it('未批准写被 hold 后，手机回「做吧」→ 批准同一次→真 adapter 写 +1；回「先别做」→ stopTicket 零写；认不出的答 → 如实拒绝不动', async () => {
+    it('未批准写被 hold 后，手机回「做吧」→ 批准同一次→真 adapter 写 +1；回「先别做」→ 只取消这一次、票不结束；认不出的答 → 如实拒绝不动', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'msg-answer-entry-')); dirs.push(dir)
       const db = join(dir, 'canary-mobileq.db')
       execFileSync('python3', [CLI, '--db', db, 'inject', '--conversation', 'main', '--sender', 'owner', '--text', '用户：请回一句'])
@@ -215,7 +215,9 @@ describe('内部消息 MCP：真 ticket 上读放行/写审批/批准一次/拒�
       expect(typeof gate(ticket.id, 'mcp__messages__send_message', reply)).toBe('string')
       const att = runtime.store.tickets.get(ticket.id)!
       expect(att.pendingApproval).toMatchObject({ kind: 'connection', status: 'waiting' })
-      expect(att.attention?.options?.map(o => o.label)).toEqual(['做吧', '先别做', '换个做法'])
+      // 文案各自说出后果：取消这一次 ≠ 停整票。
+      expect(att.attention?.options?.map(o => o.id)).toEqual(['go', 'stop', 'revise'])
+      expect(att.attention?.options?.find(o => o.id === 'stop')!.label).toContain('这一次')
       const attentionId = att.attention!.id
       expect(attentionId).toBeTruthy()
       expect(replyCount(db)).toBe(before)
@@ -256,11 +258,15 @@ describe('内部消息 MCP：真 ticket 上读放行/写审批/批准一次/拒�
       const freshAttn = runtime.store.tickets.get(ticket.id)!.attention!.id
       expect(freshAttn).toBeTruthy()
 
-      // Mobile "先别做" → stopTicket; the ticket ends → gate refuses, DB unchanged.
+      // Mobile "先别做" → 只取消这一次调用：票不结束，同一签名再调直接回拒绝（不再出卡），DB 不变。
       const beforeStop = replyCount(db)
       expect(runtime.answerTicket(ticket.id, '先别做', freshAttn)).toEqual({ ok: true, answer: 'stop' })
-      expect(runtime.store.tickets.get(ticket.id)?.ended).toBeTruthy()
-      expect(typeof gate(ticket.id, 'mcp__messages__send_message', reply)).toBe('string')
+      const stopped = runtime.store.tickets.get(ticket.id)!
+      expect(stopped.ended).toBeUndefined()
+      expect(stopped.pendingApproval).toBeUndefined()
+      expect(stopped.approvalDenied?.signature).toBeTruthy()
+      expect(gate(ticket.id, 'mcp__messages__send_message', reply)).toContain('取消了这一次调用')
+      expect(runtime.store.tickets.get(ticket.id)?.attention).toBeUndefined()
       expect(replyCount(db)).toBe(beforeStop)
     })
   })

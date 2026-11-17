@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
@@ -66,6 +67,8 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
     var code by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var trouble by remember { mutableStateOf<String?>(null) }
+    // 检查更新页开合。放在这一屏是因为**还没配对时**也要能升级：新手机装第一个包靠的就是它。
+    var otaOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // 「问过没有」要跨 composable 生命周期成立（#34）。放持久层，不放 rememberSaveable：
@@ -144,6 +147,7 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
 
     // 键盘弹起时可用高度会变小。居中排列会让整列上移，点到的位置和看到的位置对不上 ——
     // 表现是「点配对码框，字进了地址框」。改成顶部对齐 + 可滚动 + 让出键盘高度。
+    Box(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -308,6 +312,15 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
                         }
                         val client = PairingClient(base)
                         val credential = client.pair(code, deviceId, deviceName(), "android")
+                        // 配对成功后立刻拉一次 timeline 读服务端自报的 `server:{crew, public_base}`，
+                        // 作为**本次 new-pair 登记的初始可信身份**（savedCrew）。读不到（旧后端/字段缺失）
+                        // 就是空串——不报错、不瞎填，之后有 trustedPublicBase 精确比对再补。
+                        val serverMeta = try {
+                            val c = CrewClient(listOf(base), credential.token, credential.deviceId)
+                            c.timeline(null).server
+                        } catch (_: Exception) {
+                            null
+                        }
                         // 配对时顺手把「出门那条路」「隧道那条路」和队伍指纹记下来：它们和
                         // 局域网地址是同一条 mDNS 记录给的，人不用再输第二遍。没发现到
                         // （手填地址进来的）就是空串，那时只剩局域网这一条，也不做刷新 ——
@@ -316,9 +329,12 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
                             credential.deviceId,
                             credential.token,
                             base,
-                            spot?.publicBase.orEmpty(),
+                            // 公网入口：优先服务端自报的可信 public_base，其次 mDNS 的 pub。
+                            serverMeta?.publicBase?.takeIf { it.isNotBlank() } ?: spot?.publicBase.orEmpty(),
                             spot?.p2pAddr.orEmpty(),
                             spot?.crew.orEmpty(),
+                            serverCrew = serverMeta?.crew.orEmpty(),
+                            serverPublicBase = serverMeta?.publicBase.orEmpty(),
                         ))
                     } catch (error: Exception) {
                         trouble = error.message ?: "配对被拒绝"
@@ -332,6 +348,12 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
             if (busy) CircularProgressIndicator(modifier = Modifier.padding(end = 8.dp)) 
             Text(if (busy) "配对中" else "连上")
         }
+
+        TextButton(onClick = { otaOpen = true }) {
+            Text("检查更新", fontSize = 12.sp, color = palette.faint)
+        }
+    }
+    if (otaOpen) OtaPage(palette = palette, onClose = { otaOpen = false })
     }
 }
 

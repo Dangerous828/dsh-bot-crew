@@ -127,6 +127,57 @@ class TicketAndStatusTest {
         assertEquals(listOf("req-2"), conversation.queued)
     }
 
+    @Test
+    fun preservesPerMessageRequestStateAndQueuedState() {
+        val body = """{"items":[
+            {"id":"m1","role":"user","text":"one","request_id":"req-1","request_state":"accepted"},
+            {"id":"m2","role":"user","text":"two","request_id":"req-2","request_state":"unknown"}
+        ],"bots":[],"default_bot_id":"","queued":["req-1","req-2"],"queued_state":"unknown"}"""
+        val conversation = CrewWire.parseTimeline(body)
+
+        assertEquals("accepted", conversation.messages[0].requestState)
+        assertEquals("unknown", conversation.messages[1].requestState)
+        assertEquals("unknown", conversation.queuedState)
+    }
+
+    @Test
+    fun withdrawalRequiresQueuedStateAndAuthoritativeMembership() {
+        val queued = setOf("req-accepted", "req-unknown", "req-queued")
+        fun message(id: String?, state: String?) = Message(
+            id = id ?: "message",
+            fromBot = false,
+            botId = null,
+            text = "text",
+            at = "",
+            requestId = id.orEmpty(),
+            requestState = state,
+        )
+
+        assertFalse(RequestStateCopy.canWithdraw(message("req-accepted", "accepted"), queued))
+        assertFalse(RequestStateCopy.canWithdraw(message("req-unknown", "unknown"), queued))
+        assertTrue(RequestStateCopy.canWithdraw(message("req-queued", "queued"), queued))
+        assertFalse(RequestStateCopy.canWithdraw(message("req-processing", "processing"), queued))
+        assertFalse(RequestStateCopy.canWithdraw(message("req-replied", "replied"), queued))
+        assertFalse(RequestStateCopy.canWithdraw(message("req-outside", "queued"), queued))
+        assertFalse(RequestStateCopy.canWithdraw(message(null, null), queued))
+        assertEquals("处理中", RequestStateCopy.label("evaluating"))
+        assertEquals("待处理", RequestStateCopy.label("queued"))
+        assertEquals("已发送", RequestStateCopy.label("accepted"))
+        assertEquals("已发送", RequestStateCopy.label(null))
+        // 未知值不并入「已发送」：那是替队伍说它收到了。
+        assertEquals("未知状态", RequestStateCopy.label("unknown"))
+        // finished 含 completed/stopped/dropped，通用一句「已结束」，不一律说已完成。
+        assertEquals("已结束", RequestStateCopy.label("finished"))
+        // waiting_for_person：有问题卡才叫「等你答复」，只是卡在等处理叫「需要你处理」。
+        assertEquals("需要你处理", RequestStateCopy.label("waiting_for_person"))
+        assertEquals("等你答复", RequestStateCopy.label("waiting_for_person", hasQuestion = true))
+        // ack / notice 不是最终答复。
+        assertEquals(false, RequestStateCopy.isFinalReply("acknowledgement"))
+        assertEquals(false, RequestStateCopy.isFinalReply("notice"))
+        assertEquals(false, RequestStateCopy.isFinalReply(null))
+        assertEquals(true, RequestStateCopy.isFinalReply("reply"))
+    }
+
     // 子代理还能再派子代理：三层要原样读出来，不能压平。
     @Test
     fun readsNestedSubagents() {
@@ -144,6 +195,28 @@ class TicketAndStatusTest {
         assertEquals(1, tree.size)
         assertEquals(2, tree[0].children.size)
         assertEquals("sub-a-1", tree[0].children[0].children[0].id)
+        val descendants = AgentCopy.subagents(tree)
+        assertEquals(3, AgentCopy.count(descendants))
+        assertEquals(1, AgentCopy.countRunning(descendants))
+        assertEquals(2, AgentCopy.countDone(descendants))
+    }
+
+    @Test
+    fun aWorkerRootWithoutChildrenHasNoSubagentRows() {
+        val roots = AgentWire.parse("""{"agents":[{"id":"worker","label":"工单","state":"working","children":[]}] }""")
+        assertTrue(AgentCopy.subagents(roots).isEmpty())
+    }
+
+    @Test
+    fun idleAndUnknownAgentStatesAreNotCountedAsRunning() {
+        val nodes = listOf("idle", "mystery", "").mapIndexed { index, state ->
+            AgentNode("agent-$index", "子代理", state, null, emptyList())
+        }
+        assertEquals(0, AgentCopy.countRunning(nodes))
+        assertEquals("空闲", AgentCopy.status(nodes[0], working = false))
+        assertEquals("状态未知", AgentCopy.status(nodes[1], working = false))
+        assertEquals("状态未知", AgentCopy.word(""))
+        assertEquals("状态未知", AgentCopy.word("mystery"))
     }
 
     @Test
@@ -962,14 +1035,13 @@ class OutputsBarTest {
         assertFalse(cache.need("tk-1", 1))
         assertEquals("1 个文件 · 1 张图片已放进产出", cache.line("tk-1", 1))
         // 时间线又读回来一次（第 2 轮）：worker 可能只写了个文件、一句新话也没说，
-        // 所以这一轮必须重读，而不是继续拿第 1 轮的结果画。
+        // 所以这一轮要重读，同时继续显示最近成功的结果。
         assertTrue(cache.need("tk-1", 2))
-        assertNull("上一轮的结果不拿来画这一轮", cache.line("tk-1", 2))
+        assertEquals("刷新期间沿用最近成功结果", "1 个文件 · 1 张图片已放进产出", cache.line("tk-1", 2))
         assertTrue(cache.start("tk-1", 2))
-        // 第 1 轮的请求这会儿才回来：它不能把第 2 轮的账本改成旧数据，
-        // 更不能把第 2 轮「正在读」的记号抹掉 —— 那会让这一轮永远停在「读过、没有」。
+        // 第 1 轮的请求这会儿才回来：它不能把第 2 轮的账本或在途标记改掉。
         cache.finish("tk-1", view(liveBody), 1)
-        assertNull(cache.line("tk-1", 2))
+        assertEquals("旧请求不影响屏幕上的结果", "1 个文件 · 1 张图片已放进产出", cache.line("tk-1", 2))
         assertFalse("第 2 轮仍在读，不该再发第二个请求", cache.need("tk-1", 2))
         // 这一轮自己读回来，才开始算数。
         cache.finish("tk-1", view(liveBody), 2)
@@ -986,6 +1058,28 @@ class OutputsBarTest {
         assertTrue("滚回来还要再读一次", cache.start("tk-9", 1))
         cache.finish("tk-9", null, 1)
         assertTrue(cache.tried("tk-9", 1))
+    }
+
+    @Test
+    fun aRefreshKeepsTheLastSuccessfulOutputVisibleUntilNewDataArrives() {
+        val cache = OutputsCache()
+        val first = view(liveBody)
+        val newer = view(liveBody.replace("\"image\":1", "\"image\":3"))
+        cache.start("tk-10", 1)
+        cache.finish("tk-10", first, 1)
+
+        assertTrue("新轮仍要拉取", cache.need("tk-10", 2))
+        assertEquals("旧的成功结果继续显示", "1 个文件 · 1 张图片已放进产出", cache.line("tk-10", 2))
+        assertTrue(cache.start("tk-10", 2))
+        assertEquals("请求在途时仍显示旧结果", "1 个文件 · 1 张图片已放进产出", cache.line("tk-10", 2))
+
+        cache.finish("tk-10", newer, 2)
+        assertEquals("新响应回来后替换旧结果", "1 个文件 · 3 张图片已放进产出", cache.line("tk-10", 2))
+
+        assertTrue(cache.start("tk-10", 3))
+        cache.finish("tk-10", null, 3)
+        assertEquals("读取失败时保留最后一次成功结果", "1 个文件 · 3 张图片已放进产出", cache.line("tk-10", 3))
+        assertTrue(cache.tried("tk-10", 3))
     }
 
     // ── 结果条挂在哪一条（同一张票只挂最后一次）───────────────────
@@ -1636,6 +1730,43 @@ class LastOfTicketBatchTest {
  * 这里用一个「同一份缓存跨两次取用」的用例把它钉住 —— 它要是跟着页面重建，
  * 切回来第一帧就得重发一遍 /agents，那几百毫秒的空块正是切屏时最容易被看见的半次卡顿。
  */
+class SubagentCardSelectionTest {
+    private fun ticket(id: String, open: Boolean, state: String): WorkTicket = WorkTicket(
+        id = id,
+        title = id,
+        state = state,
+        botId = "bot",
+        needsPerson = "",
+        open = open,
+    )
+
+    @Test
+    fun ordinaryChatDoesNotSurfaceHistoricalTickets() {
+        val completed = ticket("done-1", open = false, state = "completed")
+        assertNull(SubagentCardSelection.ticket(listOf(completed), expandedTicketId = null))
+    }
+
+    @Test
+    fun anExpandedTicketStaysVisibleAndUsesItsCompletedStateUntilCollapsed() {
+        val active = ticket("task-1", open = true, state = "working")
+        val completed = ticket("task-1", open = false, state = "completed")
+
+        assertEquals(active, SubagentCardSelection.ticket(listOf(active), active.id))
+        val afterRefresh = SubagentCardSelection.ticket(listOf(completed), active.id)
+        assertEquals(completed, afterRefresh)
+        assertEquals("completed", afterRefresh?.state)
+        assertFalse(afterRefresh?.open ?: true)
+        assertNull(SubagentCardSelection.ticket(listOf(completed), SubagentCardSelection.toggle(active.id, active.id)))
+    }
+
+    @Test
+    fun aStaleSelectionFallsBackToTheCurrentOpenTicket() {
+        val historical = ticket("done-1", open = false, state = "completed")
+        val active = ticket("task-2", open = true, state = "working")
+        assertEquals(active, SubagentCardSelection.ticket(listOf(historical, active), "removed-task"))
+    }
+}
+
 class AgentsCacheTest {
 
     private fun tree(): List<AgentNode> = AgentWire.parse(
@@ -1699,12 +1830,32 @@ class AgentsCacheTest {
     }
 
     @Test
+    fun unknownAndEmptyTreesCreateNoCardButRealDescendantsDo() {
+        val cache = AgentsCache()
+        assertNull("未知树不创建卡", AgentCopy.visibleSubagents(cache.get("tk-card", 1)))
+
+        assertTrue(cache.start("tk-card", 1))
+        cache.finish("tk-card", emptyList(), 1)
+        assertNull("成功空树也不创建卡", AgentCopy.visibleSubagents(cache.get("tk-card", 1)))
+
+        assertTrue(cache.need("tk-card", 2))
+        assertTrue(cache.start("tk-card", 2))
+        assertNull("新一轮未知期间仍无卡", AgentCopy.visibleSubagents(cache.get("tk-card", 2)))
+        cache.finish("tk-card", tree(), 2)
+        assertEquals("真实后代到达后才创建卡", AgentCopy.subagents(tree()),
+            AgentCopy.visibleSubagents(cache.get("tk-card", 2)))
+    }
+
+    @Test
     fun anUnreadableTreeIsRememberedButNotDrawn() {
         val cache = AgentsCache()
         assertTrue(cache.start("tk-9", 1))
         cache.finish("tk-9", null, 1)
         assertTrue("读不到也记一笔", cache.tried("tk-9", 1))
-        assertNull("读不到就没有树可画", cache.get("tk-9", 1))
+        assertNull("失败仍是未知，不是空树", cache.get("tk-9", 1))
+        assertNull("失败时不冒出空卡", AgentCopy.visibleSubagents(cache.get("tk-9", 1)))
+        assertEquals("子代理读取失败：服务异常", AgentCopy.failureNote("服务异常"))
+        assertEquals("子代理读取失败：读取失败", AgentCopy.failureNote(null))
         assertFalse("这一轮不再反复请求", cache.need("tk-9", 1))
         assertFalse(cache.start("tk-9", 1))
 
@@ -1713,6 +1864,28 @@ class AgentsCacheTest {
         assertTrue(cache.need("tk-9", 2))
         assertNull("上一轮的答案不拿来画这一轮", cache.get("tk-9", 2))
         assertFalse(cache.tried("tk-9", 2))
+    }
+
+    @Test
+    fun aRefreshKeepsTheLastSuccessfulTreeVisibleUntilNewDataArrives() {
+        val cache = AgentsCache()
+        val first = tree()
+        val newer = tree().map { it.copy(label = "${it.label} newer") }
+        cache.start("tk-10", 1)
+        cache.finish("tk-10", first, 1)
+
+        assertTrue("新时间线仍要刷新", cache.need("tk-10", 2))
+        assertEquals("旧树继续显示", first, cache.get("tk-10", 2))
+        assertTrue(cache.start("tk-10", 2))
+        assertEquals("刷新在途时保留旧树", first, cache.get("tk-10", 2))
+
+        cache.finish("tk-10", newer, 2)
+        assertEquals("新树到达后替换旧树", newer, cache.get("tk-10", 2))
+
+        assertTrue(cache.start("tk-10", 3))
+        cache.finish("tk-10", null, 3)
+        assertEquals("刷新失败时保留最后一次成功的树", newer, cache.get("tk-10", 3))
+        assertTrue("失败刷新仍记为本轮已尝试", cache.tried("tk-10", 3))
     }
 
     @Test
@@ -1742,10 +1915,9 @@ class AgentsCacheTest {
         cache.finish("tk-5", tree(), 1)
         assertTrue("新一轮时间线要重读", cache.need("tk-5", 2))
         assertTrue(cache.start("tk-5", 2))
-        // 第 1 轮的请求这会儿才回来：不能把第 2 轮的账改成旧数据，
-        // 更不能把第 2 轮「正在读」的记号抹掉（那会让这一轮永远停在「读过、没有」）。
+        // 第 1 轮的请求这会儿才回来：不能覆盖第 2 轮正在读的标记；最近成功的树仍留在屏幕上。
         cache.finish("tk-5", null, 1)
-        assertNull("旧一轮的答案不写在第 2 轮上", cache.get("tk-5", 2))
+        assertEquals("刷新期间继续显示最近成功树", tree(), cache.get("tk-5", 2))
         assertFalse(cache.tried("tk-5", 2))
         assertFalse("第 2 轮还在读，不许再发第二个", cache.need("tk-5", 2))
         // 这一轮自己读回来，才开始算数。
@@ -1795,152 +1967,46 @@ class AgentsCacheTest {
         assertEquals(tree(), atCrewRoot.get("tk-1", 7))
         assertFalse("切回来不该在首帧再发一遍请求", atCrewRoot.need("tk-1", 7))
 
-        // 反过来说清楚为什么要上提：缓存若跟着页面重建，回来就是一个空账本，
-        // 那一趟请求又得重发 —— 这正是「切屏第一帧一块空白」的来源。
+        // 缓存若跟着页面重建，回来就会丢掉已展示的树，等新读取结束后再出现。
         val recreated = AgentsCache()
         assertNull(recreated.get("tk-1", 7))
         assertTrue(recreated.need("tk-1", 7))
     }
 }
 
-/**
- * 结果条缓存的「待取」与「已试过」（[OutputsCache.pending] / [OutputsCache.tried]）。
- *
- * 两句话问的是两件事，混起来两头都错：
- * - pending：「这一轮还没有答案吗」。界面据此在结果条的位置先占一行高，
- *   读回来时列表不往上顶一下（滑动中那一下就是一次顿挫）。它不区分「还没发」与「正在读」——
- *   两种都占。空票号永远不占：没有票号就没有结果条。
- * - tried：「这一轮读过了没有」。成功、失败都算读过；读过就不再发请求。
- *   所以一张票可以 pending 而不 tried（还没读），绝不反过来 —— 非空票号下两者恒相反。
- *
- * 读不到（null）之后 pending 必须落回 false：占着一块「读不到」的空白是永久的，
- * 比读回来时动一下难看得多。
- */
-class OutputsPendingTest {
-
+/** 结果行只由 OutputsCache.line 的真实可见文本驱动；未知与空结果不预留高度。 */
+class OutputsVisibleRowTest {
     private fun view(body: String): OutputsView = OutputsWire.parse(body)
-
-    private val liveBody = """
-        {"items":[
-           {"id":"tk-1|a.png","ticket_id":"tk-1","path":"a.png","title":"a.png","kind":"image","writes":2,"at":"2026-11-11T10:05:00Z"}],
-         "state":"live","counts":{"file":0,"image":1},"ticket_id":"tk-1"}
-    """.trimIndent()
 
     private val emptyBody = """{"items":[],"state":"empty","counts":{"file":0,"image":0}}"""
 
     @Test
-    fun anUnreadTicketOccupiesItsRowButHasNotBeenTried() {
+    fun successfulEmptyResultCreatesNoRowAcrossTheNextEpoch() {
         val cache = OutputsCache()
-        // 还没发请求：这一轮确实没有答案，先占一行高。
-        assertTrue("还没读：先占一行高", cache.pending("tk-1", 1))
-        assertFalse("占着不等于试过", cache.tried("tk-1", 1))
-        assertTrue("还没读过，该去读一次", cache.need("tk-1", 1))
-        assertNull("没有答案就不画", cache.line("tk-1", 1))
+        assertTrue(cache.start("tk-empty", 1))
+        cache.finish("tk-empty", view(emptyBody), 1)
+        assertTrue(cache.tried("tk-empty", 1))
+        assertNull("成功空结果不提供 ResultBar 文案", cache.line("tk-empty", 1))
+
+        assertTrue("新轮仍会读取", cache.need("tk-empty", 2))
+        assertTrue(cache.start("tk-empty", 2))
+        // MessageRow 只从 line?.let 创建 ResultBar；刷新期间的 null 就是没有结果行。
+        assertNull("空结果进入下一轮时不创建行", cache.line("tk-empty", 2))
+        cache.finish("tk-empty", view(emptyBody), 2)
+        assertTrue(cache.tried("tk-empty", 2))
+        assertNull("新一轮仍为空时继续没有结果行", cache.line("tk-empty", 2))
     }
 
     @Test
-    fun anEmptyTicketNeverOccupiesAnything() {
+    fun unknownAndFailedReadsHaveNoVisibleResultLine() {
         val cache = OutputsCache()
-        assertFalse("空票号不占位", cache.pending("", 1))
-        assertFalse(cache.need("", 1))
-        assertFalse(cache.start("", 1))
-        assertFalse(cache.tried("", 1))
-    }
-
-    @Test
-    fun aReadInFlightStillCountsAsPending() {
-        // pending 不看「有没有人正在读」：正读着同样没有答案，那一行照样要占住。
-        val cache = OutputsCache()
-        assertTrue(cache.start("tk-1", 1))
-        assertTrue("正在读：照样占那一行", cache.pending("tk-1", 1))
-        assertFalse("正在读不算读过", cache.tried("tk-1", 1))
-        assertFalse("同一轮不发第二个请求", cache.need("tk-1", 1))
-
-        cache.finish("tk-1", view(liveBody), 1)
-        assertFalse("读到了就不再占位", cache.pending("tk-1", 1))
-        assertTrue(cache.tried("tk-1", 1))
-        // 有答案了：占位换成真那一行，文案由 counts 拼。
-        assertEquals("1 张图片已放进产出", cache.line("tk-1", 1))
-    }
-
-    @Test
-    fun anUnreadableTicketStopsPendingAndIsNotAskedAgain() {
-        val cache = OutputsCache()
-        assertTrue(cache.start("tk-2", 1))
-        cache.finish("tk-2", null, 1)
-        assertTrue("失败也是读过", cache.tried("tk-2", 1))
-        assertFalse("读不到就不占了（留着是一块永久的空白）", cache.pending("tk-2", 1))
-        assertNull("读不到不画", cache.line("tk-2", 1))
-        assertFalse("这一轮不再反复请求", cache.need("tk-2", 1))
-        assertFalse("也不许在同一个票号上强行开始", cache.start("tk-2", 1))
-        // 下一轮时间线（第 2 轮）又是一份新账：还得读，否则 worker 后来写了文件也看不见。
-        assertTrue(cache.need("tk-2", 2))
-        assertTrue("新一轮要重新占位", cache.pending("tk-2", 2))
-        assertFalse(cache.tried("tk-2", 2))
-    }
-
-    @Test
-    fun emptyOutputsAlsoStopPending() {
-        // 我读到了、确实没有产出：这一轮已经有答案了，别留一行空白。
-        val cache = OutputsCache()
-        assertTrue(cache.start("tk-3", 1))
-        cache.finish("tk-3", view(emptyBody), 1)
-        assertFalse(cache.pending("tk-3", 1))
-        assertTrue(cache.tried("tk-3", 1))
-        assertNull("确实没有产出：不画", cache.line("tk-3", 1))
-        assertFalse("答案是「没有」也不重发", cache.need("tk-3", 1))
-    }
-
-    @Test
-    fun aCancelledReadIsPendingAgainAndWillBeRetried() {
-        // 那一条的消息行被组合带走（滚动、切屏）：取消不是「读不到」。
-        val cache = OutputsCache()
-        assertTrue(cache.start("tk-4", 1))
-        cache.abandon("tk-4", 1)
-        assertFalse("取消不记成读过", cache.tried("tk-4", 1))
-        assertTrue("滚回来还得占位", cache.pending("tk-4", 1))
-        assertTrue("也还得再读一次", cache.need("tk-4", 1))
-        assertTrue(cache.start("tk-4", 1))
-
-        // 第 2 轮正在读时，第 1 轮迟到的取消不能抹掉这一轮的在读记号。
-        assertTrue(cache.start("tk-8", 2))
-        cache.abandon("tk-8", 1)
-        assertFalse("第 2 轮仍在读，不该再发第二个", cache.need("tk-8", 2))
-    }
-
-    @Test
-    fun pendingAndTriedNeverBothLightUpOrGoOutTogether() {
-        // 非空票号下两者恒相反：占位只在「这一轮还没有答案」时出现，
-        // 有答案（成功或失败）就一定不再占位；而没答案就一定会去读。
-        val cache = OutputsCache()
-        val seen = mutableListOf<String>()
-        fun snap(what: String, epoch: Int, pending: Boolean, tried: Boolean) {
-            val atPending = cache.pending("tk-7", epoch)
-            val atTried = cache.tried("tk-7", epoch)
-            seen.add("$what/$epoch")
-            assertEquals("第 $epoch 轮「$what」的待取", pending, atPending)
-            assertEquals("第 $epoch 轮「$what」的已试过", tried, atTried)
-            assertTrue("第 $epoch 轮「$what」：待取与已试过必须相反", atPending != atTried)
-        }
-
-        // 还没发：占位、没试过。
-        snap("还没发", 1, pending = true, tried = false)
-        // 正在读：照样占位，还没试过。
-        cache.start("tk-7", 1)
-        snap("正在读", 1, pending = true, tried = false)
-        // 被取消：回到「还没发」那一档，既不占着旧答案、也不算读过。
-        cache.abandon("tk-7", 1)
-        snap("被取消", 1, pending = true, tried = false)
-        // 读不到：有答案了（答案就是「没有」），不占位、算读过、这一轮不再重发。
-        cache.start("tk-7", 1)
-        cache.finish("tk-7", null, 1)
-        snap("读不到", 1, pending = false, tried = true)
-        assertFalse("这一轮不再反复请求", cache.need("tk-7", 1))
-        // 下一轮时间线：只有旧一轮的账，等于没读过 —— 重新占位、重新去读。
-        assertTrue("新一轮要重读", cache.need("tk-7", 2))
-        snap("新一轮只有旧账", 2, pending = true, tried = false)
-
-        assertEquals(listOf("还没发/1", "正在读/1", "被取消/1", "读不到/1", "新一轮只有旧账/2"), seen)
+        assertTrue(cache.need("tk-unknown", 1))
+        assertNull(cache.line("tk-unknown", 1))
+        assertTrue(cache.start("tk-unknown", 1))
+        cache.finish("tk-unknown", null, 1)
+        assertTrue(cache.tried("tk-unknown", 1))
+        assertFalse(cache.need("tk-unknown", 1))
+        assertNull("读取失败不生成结果行", cache.line("tk-unknown", 1))
     }
 }
 

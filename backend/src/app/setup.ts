@@ -41,18 +41,33 @@ export class Setup {
     return this.resolved
   }
   configured(): boolean { return this.resolved !== undefined }
-  /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
+  /**
+   * Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors.
+   *
+   * A successful run **clears** the recorded problem. Setup fails for reasons that repair themselves (a proxy back up,
+   * a CLI re-authenticated, a repository made readable), and `Runtime` retries it; keeping the old problem after the
+   * retry succeeds left a crew whose every health entry was green yet whose Sources stayed `paused` forever, because
+   * they read `context.problem` to decide whether to poll. `resolve` only returns once the worker environment is
+   * written and verified, so reaching that line means setup is fully healthy, not merely that the first probe passed.
+   */
   async run(settings: Settings): Promise<boolean> {
-    try { this.resolved = await this.resolve(settings); return true }
-    catch (error) {
+    try {
+      this.resolved = await this.resolve(settings)
+      this.problem = undefined
+      return true
+    } catch (error) {
       if (!(error instanceof SetupError)) throw error
       this.problem = error.problem
       return false
     }
   }
-  /** Trigger a restart to re-run setup, refusing if setup and Feishu are already healthy so running assignments are not interrupted. */
+  /**
+   * Trigger a restart to re-run setup, refusing only when setup is *entirely* healthy so running assignments are not
+   * interrupted. A resolved deployment with a stale `problem` is not healthy: that is exactly the state in which the
+   * Sources stay paused, so it must still be allowed to re-run.
+   */
   check(): void {
-    if (this.configured() && !this.feishuProblem) throw new UserError('setupComplete')
+    if (this.configured() && !this.problem && !this.feishuProblem) throw new UserError('setupComplete')
     this.restart()
   }
   /** Defer the restart to the next macrotask so the current HTTP or tool caller receives its response first. */
@@ -81,12 +96,18 @@ export class Setup {
     const deployment: Deployment = githubEnabled
       ? await resolveDeployment(machine, settings.sources.github?.config, probe)
       : { ...machine, repository: '', github: { cli: '', login: '', noreply: '' } }
+    let feishuFailed = false
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
+      feishuFailed = true
       this.feishuProblem = error.problem
       context.logger.warn('dsh-superagent leaves Feishu out: %s', error.message)
       return undefined
     })
+    // Only after the probe actually returned: a Feishu bot that resolved, and a Feishu Source that is normally
+    // disabled (no CLI named), both mean the previously recorded problem no longer holds. Clearing before the await
+    // would make a still-failing bot look recovered for the duration of the probe.
+    if (!feishuFailed) this.feishuProblem = undefined
     const resolved = { ...deployment, ...(feishu ? { feishu } : {}) }
     const machineProblem = (error: unknown): never => {
       if (error instanceof SetupError) throw error

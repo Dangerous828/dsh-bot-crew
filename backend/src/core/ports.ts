@@ -75,7 +75,7 @@ export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */
 export interface Outbox {
   /** Queue a message idempotently; an id queued before keeps its first message. */
-  send(message: OutboundMessage): void
+  send(message: OutboundMessage, options?: { allowHandoff?: boolean }): void
   /** Whether a message was queued, and what became of it. */
   status(id: string): ReplyStatus | undefined
   /** Withdraw a message that has not gone out. */

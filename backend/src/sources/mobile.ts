@@ -115,6 +115,8 @@ const MessageSchema = z.looseObject({
   text: z.string(),
   at: z.string(),
   url: z.string().optional(),
+  /** 客户端的幂等键（`messages.request_id`）。带上它，活动端点就不必为了一次关联去拉整份时间线。 */
+  request_id: z.string().optional(),
 })
 type QueueMessage = z.infer<typeof MessageSchema>
 
@@ -137,7 +139,9 @@ export function mobileTrigger(message: QueueMessage, me: string): Trigger | unde
     channel: { source: SOURCE, thread: `${SOURCE}:${thread}`,
       address: { conversation: message.conversation, message: message.id, ...(message.url ? { url: message.url } : {}) } },
     ...(message.url ? { url: message.url } : {}),
-    meta: { conversation: message.conversation, messageId: message.id, root: message.thread ?? message.id },
+    meta: { conversation: message.conversation, messageId: message.id, root: message.thread ?? message.id,
+      // 关联键是**客户端的 request_id**，不是 Trigger id：`/activity` 的 items[].request_id 与它同源。
+      ...(message.request_id ? { request_id: message.request_id } : {}) },
   }
 }
 
@@ -209,7 +213,9 @@ export async function sendMobile(host: { commands: SourceContext['commands'] }, 
   const { conversation, message: to } = message.channel.address
   if (!conversation || !to) throw new Error('Missing mobile reply target')
   try {
-    await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text])
+    await host.commands.run('mobileq', ['reply', '--conversation', conversation, '--to', to, '--key', message.id, '--text', message.text,
+      // 出站类型必须跟着走：网关把它落库，手机才分得清「收到回执」与「最终答复」。
+      '--kind', message.kind])
     return 'sent'
   } catch (error) {
     if (error instanceof CliError && error.code === 410) return 'gone'

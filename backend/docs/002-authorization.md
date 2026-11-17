@@ -23,7 +23,7 @@ A person's message on a Ticket's own Thread belongs to that Ticket's Executor to
 
 Ownership continues while the Ticket is live, even if a person removes its Subscription. It also covers an ended Ticket that was not stopped by a person and has the message waiting to resume it.
 
-The main Session receives a follow-up notice. While an Executor owns the message, the main Session may only stop work on the person's request; accept, attach, ignore and requeue are refused. A stop still passes through the gate with the follow-up strength described below.
+The main Session receives a follow-up notice. While an Executor owns the message, the main Session may only stop work on the person's request; accept, attach, answer, ignore and requeue are refused. A stop still passes through the gate with the follow-up strength described below.
 
 ### Handing back and releasing follow-ups
 
@@ -82,7 +82,7 @@ An automated reviewer using an ordinary account counts as a person to the host. 
 
 ## Routing candidates
 
-The main Session routes explicit candidates with `orchestrator_route`. One call can contain several accept, attach, stop or ignore decisions. Each item is processed independently: a refused item or a missing field does not prevent the others from running.
+The main Session routes explicit candidates with `orchestrator_route`. One call can contain several accept, attach, answer, stop or ignore decisions. Each item is processed independently: a refused item or a missing field does not prevent the others from running.
 
 An inferred candidate normally needs a full assessment. There is one shortcut: if its card clearly touches no enabled rule, such as plain chat or unrelated discussion, the main Session may ignore it directly. The Decision records `ignoredFromCard` to distinguish this from a rule assessment. The main Session reads the enabled rules in its Policy prompt section.
 

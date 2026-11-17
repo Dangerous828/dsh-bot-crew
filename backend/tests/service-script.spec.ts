@@ -54,7 +54,13 @@ afterEach(() => {
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
-    { env: { ...process.env, HOME: join(root, 'home'), PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
+    // `DSH_HOME` 必须一起隔离。脚本的 web / no-web 判据来自 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+    // （`profile_no_web`）；只隔 `HOME` 而让 `DSH_HOME` 从开发机继承，测试就会读到真实 profile 的
+    // `webserver: disabled: true` 而走 no-web 分支——那条路没有 `--no-open`、不绑 LAN、`status` 不给 url，
+    // 于是这些断言测的其实是开发机的配置，不是被测脚本。临时目录里没有 patch 文件，
+    // `profile_plugin_disabled` 返回 False，脚本按 web 模式跑，这才是本套用例的前提。
+    { env: { ...process.env, HOME: join(root, 'home'), DSH_HOME: join(root, 'home', '.dsh'),
+      PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
@@ -161,13 +167,17 @@ it('exits 2 while a part such as a Source reports an error, which a restart does
     .toMatchObject({ code: 2, stdout: expect.stringContaining('github reports an error, which a restart does not fix: bad token') })
 }, 20_000)
 it('exits 3 while the service waits for setup, from status and from start, which a restart does not fix', async () => {
-  processes(service(sleeper()))
+  const pid = sleeper()
+  processes(service(pid))
   const waiting = { health: { runtime: { state: 'paused', detail: '' } },
     setup: { problem: { code: 'repositoryUnset', detail: 'The GitHub Source names no repository.' }, feishuProblem: null } }
   const url = await answering(waiting, true)
   expect(await run('status', '--url', url)).toMatchObject({ code: 3 })
-  expect(await run('start', '--url', url, '--timeout', '10'))
-    .toMatchObject({ code: 3, stdout: expect.stringContaining('waiting for setup: The GitHub Source names no repository.') })
+  const started = await run('start', '--url', url, '--timeout', '10')
+  expect(started).toMatchObject({ code: 3,
+    stdout: expect.stringContaining(`dsh-superagent already running (PID ${pid}); no duplicate started.`) })
+  expect(started.stdout).toContain('dsh-superagent is waiting for profile setup: The GitHub Source names no repository.')
+  expect(() => process.kill(pid, 0)).not.toThrow()
 }, 20_000)
 it('restarts the service, and a restart whose graceful stop timed out does not keep recovery off', async () => {
   const url = await answering()

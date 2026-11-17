@@ -30,10 +30,10 @@ export class Outbox implements OutboxPort {
     host.effects.handle('reply', (_payload, id) => this.deliver(id), { limit: () => host.paused() ? 0 : 1, retry: [5000, 300_000] })
   }
   /** Record a message receipt and enqueue its delivery effect atomically; duplicate message IDs are ignored. */
-  send(message: OutboundMessage): void {
+  send(message: OutboundMessage, { allowHandoff = true }: { allowHandoff?: boolean } = {}): void {
     // A worker asks for a teammate by writing a marker line in its own reply. The person must never see that
     // machinery, so the line comes out here, before the receipt is stored: what is sent is what they read.
-    const split = message.kind === 'reply' ? splitHandoff(message.text) : undefined
+    const split = message.kind === 'reply' && allowHandoff ? splitHandoff(message.text) : undefined
     if (split && split.handoffs.length > 0) {
       for (const handoff of split.handoffs) {
         this.host.handoff?.({ ...handoff, text: handoffBody(handoff, message.text), from: message, ticket: message.ticketId ? this.host.store.tickets.get(message.ticketId) : undefined })

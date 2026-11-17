@@ -62,7 +62,7 @@ function scriptedAdapter(M: any) {
 }
 
 describe('真执行器自动接线（DshExecutor + workOnly 自动 guard + 公开批准自动重投递，隔离 canary）', () => {
-  it.only('执行器自动建 worker、guard 拦未批准、公开批准后自动重投递真 MCP 只执行一次、拒后零写', async () => {
+  it('执行器自动建 worker、guard 拦未批准、公开批准后自动重投递真 MCP 只执行一次、拒后零写', async () => {
     const canary = mkdtempSync(join(tmpdir(), 'exec-auto-db-')); dirs.push(canary)
     const db = join(canary, 'mobileq.db')
     execFileSync('python3', [MOBILEQ, '--db', db, 'inject', '--conversation', 'main', '--sender', 'owner', '--text', '用户：请回一句'])
@@ -142,11 +142,12 @@ describe('真执行器自动接线（DshExecutor + workOnly 自动 guard + 公�
       const gate = (host.runtime as any).guardConnection.bind(host.runtime)
       const before = nreplies(db)
 
-      // 1) 写被 hold：真 guardConnection 返回提示串，ticket 进入 pendingApproval(waiting)+attention(做吧/先别做/换个做法)。
+      // 1) 写被 hold：真 guardConnection 返回提示串，ticket 进入 pendingApproval(waiting)+attention（按 option.id 分派、后果写在文案里）。
       expect(typeof gate(ticketId, 'mcp__messages__send_message', call)).toBe('string')
       const att = host.runtime.store.tickets.get(ticketId)!
       expect(att.pendingApproval).toMatchObject({ kind: 'connection', status: 'waiting' })
-      expect(att.attention?.options?.map(o => o.label)).toEqual(['做吧', '先别做', '换个做法'])
+      expect(att.attention?.options?.map(o => o.id)).toEqual(['go', 'stop', 'revise'])
+      expect(att.attention?.presentation).toMatchObject({ kind: 'connection' })
       const attentionId = att.attention!.id
       expect(attentionId).toBeTruthy()
       expect(nreplies(db)).toBe(before)
@@ -167,10 +168,12 @@ describe('真执行器自动接线（DshExecutor + workOnly 自动 guard + 公�
       expect(typeof gate(ticketId, 'mcp__messages__send_message', call)).toBe('string')
       expect(nreplies(db)).toBe(before + 1)
 
-      // 5) 手机回「先别做」→ 真 answerTicket → stopTicket → 票结束、guard 永不放行、+0。
+      // 5) 手机回「先别做」→ 真 answerTicket → 只取消这一次调用：票不结束、同签名不再出卡、+0。
       expect(host.runtime.answerTicket(ticketId, '先别做', host.runtime.store.tickets.get(ticketId)!.attention!.id)).toEqual({ ok: true, answer: 'stop' })
-      expect(host.runtime.store.tickets.get(ticketId)?.ended).toBeTruthy()
-      expect(typeof gate(ticketId, 'mcp__messages__send_message', call)).toBe('string')
+      const stopped = host.runtime.store.tickets.get(ticketId)!
+      expect(stopped.ended).toBeUndefined()
+      expect(stopped.approvalDenied?.signature).toBeTruthy()
+      expect(gate(ticketId, 'mcp__messages__send_message', call)).toContain('取消了这一次调用')
       expect(nreplies(db)).toBe(before + 1)
     } finally {
       await host.stop?.()

@@ -367,7 +367,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/followup.ts` | 跟进：卡在等人的票（10 分钟）与跑着很久没回报的票（45 分钟）各提醒一次，等得久的先；提醒过就安静等着，不追问 |
 | `src/app/spend.ts` | 成本账：按 `model/selection` 与 `request/header` 还原每步实际路由，再把 `assistant/message.usage` 算成合计、按模型分项和最近几步；没上报的步数单独计数 |
 | `src/app/audit.ts` | 审计账：一票一行地把谁派的、谁判的、谁干的、花了多少编成表，缺的格子写「没有记录」 |
+| `src/app/native-activity.ts` | Incremental native Session lifecycle projection, parallel tool pairing, retry phases, live-idle settling and content-free labels |
+| `src/app/activity.ts` | 轻量活动的接线层：把原生事件投影（`native-activity.ts`）与持久阶段合成契约的 `activity`。结束 > 等人 > 评估 > 原生的优先级；阶段改写 kind 时只有**同 kind** 才携带原生的 label/since/at（kind 说等人、label 说在算就是假状态）；读取出错给 `unknown` + 一句人话且不造时间，tracker 缺席仍是「不给」 |
 | `src/app/voice.ts` | 语音输入的壳：认出宿主有没有识别能力、校验录音是不是 WAV 且不过大过长，再把字节交给宿主的 `speechToText`；认不出字与跑不起来分开说 |
+| `src/app/diagnostics.ts` | App 故障上报的落盘盒：把手机上报的一批报告过白名单（去 query/header/body/text/token，err 只收类别码，crash 只收 errorClass/栈/受限 breadcrumbs）、按客户端 id 幂等、有界保留（每设备行数+字节、全球行数+字节、7 天，均在写路径淘汰），复用项目 `Store`/KV（每设备一段，无索引、不扫全库）；ACK 只在 durable 落盘后返回 |
 | `src/app/compact-memory.ts` | 压缩产物进账本：宿主折完会话那一段摘要值不值得记、怎么掐到上限、怎么按 compactionId 保持幂等；压缩本身归宿主 |
 | `src/app/push.ts` | 推送投递层：在线直送、离线留件（按到期限长、同 kind 只留最新）、系统推送留了接口但没内置；送不到如实说，绝不把「没配」说成「已送达」。留件桶经注入的 `NoticeStore` 落库（Runtime 用 `storeNoticeStore` 接项目 `Store`/KV，一桶一键 `KV.notice.pending`）：先写盘成功再回 `queued`、ACK 先持久化再移内存/回 2xx，写盘失败抛出、不假成功；`peek` 不删，仅 TTL 清理同步删盘；HMR/实例重建后从 `KV.notice.pending` 读回未 ACK 的件（只保新链以后入队的，旧进程内存件无来源不假装恢复） |
 | `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写真发生过的数、什么也没发生就不发；早报（`MORNING_HOUR`、`morningDue`、`morningNotice`）的三段口径、当天只说一次的账本 `onceToday`，以及抬头按真实窗口起算的 `windowLabel`（`今日` / `自 M 月 D 日 HH:mm 起` / `上次汇报以来`，不一律说「昨夜」）。两份报告的统计窗口**不由这里现算**：下界是持久化的水位线 `KV.notices.reported`，所以停机错过的那份通知不补发，但下一次真跑到的报告覆盖所有还没报过的窗口 |
@@ -384,6 +387,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/discovery.ts` | Announces this machine on the LAN over mDNS (`_dsh-crew._tcp`) so a phone finds it without being told an address. Publishes a name, the port, a stateDir fingerprint and, when they exist, two more entries: the public entry as `pub` and the tailcat address as `p2p`, the latter read through a getter on every announce because it arrives late and changes when the network does. Never a token, and never the path itself, since mDNS is unencrypted. A failed announce is logged and swallowed: the crew still runs |
 | `src/app/public-entry.ts` | Where "out of the house" points: the public entry a phone keeps after seeing it once. Read from `CREW_PUBLIC_URL`, else `<stateDir>/mobile-public-url`; a bare host gets `https://` and trailing slashes are trimmed. Absent means LAN-only, which is not an error |
 | `src/app/lan-server.ts` | The phone's own listener: rate-limits the pairing hop by source, verifies a crew-issued device credential, then forwards to the phone handler. Independent of Connection, whose launch-token flow serves browsers. Binds one concrete non-virtual interface, never a wildcard |
+| `src/app/updates.ts` | Public Android OTA manifest and immutable APK delivery on the phone listener; canonical release paths, scoped filesystem reads, streaming GET/HEAD, byte ranges and a fresh latest pointer |
 | `src/app/remote.ts` | Device pairing: one-time codes, digests kept on disk, per-device and blanket revoke, one store per state directory, the LAN entry gate |
 | `src/app/phone-gate.ts` | The shared gate of the phone API: only `/api/mobile/*`, the pairing POST alone is anonymous, every other request must present a paired device credential. Used by both the LAN listener and the relay tunnel, so neither entry is looser than the other |
 | `src/app/pairing-throttle.ts` | Attempts allowed on the anonymous pairing hop: twenty a minute, aggregated by IPv4 /24 or IPv6 /64 so changing address buys nothing. Every loopback spelling folds into one bucket, because tailcat proxies the tunnel into `127.0.0.1` and a phone's address is not available there; the strictest reading is chosen over keying the hop on a client-supplied device id, which would hand an attacker unlimited buckets |
@@ -513,6 +517,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/crew-speech.spec.ts` | 播报：剥掉代码与网址再念、没这个声音先说没有、空文本不念、超长截断并说明、转换错误带回原文、失败也收临时目录、WAV 时长从头部读 |
 | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
 | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
+| `tests/diagnostics.spec.ts` | App 故障上报的落盘盒：白名单（去 query/丢 message 型 err、crash 只留 errorClass/栈/breadcrumbs）、按 id 幂等、每设备行数与字节上限、全球行数/字节上限（含跨设备淘汰后计数不偏高）、7 天保留、按设备隔离、errorsOnly、NDJSON 导出不含凭据 |
+| `tests/diagnostics-http.spec.ts` | `POST/GET /api/mobile/diagnostics` 的真实 tmp sqlite 端到端：无 principal 401、exact route 命中、`{ok:true,acceptedIds}` 且 durable、重投同 id 只存一次、整批全坏 4xx、超大 413、速率 429+Retry-After、GET 只看自己那台、重开库后仍可查 |
+| `tests/diagnostics-review.spec.ts` | 独立差分（不改源）：读侧保留期兜底（沉默设备 GET/导出不吐过期）、route 编码 query 与裸 `sk_live_` 长密钥整条拒 `route_sensitive`、crash.stack 只留帧、extra 敏感值整条丢、管理面全设备带 server 派生 device + limit clamp、真实 apply() LAN forward 缝里伪造 `x-crew-principal`/`body.device`/`query.device` 不得越权 |
+| `tests/server-identity.spec.ts` | 已配对 timeline 顶层可选只读 `server:{crew,public_base}`：`crew` 与 mDNS `crewFingerprint` 同源一致、`public_base` 取自 `publicEntry` 且只放行 HTTPS 无 userinfo/query/fragment（坏/空给空串不推 LAN）、老 App 兼容（既有键仍在）、gate 仍 401 |
 | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |
 | `tests/contract-timeline.spec.ts` | The message-surface contract: the roles the gateway actually writes, and unknown fields surviving a read |
 | `tests/crew-memory.spec.ts` | The Bot memory bridge: file naming, the daily budget, and what a record contributes to a prompt |
@@ -541,15 +549,24 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/team.spec.ts` | A crew reply when the outbox hands its Channel no deployment: the CLI's own queue is used instead of throwing |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
+| `tests/setup.spec.ts` | Same-instance setup recovery, GitHub and Feishu error clearing only after successful probes, failed environment preservation and healthy retry checks |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
+| `tests/sessions-message-dispatch.spec.ts` | 真实 dispatch 署名：真 `Sessions.workOnly` 注册的 scoped wrapper 实际执行时带的是谁的 Bot——默认填本票 Bot、显式`bot_id`原样保留、不碰 SDK 冻结的 `execution.arguments`、MCP 重连后重新解析工具、`dispose()` 后 wrapper 撤掉；`signs only the messages connection's send_message` 拒绝同名他服工具 |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
+| `tests/headless-http.spec.ts` | Headless loopback health, descriptor permissions and cleanup, and disposal before the listener starts |
+| `tests/mobileq.spec.ts` | 真 SQLite / 真 HTTP 的 kind 管线：`reply --kind` 落库、省略保持 NULL（legacy 不回填）、非法类型写前拒且不留半条、`/timeline` 只给已标类型的 `reply_kind`、`/meta` 只回关联元数据（无正文）且 `&row=` 能带回最近窗口之外的老行、会话不串线 |
+| `tests/native-activity.spec.ts` | Native event timestamps, lifecycle boundaries, parallel calls, delayed results, retries and content privacy |
+| `tests/sessions-activity.spec.ts` | Real managed-session subscriptions, idle/disposal liveness and cached reads without transcript polling |
+| `tests/runtime-activity.spec.ts` | Shared phone/workspace activity, truthful terminal outcomes and human attention |
+| `tests/activity.spec.ts` | 轻量活动端点：只有显式 `reply_kind=reply` 才算最终答复（回执/通知/legacy 都不宣称已回复）、`request_id` 恒为用户消息的、`evaluating` 来自 `thread.evaluating`、轻量快照与 timeline 的 `request_state` 同源（processing/person/finished）、坏应答 502 带 code 不冒充空集合、显式非 main 缺能力位 409、`&row=` 点名老活跃、后到 ignore 不被旧 accept 顶掉、阶段改写不带别种活动的 label |
 | `tests/mobile-http.spec.ts` | Connection Fetch registration, validated sends and withdrawals, server-only credentials, transport errors, and the gateway's 409 refusal kept intact |
 | `tests/mobile-work.spec.ts` | Work, agent-tree and model routes: ticket lookup, nested subagents, model validation; a withdrawn request leaving `queued` |
 | `tests/mobile-read.spec.ts` | 已读回话：报上水位才数得出未读回话、没报过/水位不在时间线里都算 unknown、只数水位之后的 Bot 回话、按时间线顺序判、缺字段与超长被拒 |
 | `tests/screen.spec.ts` | The screen snapshot: why there is nothing to show, the kinds of event lines, the tail limit and secret masking |
 | `tests/remote.spec.ts` | Pairing codes, expiring and single use, disk survival, revoke, corrupt file, route shapes |
 | `tests/lan-server.spec.ts` | The phone listener: credential gate, no leak on refusal, the pairing rate limit, port reporting, forwarding after the gate |
+| `tests/updates.spec.ts` | Real HTTP OTA manifest, atomic latest changes, immutable APKs, HEAD and resumable ranges, scoped paths and interrupted transfers |
 | `tests/discovery.spec.ts` | The mDNS announce the phone finds this machine by: a stable stateDir fingerprint that does not leak the path, the port it publishes, the public entry and the tailcat address it adds alongside it and republishes when they change, stopping cleanly twice, and a failed announce that never reaches the start path |
 | `tests/public-entry.spec.ts` | Turning one line into the public entry a phone keeps: `https` added to a bare host, environment before the state-dir file, and "not configured" reported as absent rather than as an empty address |
 | `tests/p2p.spec.ts` | The direct path's outward product, the tc-addr: both wordings tailcat prints (`with new address` and `--key=default`), the length floor that keeps a stray `tcp…` out of the announce, the last address kept for the gap right after a restart with a corrupt file treated as none, and a helper that dies clearing the address while a missing helper is not a crash |
@@ -649,7 +666,7 @@ The main Session has 14 application tools:
 | Communicate and unsubscribe | `orchestrator_reply`, `orchestrator_thread_unsubscribe` |
 | Configure | `orchestrator_settings_save`, `orchestrator_policy_sync`, `orchestrator_prompts_save` |
 
-`orchestrator_route` accepts 1–20 decisions in order. Each accept, attach, stop or ignore runs as a separate Engine command. It also permits ignoring an inferred candidate directly from its card. `orchestrator_ticket_note` sends a fact as context, not authority.
+`orchestrator_route` accepts 1–20 decisions in order: accept, attach, answer, stop or ignore. Each item is processed independently. It also permits ignoring an inferred candidate directly from its card. `orchestrator_ticket_note` sends a fact as context, not authority.
 
 Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
 

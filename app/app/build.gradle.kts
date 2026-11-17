@@ -15,8 +15,10 @@ android {
         applicationId = providers.gradleProperty("crewAppId").getOrElse("com.dsh.botcrew")
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // 版本走 Gradle 参数：发布脚本按最新递增 -PcrewVersionCode=…；缺省是给本地/调试包的一档。
+        // 诊断页与 OTA 判定都以真实安装的 versionCode 为准（见 OtaRuntime.installedVersionCode）。
+        versionCode = providers.gradleProperty("crewVersionCode").getOrElse("2").toInt()
+        versionName = providers.gradleProperty("crewVersionName").getOrElse("0.2.0")
 
         // 队伍地址与 token 从本地配置读，不进仓库；没配时指向模拟器里的宿主机。
         // 默认指向队伍自己的监听，不是网关：配对和消息面都在这条路上，网关只有对话条目。
@@ -31,6 +33,29 @@ android {
         val builtInToken = providers.gradleProperty("crewCredential").getOrElse("")
         buildConfigField("String", "CREW_DEVICE", "\"$builtInDevice\"")
         buildConfigField("String", "CREW_CREDENTIAL", "\"$builtInToken\"")
+
+        // 诊断上报 + 公网 bootstrap（lead 确认部署域名与预期 crew 后再注入；两者默认空，缺省不启用，不给别的 server 送 token）。
+        // - PUBLIC_BASE：本次固定部署的公网域名（真实 HTTPS），作缺失 fallback 的 bootstrap 候选；默认空。
+        // - EXPECTED_CREW：该部署的 server.crew 指纹（与 mDNS 同源），bootstrap 精确比对用；默认空。
+        // - DIAG_BASE：诊断上报地址，默认生产域名；空则用 DiagUploader.DEFAULT_BASE。
+        val publicBase = providers.gradleProperty("crewPublicBase").getOrElse("")
+        val expectedCrew = providers.gradleProperty("crewExpectedCrew").getOrElse("")
+        val diagBase = providers.gradleProperty("crewDiagBase").getOrElse("")
+        buildConfigField("String", "CREW_PUBLIC_BASE", "\"$publicBase\"")
+        buildConfigField("String", "CREW_EXPECTED_CREW", "\"$expectedCrew\"")
+        buildConfigField("String", "CREW_DIAG_BASE", "\"$diagBase\"")
+
+        // 轻量构建标记（只标识哪次构建，不当版本号用；不引 git 自动 commit）：
+        // 最终发布指定 -PcrewBuildId=cellular-20261115-r1；generic 默认 local。
+        // 诊断 body.build 与诊断页都显示它，便于服务端对照「哪个真实 APK」。
+        val buildId = providers.gradleProperty("crewBuildId").getOrElse("local")
+        buildConfigField("String", "CREW_BUILD_ID", "\"$buildId\"")
+
+        // OTA 入口：manifest 与 APK 同 origin，只走 HTTPS，不带任何配对凭据。
+        // 发布时可用 -PcrewUpdateUrl=… 指到预发；缺省是生产静态目录。
+        val updateUrl = providers.gradleProperty("crewUpdateUrl")
+            .getOrElse("https://crew.kentonnie.top/updates/android/manifest.json")
+        buildConfigField("String", "OTA_MANIFEST_URL", "\"$updateUrl\"")
 
         // JNI 包装对每个 ABI 都编，隧道本体（libtailcat.so）由 jniLibs 按 ABI 提供，
         // 目前只有 arm64-v8a。见 src/main/cpp/README.md。

@@ -25,7 +25,46 @@ data class Message(
      * 代码块自己带了 ticket_ref 时以代码块为准；这里留着，是为了消息没带代码块时也读得出来。
      */
     val ticketRef: String = "",
+    /** 后端给出的请求生命周期原值；未知值保留为原值，展示层再按未知处理。 */
+    val requestState: String? = null,
+    /**
+     * 队伍此刻在拿这条消息干什么（`GET /api/mobile/activity` 或 timeline item 上的可选字段）。
+     *
+     * null = 后端没给（老后端 / 没接这项能力）。界面据此**不画**活动行，
+     * 而不是画一个「未知」—— 缺数据不等于「不知道它在干什么」。
+     */
+    val activity: ExecutionActivity? = null,
+    /**
+     * 队伍这条回话是哪种（`acknowledgement` / `reply` / `notice`）。
+     *
+     * 历史条目缺类型时是 null —— 那时**不显示**「最终答复」标记。猜类型等于替队伍说它答完了。
+     */
+    val replyKind: String? = null,
 )
+
+/**
+ * 一张待决卡的人读投影（契约：`tasks[].approval`，全部字段可选）。
+ *
+ * 协议里 `question` 也可能已经是人读整句，但这三个字段让界面能分清
+ * 「这是一次发送动作，发给谁，内容是什么」，而不是把一段 `JSON.stringify(args)` 当正文。
+ *
+ * [preview] 已经是**字段解码后的真实正文**（换行是真的换行）。这里只 `optString`，
+ * 不做 %XX 解码、不做 `\n` 反转义：用户原文里的 URL、`%2F`、代码里的 `\n` 都得原样留着。
+ */
+data class TicketApproval(
+    /** `connection`（一次跨会话/连接写）或 `task`（这张票本身）。 */
+    val kind: String = "",
+    /** 这个动作叫什么（如「发送消息」）。 */
+    val action: String = "",
+    /** 作用对象（如「当前对话」）。 */
+    val target: String = "",
+    /** 人读预览正文，真实换行。 */
+    val preview: String = "",
+    /** 脱敏后的工具细节；界面默认折叠。 */
+    val details: String = "",
+) {
+    val isEmpty: Boolean get() = preview.isEmpty() && action.isEmpty() && details.isEmpty()
+}
 
 /**
  * 一条消息里的代码片段：文件名、增删行数、逐行内容与类别。
@@ -115,7 +154,20 @@ data class Conversation(
     val sessionId: String = SessionRoute.MAIN,
     /** 会话显示名。S1 的名单只给 id，没有单独的名字时按 id 显示。 */
     val name: String = SessionRoute.MAIN,
+    /**
+     * 服务器身份元数据（契约：paired timeline 顶层可选 `server:{crew, public_base}`）。
+     *
+     * 老后端 / 未加该字段时是 null：调用方据此**跳过**可信自愈，不报错、不瞎猜。
+     * `crew` 与 mDNS TXT 的 `crew` 同源（stateDir 稳定指纹），用来「精确比对是不是同一台」；
+     * `public_base` 是真实 HTTPS 公网入口（可为空）。
+     */
+    val server: ServerMeta? = null,
+    /** 服务端对 queued 集合的可用性；unknown 必须保留，不能当作空集合或 live。 */
+    val queuedState: String? = null,
 )
+
+/** 服务器身份元数据。两格都可空：`crew` 空表示这台后端没报指纹，`publicBase` 空表示没配公网入口。 */
+data class ServerMeta(val crew: String = "", val publicBase: String = "")
 
 /** 一条被读过、但不打算动手的消息。 */
 data class Declined(val requestId: String, val reason: String)
@@ -352,8 +404,31 @@ object CrewWire {
      * 条数不足 2 条时不是「后端给了 1 个选项」，而是这组选项读不成 A/B，按空处理，
      * 让卡片走「只有一个自写框」那条路 —— 那才是诚实的退路。
      */
+    /**
+     * 待决卡的人读投影（契约 `tasks[].approval`，全字段可选）。
+     *
+     * 只做 `optString`：`preview` 已经是字段解码后的真实正文。**不做** %XX 解码、
+     * **不做** `\n` 反转义 —— 用户原文里的 URL、`%2F`、代码里的 `\n` 必须原样保留。
+     * 四个字段都空时返回 null（等价于老协议）。
+     */
+    private fun parseApproval(row: JSONObject?): TicketApproval? {
+        if (row == null) return null
+        val approval = TicketApproval(
+            kind = row.optString("kind").trim(),
+            action = row.optString("action").trim(),
+            target = row.optString("target").trim(),
+            // 不 trim 正文：首行缩进与行尾都是用户/工具内容的一部分。
+            preview = row.optString("preview"),
+            details = row.optString("details"),
+        )
+        return if (approval.isEmpty) null else approval
+    }
+
     private fun parseOptions(task: JSONObject): List<AttentionOption> {
-        if (task.optString("question").isBlank()) return emptyList()
+        // 只有 approval 没有 question 的卡也是审批卡：有选项就该画（老后端没这形状，行为不变）。
+        if (task.optString("question").isBlank() && parseApproval(task.optJSONObject("approval")) == null) {
+            return emptyList()
+        }
         val raw = task.optJSONArray("options") ?: return emptyList()
         val seen = mutableSetOf<String>()
         val options = mutableListOf<AttentionOption>()
@@ -379,6 +454,9 @@ object CrewWire {
      */
     fun answerSignature(ticket: WorkTicket): String = buildString {
         append(ticket.question)
+        // approval 变了就是另一张卡：签名跟着变，旧的在途答复就不会写在新卡上。
+        ticket.approval?.let { append('\u0001').append(it.kind).append('\u0001').append(it.action)
+            .append('\u0001').append(it.target).append('\u0001').append(it.preview) }
         for (option in ticket.options) append('\u0000').append(option.id).append('\u0000').append(option.label)
     }
 
@@ -435,6 +513,10 @@ object CrewWire {
                     requestId = item.optString("request_id"),
                     code = parseCode(item),
                     ticketRef = ticketRefOf(item),
+                    requestState = item.optString("request_state").trim().takeIf { item.has("request_state") && it.isNotEmpty() },
+                    // 可选：只有后端真给了才画活动行 / 最终答复标记（缺字段一律不画，不猜）。
+                    activity = ActivityWire.activityOf(item.optJSONObject("activity")),
+                    replyKind = item.optString("reply_kind").trim().takeIf { item.has("reply_kind") && it.isNotEmpty() },
                 ),
             )
         }
@@ -475,6 +557,7 @@ object CrewWire {
                     // 「没有计划」就落到 totalSteps = 0，正好是「不画进度条」那一档。
                     totalSteps = task.optInt("total_steps", 0),
                     stepsDone = task.optInt("steps_done", 0),
+                    approval = parseApproval(task.optJSONObject("approval")),
                 ),
             )
         }
@@ -497,8 +580,16 @@ object CrewWire {
         // 老响应一个字段都没有：按 main 兼容，不把老数据挂到刚切过去的会话上。
         val sessionId = root.optString("session_id").trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
         val sessionName = root.optString("session_name").trim().takeIf(String::isNotBlank) ?: sessionId
+        // server 身份元数据：可选，缺了就是 null（老后端），不报错。
+        val serverJson = root.optJSONObject("server")
+        val server = serverJson?.let {
+            val crew = it.optString("crew").trim()
+            val publicBase = it.optString("public_base").trim()
+            if (crew.isEmpty() && publicBase.isEmpty()) null else ServerMeta(crew, publicBase)
+        }
         return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined,
-            unreadOf(root, "unread"), unreadOf(root, "unread_replies"), sessionId, sessionName)
+            unreadOf(root, "unread"), unreadOf(root, "unread_replies"), sessionId, sessionName, server,
+            queuedState = root.optString("queued_state").trim().takeIf(String::isNotBlank))
     }
 
     /**
@@ -550,6 +641,43 @@ object CrewWire {
     }
 }
 
+/** 每条用户消息的请求状态文案，以及唯一可撤回集合的前端读法。 */
+object RequestStateCopy {
+    /**
+     * 收据那一行：**这条消息到没到、有没有回话**。它说的是收据，不是任务进度 ——
+     * 所以 `replied` 不能读成「做完了」，`finished` 也不能一律读成「已完成」。
+     *
+     * @param state 后端原值。
+     * @param hasQuestion 这个请求此刻是否带着一张要人回答的问题卡。同样是 `waiting_for_person`，
+     *   有问题才叫「等你答复」，只是卡在等处理（review / delivery / failed）就叫「需要你处理」。
+     */
+    fun label(state: String?, hasQuestion: Boolean = false): String = when (state?.trim()) {
+        "accepted", null, "" -> "已发送"
+        "queued", "waiting" -> "待处理"
+        "evaluating", "processing" -> "处理中"
+        "waiting_for_person" -> if (hasQuestion) "等你答复" else "需要你处理"
+        // `replied` 只是「有过一句回话」，后续执行可能还在跑。别让它冒充最终答复。
+        "replied" -> "已回复"
+        // finished 含 completed / stopped / dropped 等结局：具体结局由活动与工单 outcome 细分，
+        // 这里给通用的一句，不一律说成「已完成」。
+        "finished" -> "已结束"
+        "declined" -> "未接收"
+        // 未知值不并入「已发送」：那是替队伍说它收到了。
+        else -> "未知状态"
+    }
+
+    /**
+     * 「有过回话」是否等于「答复完了」。只有 `reply` 才是最终答复；
+     * `acknowledgement` / `notice` 只是过程中的话，不能打完成标记。
+     */
+    fun isFinalReply(replyKind: String?): Boolean = replyKind?.trim() == "reply"
+
+    /** 撤回要求消息状态仍精确为 queued，且请求仍在服务端的权威 queued 集合中。 */
+    fun canWithdraw(message: Message, queued: Collection<String>): Boolean =
+        message.requestState?.trim() == "queued" &&
+            message.requestId.isNotBlank() && message.requestId in queued
+}
+
 /** 一条工单在本地的样子。它是后台的只读投影，客户端不据此维护状态机。 */
 data class WorkTicket(
     val id: String,
@@ -588,7 +716,24 @@ data class WorkTicket(
      * 后端版本不一时可能越界，画之前由调用方夹一次（与桌面端 progressOf 同口径）。
      */
     val stepsDone: Int = 0,
+    /**
+     * 这张卡的人读投影（契约 `tasks[].approval`，可选）。
+     *
+     * null = 老协议 / 没有这个字段 —— 那时行为逐字不变（用 question 原文）。
+     * 有值时卡片先用它说清「什么动作、发给谁、什么内容」，question 退成副标题。
+     */
+    val approval: TicketApproval? = null,
 )
+
+/** 活跃工单默认显示；用户已展开的同票，即使转为终态也继续显示到收起。 */
+internal object SubagentCardSelection {
+    fun ticket(tickets: List<WorkTicket>, expandedTicketId: String?): WorkTicket? =
+        expandedTicketId?.let { id -> tickets.firstOrNull { it.id == id } }
+            ?: tickets.firstOrNull { it.open }
+
+    fun toggle(expandedTicketId: String?, ticketId: String): String? =
+        if (expandedTicketId == ticketId) null else ticketId
+}
 
 /**
  * 这张票走到第几步 / 共几步。与桌面端 ui.go 的 progressOf 同一口径。
@@ -719,28 +864,72 @@ object AgentWire {
  */
 object AgentCopy {
 
-    /** 子代理那一行的状态词。零状态（后端没给）按在跑算，与桌面端兜底一致。 */
-    fun word(state: String): String = when (state) {
+    /** 子代理状态按后端值展示；只有明确的 working 才算运行中。 */
+    fun word(state: String): String = when (state.trim()) {
         "work", "working" -> "在跑"
-        "completed", "done", "merged", "closed" -> "已完成"
+        "idle" -> "空闲"
+        "waiting_for_person" -> "等你答复"
+        "waiting" -> "等待开始"
+        "processing" -> "处理中"
+        "completed", "done", "merged", "closed", "ended" -> "已完成"
         "failed", "stopped" -> "已停下"
         "dropped" -> "已放弃"
-        else -> "在跑"
+        else -> "状态未知"
     }
 
-    /**
-     * 一行右侧的整句话：状态，跑完了的再补上耗时。
-     *
-     * working 由调用方按 agentDone 算好传进来 —— 与桌面端 `agentStatus(node, working)`
-     * 同一个分工：这里只负责说，不负责判断谁算收工。
-     */
-    fun status(node: AgentNode, working: Boolean): String {
+    fun isRunning(state: String): Boolean = state.trim() in RUNNING_STATES
+    fun isIdle(state: String): Boolean = state.trim() == "idle"
+    fun isDone(state: String): Boolean = state.trim() in COMPLETED_STATES
+    fun isTerminal(state: String): Boolean = state.trim() in TERMINAL_STATES
+
+    /** 将工单 worker root 剥离，只把实际后代交给子代理摘要计数。 */
+    fun subagents(roots: List<AgentNode>): List<AgentNode> = roots.flatMap { it.children }
+
+    /** 未知或空树都不生成可展开卡；只有真实后代才能成为卡片内容。 */
+    fun visibleSubagents(roots: List<AgentNode>?): List<AgentNode>? =
+        roots?.let(::subagents)?.takeIf { it.isNotEmpty() }
+
+    fun failureNote(message: String?): String =
+        "子代理读取失败：${message?.takeIf { it.isNotBlank() } ?: "读取失败"}"
+
+    fun count(nodes: List<AgentNode>): Int = nodes.sumOf { 1 + count(it.children) }
+    fun countRunning(nodes: List<AgentNode>): Int = countWhere(nodes, ::isRunning)
+    fun countDone(nodes: List<AgentNode>): Int = countWhere(nodes, ::isDone)
+    fun countStopped(nodes: List<AgentNode>): Int = countWhere(nodes) { it.trim() in STOPPED_STATES }
+    fun countDropped(nodes: List<AgentNode>): Int = countWhere(nodes) { it.trim() == "dropped" }
+    fun countEnded(nodes: List<AgentNode>): Int = countWhere(nodes) { it.trim() == "ended" }
+    fun countIdle(nodes: List<AgentNode>): Int = countWhere(nodes, ::isIdle)
+    fun countWaiting(nodes: List<AgentNode>): Int = countWhere(nodes) { it.trim() in WAITING_STATES }
+    fun countUnknown(nodes: List<AgentNode>): Int = countWhere(nodes) { it.trim() !in KNOWN_STATES }
+
+    fun summary(nodes: List<AgentNode>): String = listOf(
+        countRunning(nodes) to "在跑",
+        countDone(nodes) to "已完成",
+        countStopped(nodes) to "已停下",
+        countDropped(nodes) to "已放弃",
+        countEnded(nodes) to "已结束",
+        countWaiting(nodes) to "等待中",
+        countIdle(nodes) to "空闲",
+        countUnknown(nodes) to "状态未知",
+    ).filter { it.first > 0 }.joinToString(" · ") { "${it.first} ${it.second}" }
+
+    /** 状态清楚且已结束的节点才显示耗时；运行、空闲、等待、未知状态不附带耗时。 */
+    fun status(node: AgentNode, working: Boolean = isRunning(node.state)): String {
         val line = word(node.state)
-        // 在跑的那个没有「跑了多久」；后端没给也一样，不补一个空壳「· 」。
-        if (working) return line
+        if (working || !isTerminal(node.state)) return line
         val spent = elapsed(node.elapsedSeconds) ?: return line
         return "$line · $spent"
     }
+
+    private fun countWhere(nodes: List<AgentNode>, matches: (String) -> Boolean): Int =
+        nodes.sumOf { (if (matches(it.state)) 1 else 0) + countWhere(it.children, matches) }
+
+    private val RUNNING_STATES = setOf("work", "working")
+    private val COMPLETED_STATES = setOf("completed", "done", "merged", "closed")
+    private val STOPPED_STATES = setOf("failed", "stopped")
+    private val WAITING_STATES = setOf("waiting", "waiting_for_person", "processing")
+    private val TERMINAL_STATES = COMPLETED_STATES + STOPPED_STATES + setOf("dropped", "ended")
+    private val KNOWN_STATES = TERMINAL_STATES + RUNNING_STATES + WAITING_STATES + setOf("idle")
 
     /**
      * 把秒数说成人话，量级跟画板一致（画板是「42 秒」）。
@@ -877,11 +1066,47 @@ object AnswerCopy {
     }
 
     /**
-     * 卡片正文：有 question 就读 question，没有才退回 needs_person 的人话。
-     * 与桌面端 pendingCard 同一句（「这张票卡在等你，原因：…」）。
+     * 卡片正文：有 approval 用它的预览（真实换行），否则有 question 读 question，
+     * 都没有才退回 needs_person 的人话。
+     *
+     * 顺序的理由：approval 是**为此卡专门做的**人读投影；question 只是兜底。
+     * 老后端没有 approval → 逐字退回原来的行为。
      */
-    fun body(ticket: WorkTicket): String =
-        ticket.question.ifBlank { "这张票卡在等你，原因：" + waitingWord(ticket.needsPerson) }
+    fun body(ticket: WorkTicket): String {
+        val preview = ticket.approval?.preview?.trim().orEmpty()
+        if (preview.isNotEmpty()) return preview
+        if (ticket.question.isNotBlank()) return ApiQuestionCopy.headline(ticket.question)
+        return "这张票卡在等你，原因：" + waitingWord(ticket.needsPerson)
+    }
+
+    /**
+     * 卡片副标题：说明这张卡要做什么、对谁做。
+     * 没有 approval 或它没给这几项时返回 null（那一行不画）。
+     */
+    fun actionLine(ticket: WorkTicket): String? {
+        val approval = ticket.approval ?: return null
+        val action = approval.action
+        val target = approval.target
+        return when {
+            action.isNotEmpty() && target.isNotEmpty() -> "$action · $target"
+            action.isNotEmpty() -> action
+            target.isNotEmpty() -> target
+            else -> null
+        }
+    }
+
+    /**
+     * 折叠区里的原文：tools 细节（脱敏后）优先，其次是 question 全文。
+     * 只在比正文多东西时才值得展开 —— 否则返回 null，那一行「详情」不画。
+     */
+    fun details(ticket: WorkTicket): String? {
+        val details = ticket.approval?.details?.trim().orEmpty()
+        if (details.isNotEmpty()) return details
+        val question = ticket.question
+        if (question.isBlank()) return null
+        return if (question.trim() == body(ticket).trim()) null else question
+    }
+
 
     /** 选项左边那个字母：A、B、C…。后端最多给四个，超过 26 只是兜底。 */
     fun optionMark(index: Int): String = if (index in 0..25) ('A' + index).toString() else "${index + 1}"
@@ -891,7 +1116,64 @@ object AnswerCopy {
 
     /** 答失败。detail 是后端错误体的原文，直译，不粉饰。 */
     fun answerFailed(detail: String?): String = "没答上：${detail?.takeIf { it.isNotBlank() } ?: "队伍没回话"}"
+
+    /** 取消这一类操作的后果。连接类只拒绝这一次，任务类会结束整票 —— 不能混成一句话。 */
+    fun cancelConsequence(kind: String): String = when (kind) {
+        "connection" -> "只拒绝这一次操作，这张任务还会继续"
+        else -> "会结束这张任务"
+    }
+
+    /** 「详情」那一行展开/收起的字。 */
+    const val DETAILS_SHOW = "看详情"
+    const val DETAILS_HIDE = "收起详情"
 }
+
+/**
+ * 一条 `question` 到底该在人眼前长什么样。
+ *
+ * ## 为什么要这一层
+ *
+ * 实机上见过「等你决定」卡直接把 `mcp_messages_send_message({channel,to,text…})` 当正文画出来：
+ * 字面量 `\n`、Markdown 星号、被截断的 JSON、本地路径全在屏幕上。那不是一个问题，是一段协议。
+ *
+ * 后端会改成人读整句；Android 这边仍要**兜住老/新两种形状**：
+ * - 整段就是一个 JSON 对象/数组 → 不铺开，给一句标题 + 可展开原文；
+ * - 长文本 → 正文只留前几行，其余进折叠；
+ * - **不做任何反转义**：不加 `\n`→换行，不做 %XX 解码。用户原文里的 `\n`、`%2F`、
+ *   代码里的引号都是内容本身。真的换行由后端在 `preview` 里给。
+ */
+object ApiQuestionCopy {
+    /** 正文最多显示几行；再多就折叠。 */
+    const val HEADLINE_LINES = 6
+
+    /** 整段像一段序列化 JSON（工具调用/参数）—— 那不是给人读的问题。 */
+    fun looksStructured(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.length < 2) return false
+        val jsonish = (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+            (trimmed.startsWith("[") && trimmed.endsWith("]"))
+        if (jsonish) return true
+        // 工具调用形状：`name({...})` —— 名字里不带空格，括号里立刻是 {。
+        return Regex("""^[A-Za-z_][A-Za-z0-9_.]*\(\{""").containsMatchIn(trimmed)
+    }
+
+    /** 折叠后的正文：结构化的一律换成一句标题；长文本只留前 [HEADLINE_LINES] 行。 */
+    fun headline(text: String): String {
+        if (looksStructured(text)) return "这条要你确认（原文已折叠，展开可看）"
+        val lines = text.trimEnd().lines()
+        if (lines.size <= HEADLINE_LINES) return text.trimEnd()
+        return lines.take(HEADLINE_LINES).joinToString("\n").trimEnd() + "\n…"
+    }
+
+    /** 是否有被折叠掉的部分（决定要不要画「看详情」）。 */
+    fun folds(text: String): Boolean {
+        if (looksStructured(text)) return true
+        return text.trimEnd().lines().size > HEADLINE_LINES || text.length > LONG_CHARS
+    }
+
+    private const val LONG_CHARS = 400
+}
+
 
 /**
  * 代码卡下面那两个按钮的文字与去向。
@@ -1145,10 +1427,19 @@ internal object CodeSyntax {
         c in '0'..'9' || c in 'a'..'z' || c in 'A'..'Z' || c == '.'
 }
 
-/** 工作区页里那两个动作。名字就是画板上的字，界面和文案都从这一处取。 */
+/**
+ * 工作区页里那两个动作。名字就是画板上的字，界面和文案都从这一处取。
+ *
+ * 两个名字都必须**说清作用范围**：
+ * - 暂停是执行器的全局暂停（后端只回 `scope: executor`），所以要写「全队」，不写「它」；
+ * - 接手实际调用的是 `stopTicket`，作用对象是这一张票，所以要写「此任务」，不写「它」。
+ *
+ * 从前一个叫「让它停一下」、一个叫「接手操作」：进某个 Bot 的工作区点前者，整队一起停；
+ * 点后者，整张票结束 —— 两句话都让人以为只影响眼前这一个。
+ */
 enum class WorkspaceAction(val label: String) {
-    Takeover("接手操作"),
-    Pause("让它停一下"),
+    Takeover("停止此任务"),
+    Pause("暂停全队"),
 }
 
 /**
@@ -1194,7 +1485,7 @@ object WorkspaceCopy {
     const val SCREEN_UNREAD = "读不到它的画面"
 
     /** 接手的说明。它说的是设计里的约定（接手后 Bot 停在原地），不是此刻在发生的事。 */
-    const val TAKEOVER_NOTE = "接手后它就不动了，把手机放下才算还给它"
+    const val TAKEOVER_NOTE = "停止此任务：这张票会结束，不再往下做"
 
     /** 顶栏的副行。 */
     const val SUBTITLE = "这不是你的屏幕，是它的"
@@ -1203,7 +1494,7 @@ object WorkspaceCopy {
     const val FULLSCREEN_NOTE = "全屏还没接上"
 
     /** 接手成功。工单真的停了才这么说。 */
-    const val TAKEOVER_DONE = "已接手，这个工单停了"
+    const val TAKEOVER_DONE = "已停止此任务"
 
     /** 它手上没有在跑的票：没有可接的活，别假装接成功了。 */
     const val TAKEOVER_IDLE = "它手上没有活儿"
@@ -1215,13 +1506,14 @@ object WorkspaceCopy {
      * 同一个按钮停完就变成「继续执行」。说清「再按一下」，人才不会跑去面板找。
      */
     fun pauseDone(scope: String): String =
-        if (scope == "executor") "已让它停一下（全局执行器，再按一下继续）" else "已让它停一下"
+        if (scope == "executor") "全队已暂停调度和回复投递（正在跑的这一步不会被中断，再按一下恢复）"
+        else "已暂停"
 
     /** 继续执行成功。后端确认过 `resumed: true` 才会走到这句话。 */
-    const val RESUMED = "已继续执行（全局执行器）"
+    const val RESUMED = "全队已恢复调度和回复投递"
 
     /** 暂停按钮那一格的字：停了就写「继续执行」。同一个按钮，两个方向。 */
-    const val RESUME_LABEL = "继续执行"
+    const val RESUME_LABEL = "恢复全队"
 
     /**
      * 暂停按钮此刻该写什么。抽成函数是为了让它可断言 —— 真机上看这一格要解锁屏幕，
@@ -1528,8 +1820,10 @@ object OutputsCopy {
  * 免得一条读完就把整列消息行都重组一遍。
  */
 class OutputsCache {
-    /** 票号 → （这一轮的产出，读不到时是 null）。只有当前轮次的那条算数。 */
+    /** 票号 → 最新一轮的尝试（读不到时是 null）。 */
     private val read = mutableMapOf<String, Pair<Int, OutputsView?>>()
+    /** 票号 → 最近一次成功结果，刷新期间与刷新失败后继续显示。 */
+    private val successful = mutableMapOf<String, OutputsView>()
     /** 正在读的：票号 → 这一轮是第几轮。 */
     private val reading = mutableMapOf<String, Int>()
 
@@ -1539,8 +1833,7 @@ class OutputsCache {
      */
     fun need(ticket: String, epoch: Int): Boolean {
         if (ticket.isEmpty()) return false
-        val cached = read[ticket]
-        if (cached != null && cached.first == epoch) return false
+        if (read[ticket]?.first == epoch) return false
         return reading[ticket] != epoch
     }
 
@@ -1551,20 +1844,14 @@ class OutputsCache {
         return true
     }
 
-    /**
-     * 一次读取结束。view 为 null 表示读不到（请求失败、404 等），也照样记一笔，
-     * 据此不再重发；结果条据此不画。
-     *
-     * 比手上这一轮旧的答案直接丢掉：刷新之后旧请求晚回来，不能把新轮次的账本
-     * 改成旧数据，也不能把新轮次「正在读」的记号抹掉 —— 那会让这一轮
-     * 永远停在「读过、没有」，结果条再也不出现。
-     */
+    /** 一次读取结束。失败也记录当前轮次，停止本轮重试；最近一次成功结果单独保留用于显示。 */
     fun finish(ticket: String, view: OutputsView?, epoch: Int) {
         val startedAt = reading[ticket]
         val current = read[ticket]?.first ?: 0
         if (epoch < maxOf(startedAt ?: 0, current)) return
-        if (startedAt == epoch) reading.remove(ticket)
+        if (startedAt != null && startedAt <= epoch) reading.remove(ticket)
         read[ticket] = epoch to view
+        if (view != null) successful[ticket] = view
     }
 
     /**
@@ -1576,26 +1863,9 @@ class OutputsCache {
         if (reading[ticket] == epoch) reading.remove(ticket)
     }
 
-    /** 这张票下面该画的那句话。null 就是「不画」。上一轮的结果不算数。 */
-    fun line(ticket: String, epoch: Int): String? {
-        val cached = read[ticket] ?: return null
-        if (cached.first != epoch) return null
-        return OutputsCopy.barLine(cached.second)
-    }
-
-    /**
-     * 这一轮还在读、还没有答案。界面据此在结果条的位置上先占一行高 ——
-     * 读到之前与读到之后高度一样，列表就不会在读完那一刻被顶走一下。
-     *
-     * 读过了（有结果、或确实读不到）就是 false：那两种都不该再占着地方，
-     * 尤其在「这张票本来就没有产出」时，占着就是一块永久的空白。
-     */
-    fun pending(ticket: String, epoch: Int): Boolean {
-        if (ticket.isEmpty()) return false
-        val cached = read[ticket]
-        if (cached != null && cached.first == epoch) return false
-        return true
-    }
+    /** 最近一次成功结果继续显示，直到同票新成功结果替换它。 */
+    fun line(ticket: String, epoch: Int): String? =
+        successful[ticket]?.let(OutputsCopy::barLine)
 
     /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */
     fun tried(ticket: String, epoch: Int): Boolean = read[ticket]?.first == epoch
@@ -1608,21 +1878,21 @@ class OutputsCache {
  * 每一条记录都带「它是第几轮时间线读来的」，旧一轮的答案不算数。放在这里而不是界面里，
  * 是因为它和 OutputsCache 是同一类东西 —— 纯记账，可以单测。
  *
- * 为什么要缓存：这张卡画在消息列表**末尾**，从后台/工作区切回来时人第一眼看的就是它。
- * 缓存跟着页面重新组合的话，每次都要「一边出现一边拉数据」：几百毫秒里那块地方是空的，
- * 读到之后才长出来 —— 切屏第一帧看上去就是一次卡顿。
+ * 为什么要缓存：卡片位于消息列表**末尾**；刷新或读失败时保留最近一次成功树，避免已有信息消失。
+ * 尚无成功树或树中没有后代时不创建空卡片。
  */
 class AgentsCache {
     /** 票号 →（这一轮读到的树，读不到时是 null）。 */
     private val read = mutableMapOf<String, Pair<Int, List<AgentNode>?>>()
+    /** 票号 → 最近一次成功的树，刷新期间与刷新失败后继续显示。 */
+    private val successful = mutableMapOf<String, List<AgentNode>>()
     /** 正在读的：票号 → 这一轮是第几轮。 */
     private val reading = mutableMapOf<String, Int>()
 
     /** 这一轮该不该发请求。空票号永远不发（没有票就没有树可读）。 */
     fun need(ticket: String, epoch: Int): Boolean {
         if (ticket.isEmpty()) return false
-        val cached = read[ticket]
-        if (cached != null && cached.first == epoch) return false
+        if (read[ticket]?.first == epoch) return false
         return reading[ticket] != epoch
     }
 
@@ -1640,8 +1910,9 @@ class AgentsCache {
         // 比手上这一轮旧的答案丢掉：刷新之后旧请求晚回来，不能把新轮次的账改回去，
         // 也不能把新轮次「正在读」的记号抹掉。
         if (epoch < maxOf(startedAt ?: 0, current)) return
-        if (startedAt == epoch) reading.remove(ticket)
+        if (startedAt != null && startedAt <= epoch) reading.remove(ticket)
         read[ticket] = epoch to nodes
+        if (nodes != null) successful[ticket] = nodes
     }
 
     /** 读了一半被取消（这一格被组合带走了）：放掉「正在读」，切回来再读一次。 */
@@ -1649,18 +1920,14 @@ class AgentsCache {
         if (reading[ticket] == epoch) reading.remove(ticket)
     }
 
-    /** 清掉这张票的账（按「重试」时用）：下一趟会当成没读过。 */
+    /** 清掉失败轮次的尝试记录；最近成功的树继续留在屏幕上。 */
     fun forget(ticket: String) {
         read.remove(ticket)
         reading.remove(ticket)
     }
 
-    /** 这一轮读到的树。没读过、或只有旧一轮的，都是 null。 */
-    fun get(ticket: String, epoch: Int): List<AgentNode>? {
-        val cached = read[ticket] ?: return null
-        if (cached.first != epoch) return null
-        return cached.second
-    }
+    /** 最近一次成功读到的树；刷新期间与刷新失败后仍可显示。 */
+    fun get(ticket: String, epoch: Int): List<AgentNode>? = successful[ticket]
 
     /** 这一轮读过了没有（成功或失败都算）。测试与自查用。 */
     fun tried(ticket: String, epoch: Int): Boolean = read[ticket]?.first == epoch
@@ -2167,30 +2434,6 @@ object MemoryCopy {
 }
 
 
-/** 一次语音识别的结果：认出来了给文字，认不出来给一句人话原因。 */
-data class VoiceResult(val available: Boolean, val text: String, val reason: String = "")
-
-object VoiceWire {
-    /**
-     * 读 `/api/mobile/voice` 的回答。
-     *
-     * 空正文、坏 JSON、认出来但是空串，都算「没认出来」并给一句原因：
-     * 把空串当成功塞进输入框，用户会以为自己的话被吞了。
-     */
-    fun parse(body: String): VoiceResult {
-        val root = try {
-            JSONObject(body)
-        } catch (_: Exception) {
-            return VoiceResult(false, "", "后端回的不是 JSON")
-        }
-        val available = root.optBoolean("available", false)
-        val text = root.optString("text").trim()
-        if (!available) return VoiceResult(false, "", root.optString("reason").ifBlank { "没认出来" })
-        if (text.isEmpty()) return VoiceResult(false, "", "没听出字来")
-        return VoiceResult(true, text)
-    }
-}
-
 
 /** 一条回复的账：答卷的是谁、花了多少、上下文还剩多少。 */
 data class ReplySpend(
@@ -2262,40 +2505,6 @@ object ReplySpendCopy {
 
     /** 额度告急那行字；不告急或不知道时是空串（不写一句「额度充足」占位置）。 */
     fun warning(view: ReplySpends): String = view.warning
-}
-
-
-/** 播报：把一句话念出来。念不出声时说的是为什么。 */
-data class SpeechResult(val available: Boolean, val wav: ByteArray?, val seconds: Double, val truncated: Boolean, val reason: String)
-
-object SpeechWire {
-    /** 失败时的 JSON 回答（后端念不出来时回的是 JSON，不是音频）。 */
-    fun parseFailure(body: String): SpeechResult {
-        val reason = try {
-            JSONObject(body).optString("reason")
-        } catch (_: Exception) { "" }
-        return SpeechResult(false, null, 0.0, false, reason.ifBlank { "这次没念出声" })
-    }
-}
-
-/** 播报那几行字。纯函数，测试直接钉住。 */
-object SpeechCopy {
-    const val LISTEN = "听播报"
-    const val PLAYING = "念着…"
-    const val FAILED = "念不出来"
-
-    /** 念完那一句：说清多长，截断的还要说明为什么只念了一部分。 */
-    fun done(seconds: Double, truncated: Boolean): String {
-        val length = when {
-            seconds <= 0.0 -> ""
-            seconds < 1.0 -> "不到 1 秒"
-            else -> "${seconds.toInt()} 秒"
-        }
-        val parts = mutableListOf<String>()
-        if (length.isNotEmpty()) parts.add(length)
-        if (truncated) parts.add("太长了，只念了前面一段")
-        return parts.joinToString(" · ")
-    }
 }
 
 /** 一条设备推送：后端稳定 id（去重键）+ 抬头/正文 + 可选会话与来源。 */

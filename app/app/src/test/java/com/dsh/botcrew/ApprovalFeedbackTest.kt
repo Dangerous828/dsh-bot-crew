@@ -9,8 +9,9 @@ import org.junit.Test
  * 审批答复的同题互斥与阶段反馈：
  * - 同一张票任一阶段在途就不再放行（挡住 A/B 并发、挡住重复点）；
  * - HTTP 成功只叫「已受理」，继续锁，等时间线收敛才解锁；
- * - 409 stale 锁住刷新，刷新失败只给「重试读取」，不立刻解锁；
- * - 收敛判定：签名变了或票没了才解锁。
+ * - 409 **解锁**并如实转述服务端原话：它不再等于「这张卡已更新」（四种 409 来源里只有一种
+ *   是换了卡，判不出来就不提示，见 [AttentionSupersedeTest]）；
+ * - 收敛判定：签名变了或票没了才解锁；问题换了，旧卡上的回执一并作废。
  */
 class ApprovalFeedbackTest {
 
@@ -46,26 +47,23 @@ class ApprovalFeedbackTest {
     }
 
     @Test
-    fun staleStaysLocked() {
-        val stale = ApprovalGate.stale()
-        assertEquals(ApprovalGate.Phase.Stale, stale.phase)
-        assertTrue(stale.busy)
-        assertFalse(ApprovalGate.canSubmit(stale))
-        assertEquals("这张问题卡已更新，请按最新的那张再答", stale.note)
+    fun rejectionReleasesAndQuotesTheServerInsteadOfClaimingAnUpdate() {
+        // 409：解锁并照实转述服务端原话。从前的「这张问题卡已更新，请按最新的那张再答」
+        // 在只有一张卡的现场是一条找不到出路的指引 —— 这里钉住它不再回来。
+        val rejected = ApprovalGate.rejected("这句不是一个可执行的答复")
+        assertEquals(ApprovalGate.Phase.Idle, rejected.phase)
+        assertFalse("409 之后必须能重新选一项，否则卡片就永久锁死", rejected.busy)
+        assertTrue(ApprovalGate.canSubmit(rejected))
+        assertEquals(AnswerCopy.answerFailed("这句不是一个可执行的答复"), rejected.note)
+        assertFalse(rejected.note!!.contains("已更新"))
+        assertFalse(rejected.note!!.contains("最新的那张"))
     }
 
     @Test
-    fun staleLocksAndPointsToRefreshThenLatest() {
-        // 409 旧卡：锁住，文案指向「按最新的那张再答」——刷新由调用方触发（onSent），
-        // 收敛靠新签名解锁。不另设一个未接线的「刷新失败」死态。
-        val stale = ApprovalGate.stale()
-        assertEquals(ApprovalGate.Phase.Stale, stale.phase)
-        assertTrue(stale.busy)
-        assertFalse(ApprovalGate.canSubmit(stale))
-        assertEquals(ApprovalGate.STALE, stale.note)
-        // 签名未变继续锁；刷新出新签名才解锁。
-        assertFalse(ApprovalGate.converged(stale.phase, "s", "s"))
-        assertTrue(ApprovalGate.converged(stale.phase, "s", "s2"))
+    fun rejectionWithoutAReasonStillSaysSomethingTrue() {
+        val rejected = ApprovalGate.rejected(null)
+        assertEquals(ApprovalGate.Phase.Idle, rejected.phase)
+        assertEquals(AnswerCopy.answerFailed(ApprovalGate.REJECTED_UNKNOWN), rejected.note)
     }
 
     @Test
@@ -79,9 +77,24 @@ class ApprovalFeedbackTest {
         assertTrue(ApprovalGate.converged(ApprovalGate.Phase.Accepted, "sig", "sig2"))
         // 票没了（newSignature=null）→ 收敛。
         assertTrue(ApprovalGate.converged(ApprovalGate.Phase.Accepted, "sig", null))
-        // stale 同理只在签名变/票没了时收敛。
-        assertFalse(ApprovalGate.converged(ApprovalGate.Phase.Stale, "sig", "sig"))
-        assertTrue(ApprovalGate.converged(ApprovalGate.Phase.Stale, "sig", "sig2"))
+    }
+
+    @Test
+    fun aNoteNeverSurvivesToADifferentQuestion() {
+        // 旧卡上的「没答上：…」不该挂在新问题下面（409 之后换卡正是这条路径）。
+        var sig = "q1|A|B"
+        val holder = ApprovalGateHolder({ sig })
+        assertTrue(holder.begin())
+        holder.rejected("这句不是一个可执行的答复")
+        assertEquals(AnswerCopy.answerFailed("这句不是一个可执行的答复"), holder.state.note)
+        // 同一道题还在：回执留着（人还要看见它）。
+        holder.reconcile()
+        assertEquals(AnswerCopy.answerFailed("这句不是一个可执行的答复"), holder.state.note)
+        // 问题换了：回执作废。
+        sig = "q2|X|Y"
+        holder.reconcile()
+        assertEquals(null, holder.state.note)
+        assertEquals(ApprovalGate.Phase.Idle, holder.state.phase)
     }
 
     @Test

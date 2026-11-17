@@ -625,15 +625,20 @@ class CrewClient(
      * body 只带必要三项：ticket / text / attention_id。actor 由服务端认证（x-crew-principal 由入口注入），
      * 客户端不发任何可伪造的身份。text 是所选 option 的 label，或自写 revise 的原文。
      *
-     * 旧卡批新请求 / 票已结束 / 重复答 → 后端 409；这里抛 [AnswerStale] 让界面刷新旧卡并说「已更新」，
-     * 绝不把 409 当成成功。其它失败（网络、400）保持普通 IOException 语义可重试同事件。
+     * 旧卡批新请求 / 票已结束 / 这句不是一个可执行的答复 → 后端 409；这里抛 [AnswerStale]，
+     * 并把**服务端的原话**带出来（`{"error": "…"}` 里的那一句），界面照实转述。
+     * 绝不把 409 当成成功，也绝不替服务端把它说成「卡已更新」—— 409 的四种来源里只有一种
+     * 是「换了新卡」，另外三种根本没有「最新那张」可指。
+     * 其它失败（网络、400）保持普通 IOException 语义可重试同事件。
      */
     suspend fun answer(ticketId: String, text: String, attentionId: String, sessionId: String? = null) {
         val body = JSONObject().put("ticket", ticketId).put("text", text).put("attention_id", attentionId).toString()
         try {
             read(sessionPath("/api/mobile/answer", sessionId), "POST", body)
         } catch (error: CrewHttpStatus) {
-            if (error.status == 409) throw AnswerStale(error.message ?: "这张问题卡已经过期")
+            if (error.status == 409) {
+                throw AnswerStale(CrewWire.errorReason(error.body) ?: AnswerStale.UNKNOWN)
+            }
             throw error
         }
     }
@@ -839,8 +844,9 @@ class CrewClient(
             if (status >= 300) {
                 val detail = connection.errorStream?.bufferedReader()?.use { it.readText() }?.take(200).orEmpty()
                 // 404 是「老后端没有 /sessions」的判据，409/503 是新建的如实错误；
-                // 保留原来的整句 message，另外把状态码带出来给能力位先验分类。
-                throw CrewHttpStatus(status, "队伍返回 $status：$detail")
+                // 保留原来的整句 message，另外把状态码与错误体带出来：409 的正文里有服务端
+                // 自己写的那句话（`{"error": "…"}`），界面要照实转述，不能替它编。
+                throw CrewHttpStatus(status, "队伍返回 $status：$detail", detail)
             }
         } catch (error: IOException) {
             connection.disconnect()
@@ -857,10 +863,18 @@ class CrewClient(
 private class CrewRejected(message: String) : IOException(message)
 
 /**
- * 答复的这张问题卡已经过期（409）：票/请求已变、已结束或已答过。
- * 界面据此刷新旧卡并明说「已更新」，**不**当成答复成功，也不保着旧卡再点批准新 signature。
+ * 这次答复被服务端拒了（409）。**不等于「这张卡已更新」**：`answerTicket` 有四种 409 来源
+ * （没有这张票 / 票已结束 / attention_id 不符 / 这句不是一个可执行的答复），只有一种是真的换了新卡。
+ *
+ * [reason] 是服务端 `{"error": "…"}` 里的原话，界面照实转述；「有没有更新的一张」另由
+ * [AttentionSupersede] 拿刷新回来的时间线判 —— 判得出来才提示，判不出来一个字都不说。
  */
-class AnswerStale(message: String) : IOException(message)
+class AnswerStale(val reason: String) : IOException(reason) {
+    companion object {
+        /** 服务端没给原因时，只说确定的那点事。 */
+        const val UNKNOWN = "这张卡在服务端已经变了"
+    }
+}
 
 /**
  * 探一条入口通不通时敲的路径。
@@ -874,8 +888,8 @@ private const val PROBE_PATH = "/api/mobile/__latency"
 /** bootstrap 自愈验域名身份用的超时：这是出门兜底路径，给足握手时间，但不能无限等。 */
 private const val BOOTSTRAP_TIMEOUT_MS = 8_000
 
-/** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码。 */
-private class CrewHttpStatus(val status: Int, message: String) : IOException(message)
+/** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码和错误体原文。 */
+private class CrewHttpStatus(val status: Int, message: String, val body: String = "") : IOException(message)
 
 /**
  * 会话名单读不回来。status=404 表示老后端（锁 main 并显示那句提示），其它非 0 状态

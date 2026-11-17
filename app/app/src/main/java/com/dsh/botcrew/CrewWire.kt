@@ -465,6 +465,24 @@ object CrewWire {
     fun answerSlot(ticketId: String, optionId: String): String = "$ticketId|$optionId"
 
     /**
+     * 错误体里那句人话：`{"error": "…"}` 的 `error`。
+     *
+     * 只读字段，不改写、不翻译、不拼接 —— 界面要转述的就是服务端自己写的那一句
+     * （「这句不是一个可执行的答复」/「这张问题卡已经过期（票或请求已变），请刷新后再答」）。
+     * 不是 JSON、没有 error、或者 error 不是字符串时返回 null，由调用方退回自己的兜底文案。
+     */
+    fun errorReason(body: String): String? {
+        val text = body.trim()
+        if (text.isEmpty() || !text.startsWith("{")) return null
+        val reason = try {
+            JSONObject(text).opt("error") as? String
+        } catch (_: Exception) {
+            null
+        }
+        return reason?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
      * 读 `GET / POST /api/mobile/sessions` 的回答。
      *
      * S1 的 `sessions` 是 **id 字符串数组**；也认 `{id, name}` 形状的条目（带显示名时用它的）。

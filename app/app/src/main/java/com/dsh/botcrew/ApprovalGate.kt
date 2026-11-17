@@ -17,18 +17,33 @@ import androidx.compose.runtime.setValue
  *  2. **pending 误导**：从前「发出去了但还没回来」就画 ✓，像已经答成。现在分成两段：
  *     HTTP 未回来 = [Phase.Submitting]（画「提交中…」，双禁用，还没答成）；
  *     HTTP 成功 = [Phase.Accepted]（说「答复已受理，等待状态更新」，**继续锁这一题**）。
- *  3. **stale 重复发**：旧卡过期（409）时先锁住并刷新，刷新失败只给「重试读取」，不立刻解锁
- *     让人对着旧卡再发一次。
+ *  3. **409 不等于「卡已更新」**：从前后端回 409 就锁住并弹「这张问题卡已更新，请按最新的那张再答」。
+ *     但 409 有四种来源（没这张票 / 票已结束 / attention id 不符 / 这句话不是一个可执行的答复），
+ *     后两种根本没有「最新那张」可指。现在 409 走 [rejected]：**解锁**并如实转述服务端原话；
+ *     「有没有更新的一张」由 [AttentionSupersede] 拿刷新回来的时间线判，判得出来才另出提示条。
  *
  * 锁的释放只认**时间线收敛**：当这一题的签名变了、或这张票不见了（后端把它换掉/结掉了），
  * 才解锁。HTTP 成功本身不解锁 —— 那只是「受理」，不是「已更新到界面」。
+ * 回执（note）同理：问题换了，旧卡上的那条回执就不再属于这张卡，一并作废。
  *
  * 纯逻辑在 [ApprovalGate] object 里，可 JVM 单测；Compose 侧用 [rememberApprovalGate] 持有。
  */
 object ApprovalGate {
 
     /** 一次答复发射的结局。由调用方（CrewUi）按 HTTP 结果归类后回传。 */
-    enum class Outcome { Accepted, Stale, Failed }
+    sealed interface Outcome {
+        /** HTTP 200：后端已受理。 */
+        data object Accepted : Outcome
+
+        /**
+         * 后端 409：这张卡在服务端已经变了 / 这句不被认作答复 / 票已结束。
+         * 带服务端原话 —— 界面照实转述，绝不替它说成「已更新」。
+         */
+        data class Rejected(val reason: String) : Outcome
+
+        /** 别的失败（网络、400）：可重试同一事件。 */
+        data class Failed(val detail: String?) : Outcome
+    }
 
     /** 一张票的一次答复所处的阶段。 */
     enum class Phase {
@@ -38,8 +53,6 @@ object ApprovalGate {
         Submitting,
         /** HTTP 成功：后端已受理。锁着，等时间线收敛。 */
         Accepted,
-        /** 后端回 409（旧卡）：锁着并刷新，等时间线收敛到最新那张。 */
-        Stale,
     }
 
     /** 某张票此刻的答复态。 [busy] 为真期间这张票上任何答复入口都不接受点击。 */
@@ -54,7 +67,7 @@ object ApprovalGate {
     }
 
     /**
-     * 点某一个答复前的准入判定：这张票现在是 Idle 才放行，其余阶段（含 Accepted 锁、Stale 锁）
+     * 点某一个答复前的准入判定：这张票现在是 Idle 才放行，其余阶段（含 Accepted 锁）
      * 一律拦住 —— 同题互斥就落在这一个函数里。
      */
     fun canSubmit(state: State): Boolean = state.phase == Phase.Idle
@@ -65,17 +78,24 @@ object ApprovalGate {
     /** HTTP 已受理（还没收敛到时间线）。不叫「提交中」也不叫「答完了」。 */
     const val ACCEPTED = "答复已受理，等待状态更新"
 
-    /** 后端回 409：这张卡已经过期，锁住并刷新，请按最新那张重答（不冒充成功、不重复发）。 */
-    const val STALE = "这张问题卡已更新，请按最新的那张再答"
-
     /** HTTP 成功：后端已受理。文案不叫「提交中」，也不叫「答完了」，是「已受理，等状态更新」。 */
     fun accepted(): State = State(Phase.Accepted, ACCEPTED)
 
     /** 普通失败：退回 Idle，允许重试（草稿/输入框由 UI 保留，不在这里清）。 */
     fun failed(detail: String?): State = State(Phase.Idle, AnswerCopy.answerFailed(detail))
 
-    /** 409 旧卡：锁住并刷新，明说「已更新，请按最新那张」，不冒充成功、不重复发。 */
-    fun stale(): State = State(Phase.Stale, STALE)
+    /**
+     * 后端 409：**解锁**并如实转述服务端原话。
+     *
+     * 这里不解锁会造成实机那个死局：409 的原因是「这句不是一个可执行的答复」时，时间线里
+     * 什么都没变、签名永远不收敛，卡片于是永久锁死，提示还挂着「请按最新的那张」——
+     * 而那张不存在。解锁让人能重新选一项；「是不是真换了卡」交给 [AttentionSupersede] 判。
+     */
+    fun rejected(reason: String?): State =
+        State(Phase.Idle, AnswerCopy.answerFailed(reason ?: REJECTED_UNKNOWN))
+
+    /** 409 但服务端没给原因时，只说确定的那点事。 */
+    const val REJECTED_UNKNOWN = "这张卡在服务端已经变了"
 
     /**
      * 时间线是否已收敛到「可以解锁」：
@@ -83,8 +103,8 @@ object ApprovalGate {
      * - 这一题的签名变了（换了问题或换了选项）→ 收敛；
      * - 都没有 → 还没收敛，继续锁。
      *
-     * 只对 [Phase.Accepted] / [Phase.Stale] 有意义；Idle/Submitting 不受影响
-     * （Submitting 等它自己的 HTTP 回来）。
+     * 只对 [Phase.Accepted] 有意义；Idle/Submitting 不受影响
+     * （Submitting 等它自己的 HTTP 回来，Idle 本来就是可点的）。
      */
     fun converged(phase: Phase, oldSignature: String, newSignature: String?): Boolean {
         if (phase == Phase.Idle || phase == Phase.Submitting) return false
@@ -124,8 +144,9 @@ class ApprovalGateHolder(
         if (stillSameTicket()) state = ApprovalGate.accepted()
         else { state = ApprovalGate.State(); answeredSignature = null }
     }
-    fun stale() {
-        if (stillSameTicket()) state = ApprovalGate.stale()
+    /** 后端 409：同一张票上解锁并如实转述；已经换票了就直接回 Idle（结果不写到新票上）。 */
+    fun rejected(reason: String?) {
+        if (stillSameTicket()) state = ApprovalGate.rejected(reason)
         else { state = ApprovalGate.State(); answeredSignature = null }
     }
     fun failed(detail: String?) {
@@ -139,7 +160,17 @@ class ApprovalGateHolder(
      * 由 [rememberApprovalGate] 在签名变化的 LaunchedEffect 里调用一次，不在每帧 recomposition 里调。
      */
     fun reconcile() {
-        if (ApprovalGate.converged(state.phase, answeredSignature ?: "", signatureOf())) {
+        val current = signatureOf()
+        if (state.phase == ApprovalGate.Phase.Idle) {
+            // Idle 只可能带一条回执（失败/409 的原话）。问题换了这条回执就不再属于这张卡：
+            // 旧卡上的「没答上：这句不是一个可执行的答复」不该挂在新问题上。
+            if (state.note != null && (answeredSignature == null || answeredSignature != current)) {
+                state = ApprovalGate.State()
+                answeredSignature = null
+            }
+            return
+        }
+        if (ApprovalGate.converged(state.phase, answeredSignature ?: "", current)) {
             state = ApprovalGate.State()
             answeredSignature = null
         }

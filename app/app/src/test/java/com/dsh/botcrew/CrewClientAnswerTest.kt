@@ -12,7 +12,8 @@ import org.junit.Test
 /**
  * 答复控件的客户端契约（task-12）：审批卡的答复走专用 POST /api/mobile/answer，
  * body 只带必要三项（ticket / text / attention_id），**不带**任何可伪造的 actor；
- * 409（旧卡过期/已结束/重复答）单独抛 [AnswerStale]，好让界面刷新而不是当成功。
+ * 409（旧卡过期/票已结束/这句不是一个可执行的答复）单独抛 [AnswerStale]，
+ * 并带上服务端 `{"error": "…"}` 的原话 —— 界面照实转述，不再一律说成「这张卡已更新」。
  *
  * 这条不再拼 `@某人 选项` 发 /send —— 那会让引擎起一段新活，而不是回这张卡的审批。
  */
@@ -95,18 +96,62 @@ class CrewClientAnswerTest {
         }
     }
 
-    // 409 → AnswerStale：界面据此刷新旧卡、说「已更新」，绝不冒充成功。
+    // 409 → AnswerStale：绝不冒充成功，并且把服务端那句原话带出来（界面照实转述）。
     @Test
     fun a409BecomesAnswerStaleNotSuccess() {
         val cap = Capture(409, """{"error":"这张问题卡已经过期（票或请求已变），请刷新后再答"}""")
         try {
             val client = CrewClient(listOf(cap.entry), "tok-1")
-            assertThrows(AnswerStale::class.java) {
+            val error = assertThrows(AnswerStale::class.java) {
                 runBlocking { client.answer("tk-1", "去改首页", "stale-id") }
             }
+            assertEquals("这张问题卡已经过期（票或请求已变），请刷新后再答", error.reason)
         } finally {
             cap.close()
         }
+    }
+
+    // 409 的原因不止「卡过期」：认不出这句话也是 409，这时**不能**说成「卡已更新」。
+    @Test
+    fun a409ForAnUnrecognisedAnswerKeepsTheServersOwnWords() {
+        val cap = Capture(409, """{"error":"这句不是一个可执行的答复"}""")
+        try {
+            val client = CrewClient(listOf(cap.entry), "tok-1")
+            val error = assertThrows(AnswerStale::class.java) {
+                runBlocking { client.answer("tk-1", "不用做了", "attention-connection-b27d050c") }
+            }
+            assertEquals("这句不是一个可执行的答复", error.reason)
+            assertTrue("不该替服务端说成「已更新」", !error.reason.contains("已更新"))
+        } finally {
+            cap.close()
+        }
+    }
+
+    // 409 的错误体读不出人话时，退回一句确定的兜底，不编原因。
+    @Test
+    fun a409WithoutAReadableErrorBodyFallsBackToTheKnownFact() {
+        val cap = Capture(409, "not json at all")
+        try {
+            val client = CrewClient(listOf(cap.entry), "tok-1")
+            val error = assertThrows(AnswerStale::class.java) {
+                runBlocking { client.answer("tk-1", "去改首页", "attention-connection-x") }
+            }
+            assertEquals(AnswerStale.UNKNOWN, error.reason)
+        } finally {
+            cap.close()
+        }
+    }
+
+    @Test
+    fun errorReasonReadsOnlyTheErrorField() {
+        assertEquals("这句不是一个可执行的答复", CrewWire.errorReason("""{"error":"这句不是一个可执行的答复"}"""))
+        // 前后空白不算内容；空串与缺失都当没有。
+        assertEquals("票已结束", CrewWire.errorReason("""{"error":"  票已结束  "}"""))
+        assertEquals(null, CrewWire.errorReason("""{"error":"   "}"""))
+        assertEquals(null, CrewWire.errorReason("""{"ok":false}"""))
+        assertEquals(null, CrewWire.errorReason("""{"error":42}"""))
+        assertEquals(null, CrewWire.errorReason(""))
+        assertEquals(null, CrewWire.errorReason("<html>502</html>"))
     }
 
     // 别的失败（如 400/网络）不是过期：保持普通 IOException 语义，可重试同一事件。

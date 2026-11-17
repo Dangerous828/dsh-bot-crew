@@ -51,6 +51,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.rememberDrawerState
 import androidx.activity.compose.BackHandler
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -1345,7 +1346,8 @@ private fun CrewScreen(
      * - 老后端没下发 attention_id 的票 / 普通聊天：attention_id 为空 → 退回既有 /send 路径，逐字不变。
      * - 选明确选项：text 传选项 label（后端 label/id 都认）。
      * - 自写 revise：走 [sendRevise]，text 是用户原文，同样带上这张卡的 attentionId。
-     * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+     * - 409：**不冒充成功，也不替服务端说「卡已更新」** —— 409 有四种来源，只有一种是真换了卡。
+     *   这里照实转述服务端原话（[AnswerStale.reason]），并刷新时间线。
      * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
      */
     fun answerByTicket(ticket: WorkTicket, text: String, done: (ApprovalGate.Outcome) -> Unit) {
@@ -1361,13 +1363,13 @@ private fun CrewScreen(
                 onSent()
                 ApprovalGate.Outcome.Accepted
             } catch (error: AnswerStale) {
-                // 旧卡已过期：刷新时间线把卡换成最新一张，明说「已更新」不冒充成功。
+                // 服务端拒了这一次：刷新时间线，把它的原话照实说出去（不粉饰成「已更新」）。
                 onSent()
-                onSendFailed(owner, "这张问题卡已更新，请按最新的那张再答", true)
-                ApprovalGate.Outcome.Stale
+                onSendFailed(owner, AnswerCopy.answerFailed(error.reason), true)
+                ApprovalGate.Outcome.Rejected(error.reason)
             } catch (error: Exception) {
                 onSendFailed(owner, error.message ?: "答复没发出去", true)
-                ApprovalGate.Outcome.Failed
+                ApprovalGate.Outcome.Failed(error.message)
             } finally {
                 onSending(owner, false)
             }
@@ -1381,7 +1383,8 @@ private fun CrewScreen(
      * - 老后端没下发 attention_id 的票 / 普通聊天：attention_id 为空 → 退回既有 /send 路径，逐字不变。
      * - 选明确选项：text 传选项 label（后端 label/id 都认）。
      * - 自写 revise：由队伍消息区的待决卡（TicketStrip）内联输入框直接发 /answer，text 是用户原文。
-     * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+     * - 409：不当成功；刷新时间线，服务端原话照实说（「卡已更新」只在真的换了卡时才提示，
+     *   判定见 [AttentionSupersede]）。
      * - 请求中禁重入由 [ApprovalGate] / 桌面 answers[slot] 保证；这里只做一次发射。
      */
     fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (ApprovalGate.Outcome) -> Unit) {
@@ -1390,7 +1393,9 @@ private fun CrewScreen(
             val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
             val address = name.ifEmpty { ticket.botId.trim() }
             val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
-            sendBoardText(text) { ok -> done(if (ok) ApprovalGate.Outcome.Accepted else ApprovalGate.Outcome.Failed) }
+            sendBoardText(text) { ok ->
+                done(if (ok) ApprovalGate.Outcome.Accepted else ApprovalGate.Outcome.Failed(null))
+            }
             return
         }
         answerByTicket(ticket, option.label, done)
@@ -2054,7 +2059,7 @@ private fun CrewDrawerSheet(    palette: CrewPalette,
         Column(
             modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
         ) {
-            DrawerSectionLabel("导航", palette)
+            DrawerSectionLabel("导航", palette, first = true)
             val nav = CrewNavigation.selectedNav(mode)
             DrawerNavItem(NavEntry.Chat.label, selected = nav == NavEntry.Chat, palette) { onNavChat() }
             DrawerNavItem(NavEntry.Tasks.label, selected = nav == NavEntry.Tasks, palette) { onNavTasks() }
@@ -2095,13 +2100,62 @@ private fun effectiveRecipientId(recipientId: String?, bots: List<BotCard>, defa
     return if (id.isNotEmpty() && bots.any { it.id == id }) id else null
 }
 
+/**
+ * 分组标题（导航 / 成员 / 工具）。
+ *
+ * 实机上三组读不出来：组内一行的间距是 180px（文字顶到文字顶），组与组之间只有 188px ——
+ * 差 8px 等于没差，一整条侧栏看着像一长串同级的行。
+ *
+ * 现在两条一起给层级：组与组之间拉开到组内的 1.5 倍以上（[DRAWER_GROUP_TOP]），
+ * 并在非首组的上方压一条 1px 细分割线；字重从 Medium 提到 SemiBold、颜色从 faint 提到 muted。
+ * 不用大色块 —— 侧栏里一坨底色比没有层级更吵。
+ */
 @Composable
-private fun DrawerSectionLabel(text: String, palette: CrewPalette) {
-    Text(
-        text, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = palette.faint,
-        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
-    )
+private fun DrawerSectionLabel(text: String, palette: CrewPalette, first: Boolean = false) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                start = 20.dp,
+                end = 20.dp,
+                top = if (first) DRAWER_FIRST_TOP else DRAWER_GROUP_TOP,
+                bottom = 6.dp,
+            ),
+    ) {
+        if (!first) {
+            HorizontalDivider(
+                color = palette.line,
+                thickness = 1.dp,
+                modifier = Modifier.padding(bottom = DRAWER_DIVIDER_GAP),
+            )
+        }
+        Text(text, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.muted)
+    }
 }
+
+
+/**
+ * 组与组之间，组标题上方留出的间距。
+ *
+ * 实机账（ui-drawer.xml，px ÷ 2 是 dp；「边界」= 上一组末行文字顶 → 下一组标题文字顶）：
+ * - 导航组内文字顶 574 → 754 → 934，组内 180px；末行（934）到「成员」标题（1122）只有 188px；
+ * - 成员组内文字顶 1281 → 1477 → 1673，组内 196px；末行（1673）到「工具」标题（1868）只有 195px。
+ * 两处都几乎是「没差」，一整条侧栏读着像一长串同级行。要求：组间 ≥ 组内 1.5 倍，
+ * 即导航边界 ≥ 270px、成员边界 ≥ 294px。
+ *
+ * 原实现的标题块只有 14dp（28px）上距，所以「末行文字顶 → 标题块上沿」的固定部分
+ * 导航是 160px、成员是 167px。要让成员边界到 294px，标题块（上距 + 分割线 1dp + 线下间距）
+ * 至少要 (294-167)/2 ≈ 64dp。这里给 40 + 1 + 28 = 69dp：
+ * 导航边界 298px（组内的 1.66 倍）、成员边界 305px（1.56 倍），两个读数都过线。
+ * 分割线放在间距里偏下、贴近它引出的标题 —— 它是「下一组从这里开始」，不是上一组的尾巴。
+ */
+private val DRAWER_GROUP_TOP = 40.dp
+
+/** 分割线与它引出的组标题之间的间距（账见 [DRAWER_GROUP_TOP]）。 */
+private val DRAWER_DIVIDER_GAP = 28.dp
+
+/** 首组上方不需要分割线，也不需要那么大的间隔。 */
+private val DRAWER_FIRST_TOP = 8.dp
 
 /** 导航项：48dp 命中，选中态用 accentSoft 底 + accent 字。 */
 @Composable
@@ -3408,6 +3462,12 @@ private fun MemoryRow(item: MemoryItem, palette: CrewPalette, onForget: () -> Un
  * - 后端没给 options 就一个选项都不画，也不把 question 拆成选项；
  * - 防连点：正在发的那一格换成 ✓ 且不再接第二下；
  * - 回执只写在这张卡自己的问题下：问题的文本或选项一变，旧的另存为作废。
+ *
+ * 实机量出来的四件事也落在这里（都是「这一块长得不像它该长的样子」）：
+ * - 409 不再等于「这张卡已更新」：判不出更新的 attention 就一个字都不提示（[AttentionSupersede]）；
+ * - 卡内输入行默认收起，只有选了「修改内容」才展开，并且和底部聊天输入长得不一样；
+ * - 元信息与正文之间留出更大间隔、小一号、次要色；
+ * - 详情区等宽小字 + 浅底 + 分节 + 限高滚动，原文一个字不改。
  */
 @Composable
 private fun TicketStrip(
@@ -3444,7 +3504,21 @@ private fun TicketStrip(
     // 这张卡是不是审批卡：后端下发了 attention_id 的才是。是就**必须**走审批通道 /answer，
     // 拼 @label 发 /send 会让引擎起一段新活而不是回这张卡。老后端没这字段 → 退回 /send，逐字不变。
     val isApproval = waiting.attentionId.isNotEmpty()
-    /** 一次答复的发射，返回结局（Accepted / Stale / Failed）。审批卡走 /answer，否则走既有 /send。 */
+
+    // 409 之后要判「这张卡到底有没有被换成更新的一张」：记下这次答的是哪一张卡，
+    // 等刷新回来的时间线再判（[AttentionSupersede]）。判不出来就一个字都不提示 ——
+    // 一条指向不存在的卡的指引比没有提示更糟。
+    var rejected by remember(waiting.id) { mutableStateOf<AnsweredCard?>(null) }
+    val newer = rejected?.let { AttentionSupersede.judge(it, conversation.tickets) } as? Supersede.Newer
+
+    // 卡内输入行：默认收起，只有点了「修改内容」才展开（规则见 [CardReviseInput]）。
+    // choice 只按票 id 记：选了「修改内容」之后后端会换一张新卡（问「请写下新的做法」），
+    // 换卡不该把刚打开的那一行又收回去。
+    var choice by remember(waiting.id) { mutableStateOf<AttentionOption?>(null) }
+    var revise by remember(waiting.id, signature) { mutableStateOf("") }
+    val reviseOpen = CardReviseInput.expanded(choice, waiting.options)
+
+    /** 一次答复的发射，返回结局（Accepted / Rejected / Failed）。审批卡走 /answer，否则走既有 /send。 */
     suspend fun fire(label: String): ApprovalGate.Outcome {
         return try {
             if (isApproval) {
@@ -3454,23 +3528,30 @@ private fun TicketStrip(
                 client.send(text, CrewWire.mentionsIn(text, conversation.bots),
                     java.util.UUID.randomUUID().toString(), sessionId)
             }
+            // 答上了：上一条「换了新卡」的提示也就没有意义了。
+            rejected = null
             gate.accepted()
             onSent()
             ApprovalGate.Outcome.Accepted
         } catch (error: AnswerStale) {
-            // 旧卡已过期：锁住并刷新，明说「已更新」，不冒充成功、不重复提交。
-            gate.stale()
+            // 409 不是「已更新」的同义词：认不出这句话、票已结束都会回 409。
+            // 这里只做两件事：解锁并把服务端原话照实说出来；记下答的是哪一张，等时间线判。
+            rejected = AnsweredCard(waiting.id, waiting.attentionId)
+            gate.rejected(error.reason)
             onSent()
-            ApprovalGate.Outcome.Stale
+            ApprovalGate.Outcome.Rejected(error.reason)
         } catch (error: Exception) {
             gate.failed(error.message)
-            ApprovalGate.Outcome.Failed
+            ApprovalGate.Outcome.Failed(error.message)
         }
     }
+
     /** 点某一格：准入 → 置提交中 → 发 → 按结局落状态（同题互斥靠 gate.begin）。 */
-    fun answerOption(label: String) {
+    fun answerOption(option: AttentionOption) {
+        // 选「修改内容」就是这次审批的入口：点它就展开本卡输入行（不发空答复）。
+        choice = option
         if (!gate.begin()) return
-        scope.launch { fire(label) }
+        scope.launch { fire(option.label) }
     }
 
     // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
@@ -3484,6 +3565,16 @@ private fun TicketStrip(
             .padding(11.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        // ① 提示条在**卡片最上面**：独立浅底 + 小字 + 图标，一眼看出不是正文。
+        //    只在真的拿到更新的 attention 时出现，并且一定给出一条走得通的出路。
+        if (newer != null) {
+            SupersedeBanner(
+                onThisCard = newer.ticketId == waiting.id,
+                palette = palette,
+                onJump = onOpenAllPending,
+                onDismiss = { rejected = null },
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("◷", color = palette.warn, fontSize = 11.sp)
             Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight(620))
@@ -3491,31 +3582,22 @@ private fun TicketStrip(
         // 有 approval 用它的预览（真实换行）；没有就读 question；都没有才退回 needs_person 的人话。
         // 段落、加粗/行内代码、超长折叠都在纯函数里定，这里只画（见 AnswerBody）。
         AnswerBody(waiting, palette)
-        // 这张卡要做什么、对谁做。没有就整行不画。
+        // ② 这张卡要做什么、对谁做：元信息行。和正文之间留出明显更大的间隔（6+8=14dp），
+        //    小一号、次要色 —— 实机上它和正文段落同距（23px）同色，读起来像正文的下一句。
         AnswerCopy.actionLine(waiting)?.let {
-            Text(it, color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp)
+            Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 15.sp)
+            }
         }
-        // 细节默认折叠：工具名、参数、路径这些不该占正文，但真的要看时必须在。
+        // ③ 细节默认折叠：工具名、参数、路径这些不该占正文，但真的要看时必须在。
         val folded = AnswerCopy.details(waiting)
         if (folded != null) {
             var openDetails by remember(waiting.id, signature) { mutableStateOf(false) }
-            TextButton(onClick = { openDetails = !openDetails }, contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
-                Text(
-                    if (openDetails) AnswerCopy.DETAILS_HIDE else AnswerCopy.DETAILS_SHOW,
-                    color = palette.accent, fontSize = 11.sp,
-                )
-            }
-            if (openDetails) {
-                // 原文照录：字面 \n、JSON、路径都在这里，一个字符不改；只保证长路径能折行。
-                Text(
-                    folded,
-                    color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp,
-                    softWrap = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
+            DetailsToggle(open = openDetails, palette = palette) { openDetails = !openDetails }
+            // 原文照录：字面 \n、JSON、路径都在这里，一个字符不改；只换排版（等宽小字 + 浅底 + 分节 + 限高）。
+            if (openDetails) DetailsBlock(folded, palette)
         }
-        // A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
+        // ④ A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
         val g = gate.state
         waiting.options.forEachIndexed { index, option ->
             // 同题互斥：任一答复在途/已受理，所有选项一起禁用。
@@ -3526,17 +3608,22 @@ private fun TicketStrip(
                     .background(palette.card, RoundedCornerShape(8.dp))
                     .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
                     // 发着的那一格不再接第二下：提交中说「提交中…」，不画 ✓（还没答成）。
-                    .clickable(enabled = !busy) { answerOption(option.label) }
+                    .clickable(enabled = !busy) { answerOption(option) }
                     .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                     .padding(horizontal = 11.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                // 字母徽标与右边那句话**同一个行高、固定宽度、居中**：
+                // 实机上字母框 90px、文字框 72px，两个顶端差 9px，看着像没对齐。
                 Text(
                     if (busy && g.submitting) "…" else AnswerCopy.optionMark(index),
                     color = if (busy) palette.faint else palette.accent,
                     fontSize = 13.sp,
+                    lineHeight = 19.sp,
                     fontWeight = FontWeight(620),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.width(16.dp),
                 )
                 Text(
                     if (busy && g.submitting) "提交中…" else option.label,
@@ -3546,85 +3633,99 @@ private fun TicketStrip(
                 )
             }
         }
-        // 这张卡自己的结果：提交中/已受理/stale/失败，只有这一张卡会显示。
+        // ⑤ 这张卡自己的结果：提交中/已受理/409/失败。做成独立提示条，不再混在正文里。
         g.note?.let {
-            Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 16.sp)
+            NoteBar(it, palette, alert = g.phase == ApprovalGate.Phase.Idle)
         }
-        // 自由输入（revise）：审批卡在本卡内就有一格，typed 原文带 attention_id 走 /answer，
-        // 不猜票号、不把回答滑进群聊 /send（契约：text revise 按既有 question 布局提供）。
-        // 老后端没 attention_id 的卡保持原样：点一下把在等的人带进输入框，仍走普通 /send。
+        // ⑥ 卡内输入行。审批卡才有（typed 原文带 attention_id 走 /answer，不猜票号、
+        //    不把回答滑进群聊 /send）。默认收起，只有选了「修改内容」才展开。
         if (isApproval) {
-            var revise by remember(waiting.id, signature) { mutableStateOf("") }
-            val trimmed = revise.trim()
-            val busy = gate.state.busy
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                Box(
+            if (reviseOpen) {
+                val trimmed = revise.trim()
+                val busy = g.busy
+                // 缩进 + 白底 + 一道 accent 描边 + 独立标签：和底部聊天输入（顶到屏幕边、
+                // 浅灰底、无边框）明确不是同一个东西，截图一眼就能分开。
+                Column(
                     modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
+                        .fillMaxWidth()
+                        .padding(start = 12.dp)
                         .background(palette.card, RoundedCornerShape(8.dp))
-                        .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
-                        .padding(horizontal = 4.dp),
-                    contentAlignment = Alignment.CenterStart,
+                        .border(1.dp, palette.accent, RoundedCornerShape(8.dp))
+                        .padding(start = 10.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
-                    OutlinedTextField(
-                        value = revise,
-                        onValueChange = { revise = it },
-                        enabled = !busy,
-                        singleLine = true,
-                        placeholder = { Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp) },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color.Transparent,
-                            unfocusedBorderColor = Color.Transparent,
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent,
-                        ),
-                        modifier = Modifier.fillMaxWidth(),
+                    Text(
+                        CardReviseInput.LABEL,
+                        color = palette.accent, fontSize = 10.5.sp, fontWeight = FontWeight(620),
                     )
-                }
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .background(if (busy || trimmed.isEmpty()) palette.track else palette.warn, RoundedCornerShape(8.dp))
-                        .clickable(enabled = !busy && trimmed.isNotEmpty()) {
-                            if (!gate.begin()) return@clickable
-                            scope.launch {
-                                val outcome = fire(trimmed)
-                                if (outcome == ApprovalGate.Outcome.Accepted) revise = ""
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("回", color = palette.onWarn, fontSize = 11.5.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        Box(
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            OutlinedTextField(
+                                value = revise,
+                                onValueChange = { revise = it },
+                                enabled = !busy,
+                                singleLine = true,
+                                placeholder = { Text("新的做法写在这里…", color = palette.hint, fontSize = 11.5.sp) },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color.Transparent,
+                                    unfocusedBorderColor = Color.Transparent,
+                                    disabledBorderColor = Color.Transparent,
+                                    focusedContainerColor = Color.Transparent,
+                                    unfocusedContainerColor = Color.Transparent,
+                                    disabledContainerColor = Color.Transparent,
+                                ),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        // 48dp 命中（实机 180×180 已经合格，别改坏）；图标是画出来的箭头，不再只靠一个字。
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (busy || trimmed.isEmpty()) palette.track else palette.accent)
+                                .clickable(enabled = !busy && trimmed.isNotEmpty()) {
+                                    if (!gate.begin()) return@clickable
+                                    scope.launch {
+                                        val outcome = fire(trimmed)
+                                        if (outcome is ApprovalGate.Outcome.Accepted) revise = ""
+                                    }
+                                }
+                                .semantics { contentDescription = "回这一句，只影响这一次审批" },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            ReplyGlyph(if (busy || trimmed.isEmpty()) palette.faint else palette.surface)
+                        }
+                    }
+                    Text(CardReviseInput.HINT, color = palette.hint, fontSize = 10.5.sp, lineHeight = 15.sp)
                 }
             }
         } else {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .background(palette.card, RoundedCornerShape(8.dp))
-                        .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
-                        // 点它 = 把这句在等的人带进输入框，省得人再想上下文。
-                        .clickable { onPrefill(address) }
-                        .padding(horizontal = 11.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    Text("自己写一句…", color = palette.hint, fontSize = 11.5.sp)
-                }
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .background(palette.warn, RoundedCornerShape(8.dp))
-                        .clickable { onPrefill(address) },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("回", color = palette.onWarn, fontSize = 11.5.sp)
-                }
+            // 老后端没 attention_id 的卡保持原样：点一下把在等的人带进输入框，仍走普通 /send。
+            // 但它不再冒充聊天输入框（浅灰底 + 无边框 + 顶边对齐），而是一个「带进下面输入框」的动作块。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp)
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+                    .clickable { onPrefill(address) }
+                    .padding(start = 10.dp, end = 6.dp)
+                    .semantics { contentDescription = "把这句话带进下面的输入框" },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "要回这一句？带进下面的输入框",
+                    color = palette.muted, fontSize = 11.sp, modifier = Modifier.weight(1f),
+                )
+                ReplyGlyph(palette.accent)
             }
         }
-        // 另有几项在等：给总数与逐项入口，不把每一张的长正文都铺进聊天。
+        // ⑦ 另有几项在等：给总数与逐项入口，不把每一张的长正文都铺进聊天。
         if (pending.size > 1) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -3632,7 +3733,7 @@ private fun TicketStrip(
                     color = palette.warn, fontSize = 11.sp, modifier = Modifier.weight(1f),
                 )
                 TextButton(onClick = onOpenAllPending) {
-                    Text("逐项看", color = palette.accent, fontSize = 11.sp)
+                    Text(AttentionSupersede.JUMP, color = palette.accent, fontSize = 11.sp)
                 }
             }
             pending.drop(1).forEach { ticket ->
@@ -3645,6 +3746,166 @@ private fun TicketStrip(
     }
 }
 
+/**
+ * 「这张卡的问题已经换了」提示条。
+ *
+ * 只在 [AttentionSupersede] 判出**确实拿到了更新的 attention** 时出现；判不出来一个字都不说。
+ * 独立于正文：浅底、圆角、小字号、左侧图标，放在卡片最上面。
+ * 动作一定给得出去路：最新那张就是这张卡 → 「知道了」收掉；在别处 → 「逐项看」跳过去。
+ */
+@Composable
+private fun SupersedeBanner(
+    onThisCard: Boolean,
+    palette: CrewPalette,
+    onJump: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(palette.accentSoft)
+            .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("↻", color = palette.accent, fontSize = 12.sp)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                AttentionSupersede.BANNER,
+                color = palette.accent, fontSize = 11.sp, fontWeight = FontWeight(620),
+            )
+            Text(
+                AttentionSupersede.bannerDetail(onThisCard),
+                color = palette.muted, fontSize = 10.5.sp, lineHeight = 15.sp,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { if (onThisCard) onDismiss() else onJump() }
+                .semantics {
+                    contentDescription = if (onThisCard) "收掉这条提示" else "去看最新的那张卡"
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                AttentionSupersede.bannerAction(onThisCard),
+                color = palette.accent, fontSize = 11.sp, fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+/**
+ * 卡片自己的回执：提交中 / 已受理 / 409 / 失败。
+ *
+ * 从前它是和正文同字号（10.5sp）同色（faint）的一行裸字，夹在 C 选项和输入框之间，
+ * 读起来就是正文的下一句。现在是一条独立提示条：浅底 + 图标 + 小字。
+ *
+ * @param alert true = 这张卡此刻没锁、上一条答复没落地（失败/409）→ 用警示底色；
+ *   false = 只是过程状态（已受理、等状态更新）→ 用中性底色。
+ */
+@Composable
+private fun NoteBar(note: String, palette: CrewPalette, alert: Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (alert) palette.warnSoft else palette.field)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Text(
+            if (alert) "!" else "·",
+            color = if (alert) palette.warn else palette.faint,
+            fontSize = 11.sp, fontWeight = FontWeight(700),
+        )
+        Text(
+            note,
+            color = if (alert) palette.ink else palette.muted,
+            fontSize = 10.5.sp, lineHeight = 15.sp,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** 「看详情」/「收起详情」：48dp 命中、文字与命中区居中的小按钮。 */
+@Composable
+private fun DetailsToggle(open: Boolean, palette: CrewPalette, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            if (open) AnswerCopy.DETAILS_HIDE else AnswerCopy.DETAILS_SHOW,
+            color = palette.accent, fontSize = 11.sp, textAlign = TextAlign.Center,
+        )
+    }
+}
+
+/**
+ * 「看详情」展开后的原文块。
+ *
+ * 实机上它是一堵墙：一整块 2000 字的原文（含 `mcp__messages__send_message({"channel":…` 这种
+ * 原始协议）与正文同字号同色，从 y=1903 一路压到卡片底部。这里只改**排版**，不改内容：
+ * 等宽小字 + 浅底 + 按空行分节（[DetailsCopy]）+ 最多 [DetailsCopy.MAX_HEIGHT_DP] 高，超出就滚动。
+ */
+@Composable
+private fun DetailsBlock(text: String, palette: CrewPalette) {
+    val sections = remember(text) { DetailsCopy.sections(text) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(palette.field, RoundedCornerShape(8.dp))
+            .padding(horizontal = 9.dp, vertical = 8.dp)
+            // 限高必须排在 verticalScroll 之前：滚动容器自己得有界，否则它按内容量出来的高度
+            // 还是整块原文，卡片照旧被撑爆。
+            .heightIn(max = DetailsCopy.MAX_HEIGHT_DP.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        for (section in sections) {
+            Text(
+                section,
+                color = palette.muted,
+                fontSize = DetailsCopy.FONT_SP.sp,
+                lineHeight = (DetailsCopy.FONT_SP + 5).sp,
+                fontFamily = FontFamily.Monospace,
+                softWrap = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * 「回」的图标：一个画出来的箭头，不再只靠一个字。
+ *
+ * 实机上那一格是个 11.5sp 的「回」字，和正文没区别 —— 而它是**发送**，不是正文。
+ * 用形状而不是字来说这件事，也免得换个字体就变成豆腐块。
+ */
+@Composable
+private fun ReplyGlyph(color: Color) {
+    Canvas(modifier = Modifier.size(20.dp)) {
+        val mid = size.height / 2f
+        val stroke = size.height * 0.14f
+        val head = size.width * 0.28f
+        drawLine(color, Offset(size.width * 0.1f, mid), Offset(size.width * 0.88f, mid),
+            strokeWidth = stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(size.width * 0.88f - head, mid - head), Offset(size.width * 0.88f, mid),
+            strokeWidth = stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(size.width * 0.88f - head, mid + head), Offset(size.width * 0.88f, mid),
+            strokeWidth = stroke, cap = StrokeCap.Round)
+    }
+}
 /**
  * 「等你决定」卡的正文：按段落画，段间留行距；`**加粗**` 与 `` `行内代码` `` 轻量渲染；
  * 超过 [QuestionBodyCopy.BRIEF_LINES] 行先折叠，点「展开全文」再看完整正文。

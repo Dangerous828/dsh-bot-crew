@@ -447,9 +447,11 @@ private fun rememberBoardAnswerState(
         if (holder.begin()) {
             onAnswer(ticket, option) { outcome ->
                 when (outcome) {
-                    ApprovalGate.Outcome.Accepted -> holder.accepted()
-                    ApprovalGate.Outcome.Stale -> holder.stale()
-                    ApprovalGate.Outcome.Failed -> holder.failed(null)
+                    is ApprovalGate.Outcome.Accepted -> holder.accepted()
+                    // 409：解锁并照实转述服务端原话。「是不是真换了新卡」由待决卡那边判
+                    // （[AttentionSupersede]），这里不再替它说「已更新」。
+                    is ApprovalGate.Outcome.Rejected -> holder.rejected(outcome.reason)
+                    is ApprovalGate.Outcome.Failed -> holder.failed(outcome.detail)
                 }
             }
         }

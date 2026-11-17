@@ -3659,8 +3659,11 @@ private fun TicketStrip(
                         color = palette.accent, fontSize = 10.5.sp, fontWeight = FontWeight(620),
                     )
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        // 高度交给 OutlinedTextField 自己算：Material3 的输入域自然高度约 56dp，
+                        // 硬压成 48dp 会把单行文字垂直裁掉，占位提示看起来像被切了一半。
+                        // 48dp 只作为命中下限。
                         Box(
-                            modifier = Modifier.weight(1f).height(48.dp),
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                             contentAlignment = Alignment.CenterStart,
                         ) {
                             OutlinedTextField(
@@ -3668,7 +3671,8 @@ private fun TicketStrip(
                                 onValueChange = { revise = it },
                                 enabled = !busy,
                                 singleLine = true,
-                                placeholder = { Text("新的做法写在这里…", color = palette.hint, fontSize = 11.5.sp) },
+                                // 占位文案不带省略号：结尾的「…」会被读成「这里被裁掉了」。
+                                placeholder = { Text("写下新的做法", color = palette.muted, fontSize = 12.sp, maxLines = 1) },
                                 colors = OutlinedTextFieldDefaults.colors(
                                     focusedBorderColor = Color.Transparent,
                                     unfocusedBorderColor = Color.Transparent,
@@ -3699,7 +3703,9 @@ private fun TicketStrip(
                             ReplyGlyph(if (busy || trimmed.isEmpty()) palette.faint else palette.surface)
                         }
                     }
-                    Text(CardReviseInput.HINT, color = palette.hint, fontSize = 10.5.sp, lineHeight = 15.sp)
+                    // 说明小字从 hint 提到 faint：hint 是「比 faint 更淡」的那一档，
+                    // 白底上读不清（真机截图里几乎看不见）。
+                    Text(CardReviseInput.HINT, color = palette.faint, fontSize = 10.5.sp, lineHeight = 15.sp)
                 }
             }
         } else {

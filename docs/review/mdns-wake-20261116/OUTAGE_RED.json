@@ -1,0 +1,6 @@
+{
+  "at": "2026-11-16T18:09:40.948309+08:00",
+  "returncode": 1,
+  "stdout": "{\"phase\":\"offline\",\"published\":43497,\"errors\":0,\"faulted\":4}\n",
+  "stderr": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: startup send failures must be surfaced without any incoming query\n    at file:///Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/mdns-wake-20261116/TRANSPORT_PROBE.mjs:58:12 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: false,\n  expected: true,\n  operator: '==',\n  diff: 'simple'\n}\n\nNode.js v24.11.1\n"
+}

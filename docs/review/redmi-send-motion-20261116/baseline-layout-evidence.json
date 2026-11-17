@@ -1,0 +1,54 @@
+[
+  {
+    "snapshot": "record-initial",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": null,
+    "loadingRows": []
+  },
+  {
+    "snapshot": "record-after-send-0",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": null,
+    "loadingRows": []
+  },
+  {
+    "snapshot": "record-after-send-1",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": "[338,1447][481,1537]",
+    "loadingRows": []
+  },
+  {
+    "snapshot": "record-expanded",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": "[338,1447][481,1537]",
+    "loadingRows": [
+      "读着…",
+      "· 读着…"
+    ]
+  },
+  {
+    "snapshot": "record-after-send-2",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": "[338,1447][481,1537]",
+    "loadingRows": []
+  },
+  {
+    "snapshot": "record-after-send-3",
+    "headerMenu": "[0,0][0,0]",
+    "composer": "[259,1741][1079,1951]",
+    "subagent": "[338,1447][481,1537]",
+    "loadingRows": []
+  },
+  {
+    "snapshot": "record-after-ime",
+    "headerMenu": "[85,220][142,312]",
+    "composer": "[259,2892][1079,3102]",
+    "subagent": null,
+    "loadingRows": []
+  }
+]

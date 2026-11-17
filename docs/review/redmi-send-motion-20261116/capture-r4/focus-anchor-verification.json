@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "previous_reply_id": 65,
+  "states": [
+    {
+      "phase": "before-focus",
+      "visible": true,
+      "bounds": [
+        177,
+        2732,
+        708,
+        2816
+      ],
+      "composer_gap": 76
+    },
+    {
+      "phase": "record-initial",
+      "visible": true,
+      "bounds": [
+        177,
+        1543,
+        708,
+        1627
+      ],
+      "composer_gap": 76
+    }
+  ]
+}

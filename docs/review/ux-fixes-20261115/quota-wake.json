@@ -1,0 +1,22 @@
+{
+  "quotaResetAt": "2026-11-16T02:28:40+08:00",
+  "quotaRemainingPercent": 10,
+  "requestedWakeAt": "2026-11-16T02:29:40+08:00",
+  "ok": true,
+  "wakeReceivedAt": "2026-11-16T02:29:40+08:00",
+  "quotaCheckedAt": "2026-11-16T02:29:54+08:00",
+  "quotaRemainingAfterResetPercent": 100,
+  "resumedMembers": ["luna-app", "luna-runtime", "luna-headless", "luna-ux-review"],
+  "goalRearm": "schedule delivery is not a direct human turn; resume rejected; continue authorized work in current turn",
+  "record": {
+    "id": "schedule-cf951962-ce94-4838-bc7a-b4e5605b3be3",
+    "sessionId": "session-4b67d48d-83ec-484b-aed1-8e74a277be81",
+    "kind": "at",
+    "title": "BotCrew：5h额度刷新后恢复与成员检查",
+    "prompt": "用户已授权的5小时额度恢复唤醒。现在是本轮Codex 5h窗口刷新后1分钟，请继续当前dsh-bot-crew任务，不新建会话。先get_goal和list_agents，读取/Users/cpuser/Code/dsh-bot-crew/docs/review/ux-fixes-20261115/acceptance.md与lead-findings.md、开发进度.md和共享task看板，检查luna-app、luna-runtime、luna-headless、luna-ux-review是否正常、是否因额度中断。若原任务已完成或用户已暂停/取消，停止，不重启任务、不重发消息；否则保留全部未提交修改、配对和原成员上下文，向被额度打断的原成员send_message继续原工作，不重复创建相同成员或重复测试已验收蜂窝/恢复/日志。检查Magpie codex配额是否已刷新；若仍耗尽，按实时resetsAt加60秒安排下一次一次性当前会话提醒。继续未完成的代码评审、同签OPPO安装、用户体验回归与独立profile无DSH Web切换，不commit/push，不接管Mac输入焦点。仅报告关键结果。",
+    "state": "active",
+    "scheduledAt": "2026-11-15T18:29:40.000Z",
+    "updatedAt": "2026-11-15T16:31:38.605Z",
+    "status": "active"
+  }
+}

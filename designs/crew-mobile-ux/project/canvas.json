@@ -1,0 +1,17 @@
+{
+  "v": 3,
+  "createdOnFiles": { "v": 1, "at": "2026-11-15T15:30:00Z" },
+  "title": "Bot Crew 手机紧凑布局",
+  "launch": { "view": "canvas" },
+  "pages": [],
+  "boards": {
+    "Main.dc.html": { "x": 0, "y": 0, "w": 390, "h": 844, "title": "聊天首屏（单行顶栏）" },
+    "Drawer.dc.html": { "x": 470, "y": 0, "w": 390, "h": 844, "title": "侧边栏打开" },
+    "Tasks.dc.html": { "x": 940, "y": 0, "w": 390, "h": 844, "title": "任务 / 审批（单行顶栏）" }
+  },
+  "order": ["Main.dc.html", "Drawer.dc.html", "Tasks.dc.html"],
+  "notes": {
+    "hdr1": { "x": 0, "y": -320, "text": "Bot Crew 手机端 · 单行顶栏 + 侧边栏", "kind": "title1", "maxW": 1840 }
+  },
+  "designSystems": []
+}

@@ -1,0 +1,446 @@
+{
+  "generatedAt": "2026-11-17T10:58:40+08:00",
+  "mode": "promote-prepared-existing-bytes",
+  "prepared": {
+    "dir": "/Users/cpuser/Code/dsh-bot-crew/app/build/ota/4-product-ux-20261117-r3",
+    "manifestPath": "/Users/cpuser/Code/dsh-bot-crew/app/build/ota/4-product-ux-20261117-r3/manifest.json",
+    "manifestSha256OfFile": "14650d7213f64ed3c66057041374b1c25a8980553e44e58293eac1b1cca1fe41",
+    "manifest": {
+      "schemaVersion": 1,
+      "packageName": "com.dsh.botcrew",
+      "versionCode": 4,
+      "versionName": "0.2.1",
+      "buildId": "product-ux-20261117-r3",
+      "minSdk": 26,
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "size": 12889245,
+      "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+    },
+    "apk": "/Users/cpuser/Code/dsh-bot-crew/app/build/ota/4-product-ux-20261117-r3/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+    "apkSize": 12889245,
+    "apkSha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+    "receiptBefore": {
+      "published": false,
+      "apk": "/Users/cpuser/Code/dsh-bot-crew/app/build/ota/4-product-ux-20261117-r3/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "versionCode": 4,
+      "versionName": "0.2.1",
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "manifestUrl": "https://crew.kentonnie.top/updates/android/manifest.json",
+      "bootstrapUrl": "https://crew.kentonnie.top/updates/android/latest.apk",
+      "publishedFile": null
+    }
+  },
+  "toolchain": {
+    "javaHome": "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+    "androidHome": "/Users/cpuser/Library/Android/sdk",
+    "buildTools": "/Users/cpuser/Library/Android/sdk/build-tools/35.0.0",
+    "apksigner": "/Users/cpuser/Library/Android/sdk/build-tools/35.0.0/apksigner",
+    "aapt": "/Users/cpuser/Library/Android/sdk/build-tools/35.0.0/aapt"
+  },
+  "checks": [
+    {
+      "name": "module.PACKAGE",
+      "ok": true,
+      "expected": "com.dsh.botcrew",
+      "actual": "com.dsh.botcrew"
+    },
+    {
+      "name": "module.SIGNER 与发布目标一致",
+      "ok": true,
+      "expected": "ad0e44...f7eb",
+      "actual": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb"
+    },
+    {
+      "name": "toolchain exists: /Users/cpuser/Library/Android/sdk/build-tools/35.0.0/apksigner",
+      "ok": true,
+      "expected": "exists",
+      "actual": true
+    },
+    {
+      "name": "toolchain exists: /Users/cpuser/Library/Android/sdk/build-tools/35.0.0/aapt",
+      "ok": true,
+      "expected": "exists",
+      "actual": true
+    },
+    {
+      "name": "toolchain exists: /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java",
+      "ok": true,
+      "expected": "exists",
+      "actual": true
+    },
+    {
+      "name": "prepared receipt published=false",
+      "ok": true,
+      "expected": false,
+      "actual": false
+    },
+    {
+      "name": "flock 获取成功",
+      "ok": true
+    },
+    {
+      "name": "线上原为 3 / 0.2.0",
+      "ok": true,
+      "expected": "3/0.2.0",
+      "actual": "3/0.2.0"
+    },
+    {
+      "name": "目标 versionCode=4 严格递增",
+      "ok": true,
+      "expected": "4 > 3",
+      "actual": 4
+    },
+    {
+      "name": "versionName 与 prepared 一致",
+      "ok": true,
+      "expected": "0.2.1",
+      "actual": "0.2.1"
+    },
+    {
+      "name": "minSdk 与 prepared 一致",
+      "ok": true,
+      "expected": 26,
+      "actual": 26
+    },
+    {
+      "name": "size 与 prepared 一致",
+      "ok": true,
+      "expected": 12889245,
+      "actual": 12889245
+    },
+    {
+      "name": "APK sha256 与 prepared 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "manifest signerSha256 为既有 BotCrew",
+      "ok": true,
+      "expected": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "actual": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb"
+    },
+    {
+      "name": "manifest packageName",
+      "ok": true,
+      "expected": "com.dsh.botcrew",
+      "actual": "com.dsh.botcrew"
+    },
+    {
+      "name": "manifest apkPath 与 code/sha 一致",
+      "ok": true,
+      "expected": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "actual": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk"
+    },
+    {
+      "name": "manifest schemaVersion",
+      "ok": true,
+      "expected": 1,
+      "actual": 1
+    },
+    {
+      "name": "不可变 APK 落地且内容一致",
+      "ok": true,
+      "expected": "/Users/cpuser/.dsh/state/superagent/android-updates/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "actual": "/Users/cpuser/.dsh/state/superagent/android-updates/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk"
+    },
+    {
+      "name": "线上 manifest == prepared manifest",
+      "ok": true,
+      "expected": {
+        "schemaVersion": 1,
+        "packageName": "com.dsh.botcrew",
+        "versionCode": 4,
+        "versionName": "0.2.1",
+        "buildId": "product-ux-20261117-r3",
+        "minSdk": 26,
+        "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+        "size": 12889245,
+        "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+        "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+        "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+      },
+      "actual": {
+        "schemaVersion": 1,
+        "packageName": "com.dsh.botcrew",
+        "versionCode": 4,
+        "versionName": "0.2.1",
+        "buildId": "product-ux-20261117-r3",
+        "minSdk": 26,
+        "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+        "size": 12889245,
+        "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+        "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+        "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+      }
+    },
+    {
+      "name": "线上 versionCode=4",
+      "ok": true,
+      "expected": 4,
+      "actual": 4
+    },
+    {
+      "name": "线上 versionName=0.2.1",
+      "ok": true,
+      "expected": "0.2.1",
+      "actual": "0.2.1"
+    },
+    {
+      "name": "线上 sha256 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "线上 apkPath 正确",
+      "ok": true,
+      "expected": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "actual": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk"
+    },
+    {
+      "name": "旧版本目录 3/ 保留（递增而非覆盖）",
+      "ok": true,
+      "expected": "exists",
+      "actual": true
+    },
+    {
+      "name": "本地 apkPath 文件 hash 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "本地 HTTP apkPath hash 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "公网 manifest versionCode=4",
+      "ok": true,
+      "expected": 4,
+      "actual": 4
+    },
+    {
+      "name": "公网 manifest versionName=0.2.1",
+      "ok": true,
+      "expected": "0.2.1",
+      "actual": "0.2.1"
+    },
+    {
+      "name": "公网 manifest sha256 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "公网 manifest apkPath 正确",
+      "ok": true,
+      "expected": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "actual": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk"
+    },
+    {
+      "name": "公网 manifest 与本地发布根一致",
+      "ok": true,
+      "expected": "equal",
+      "actual": "equal"
+    },
+    {
+      "name": "公网 apkPath HTTP 200",
+      "ok": true,
+      "expected": 200,
+      "actual": 200
+    },
+    {
+      "name": "公网 apkPath 字节数一致",
+      "ok": true,
+      "expected": 12889245,
+      "actual": 12889245
+    },
+    {
+      "name": "公网 apkPath hash 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "公网 latest.apk 302 指向新 apkPath（Cloudflare 将相对 Location 改写为绝对 URL）",
+      "ok": true,
+      "expected": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "actual": "https://crew.kentonnie.top/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "note": "原始 Location 由 Cloudflare 边缘改写为绝对 URL；同源、路径部分与 manifest.apkPath 完全一致，且跟随下载的 12889245 字节 hash 已验证为 81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec。",
+      "rawRelativeFromOrigin": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "assertionFixAt": "2026-11-17T10:59:21+08:00"
+    },
+    {
+      "name": "公网 latest.apk 引导包 hash 与 manifest 一致",
+      "ok": true,
+      "expected": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "actual": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    {
+      "name": "公网旧 3/ APK 仍可取",
+      "ok": true,
+      "expected": "200",
+      "actual": "200 0"
+    }
+  ],
+  "publish": {
+    "called": true,
+    "destination": "/Users/cpuser/.dsh/state/superagent/android-updates/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+    "destinationSize": 12889245,
+    "destinationSha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+  },
+  "online": {
+    "localManifest": {
+      "schemaVersion": 1,
+      "packageName": "com.dsh.botcrew",
+      "versionCode": 4,
+      "versionName": "0.2.1",
+      "buildId": "product-ux-20261117-r3",
+      "minSdk": 26,
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "size": 12889245,
+      "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+    },
+    "apkFile": {
+      "path": "/Users/cpuser/.dsh/state/superagent/android-updates/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "size": 12889245,
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    "apkOverLocalHttp": {
+      "url": "http://127.0.0.1:43499/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "finalUrl": "http://127.0.0.1:43499/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "bytes": 12889245,
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    "uaNote": {
+      "pythonUrllibUa": "Python-urllib/3.9 -> HTTP 403 (Cloudflare)",
+      "browserUa": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 -> HTTP 200",
+      "conclusion": "Cloudflare 按 UA 拦截脚本默认 UA；浏览器与 App 下载不受影响。"
+    },
+    "publicManifest": {
+      "url": "https://crew.kentonnie.top/updates/android/manifest.json",
+      "value": {
+        "schemaVersion": 1,
+        "packageName": "com.dsh.botcrew",
+        "versionCode": 4,
+        "versionName": "0.2.1",
+        "buildId": "product-ux-20261117-r3",
+        "minSdk": 26,
+        "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+        "size": 12889245,
+        "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+        "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+        "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+      }
+    },
+    "publicApkDownload": {
+      "url": "https://crew.kentonnie.top/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "status": 200,
+      "bytes": 12889245,
+      "finalUrl": "https://crew.kentonnie.top/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    "publicLatestRedirect": {
+      "url": "https://crew.kentonnie.top/updates/android/latest.apk",
+      "status": 302,
+      "location": "https://crew.kentonnie.top/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk"
+    },
+    "publicLatestDownload": {
+      "url": "https://crew.kentonnie.top/updates/android/latest.apk",
+      "status": 200,
+      "bytes": 12889245,
+      "finalUrl": "https://crew.kentonnie.top/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+    },
+    "publicOldApkHead": {
+      "url": "https://crew.kentonnie.top/updates/android/3/17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679.apk",
+      "result": "200 0"
+    }
+  },
+  "previous": {
+    "manifest": {
+      "schemaVersion": 1,
+      "packageName": "com.dsh.botcrew",
+      "versionCode": 3,
+      "versionName": "0.2.0",
+      "buildId": "ota-20261116-r1",
+      "minSdk": 26,
+      "sha256": "17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679",
+      "size": 12852381,
+      "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "apkPath": "/updates/android/3/17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679.apk",
+      "notes": "支持应用内检查更新、断点续传和系统安装确认。"
+    },
+    "manifestPath": "/Users/cpuser/.dsh/state/superagent/android-updates/manifest.json",
+    "manifestFileSha256": "3e823552e1808a9f288396c5443aff6ec80428ee91feb73ed6bb09a99fb0830c"
+  },
+  "receiptAfter": {
+    "published": true,
+    "apk": "/Users/cpuser/Code/dsh-bot-crew/app/build/ota/4-product-ux-20261117-r3/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+    "versionCode": 4,
+    "versionName": "0.2.1",
+    "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+    "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+    "manifestUrl": "https://crew.kentonnie.top/updates/android/manifest.json",
+    "bootstrapUrl": "https://crew.kentonnie.top/updates/android/latest.apk",
+    "publishedFile": "/Users/cpuser/.dsh/state/superagent/android-updates/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+    "publishedAt": "2026-11-17T10:58:40+08:00",
+    "root": "/Users/cpuser/.dsh/state/superagent/android-updates",
+    "previousVersionCode": 3,
+    "previousSha256": "17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679",
+    "reconstructedAt": "2026-11-17T10:59:54+08:00",
+    "note": "prepared 目录的 receipt.json 保持 published=false 未改动；发布后 receipt 记录在此。"
+  },
+  "status": "published-verified",
+  "failure": null,
+  "finalSnapshot": {
+    "root": "/Users/cpuser/.dsh/state/superagent/android-updates",
+    "manifest": {
+      "schemaVersion": 1,
+      "packageName": "com.dsh.botcrew",
+      "versionCode": 4,
+      "versionName": "0.2.1",
+      "buildId": "product-ux-20261117-r3",
+      "minSdk": 26,
+      "sha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec",
+      "size": 12889245,
+      "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+      "apkPath": "/updates/android/4/81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec.apk",
+      "notes": "显示真实执行状态，提供可读审批，保存草稿并恢复待确认发送。"
+    },
+    "manifestFileSha256": "14650d7213f64ed3c66057041374b1c25a8980553e44e58293eac1b1cca1fe41",
+    "entries": [
+      ".publish.lock",
+      "3",
+      "4",
+      "manifest.json"
+    ],
+    "v4ApkSha256": "81166773c515cb473eddde85d0376a30e9c08cb8e78ff47a9020e0e5ef30edec"
+  },
+  "verifiedAt": "2026-11-17T10:59:08+08:00",
+  "checksPassed": 37,
+  "checksTotal": 37,
+  "verificationNotes": [
+    "公网首轮取包使用 Python-urllib 默认 UA，被 Cloudflare 以 403 拒绝；同一 URL 用浏览器 UA 为 200，浏览器与 App 下载不受影响。",
+    "Cloudflare 把后端相对 Location 改写为绝对 URL，路径同源同值；已按路径校验并保留改写后的原始值。",
+    "首轮脚本在公网取包处因 UA 被 403 中断，publish 已完成；第 8-10 步由 verify_r3.py 补齐。发布后 receipt 由 prepared receipt + 实际 publish 结果重建记录，prepared 目录未改动。"
+  ],
+  "interrupted": {
+    "step": "[7] 公网 apkPath HTTP 直取",
+    "exception": "EXCEPTION: HTTPError: HTTP Error 403: Forbidden",
+    "cause": "Cloudflare 以 403 拒绝 Python-urllib 默认 User-Agent；同一 URL 用浏览器 UA 为 200。",
+    "resolved": true,
+    "resolvedBy": "verify_r3.py 改用浏览器 UA 重取，manifest/apkPath/latest.apk 全部通过",
+    "publishAlreadyDone": true,
+    "note": "异常发生在 publish 之后，line[8]-[10] 未在该进程执行，由后续只读验证补齐。"
+  },
+  "completedAt": "2026-11-17T10:59:54+08:00"
+}

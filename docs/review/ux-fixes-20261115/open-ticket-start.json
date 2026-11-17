@@ -1,0 +1,31 @@
+[
+  {
+    "id": "19467b31071433bf3e5e5c552602765c",
+    "title": "只回复一句「嗨」",
+    "origin": {
+      "triggerId": "5e7e28cae34233e2d287983be5d2da67",
+      "triggerIds": [
+        "5e7e28cae34233e2d287983be5d2da67"
+      ]
+    },
+    "assignments": [
+      {
+        "id": "558ab1cc5e60849654303faeffc6c5ee",
+        "state": "running",
+        "createdAt": "2026-11-15T15:38:46.417Z",
+        "startedAt": "2026-11-15T15:38:49.265Z",
+        "idleAt": "2026-11-15T15:39:00.068Z"
+      }
+    ],
+    "attention": {
+      "id": "attention-connection-19467b31071433bf3e5e5c552602765c-3e23fec292a0c463ea1dd7ff5f0384f3",
+      "question": "要通过消息做改动（send_message），先问你一声。要「mcp__messages__send_message（{\"channel\":\"main\",\"to\":\"m19\",\"text\":\"嗨\"}）」吗？",
+      "triggerId": "5e7e28cae34233e2d287983be5d2da67"
+    },
+    "pendingApproval": {
+      "kind": "connection",
+      "status": "waiting"
+    },
+    "updatedAt": "2026-11-15T15:38:53.731Z"
+  }
+]

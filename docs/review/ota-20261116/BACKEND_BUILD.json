@@ -1,0 +1,23 @@
+{
+  "at": "2026-11-16T21:52:01.043402+08:00",
+  "results": [
+    {
+      "command": [
+        "pnpm",
+        "typecheck"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "$ tsc --noEmit\n"
+    },
+    {
+      "command": [
+        "pnpm",
+        "build"
+      ],
+      "returncode": 0,
+      "stdout": "\u2139 tsdown v0.22.14 powered by rolldown v1.2.7\n\u2139 config file: /Users/cpuser/Code/dsh-bot-crew/backend/tsdown.config.ts \n\u2139 entry: src/index.ts, src/sources/github.ts, src/sources/feishu.ts, src/sources/mobile.ts, src/sources/team.ts, src/executor/sandbox.ts, src/executor/worker-fs.ts, src/executor/worker-search-subprocess.ts\n\u2139 target: es2024\n\u2139 tsconfig: tsconfig.json\n\u2139 entry: src/client/index.tsx\n\u2139 target: node22.19.0\n\u2139 tsconfig: tsconfig.json\n\u2139 Build start\n\u2139 Cleaning 27 files\n\u2139 [CJS] lib/client.js  386.06 kB \u2502 gzip: 94.61 kB\n\u2139 [CJS] 1 files, total: 386.06 kB\n\u2714 Build complete in 1580ms\n\u2139 [ESM] lib/index.js                       922.30 kB \u2502 gzip: 295.67 kB\n\u2139 [ESM] lib/github-watch.js                 33.99 kB \u2502 gzip:  11.02 kB\n\u2139 [ESM] lib/team-watch.js                   19.01 kB \u2502 gzip:   7.12 kB\n\u2139 [ESM] lib/worker-fs.js                    15.38 kB \u2502 gzip:   5.82 kB\n\u2139 [ESM] lib/mobile-watch.js                 14.57 kB \u2502 gzip:   6.01 kB\n\u2139 [ESM] lib/worker-search-subprocess.js      4.32 kB \u2502 gzip:   2.21 kB\n\u2139 [ESM] lib/worker-sandbox.js                3.57 kB \u2502 gzip:   2.06 kB\n\u2139 [ESM] lib/feishu-watch.js                  0.60 kB \u2502 gzip:   0.29 kB\n\u2139 [ESM] lib/feishu-DqYUIoyf.js              48.40 kB \u2502 gzip:  14.60 kB\n\u2139 [ESM] lib/github-pull-CnGkHzoR.js         25.46 kB \u2502 gzip:   8.25 kB\n\u2139 [ESM] lib/environment-WOZwMtK8.js         21.37 kB \u2502 gzip:   9.46 kB\n\u2139 [ESM] lib/kv-BfV7HAyj.js                  14.25 kB \u2502 gzip:   6.75 kB\n\u2139 [ESM] lib/poll-DMzkq2KA.js                11.24 kB \u2502 gzip:   4.39 kB\n\u2139 [ESM] lib/commands-x6CB7e06.js             7.52 kB \u2502 gzip:   3.15 kB\n\u2139 [ESM] lib/directory-Dn-D12LZ.js            1.62 kB \u2502 gzip:   0.69 kB\n\u2139 [ESM] lib/index.d.ts                      27.66 kB \u2502 gzip:   9.29 kB\n\u2139 [ESM] lib/worker-fs.d.ts                   6.11 kB \u2502 gzip:   2.77 kB\n\u2139 [ESM] lib/feishu-watch.d.ts                5.98 kB \u2502 gzip:   2.00 kB\n\u2139 [ESM] lib/team-watch.d.ts                  5.44 kB \u2502 gzip:   2.75 kB\n\u2139 [ESM] lib/mobile-watch.d.ts                5.08 kB \u2502 gzip:   2.57 kB\n\u2139 [ESM] lib/worker-sandbox.d.ts              2.31 kB \u2502 gzip:   1.24 kB\n\u2139 [ESM] lib/worker-search-subprocess.d.ts    1.71 kB \u2502 gzip:   1.03 kB\n\u2139 [ESM] lib/github-watch.d.ts                0.39 kB \u2502 gzip:   0.22 kB\n\u2139 [ESM] lib/kind-C69yjNtk.d.ts              46.74 kB \u2502 gzip:   9.85 kB\n\u2139 [ESM] lib/intake-xX55zmMx.d.ts            31.00 kB \u2502 gzip:  10.01 kB\n\u2139 [ESM] 25 files, total: 1.28 MB\n\u2714 Build complete in 1855ms\n",
+      "stderr": "$ tsdown\n\n WARN  We recommend using the ESM format instead of CommonJS.\nThe ESM format is compatible with modern platforms and runtimes, and most new libraries are now distributed only in ESM format.\nLearn more at https://nodejs.org/en/learn/modules/publishing-a-package#how-did-we-get-here\n\n"
+    }
+  ]
+}

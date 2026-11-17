@@ -1,0 +1,34 @@
+{
+  "pids": [
+    12345
+  ],
+  "cwd": "/Users/cpuser/Code/dsh-bot-crew/backend",
+  "mode": "no-web",
+  "url": "http://127.0.0.1:63886",
+  "manually_stopped": false,
+  "health": {
+    "runtime": "ready",
+    "relay": "ready",
+    "notice": "ready",
+    "memory": "ready",
+    "launch": "ready",
+    "delivery": "ready",
+    "assessment": "ready",
+    "reply": "ready",
+    "evals": "ready",
+    "models": "ready",
+    "discovery": "ready",
+    "p2p": "ready",
+    "github": "ready",
+    "team": "ready"
+  },
+  "errors": {},
+  "setup": null,
+  "feishu": null,
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "paused": false
+}

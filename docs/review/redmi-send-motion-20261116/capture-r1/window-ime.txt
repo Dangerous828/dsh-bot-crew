@@ -1,0 +1,6 @@
+  Window #13 Window{e044ff u0 com.dsh.botcrew/com.dsh.botcrew.MainActivity}:
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan forwardNavigation} layoutInDisplayCutoutMode=always pkg = com.dsh.botcrew adpkg = null ty=BASE_APPLICATION wanim=0x103030e
+    mViewVisibility=0x0 mHaveFrame=true mObscured=false
+    mGivenContentInsets=[0,0][0,0] mGivenVisibleInsets=[0,0][0,0]
+    mHasSurface=true isReadyForDisplay()=true mWindowRemovalAllowed=false
+    Frames: parent=[0,0][1440,3200] display=[0,0][1440,3200] frame=[0,0][1440,3200] last=[0,0][1440,3200] insetsChanged=false

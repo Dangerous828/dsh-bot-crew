@@ -1,0 +1,86 @@
+{
+  "passed": false,
+  "visual_frame_review_required": true,
+  "failures": [
+    "record-initial: header outside visible window",
+    "record-after-send-0: header outside visible window",
+    "record-after-send-1: header outside visible window",
+    "record-after-send-1: direct chat exposes an unrelated subagent card",
+    "record-expanded: header outside visible window",
+    "record-expanded: direct chat exposes an unrelated subagent card",
+    "record-expanded: loading text inserted into the message list",
+    "record-after-send-2: header outside visible window",
+    "record-after-send-2: direct chat exposes an unrelated subagent card",
+    "record-after-send-3: header outside visible window",
+    "record-after-send-3: direct chat exposes an unrelated subagent card",
+    "reply-to-composer gap changes after response/keyboard settles"
+  ],
+  "snapshots": [
+    {
+      "snapshot": "record-initial",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-0",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-1",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": true,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-expanded",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": true,
+      "loading_rows": [
+        "读着…",
+        "· 读着…"
+      ],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-2",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": true,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": 332
+    },
+    {
+      "snapshot": "record-after-send-3",
+      "header": "[0,0][0,0]",
+      "header_visible": false,
+      "subagent_card": true,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": 332
+    },
+    {
+      "snapshot": "record-after-ime",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": 76
+    }
+  ]
+}

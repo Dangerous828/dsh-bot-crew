@@ -1,0 +1,27 @@
+{
+  "before": {
+    "messages": 69,
+    "replies": 52,
+    "tickets": 28
+  },
+  "after": {
+    "messages": 70,
+    "replies": 53,
+    "tickets": 28
+  },
+  "sent": {
+    "id": 72,
+    "text": "Only reply hi",
+    "conversation": "main"
+  },
+  "reply": {
+    "id": 58,
+    "to_msg": 72,
+    "text": "hi",
+    "bot_id": "lead"
+  },
+  "oneReplyOnly": true,
+  "noTicketCreated": true,
+  "noLiveApprovalCard": true,
+  "noRePair": true
+}

@@ -1,0 +1,32 @@
+{
+  "apkSha256": "60c1fe57e8ce200275a462c05bffadedb29d2ddeac5178216e906dc5b7471516",
+  "before": {
+    "messages": 70,
+    "replies": 53,
+    "tickets": 28
+  },
+  "after": {
+    "messages": 71,
+    "replies": 54,
+    "tickets": 28
+  },
+  "sent": {
+    "id": 73,
+    "text": "Reply with OK",
+    "conversation": "main"
+  },
+  "reply": {
+    "id": 59,
+    "to_msg": 73,
+    "text": "OK",
+    "bot_id": "lead"
+  },
+  "reasonCode": "answeredDirectly",
+  "latestUserAndReplyVisible": true,
+  "noDeclinedBanner": true,
+  "noQueueLabel": true,
+  "noApproval": true,
+  "noNewTicket": true,
+  "firstInstallTime": "2026-11-11 22:27:11",
+  "noRePair": true
+}

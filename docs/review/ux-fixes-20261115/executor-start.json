@@ -1,0 +1,9 @@
+{
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "paused": false,
+  "masterId": "orchestrator-bbbb4bafe8b5e5afe49748149f93df3d"
+}

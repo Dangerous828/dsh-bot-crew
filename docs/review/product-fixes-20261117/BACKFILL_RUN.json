@@ -1,0 +1,214 @@
+{
+  "at": "2026-11-17T10:59:16+08:00",
+  "executedBy": "developer",
+  "repo": "/Users/cpuser/Code/dsh-bot-crew",
+  "script": "scripts/backfill-mobile-reply-kinds",
+  "log": "docs/review/product-fixes-20261117/BACKFILL_RUN.log",
+  "matchRule": "exact: orchestrator.outbox.id == mobileq.replies.rkey, kind from outbox.value.kind, legal set only",
+  "legalKinds": [
+    "acknowledgement",
+    "notice",
+    "reply"
+  ],
+  "textOrRegexInference": false,
+  "schemaChanged": false,
+  "tests": {
+    "command": "python3 -m unittest scripts/tests/test_backfill_mobile_reply_kinds.py -v",
+    "count": 4,
+    "failures": 0,
+    "result": "OK"
+  },
+  "snapshot": {
+    "method": "sqlite3 .backup (consistent online backup, WAL included)",
+    "dir": "/Users/cpuser/.dsh/backups/botcrew-reply-kinds-20261117-105747",
+    "overwroteExisting": false,
+    "files": {
+      "orchestrator.sqlite": {
+        "sha256": "66f2bafe1ca00154fb36af565a0ed6b6371527dd795419b396a510387288f6a8",
+        "bytes": 6033408,
+        "integrityCheck": "ok",
+        "journalMode": "wal"
+      },
+      "mobileq.db": {
+        "sha256": "f563e198b26aeb902bad6d689faa49238267d71cf911b20f86d34a9bf3bc3258",
+        "bytes": 57344,
+        "integrityCheck": "ok",
+        "journalMode": "delete"
+      }
+    },
+    "contents": {
+      "outboxRows": 65,
+      "outboxKinds": {
+        "acknowledgement": 29,
+        "notice": 2,
+        "reply": 34
+      },
+      "repliesRows": 65,
+      "repliesKindNull": 65
+    }
+  },
+  "rehearsal": {
+    "where": "/Users/cpuser/.dsh/backups/botcrew-reply-kinds-20261117-105747-rehearsal (copy of snapshot; snapshot itself never written)",
+    "expectedFrom": "docs/review/product-fixes-20261117/MIGRATION_CHECK.json",
+    "dryRunOnSnapshot": {
+      "applied": false,
+      "matched": 65,
+      "remainingLegacy": 0,
+      "kinds": {
+        "acknowledgement": 29,
+        "notice": 2,
+        "reply": 34
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "contentPreserved": true,
+      "snapshotMobileqShaBeforeAfter": "f563e198b26aeb902bad6d689faa49238267d71cf911b20f86d34a9bf3bc3258"
+    },
+    "applyOnCopy": {
+      "applied": true,
+      "matched": 65,
+      "remainingLegacy": 0,
+      "kinds": {
+        "acknowledgement": 29,
+        "notice": 2,
+        "reply": 34
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "contentPreserved": true
+    },
+    "secondApplyOnCopy": {
+      "applied": true,
+      "matched": 0,
+      "remainingLegacy": 0,
+      "kinds": {
+        "acknowledgement": 0,
+        "notice": 0,
+        "reply": 0
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "contentPreserved": true
+    },
+    "finalDistributionOnCopy": {
+      "acknowledgement": 29,
+      "notice": 2,
+      "reply": 34
+    },
+    "matchesMigrationCheck": true,
+    "differences": []
+  },
+  "production": {
+    "stateDir": "/Users/cpuser/.dsh/state/superagent",
+    "before": {
+      "repliesRows": 65,
+      "kindDistribution": {
+        "<null>": 65
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "mobileqSha256": "d0be9de2ad93170bde482832a12c655982559d513b593779f62bdbf0b241fa34",
+      "orchestratorSha256": "bc205ae5ab684a76e9beb19aa5e86d57d5409ec4e7fc8bcf3bd0bfada5e91284"
+    },
+    "run1": {
+      "command": "python3 scripts/backfill-mobile-reply-kinds --state-dir /Users/cpuser/.dsh/state/superagent --apply",
+      "applied": true,
+      "matched": 65,
+      "remainingLegacy": 0,
+      "kinds": {
+        "acknowledgement": 29,
+        "notice": 2,
+        "reply": 34
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "contentPreserved": true,
+      "exitCode": 0
+    },
+    "run2": {
+      "command": "python3 scripts/backfill-mobile-reply-kinds --state-dir /Users/cpuser/.dsh/state/superagent --apply",
+      "applied": true,
+      "matched": 0,
+      "written": 0,
+      "remainingLegacy": 0,
+      "kinds": {
+        "acknowledgement": 0,
+        "notice": 0,
+        "reply": 0
+      },
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "contentPreserved": true,
+      "exitCode": 0,
+      "idempotent": true
+    },
+    "after": {
+      "repliesRows": 65,
+      "kindDistribution": {
+        "acknowledgement": 29,
+        "notice": 2,
+        "reply": 34
+      },
+      "kindNull": 0,
+      "kindOutsideLegalSet": 0,
+      "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+      "mobileqSha256": "3abd04aa13743f902eff868c77f33e10066e7a0538a5c34d86ad2a78faa06659",
+      "orchestratorSha256": "bc205ae5ab684a76e9beb19aa5e86d57d5409ec4e7fc8bcf3bd0bfada5e91284",
+      "integrityCheck": "ok",
+      "schemaColumns": [
+        "id",
+        "conversation",
+        "to_msg",
+        "rkey",
+        "text",
+        "at",
+        "bot_id",
+        "kind"
+      ]
+    },
+    "otherColumnsUnchanged": true,
+    "otherColumnsEvidence": {
+      "method": "dump of (id,conversation,to_msg,rkey,text,at,bot_id) ordered by id before and after, diff",
+      "diff": "identical",
+      "files": [
+        "/Users/cpuser/.dsh/backups/botcrew-reply-kinds-20261117-105747/replies.pre.tsv",
+        "/Users/cpuser/.dsh/backups/botcrew-reply-kinds-20261117-105747/replies.post.tsv"
+      ]
+    },
+    "run3": {
+      "command": "python3 scripts/backfill-mobile-reply-kinds --state-dir /Users/cpuser/.dsh/state/superagent --apply",
+      "matched": 0,
+      "written": 0,
+      "contentPreserved": true,
+      "note": "收尾复核，仍为 0 写入"
+    }
+  },
+  "crossCheck": {
+    "rule": "for every replies row: outbox[rkey].kind == replies.kind",
+    "rowsChecked": 65,
+    "kindMismatches": 0,
+    "rkeyWithoutOutboxReceipt": 0,
+    "result": "PASS"
+  },
+  "outboxUntouched": {
+    "rowsBefore": 65,
+    "rowsAfter": 65,
+    "kinds": {
+      "acknowledgement": 29,
+      "notice": 2,
+      "reply": 34
+    },
+    "fileShaUnchanged": true,
+    "accessMode": "mode=ro only"
+  },
+  "service": {
+    "pid": 36183,
+    "command": "node /Users/cpuser/.nvm/versions/node/v24.11.1/bin/dsh --profile superagent",
+    "port": 62502,
+    "listen": "127.0.0.1:62502",
+    "restarted": false
+  },
+  "redlines": {
+    "singleExactMatchUpdateOnProduction": true,
+    "textOrRegexKindGuessing": false,
+    "schemaChange": false,
+    "otherDatabasesTouched": false,
+    "serviceRestarted": false,
+    "gitCommitOrPush": false
+  },
+  "rollback": "restore mobileq.db from /Users/cpuser/.dsh/backups/botcrew-reply-kinds-20261117-105747/mobileq.db, or set the 65 affected kind values back to NULL by id"
+}

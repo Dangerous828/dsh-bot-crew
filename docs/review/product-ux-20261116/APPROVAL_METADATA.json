@@ -1,0 +1,32 @@
+{
+  "readOnly": true,
+  "matches": [
+    {
+      "ticketId": "b27d050c32809d77a2a8b425050d379e",
+      "originTriggerId": "b4883525da2a11a2ff8fa54201ed6cdc",
+      "originSource": "team",
+      "originHuman": true,
+      "originChannel": {
+        "source": "team",
+        "thread": "team:main:82",
+        "address": {
+          "conversation": "main",
+          "message": "82",
+          "bot_id": "lead",
+          "registeredSessions": "[\"work\"]"
+        }
+      },
+      "pendingApproval": {
+        "kind": "connection",
+        "status": "waiting"
+      },
+      "attentionId": "attention-connection-b27d050c32809d77a2a8b425050d379e-8e69f0254fa7d1f12776752cbbfa20f6",
+      "questionChars": 545,
+      "targetFromScreenshot": {
+        "channel": "main",
+        "to": "m82",
+        "bot_id_present": false
+      }
+    }
+  ]
+}

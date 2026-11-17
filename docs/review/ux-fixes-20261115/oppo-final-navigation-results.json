@@ -1,0 +1,14 @@
+{
+  "chatWorkspaceSystemBackPreservesDraft": true,
+  "tasksWorkspaceUiBackPreservesModeAndDraft": true,
+  "modelsSystemBackPreservesTasksMode": true,
+  "backendSystemBackPreservesTasksMode": true,
+  "drawerImmediateSystemBackStaysInApp": true,
+  "drawerImmediateSystemBackTrials": 3,
+  "testDraftClearedWithoutSending": true,
+  "taskEntryLabel": "任务",
+  "duplicateTaskEntryAbsent": true,
+  "voiceControlsAbsent": true,
+  "staleApprovalRemoved": true,
+  "sameNameReceiveTestPackage": "disabled-user; package and data retained"
+}

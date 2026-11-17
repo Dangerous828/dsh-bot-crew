@@ -1,0 +1,18 @@
+{
+  "at": "2026-11-17T05:08:52.738744+08:00",
+  "backup": "/Users/cpuser/.dsh/backups/botcrew-product-fixes-20261117-050742",
+  "headless": {
+    "pid": 12345,
+    "port": 53959,
+    "profile": "superagent",
+    "stateDir": "/Users/cpuser/.dsh/state/superagent"
+  },
+  "sourceFiles": 453,
+  "counts": {
+    "ticket": 29,
+    "messages": 80,
+    "replies": 65
+  },
+  "pairedSha256": "c734b78fc2f3f0d717cf2c4666dd9a765da612abb944117d18868fad9f58f5de",
+  "gatewayDatabase": "mobileq.db"
+}

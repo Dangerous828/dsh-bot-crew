@@ -1,0 +1,22 @@
+{
+  "at": "2026-11-16T09:56:51.644466+08:00",
+  "serial": "9f9cc3db",
+  "model": "24117RK2CC",
+  "package": "com.dsh.botcrew",
+  "installed": true,
+  "apkSha256": "60c1fe57e8ce200275a462c05bffadedb29d2ddeac5178216e906dc5b7471516",
+  "certificateSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+  "before": {
+    "firstInstallTime": "2026-11-11 18:15:06",
+    "lastUpdateTime": "2026-11-15 22:23:54",
+    "versionName": "0.1.0"
+  },
+  "after": {
+    "firstInstallTime": "2026-11-11 18:15:06",
+    "lastUpdateTime": "2026-11-16 09:56:49",
+    "versionName": "0.1.0"
+  },
+  "sameSignature": true,
+  "dataCleared": false,
+  "uninstalled": false
+}

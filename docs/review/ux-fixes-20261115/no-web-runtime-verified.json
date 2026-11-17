@@ -1,0 +1,46 @@
+{
+  "mode": "no-web",
+  "profile": "superagent",
+  "pids": [
+    16534
+  ],
+  "health": {
+    "runtime": "ready",
+    "relay": "ready",
+    "notice": "ready",
+    "memory": "ready",
+    "launch": "ready",
+    "delivery": "ready",
+    "assessment": "ready",
+    "reply": "ready",
+    "evals": "ready",
+    "models": "ready",
+    "p2p": "ready",
+    "github": "ready",
+    "team": "ready"
+  },
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "healthUrl": "http://127.0.0.1:63455",
+  "identityFilesUnchanged": true,
+  "nonWebProfileConfigUnchanged": true,
+  "web3082Listening": false,
+  "web9082Listening": false,
+  "legacyLoopproxyStopped": [
+    70718
+  ],
+  "preservedListeners": {
+    "43499": [
+      "16534"
+    ],
+    "8788": [
+      "67367"
+    ],
+    "64333": [
+      "54111"
+    ]
+  }
+}

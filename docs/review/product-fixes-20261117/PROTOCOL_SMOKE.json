@@ -1,0 +1,90 @@
+{
+  "at": "2026-11-17T07:23:03.235680+08:00",
+  "syntheticOnly": true,
+  "results": [
+    {
+      "phase": "evaluating",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "evaluating",
+        "activity": {
+          "kind": "evaluating",
+          "since": "2026-11-16T23:23:02.724Z",
+          "at": "2026-11-16T23:23:02.724Z"
+        }
+      }
+    },
+    {
+      "phase": "model",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "accepted",
+        "ticket_ref": "fixture-ticket-1",
+        "activity": {
+          "kind": "model",
+          "at": "2026-11-16T23:23:02.795Z",
+          "since": "2026-11-16T23:23:02.795Z",
+          "label": "模型处理中"
+        }
+      }
+    },
+    {
+      "phase": "tool",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "accepted",
+        "ticket_ref": "fixture-ticket-1",
+        "activity": {
+          "kind": "tool",
+          "at": "2026-11-16T23:23:02.864Z",
+          "since": "2026-11-16T23:23:02.864Z",
+          "label": "读取文件"
+        }
+      }
+    },
+    {
+      "phase": "retrying",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "accepted",
+        "ticket_ref": "fixture-ticket-1",
+        "activity": {
+          "kind": "retrying",
+          "at": "2026-11-16T23:23:02.933Z",
+          "since": "2026-11-16T23:23:02.933Z",
+          "label": "模型正在重试"
+        }
+      }
+    },
+    {
+      "phase": "idle",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "accepted",
+        "ticket_ref": "fixture-ticket-1",
+        "activity": {
+          "kind": "idle",
+          "at": "2026-11-16T23:23:03.003Z",
+          "since": "2026-11-16T23:23:03.003Z",
+          "label": "暂未执行"
+        }
+      }
+    },
+    {
+      "phase": "ended",
+      "item": {
+        "request_id": "c0000000-0000-4000-8000-000000000001",
+        "request_state": "accepted",
+        "ticket_ref": "fixture-ticket-1",
+        "activity": {
+          "kind": "ended",
+          "at": "2026-11-16T23:23:03.075Z",
+          "label": "已完成"
+        }
+      }
+    }
+  ],
+  "ackDidNotClaimReply": true,
+  "typedReplyClaimsReply": true,
+  "completeReceiptStateConsistency": "pending member integration"
+}

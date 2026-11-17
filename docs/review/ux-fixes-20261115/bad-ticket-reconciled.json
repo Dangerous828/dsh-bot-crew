@@ -1,0 +1,21 @@
+{
+  "ticketId": "19467b31071433bf3e5e5c552602765c",
+  "origin": {
+    "conversation": "main",
+    "message": "71"
+  },
+  "existingReplyId": 55,
+  "stopped": true,
+  "pendingAttentionRemoved": true,
+  "countsBefore": {
+    "messages": 69,
+    "replies": 52
+  },
+  "countsAfter": {
+    "messages": 69,
+    "replies": 52
+  },
+  "m19ReplyCountUnchanged": true,
+  "backup": "/Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/ux-stop-20261116-031413",
+  "at": "2026-11-16T03:14:14.150550+08:00"
+}

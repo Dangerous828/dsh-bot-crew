@@ -1,0 +1,11 @@
+{
+  "kind": "isolated-pure-projection",
+  "at": "2026-11-16T15:07:59.488Z",
+  "cases": {
+    "consumedBeforeDecision": "unknown",
+    "directAnswerAwaitingDelivery": "waiting",
+    "anyLinkedAgentMessage": "replied",
+    "workingAfterToolResult": "running",
+    "workingAfterAssistantMessage": "thinking"
+  }
+}

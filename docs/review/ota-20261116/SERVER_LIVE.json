@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-16T22:01:07.113525+08:00",
+  "endpoints": {
+    "manifest": {
+      "status": 404,
+      "body": "{\"error\":\"No release published\"}"
+    },
+    "mobile": {
+      "status": 401,
+      "body": "{\"error\":\"Not paired\"}"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "typecheck": "passed",
+  "fullSuite": {
+    "testFiles": 135,
+    "passedTests": 2248,
+    "failedTests": 1,
+    "failure": "cards.spec.ts expected the route prohibition text without the new answer action"
+  },
+  "integrationCorrection": "Synchronized the follow-up routing assertion to include answer; no implementation changed",
+  "targetedRerun": {
+    "command": "pnpm exec vitest run tests/cards.spec.ts",
+    "result": "passed",
+    "log": "backend-final-cards.log"
+  },
+  "buildAndMigration": "dsh-bridge/up.sh --profile superagent --no-web --restart exited 0; final backend bundle built by the script",
+  "implementationFailuresRemaining": 0
+}

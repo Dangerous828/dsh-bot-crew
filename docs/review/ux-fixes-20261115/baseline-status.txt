@@ -1,0 +1,59 @@
+ M HANDOFF.md
+ M app/app/build.gradle.kts
+ M app/app/src/main/java/com/dsh/botcrew/BoardUi.kt
+ M app/app/src/main/java/com/dsh/botcrew/CrewClient.kt
+ M app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
+ M app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
+ M app/app/src/main/java/com/dsh/botcrew/MainActivity.kt
+ M app/app/src/main/java/com/dsh/botcrew/PairingClient.kt
+ M app/app/src/main/java/com/dsh/botcrew/PairingScreen.kt
+ M app/app/src/main/java/com/dsh/botcrew/PairingStore.kt
+ M backend/docs/007-architecture.md
+ M backend/src/app/api.ts
+ M backend/src/app/http.ts
+ M backend/src/app/mobile-http.ts
+ M backend/src/app/runtime.ts
+ M backend/tests/fixtures/panel-server.ts
+ M backend/tests/mobile-http.spec.ts
+ M docs/00-contract.md
+ M docs/review/README.md
+ M 开发进度.md
+?? app/app/src/main/java/com/dsh/botcrew/ApprovalGate.kt
+?? app/app/src/main/java/com/dsh/botcrew/BootstrapGate.kt
+?? app/app/src/main/java/com/dsh/botcrew/ClientDiag.kt
+?? app/app/src/main/java/com/dsh/botcrew/CrewConnectionStatus.kt
+?? app/app/src/main/java/com/dsh/botcrew/CrewNavigation.kt
+?? app/app/src/main/java/com/dsh/botcrew/DiagAck.kt
+?? app/app/src/main/java/com/dsh/botcrew/DiagPage.kt
+?? app/app/src/main/java/com/dsh/botcrew/DiagRingStore.kt
+?? app/app/src/main/java/com/dsh/botcrew/DiagRuntime.kt
+?? app/app/src/main/java/com/dsh/botcrew/DiagUploader.kt
+?? app/app/src/main/java/com/dsh/botcrew/Recipient.kt
+?? app/app/src/main/java/com/dsh/botcrew/RoutePolicy.kt
+?? app/app/src/test/java/com/dsh/botcrew/ApprovalFeedbackTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/BootstrapGateTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/ClientDiagTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/ConnectionStatusTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/CrewClientExecutionTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/DiagAckTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/DiagContractReviewTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/DiagRingStoreFileTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/DiagUploaderTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/DrawerNavigationTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/PairingRecordProbeTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/RecipientSelectionTest.kt
+?? app/app/src/test/java/com/dsh/botcrew/RoutePolicyTest.kt
+?? backend/.backup-publish-20261115-013720/
+?? backend/src/app/diagnostics.ts
+?? backend/tests/diagnostics-http.spec.ts
+?? backend/tests/diagnostics-review.spec.ts
+?? backend/tests/diagnostics.spec.ts
+?? backend/tests/server-identity.spec.ts
+?? designs/crew-mobile-ux/
+?? docs/review/cellular-20261115/
+?? docs/review/external-diagnostics-20261115/
+?? docs/review/final-android/deliver/
+?? docs/review/ux-fixes-20261115/
+?? docs/review/ux-mobile-20261115/
+?? docs/review/ux-sidebar-20261115/
+?? scripts/crew-watch/

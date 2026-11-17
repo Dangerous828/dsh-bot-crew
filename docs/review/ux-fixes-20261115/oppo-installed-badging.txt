@@ -1,0 +1,3 @@
+package: name='com.dsh.botcrew' versionCode='1' versionName='0.1.0' platformBuildVersionName='15' platformBuildVersionCode='35' compileSdkVersion='35' compileSdkVersionCodename='15'
+application: label='Bot 队伍' icon=''
+launchable-activity: name='com.dsh.botcrew.MainActivity'  label='Bot 队伍' icon=''

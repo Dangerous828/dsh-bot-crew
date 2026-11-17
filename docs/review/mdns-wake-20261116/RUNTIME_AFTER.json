@@ -1,0 +1,131 @@
+{
+  "at": "2026-11-16T19:32:02.792449+08:00",
+  "headless": {
+    "profile": "superagent",
+    "pid": 12345,
+    "stateDir": "/Users/cpuser/.dsh/state/superagent",
+    "port": 63886
+  },
+  "health": {
+    "runtime": {
+      "state": "ready",
+      "detail": "Orchestrator is ready",
+      "at": "2026-11-16T11:27:56.530Z"
+    },
+    "relay": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.013Z"
+    },
+    "notice": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.013Z"
+    },
+    "memory": {
+      "state": "ready",
+      "detail": "中枢凭据来自凭据文件"
+    },
+    "launch": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.027Z"
+    },
+    "delivery": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.028Z"
+    },
+    "assessment": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.028Z"
+    },
+    "reply": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T11:27:55.028Z"
+    },
+    "evals": {
+      "state": "ready",
+      "detail": "No unavailable Eval in the last hour"
+    },
+    "models": {
+      "state": "ready",
+      "detail": "No managed Session is waiting on a model budget retry"
+    },
+    "discovery": {
+      "state": "ready",
+      "detail": "Announcing on port 43499",
+      "at": "2026-11-16T11:27:59.010Z"
+    },
+    "p2p": {
+      "state": "ready",
+      "detail": "direct tunnel at tcpGFwWCDQf-…",
+      "at": "2026-11-16T11:27:58.086Z"
+    },
+    "github": {
+      "state": "ready",
+      "detail": "0 notifications; next poll ≥ 60s",
+      "at": "2026-11-16T11:31:59.621Z"
+    },
+    "team": {
+      "state": "ready",
+      "detail": "0 messages, 0 unreadable",
+      "at": "2026-11-16T11:31:59.903Z"
+    }
+  },
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "paused": false,
+  "serviceStatus": {
+    "pids": [
+      12345
+    ],
+    "cwd": "/Users/cpuser/Code/dsh-bot-crew/backend",
+    "mode": "no-web",
+    "url": "http://127.0.0.1:63886",
+    "manually_stopped": false,
+    "health": {
+      "runtime": "ready",
+      "relay": "ready",
+      "notice": "ready",
+      "memory": "ready",
+      "launch": "ready",
+      "delivery": "ready",
+      "assessment": "ready",
+      "reply": "ready",
+      "evals": "ready",
+      "models": "ready",
+      "discovery": "ready",
+      "p2p": "ready",
+      "github": "ready",
+      "team": "ready"
+    },
+    "errors": {},
+    "setup": null,
+    "feishu": null,
+    "load": {
+      "running": 0,
+      "queued": 0,
+      "maxWorkers": 3
+    },
+    "paused": false
+  },
+  "endpoints": {
+    "gui": {
+      "status": 401
+    },
+    "phone": {
+      "status": 401
+    }
+  },
+  "pairedDeviceCount": 3,
+  "pairingSha256": "c734b78fc2f3f0d717cf2c4666dd9a765da612abb944117d18868fad9f58f5de",
+  "messages": 79,
+  "replies": 62,
+  "ticketCount": 28
+}

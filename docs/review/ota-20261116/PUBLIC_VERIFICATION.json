@@ -1,0 +1,23 @@
+{
+  "at": "2026-11-16T22:17:01.760164+08:00",
+  "manifest": {
+    "schemaVersion": 1,
+    "packageName": "com.dsh.botcrew",
+    "versionCode": 3,
+    "versionName": "0.2.0",
+    "buildId": "ota-20261116-r1",
+    "minSdk": 26,
+    "sha256": "17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679",
+    "size": 12852381,
+    "signerSha256": "ad0e44804142148625ce90427ce3832747c29b795640cfb451745b44540af7eb",
+    "apkPath": "/updates/android/3/17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679.apk",
+    "notes": "支持应用内检查更新、断点续传和系统安装确认。"
+  },
+  "downloadSha256": "17c9e3c30c06c9e94f99c031bdf7c1766488cfa2b93463d96dc9b9113e9cb679",
+  "resumedAt": 11202524,
+  "rangeMatches": true,
+  "sameSigner": true,
+  "versionName": "0.2.0",
+  "minSdk": 26,
+  "size": 12852381
+}

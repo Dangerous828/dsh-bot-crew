@@ -30,6 +30,42 @@
 3. 把 `profile.example.yml` 里填好绝对路径的配置写进 profile 的 `cordis.patch.yml`（已有内容不覆盖，冲突就报错）。
 4. 起 backend，等它就绪，打印面板地址与 gateway token 的位置。
 
+## No-Web profile
+
+新建无 Web profile：
+
+```sh
+./dsh-bridge/up.sh --profile superagent --no-web
+```
+
+迁移现有 profile 时，先确认 worker/Executor 空闲并备份 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`，再构建并优雅重启：
+
+```sh
+cd backend && pnpm build
+cd .. && ./dsh-bridge/up.sh --profile superagent --no-web --restart
+```
+
+`up.sh` 保留 `dsh-web-app` 的 host 服务，在该 profile 里禁用 `webserver`、`web-runtime`、`modules`、`client-hmr`、`open-in-app`、`directory-picker` 和 `harness-dev-context`。`connection`、移动端 LAN API、provider/MCP、scheduler、session 与 worker 服务继续加载。无 Web health 地址写入该 profile 的 `stateDir/headless-health.json`，权限为 `0600`；`dsh-superagent status` 从描述文件验证 profile、PID 和 stateDir 后连接 loopback 地址，并报告 health、load 与 paused。setup 未完成时，脚本打印 health 地址并以状态码 3 返回。
+
+旧 `tools/loopproxy` 不由 no-Web 停止逻辑接管；迁移后一次性检查 `127.0.0.1:3082`。只有 PID 的命令行同时指向本仓库的 `tools/loopproxy` 和当前 profile 原 LAN 地址时才向该 PID 发 `SIGTERM`，随后再次用 `lsof` 确认 3082 无监听：
+
+```sh
+lsof -nP -iTCP:3082 -sTCP:LISTEN
+ps -p <PID> -o pid=,args=
+kill -TERM <PID>
+lsof -nP -iTCP:3082 -sTCP:LISTEN
+```
+
+先把 `<PID>` 替换为 `lsof` 输出的 PID，并核对 `ps` 命令行；其他监听进程保留。
+
+检查启动结果：
+
+```sh
+backend/scripts/dsh-superagent --profile superagent status
+```
+
+无 Web 模式不提供面板与客户端热更新；修改 backend 后执行 `pnpm build` 并重启 profile。若状态显示 setup pending，在 profile/provider 配置中补全设置后重启。
+
 ## 起停
 
 ```sh

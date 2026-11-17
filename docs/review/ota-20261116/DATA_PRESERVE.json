@@ -1,0 +1,13 @@
+{
+  "markerSha256": "d12cf569fa4b6045aaf2352c5dde66df91bafd54d4f1a1a517fbaadf5ffeb158",
+  "beforeVersion": 2,
+  "privatePrefs": {},
+  "afterVersion": 3,
+  "markerPreserved": true,
+  "systemInstallerConfirmed": true,
+  "cancelledInstallerAndRetried": true,
+  "updatedVersionUi": true,
+  "modalIsolated": true,
+  "backDismissesUpdate": true,
+  "markerPreservedAfterCacheCleanup": true
+}

@@ -1,0 +1,13 @@
+{
+  "method": "HMR",
+  "profile": "superagent",
+  "beforePid": 16534,
+  "afterPid": 16534,
+  "beforeHealthPort": 63455,
+  "afterHealthPort": 52399,
+  "health": "all ready after initialization",
+  "load": { "running": 0, "queued": 0 },
+  "backup": "/Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/ux-view-publish-20261116-035218",
+  "build": "passed",
+  "desktopGuiAndMobileGateway": "unchanged"
+}

@@ -1,0 +1,70 @@
+{
+  "passed": true,
+  "visual_frame_review_required": true,
+  "failures": [],
+  "snapshots": [
+    {
+      "snapshot": "record-initial",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-0",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-1",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-2",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "record-after-send-3",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": null
+    },
+    {
+      "snapshot": "before-ime-close",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": 76
+    },
+    {
+      "snapshot": "record-after-ime",
+      "header": "[85,220][142,312]",
+      "header_visible": true,
+      "subagent_card": false,
+      "loading_rows": [],
+      "composer_height": 210,
+      "reply_composer_gap": 76
+    }
+  ]
+}

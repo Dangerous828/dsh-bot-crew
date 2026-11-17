@@ -1,0 +1,7 @@
+{
+  "at": "2026-11-16T14:27:50.162969+08:00",
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "file:///Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/mdns-wake-20261116/TRANSPORT_PROBE.mjs:34\n    const error = faultResponse ? Object.assign(new Error('send EADDRNOTAVAIL 224.0.0.251:5353'),\n                                                ^\n\nError: send EADDRNOTAVAIL 224.0.0.251:5353\n    at socket.send (file:///Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/mdns-wake-20261116/TRANSPORT_PROBE.mjs:34:49)\n    at onbind (/Users/cpuser/Code/dsh-bot-crew/backend/node_modules/.pnpm/multicast-dns@7.2.5/node_modules/multicast-dns/index.js:88:14)\n    at apply (/Users/cpuser/Code/dsh-bot-crew/backend/node_modules/.pnpm/thunky@1.1.0/node_modules/thunky/index.js:44:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21) {\n  code: 'EADDRNOTAVAIL',\n  errno: -49,\n  syscall: 'send',\n  address: '224.0.0.251',\n  port: 5353\n}\n\nNode.js v24.11.1\n",
+  "uncaughtTransportFailure": true
+}

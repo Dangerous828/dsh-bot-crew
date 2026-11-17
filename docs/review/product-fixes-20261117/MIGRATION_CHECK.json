@@ -1,0 +1,42 @@
+{
+  "at": "2026-11-17T05:39:41.754985+08:00",
+  "unitTests": 4,
+  "rehearsal": "temporary copies of consistent deployment backup",
+  "dryRun": {
+    "applied": false,
+    "matched": 65,
+    "remainingLegacy": 0,
+    "kinds": {
+      "acknowledgement": 29,
+      "notice": 2,
+      "reply": 34
+    },
+    "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+    "contentPreserved": true
+  },
+  "applyOnCopy": {
+    "applied": true,
+    "matched": 65,
+    "remainingLegacy": 0,
+    "kinds": {
+      "acknowledgement": 29,
+      "notice": 2,
+      "reply": 34
+    },
+    "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+    "contentPreserved": true
+  },
+  "secondApplyOnCopy": {
+    "applied": true,
+    "matched": 0,
+    "remainingLegacy": 0,
+    "kinds": {
+      "acknowledgement": 0,
+      "notice": 0,
+      "reply": 0
+    },
+    "contentSha256": "07e331431bf2ebd59f37a681151971d75b50d42f73c7c9a62b9922a31b788e1a",
+    "contentPreserved": true
+  },
+  "productionWritten": false
+}

@@ -1,0 +1,87 @@
+{
+  "paused": false,
+  "running": null,
+  "queued": null,
+  "executor": null,
+  "openTickets": null,
+  "masterId": "orchestrator-bbbb4bafe8b5e5afe49748149f93df3d",
+  "health": {
+    "runtime": {
+      "state": "ready",
+      "detail": "Orchestrator is ready",
+      "at": "2026-11-15T13:23:08.060Z"
+    },
+    "relay": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T15:49:08.349Z"
+    },
+    "notice": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T13:23:06.720Z"
+    },
+    "memory": {
+      "state": "ready",
+      "detail": "中枢凭据来自凭据文件"
+    },
+    "launch": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T15:38:49.275Z"
+    },
+    "delivery": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T13:23:06.732Z"
+    },
+    "assessment": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T15:38:43.150Z"
+    },
+    "reply": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-15T15:49:11.531Z"
+    },
+    "evals": {
+      "state": "ready",
+      "detail": "No unavailable Eval in the last hour"
+    },
+    "models": {
+      "state": "ready",
+      "detail": "No managed Session is waiting on a model budget retry"
+    },
+    "p2p": {
+      "state": "ready",
+      "detail": "direct tunnel at tcpGFwWCDQf-…",
+      "at": "2026-11-15T13:23:09.595Z"
+    },
+    "github": {
+      "state": "ready",
+      "detail": "0 notifications; next poll ≥ 60s",
+      "at": "2026-11-15T15:53:34.426Z"
+    },
+    "team": {
+      "state": "ready",
+      "detail": "0 messages, 0 unreadable",
+      "at": "2026-11-15T15:53:36.468Z"
+    }
+  },
+  "setup": {
+    "machine": {
+      "stateDir": "/Users/cpuser/.dsh/state/superagent",
+      "promptMaxChars": 100000,
+      "admissionContextMaxPages": 10,
+      "admissionContextTimeoutMs": 15000
+    },
+    "problem": null,
+    "feishuProblem": null,
+    "accounts": {
+      "repository": "Dangerous828/dsh-bot-crew",
+      "agent": "Dangerous828",
+      "feishu": null
+    }
+  }
+}

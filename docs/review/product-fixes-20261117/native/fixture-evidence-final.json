@@ -1,0 +1,56 @@
+{
+  "stateDir": "/private/var/folders/n3/nbdfghkx0dq953chft91n8s40000gp/T/botcrew-product-UQxk9N",
+  "lastSend": {
+    "requestId": "689060e6-1c8d-42e5-a944-67c9c7884cfb",
+    "text": "Uncertain-C-1794888228"
+  },
+  "controls": {
+    "failBefore": false,
+    "uncertain": false,
+    "disconnected": false,
+    "responseDelayMs": 0
+  },
+  "sends": [
+    {
+      "at": "2026-11-17T04:04:03.850Z",
+      "method": "POST",
+      "path": "/api/mobile/send",
+      "status": 503,
+      "requestId": "3ca96c8c-185a-4c87-96b8-9662bf4c6462"
+    },
+    {
+      "at": "2026-11-17T04:04:23.750Z",
+      "method": "POST",
+      "path": "/api/mobile/send",
+      "status": 200,
+      "requestId": "831f8d4e-d8da-4840-acbf-4e0817504ab3"
+    },
+    {
+      "at": "2026-11-17T04:04:32.278Z",
+      "method": "POST",
+      "path": "/api/mobile/send",
+      "status": 200,
+      "requestId": "3ca96c8c-185a-4c87-96b8-9662bf4c6462"
+    },
+    {
+      "at": "2026-11-17T04:04:42.821Z",
+      "method": "POST",
+      "path": "/api/mobile/send",
+      "status": 503,
+      "requestId": "689060e6-1c8d-42e5-a944-67c9c7884cfb"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "fixture-ticket-1-b",
+      "question": "将进度汇报发送到发布频道？"
+    },
+    {
+      "id": "fixture-ticket-1-a",
+      "question": "将进度汇报发送到发布频道？"
+    }
+  ],
+  "eventCount": 158,
+  "firstAt": "2026-11-17T04:02:35.951Z",
+  "lastAt": "2026-11-17T04:05:16.187Z"
+}

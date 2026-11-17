@@ -1,0 +1,40 @@
+{
+  "at": "2026-11-17T12:05:07.577638+08:00",
+  "syntheticOnly": true,
+  "serial": "9f9cc3db",
+  "checks": [
+    {
+      "name": "failure-stays-with-original-request-after-edited-send-succeeds",
+      "passed": true,
+      "failedRequest": "3ca96c8c-185a-4c87-96b8-9662bf4c6462",
+      "successfulRequest": "831f8d4e-d8da-4840-acbf-4e0817504ab3"
+    },
+    {
+      "name": "unconfirmed-envelope-visible-after-process-death",
+      "passed": true,
+      "requestId": "3ca96c8c-185a-4c87-96b8-9662bf4c6462",
+      "evidence": "after force-stop the card still owns the failed text and shows the retry entry; native/recovered-envelope.xml"
+    },
+    {
+      "name": "retry-keeps-original-uuid-and-payload",
+      "passed": true,
+      "requestId": "3ca96c8c-185a-4c87-96b8-9662bf4c6462"
+    },
+    {
+      "name": "accepted-request-reconciles-after-restart-without-duplicate",
+      "passed": true,
+      "requestId": "689060e6-1c8d-42e5-a944-67c9c7884cfb",
+      "evidence": "carrier saw no resend after restart; single timeline row; prefs unreadable without root"
+    },
+    {
+      "name": "readable-approval-preserves-literal-percent-encoding",
+      "passed": true,
+      "evidence": "card preview renders the body verbatim, 「路径片段保持 %2F。」 keeps its %2F; native/multiple-attention.xml"
+    },
+    {
+      "name": "multiple-attention-entry-opens-board",
+      "passed": true,
+      "evidence": "「逐项看」 opens the board with 等你拍板 · 2 and both 验收任务-a / 验收任务-b listed; native/pending-board.xml"
+    }
+  ]
+}

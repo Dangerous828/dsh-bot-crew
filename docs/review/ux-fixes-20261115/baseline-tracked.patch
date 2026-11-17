@@ -1,0 +1,3183 @@
+diff --git a/HANDOFF.md b/HANDOFF.md
+index 1b9fb3d..dc1f604 100644
+--- a/HANDOFF.md
++++ b/HANDOFF.md
+@@ -445,3 +445,52 @@ backend `pnpm check` 78 个 spec 文件全绿（67 `.spec.ts` + 11 `.spec.tsx`
+ 
+ **未确认、原样保留**：11-10 深夜段落写的「当前两处角色模型均指向 `deepseek-account/deepseek-flash`，
+ 待一次真实评估确认」，在 11-11 三轮记录里没有更新结论，此处不代填。
++
++---
++
++# 交接追加：2026-11-13 消息永远排队 / 主 Session 被归档（已根治）
++
++> 接上一段「两处角色模型均指向 deepseek-account/deepseek-flash，待确认真实评估」——本轮把它查到底并根治。
++> 分支 `feat/four-blocks`，远端 HEAD `fa3ffe0`。工作区干净（仅 `scripts/crew-watch/` 是他人未跟踪，别动）。
++
++## 现象与真凶
++
++**现象**：App 发消息一直「排队中」，eval 一直 `evaluating` 到超时（decision=`unavailable/timeout`），队伍从不回话；「模型选了 workbuddy，重启又回默认」。
++
++**真凶（一路挖到底层）**：**主 Session（masterId `orchestrator-bbbb4bafe8b5e5afe49748149f93df3d`）被写进了 workspace 的归档集合 `archivedSessionIds`。**
++DSH 的 `ArchivedSessionGate`（`@deepseek-ai/dsh-api-session-controller` 的 `archived-session-gate.js`）在 `agent/pre-step` 对已归档会话直接返回 `{kind:'reject'}` → 每个 turn 以 `blocked` 收口、**连一次模型请求都不发** → candidate 卡全被拒 → eval 等不到判定 → 超时 → 消息卡排队。**与模型/余额/权限/双实例无关**，所以换模型、改权限、重启都治不好；重启从 `workspace.json` 恢复归档状态，所以「重启又回旧状态」。
++
++**排查中被证伪的几个假设**（留给后来人省时间）：
++- 不是 openconsole 欠费/模型死：那些确实存在（openconsole 402、`deepseek-account` 无 `DEEPSEEK_API_KEY` 靠 bundled catalog 假列表骗过 `listModels`），但只是「模型该切对」的一层，不是 blocked 的直接原因。
++- 不是双实例：`Service name is already in use` 是 bonjour/mDNS 同名广播，良性；实际只有一个 dsh 后端。
++- 不是 session 损坏：删重建新 session 一样 blocked（因为新 masterId 又被归档列表命中/或被同样逻辑波及）。
++
++## 本轮三处改动（都已提交推送）
++
++1. **`backend/src/app/role-models.ts`**（commit `34269a19`）——模型根治：
++   `initializeRoleModel` 原来「有 selection 就跳过」，导致主 Session 永远绑死失效 provider。改为 `selectionInConfigFamily` 确定性判据（provider 须与配置一致 + 模型仍在目录），脱管时用 `sessionController.selectModel` **真正切换**（不是 append，append 对已发过请求的老会话不生效）。测试在 `backend/tests/role-models.spec.ts`。
++
++2. **`backend/src/app/runtime.ts`**（commit `fa3ffe0`）——归档根治：
++   启动收尾 `finishSetup` 里 `ensure()` 之后新增 `ensureMasterActive()`：主 Session 永远不该被归档，若在 `archivedSessionIds` 里就调正规的 `workspaceRegistry.unarchiveSession()` 解出并 `logger.warn`，杜绝静默瘫队；组合缺归档能力时安全跳过。测试在 `backend/tests/runtime.spec.ts`「unarchives the main Session on startup…」。
++
++3. **`AGENTS.md`**——写入「开发期有问题就根治，不留小修小补」原则。
++
++## 验证（端到端，已实测）
++
++- 解除归档后主 Session 正常 turn：`request/header model=workbuddy → orchestrator_route → worker 执行 → assistant/message → turn/end completed`（不再 blocked）。
++- App 端到端：「帮我算 12 乘以 8」→ 回「**12 × 8 = 96。**」，`queued: []`。
++- 全量 backend：**1774 例通过**（tsc 0 错）；health 12 项全 `ready`（`evals` 也已 `ready`）。
++
++## 当前运行态快照（2026-11-13 09:33）
++
++- dsh 后端 pid **30419**，3082 正常；最新日志 `backend/.artifacts/dsh-superagent-superagent-20261113-080315-30409.log`。
++- 主 Session **不在** `archivedSessionIds`；`ensureMasterActive` 保证以后即使再被写入也会启动时自动解出。
++- 我从 `~/.dsh/storages/workspace.json` 手剔了 4 个误归档的 `orchestrator-*` id（含 bbbb）；备份在 `~/.dsh/storages/workspace.json.bak-*`。
++- 我误把 session 备份放进 `sessions/` 目录曾致 workspace 报 corrupt（已修）：备份现移到 `~/.dsh/session-backups/`。
++
++## 下一步 / 遗留
++
++- **Step 4「一直在线」未做**（原计划）：dsh 仍需 tmux 手动起（`scripts/dsh-superagent`），无 launchd 自启；desktop 客户端也没有捆绑起停（关桌面应关 dsh）。这是用户之前提的 (b)。
++- 别碰别人未提交/未跟踪的东西：`scripts/crew-watch/`、`designs/crew-design-system/`、`designs/crew-personal-agent`、app 的 `BoardUi.kt`/`CrewUi.kt`、`desktop/*.go`（nav/icon/main/ui/debug）。
++- 推送踩坑：`git push` 偶发 TLS/非快进失败，改用 `gh api` blobs→trees(base_tree)→commits→PATCH refs 推送，逐文件核对 blob SHA。
++- **排查心法（重要）**：遇到「重启又回旧状态 / 消息永远排队 / eval 一直 evaluating」，**优先查 `~/.dsh/storages/workspace.json` 的 `archivedSessionIds` 是否含主 Session**，别被模型/余额/权限带偏。
+diff --git a/app/app/build.gradle.kts b/app/app/build.gradle.kts
+index 074b9f6..f0b9225 100644
+--- a/app/app/build.gradle.kts
++++ b/app/app/build.gradle.kts
+@@ -32,6 +32,23 @@ android {
+         buildConfigField("String", "CREW_DEVICE", "\"$builtInDevice\"")
+         buildConfigField("String", "CREW_CREDENTIAL", "\"$builtInToken\"")
+ 
++        // 诊断上报 + 公网 bootstrap（lead 确认部署域名与预期 crew 后再注入；两者默认空，缺省不启用，不给别的 server 送 token）。
++        // - PUBLIC_BASE：本次固定部署的公网域名（真实 HTTPS），作缺失 fallback 的 bootstrap 候选；默认空。
++        // - EXPECTED_CREW：该部署的 server.crew 指纹（与 mDNS 同源），bootstrap 精确比对用；默认空。
++        // - DIAG_BASE：诊断上报地址，默认生产域名；空则用 DiagUploader.DEFAULT_BASE。
++        val publicBase = providers.gradleProperty("crewPublicBase").getOrElse("")
++        val expectedCrew = providers.gradleProperty("crewExpectedCrew").getOrElse("")
++        val diagBase = providers.gradleProperty("crewDiagBase").getOrElse("")
++        buildConfigField("String", "CREW_PUBLIC_BASE", "\"$publicBase\"")
++        buildConfigField("String", "CREW_EXPECTED_CREW", "\"$expectedCrew\"")
++        buildConfigField("String", "CREW_DIAG_BASE", "\"$diagBase\"")
++
++        // 轻量构建标记（不动 versionName/versionCode，不引 git 自动 commit）：
++        // 最终发布指定 -PcrewBuildId=cellular-20261115-r1；generic 默认 local。
++        // 诊断 body.build 与诊断页都显示它，便于服务端对照「哪个真实 APK」。
++        val buildId = providers.gradleProperty("crewBuildId").getOrElse("local")
++        buildConfigField("String", "CREW_BUILD_ID", "\"$buildId\"")
++
+         // JNI 包装对每个 ABI 都编，隧道本体（libtailcat.so）由 jniLibs 按 ABI 提供，
+         // 目前只有 arm64-v8a。见 src/main/cpp/README.md。
+         externalNativeBuild {
+diff --git a/app/app/src/main/java/com/dsh/botcrew/BoardUi.kt b/app/app/src/main/java/com/dsh/botcrew/BoardUi.kt
+index 047e78c..0c0187a 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/BoardUi.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/BoardUi.kt
+@@ -37,6 +37,7 @@ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateMapOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+@@ -218,90 +219,6 @@ fun SessionBar(
+     }
+ }
+ 
+-/** 顶栏那一行：普通 segmented「聊天 / 分拣台」，聊天模式下多一个带未读数的「事务板」。 */
+-@Composable
+-fun ModeHeader(
+-    mode: Mode,
+-    palette: CrewPalette,
+-    onModeChange: (Mode) -> Unit,
+-    unread: Int,
+-    onOpenBoard: () -> Unit,
+-) {
+-    Row(
+-        modifier = Modifier
+-            .fillMaxWidth()
+-            .background(palette.card)
+-            .padding(horizontal = 12.dp, vertical = 6.dp),
+-        verticalAlignment = Alignment.CenterVertically,
+-    ) {
+-        Row(
+-            modifier = Modifier
+-                .clip(RoundedCornerShape(9.dp))
+-                .background(palette.segment)
+-                .border(1.dp, palette.line, RoundedCornerShape(9.dp)),
+-            verticalAlignment = Alignment.CenterVertically,
+-        ) {
+-            ModeChip("聊天", mode == Mode.Chat, palette) { onModeChange(Mode.Chat) }
+-            ModeChip("分拣台", mode == Mode.Triage, palette) { onModeChange(Mode.Triage) }
+-        }
+-        Spacer(Modifier.weight(1f))
+-        if (mode == Mode.Chat) {
+-            Box {
+-                Box(
+-                    modifier = Modifier
+-                        .clip(RoundedCornerShape(8.dp))
+-                        .background(palette.card)
+-                        .border(1.dp, palette.line, RoundedCornerShape(8.dp))
+-                        .clickable(onClick = onOpenBoard)
+-                        .defaultMinSize(minWidth = 48.dp, minHeight = 40.dp)
+-                        .padding(horizontal = 11.dp, vertical = 8.dp),
+-                    contentAlignment = Alignment.Center,
+-                ) {
+-                    Text("事务板", color = palette.muted, fontSize = 11.sp)
+-                }
+-                if (unread > 0) {
+-                    Box(
+-                        modifier = Modifier
+-                            .align(Alignment.TopEnd)
+-                            .offset(x = 6.dp, y = (-6).dp)
+-                            .defaultMinSize(minWidth = 16.dp, minHeight = 16.dp)
+-                            .clip(CircleShape)
+-                            .background(palette.warn)
+-                            .padding(horizontal = 3.dp),
+-                        contentAlignment = Alignment.Center,
+-                    ) {
+-                        Text(
+-                            if (unread > 99) "99+" else unread.toString(),
+-                            color = palette.onWarn,
+-                            fontSize = 9.sp,
+-                        )
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-@Composable
+-private fun ModeChip(label: String, selected: Boolean, palette: CrewPalette, onClick: () -> Unit) {
+-    Box(
+-        modifier = Modifier
+-            .clip(RoundedCornerShape(8.dp))
+-            .background(if (selected) palette.accent else Color.Transparent)
+-            .clickable(onClick = onClick)
+-            .defaultMinSize(minWidth = 56.dp, minHeight = 44.dp)
+-            .padding(horizontal = 12.dp, vertical = 7.dp),
+-        contentAlignment = Alignment.Center,
+-    ) {
+-        Text(
+-            label,
+-            fontSize = 12.sp,
+-            fontWeight = if (selected) FontWeight(600) else FontWeight.Normal,
+-            color = if (selected) palette.surface else palette.faint,
+-        )
+-    }
+-}
+-
+ /**
+  * 聊天模式的事务板：从右侧滑入的抽屉，压在群聊上面。
+  *
+@@ -317,7 +234,7 @@ fun BoardDrawer(
+     onJumpToMessage: (String) -> Unit,
+     problem: String? = null,
+     /** 点「等你拍板」的选项：把这句原样发回去，done(true/false) 用来解除这一格的发送态。 */
+-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit = { _, _, _ -> },
++    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit = { _, _, _ -> },
+ ) {
+     Dialog(
+         onDismissRequest = onDismiss,
+@@ -327,10 +244,8 @@ fun BoardDrawer(
+         LaunchedEffect(Unit) { shown = true }
+         val slide by animateDpAsState(targetValue = if (shown) 0.dp else 306.dp)
+         val groups = boardGroups(conversation)
+-        val answerState = rememberBoardAnswerState(
+-            resetKey = groups?.deciding?.firstOrNull()?.let { CrewWire.answerSignature(it) },
+-            onAnswer = onAnswer,
+-        )
++        var doneExpanded by remember { mutableStateOf(false) }
++        val answerState = rememberBoardAnswerState(onAnswer = onAnswer)
+         Box(
+             modifier = Modifier
+                 .fillMaxSize()
+@@ -367,7 +282,8 @@ fun BoardDrawer(
+                     Spacer(Modifier.weight(1f))
+                     Box(
+                         modifier = Modifier
+-                            .size(40.dp)
++                            // 关闭是这张抽屉唯一的点击目标：命中区 ≥48（视觉 × 仍 18sp）。
++                            .size(48.dp)
+                             .clip(RoundedCornerShape(8.dp))
+                             .clickable(onClick = onDismiss),
+                         contentAlignment = Alignment.Center,
+@@ -387,8 +303,10 @@ fun BoardDrawer(
+                         problem = problem,
+                         palette = palette,
+                         titles = BoardTitles("还没回的话", "在跑", "等你拍板", "办完"),
+-                        answering = answerState.answering,
+-                        note = answerState.note,
++                        phaseOf = answerState.phaseOf,
++                        noteFor = { ticket -> answerState.phaseOf(ticket.id).note },
++                        doneExpanded = doneExpanded,
++                        onToggleDone = { doneExpanded = !doneExpanded },
+                         onAnswer = answerState.answer,
+                         onJump = { messageId -> onDismiss(); onJumpToMessage(messageId) },
+                     )
+@@ -420,31 +338,15 @@ fun TriageScreen(
+     enabled: Boolean,
+     problem: String?,
+     onDrop: (String) -> Unit,
+-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit = { _, _, _ -> },
++    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit = { _, _, _ -> },
+     onJumpToMessage: (String) -> Unit = {},
+     modifier: Modifier = Modifier,
+ ) {
+     val focus = remember { FocusRequester() }
+     val groups = boardGroups(conversation)
+-    val answerState = rememberBoardAnswerState(
+-        resetKey = groups?.deciding?.firstOrNull()?.let { CrewWire.answerSignature(it) },
+-        onAnswer = onAnswer,
+-    )
++    var doneExpanded by remember { mutableStateOf(false) }
++    val answerState = rememberBoardAnswerState(onAnswer = onAnswer)
+     Column(modifier = modifier.fillMaxSize().background(palette.surface)) {
+-        // 大按钮不另做假的「图 / 语音」入口：输入框只发文本，点它就是把焦点交给输入行。
+-        Box(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .padding(horizontal = 14.dp, vertical = 8.dp)
+-                .height(58.dp)
+-                .clip(RoundedCornerShape(10.dp))
+-                .background(palette.card)
+-                .border(1.dp, palette.accent, RoundedCornerShape(10.dp))
+-                .clickable { focus.requestFocus() },
+-            contentAlignment = Alignment.Center,
+-        ) {
+-            Text("＋ 丢一件进来", color = palette.accent, fontSize = 16.sp, fontWeight = FontWeight(600))
+-        }
+         LazyColumn(
+             modifier = Modifier.weight(1f),
+             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+@@ -456,8 +358,10 @@ fun TriageScreen(
+                 problem = problem,
+                 palette = palette,
+                 titles = BoardTitles("刚丢进来的", "各人在跑", "等你拍板", "办完"),
+-                answering = answerState.answering,
+-                note = answerState.note,
++                phaseOf = answerState.phaseOf,
++                noteFor = { ticket -> answerState.phaseOf(ticket.id).note },
++                doneExpanded = doneExpanded,
++                onToggleDone = { doneExpanded = !doneExpanded },
+                 onAnswer = answerState.answer,
+                 onJump = onJumpToMessage,
+             )
+@@ -509,36 +413,51 @@ fun TriageScreen(
+     }
+ }
+ 
+-/** 选项按钮的发送态与回执：一次只答一题，问题或选项换了旧的那一组随即作废。 */
++/**
++ * 选项按钮的发送态与回执。**按票**各持一份 gate（不是所有票共用一份，也不是按选项各自在途）：
++ * - 同一张票任一时刻只允许一个答复在途（同题互斥，A/B 不会同时发两次）；
++ * - 不同票各锁各的，答 A 不会锁住 B；第一张换题也不会重置别的票的锁；
++ * - 提交中画「提交中…」、受理后画「已受理，等待状态更新」，锁着直到**这一张票**的时间线收敛。
++ *
++ * 从前按「票号|选项」各自在途 → 同题并发；后来又差点变成所有票共用一份 state → 一张答了锁全部。
++ * 这里按 ticket.id 各建一个 [ApprovalGateHolder]，[phaseOf] 按票取、[answer] 按票发。
++ */
+ private class BoardAnswerState(
+-    val answering: Set<String>,
+-    val note: Pair<String, String>?,
++    val phaseOf: (String) -> ApprovalGate.State,
+     val answer: (WorkTicket, AttentionOption) -> Unit,
+ )
+ 
+ @Composable
+ private fun rememberBoardAnswerState(
+-    resetKey: String?,
+-    onAnswer: (WorkTicket, AttentionOption, (Boolean) -> Unit) -> Unit,
++    onAnswer: (WorkTicket, AttentionOption, (ApprovalGate.Outcome) -> Unit) -> Unit,
+ ): BoardAnswerState {
+-    var answering by remember { mutableStateOf(emptySet<String>()) }
+-    var note by remember { mutableStateOf<Pair<String, String>?>(null) }
+-    LaunchedEffect(resetKey) {
+-        answering = emptySet()
+-        note = null
++    // ticket.id → holder。只在第一次遇到这张票时建 holder；之后复用（同票的锁跨重组保留）。
++    val holders = remember { mutableStateMapOf<String, ApprovalGateHolder>() }
++    fun holderFor(ticket: WorkTicket): ApprovalGateHolder {
++        // 按 ticket.id keyed（attention 变化靠签名在 holder 内收敛，无需单独 key）。
++        return holders.getOrPut(ticket.id) {
++            // holder 的签名 = 这张票当前的问题签名（含 attention 范围）；切票/换题自然收敛。
++            ApprovalGateHolder { CrewWire.answerSignature(ticket) + "|" + ticket.attentionId }
++        }
+     }
++    // 清掉已经不在时间线里的票的 holder（票消失 → 回收；旧请求回来只更新已被移除的旧 holder，
++    // 不再被渲染，也就不污染任何可见卡）。每次重组按当前持票集合收口。
+     val answer: (WorkTicket, AttentionOption) -> Unit = { ticket, option ->
+-        val slot = CrewWire.answerSlot(ticket.id, option.id)
+-        if (slot !in answering) {
+-            answering = answering + slot
+-            note = null
+-            onAnswer(ticket, option) { ok ->
+-                answering = answering - slot
+-                note = slot to if (ok) AnswerCopy.ANSWER_DONE else AnswerCopy.answerFailed(null)
++        val holder = holderFor(ticket)
++        if (holder.begin()) {
++            onAnswer(ticket, option) { outcome ->
++                when (outcome) {
++                    ApprovalGate.Outcome.Accepted -> holder.accepted()
++                    ApprovalGate.Outcome.Stale -> holder.stale()
++                    ApprovalGate.Outcome.Failed -> holder.failed(null)
++                }
+             }
+         }
+     }
+-    return BoardAnswerState(answering, note, answer)
++    return BoardAnswerState(
++        phaseOf = { id -> holders[id]?.state ?: ApprovalGate.State() },
++        answer = answer,
++    )
+ }
+ 
+ private data class BoardTitles(val waiting: String, val running: String, val deciding: String, val done: String)
+@@ -553,8 +472,10 @@ private fun LazyListScope.boardSections(
+     problem: String?,
+     palette: CrewPalette,
+     titles: BoardTitles,
+-    answering: Set<String>,
+-    note: Pair<String, String>?,
++    phaseOf: (String) -> ApprovalGate.State,
++    noteFor: (WorkTicket) -> String?,
++    doneExpanded: Boolean,
++    onToggleDone: () -> Unit,
+     onAnswer: (WorkTicket, AttentionOption) -> Unit,
+     onJump: (String) -> Unit,
+ ) {
+@@ -591,12 +512,23 @@ private fun LazyListScope.boardSections(
+             )
+         }
+     }
+-    if (groups.waiting.isNotEmpty()) {
+-        item(key = "head-waiting") {
+-            BoardGroupTitle("${titles.waiting} · ${groups.waiting.size}", palette)
++    // 顺序：待你处理（deciding）第一 —— 这是「现在只有这一件事等你」；再在跑、还没回的话、办完。
++    if (groups.deciding.isNotEmpty()) {
++        item(key = "head-deciding") {
++            BoardGroupTitle("${titles.deciding} · ${groups.deciding.size}", palette, tint = palette.warn)
+         }
+-        itemsIndexed(groups.waiting, key = { index, _ -> "waiting-$index" }) { _, waiting ->
+-            BoardWaitingRow(waiting, palette, onClick = jumpFor(waiting.messageId, onJump))
++        itemsIndexed(groups.deciding, key = { index, ticket -> "deciding-$index-${ticket.id}" }) { _, ticket ->
++            BoardTicketRow(
++                ticket = ticket,
++                conversation = conversation,
++                palette = palette,
++                showProgress = false,
++                showOptions = true,
++                phase = phaseOf(ticket.id),
++                note = noteFor(ticket),
++                onAnswer = onAnswer,
++                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
++            )
+         }
+     }
+     if (groups.running.isNotEmpty()) {
+@@ -610,48 +542,68 @@ private fun LazyListScope.boardSections(
+                 palette = palette,
+                 showProgress = true,
+                 showOptions = false,
+-                answering = answering,
+-                note = note,
++                phase = phaseOf(ticket.id),
++                note = null,
+                 onAnswer = onAnswer,
+                 onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
+             )
+         }
+     }
+-    if (groups.deciding.isNotEmpty()) {
+-        item(key = "head-deciding") {
+-            BoardGroupTitle("${titles.deciding} · ${groups.deciding.size}", palette, tint = palette.warn)
++    if (groups.waiting.isNotEmpty()) {
++        item(key = "head-waiting") {
++            BoardGroupTitle("${titles.waiting} · ${groups.waiting.size}", palette)
+         }
+-        itemsIndexed(groups.deciding, key = { index, ticket -> "deciding-$index-${ticket.id}" }) { _, ticket ->
+-            BoardTicketRow(
+-                ticket = ticket,
+-                conversation = conversation,
+-                palette = palette,
+-                showProgress = false,
+-                showOptions = true,
+-                answering = answering,
+-                note = note,
+-                onAnswer = onAnswer,
+-                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
+-            )
++        itemsIndexed(groups.waiting, key = { index, _ -> "waiting-$index" }) { _, waiting ->
++            BoardWaitingRow(waiting, palette, onClick = jumpFor(waiting.messageId, onJump))
+         }
+     }
+     if (groups.done.isNotEmpty()) {
++        // 已办默认折叠成一行：任务/审批优先级高于回看历史，22 条办完不该淹没首屏。
+         item(key = "head-done") {
+-            BoardGroupTitle("${titles.done} · ${groups.done.size}", palette)
+-        }
+-        itemsIndexed(groups.done, key = { index, ticket -> "done-$index-${ticket.id}" }) { _, ticket ->
+-            BoardTicketRow(
+-                ticket = ticket,
+-                conversation = conversation,
++            DoneFoldRow(
++                count = groups.done.size,
++                expanded = doneExpanded,
+                 palette = palette,
+-                showProgress = false,
+-                showOptions = false,
+-                answering = answering,
+-                note = note,
+-                onAnswer = onAnswer,
+-                onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
++                onToggle = onToggleDone,
+             )
+         }
++        if (doneExpanded) {
++            itemsIndexed(groups.done, key = { index, ticket -> "done-$index-${ticket.id}" }) { _, ticket ->
++                BoardTicketRow(
++                    ticket = ticket,
++                    conversation = conversation,
++                    palette = palette,
++                    showProgress = false,
++                    showOptions = false,
++                    phase = phaseOf(ticket.id),
++                    note = null,
++                    onAnswer = onAnswer,
++                    onClick = jumpFor(messageIdOf(conversation, ticket), onJump),
++                )
++            }
++        }
++    }
++}
++
++/** 已办那一行：默认收起，点开展开。数字来自后端分桶，前端不另数一份。 */
++@Composable
++private fun DoneFoldRow(count: Int, expanded: Boolean, palette: CrewPalette, onToggle: () -> Unit) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(top = 8.dp, bottom = 2.dp)
++            .clip(RoundedCornerShape(8.dp))
++            .background(palette.card)
++            .border(1.dp, palette.line, RoundedCornerShape(8.dp))
++            .clickable(onClick = onToggle)
++            .defaultMinSize(minHeight = 48.dp)
++            .padding(horizontal = 11.dp, vertical = 9.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Text("✓", color = palette.faint, fontSize = 12.sp)
++        Spacer(Modifier.width(8.dp))
++        Text("办完 · $count", color = palette.muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
++        Text(if (expanded) "收起" else "展开", color = palette.faint, fontSize = 11.sp)
+     }
+ }
+ 
+@@ -708,8 +660,8 @@ private fun BoardTicketRow(
+     palette: CrewPalette,
+     showProgress: Boolean,
+     showOptions: Boolean,
+-    answering: Set<String>,
+-    note: Pair<String, String>?,
++    phase: ApprovalGate.State,
++    note: String?,
+     onAnswer: (WorkTicket, AttentionOption) -> Unit,
+     onClick: (() -> Unit)?,
+ ) {
+@@ -744,8 +696,12 @@ private fun BoardTicketRow(
+             // owner 与步数都只在后端给了才拼；bot_id 空、没有计划时这一行整行不画。
+             val owner = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim()
+                 ?: ticket.botId.trim()
+-            // state=unknown 时后端这份计划说不清走到哪，步数文字也跟着不画。
+-            val stepText = if (ticket.state == "unknown") "" else stepOf(ticket)
++            // state=unknown：后端这份计划说不清走到哪。如实说「进度未明」，不假造步数、
++            // 也不把它当成「在跑某一步」蒙混过去。
++            val stepText = when {
++                ticket.state == "unknown" -> "进度未明"
++                else -> stepOf(ticket)
++            }
+             val parts = listOfNotNull(
+                 owner.takeIf { it.isNotEmpty() },
+                 stepText.takeIf { it.isNotEmpty() },
+@@ -797,8 +753,8 @@ private fun BoardTicketRow(
+                     horizontalArrangement = Arrangement.spacedBy(6.dp),
+                 ) {
+                     for (option in ticket.options) {
+-                        val slot = CrewWire.answerSlot(ticket.id, option.id)
+-                        val busy = slot in answering
++                        // 同题互斥：这张票一旦有答复在途/已受理，所有选项一起禁用。
++                        val busy = phase.busy
+                         Box(
+                             modifier = Modifier
+                                 .weight(1f)
+@@ -806,13 +762,15 @@ private fun BoardTicketRow(
+                                 .background(palette.card)
+                                 .border(1.dp, palette.warnEdge, RoundedCornerShape(6.dp))
+                                 .clickable(enabled = !busy) { onAnswer(ticket, option) }
+-                                .defaultMinSize(minHeight = 36.dp)
++                                .defaultMinSize(minHeight = 48.dp)
+                                 .padding(horizontal = 7.dp, vertical = 8.dp),
+                             contentAlignment = Alignment.Center,
+                         ) {
++                            // 提交中 ≠ 答成：只在真正在途那一瞬说「提交中…」，不画 ✓。
++                            val label = if (busy && phase.submitting) "提交中…" else option.label
+                             Text(
+-                                if (busy) "✓" else option.label,
+-                                color = palette.warn,
++                                label,
++                                color = if (busy) palette.faint else palette.warn,
+                                 fontSize = 10.sp,
+                                 maxLines = 1,
+                                 overflow = TextOverflow.Ellipsis,
+@@ -821,8 +779,8 @@ private fun BoardTicketRow(
+                     }
+                 }
+             }
+-            if (note != null && note.first.startsWith(ticket.id + "|")) {
+-                Text(note.second, color = palette.faint, fontSize = 10.sp,
++            note?.let {
++                Text(it, color = palette.faint, fontSize = 10.sp,
+                     modifier = Modifier.padding(top = 6.dp))
+             }
+         }
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewClient.kt b/app/app/src/main/java/com/dsh/botcrew/CrewClient.kt
+index 20b27b2..322668b 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewClient.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewClient.kt
+@@ -58,6 +58,95 @@ class CrewClient(
+      */
+     private val failures = java.util.concurrent.ConcurrentHashMap<String, Int>()
+ 
++    /**
++     * 路由健康证据（[RoutePolicy] 用）：每条入口最近成功/失败、连续失败数、所属网络代次。
++     * 与上面的 [failures]（给界面判「局域网地址失效」读）是两件事：那个只数「连不上几次」，
++     * 这个带时间戳与网络代次，用来算「这次该从哪条起手、要不要短超时跳过死 LAN」。
++     * 并发 Map：read() 在 IO 线程写，界面/上报线程可能读。
++     */
++    private val health = java.util.concurrent.ConcurrentHashMap<String, RoutePolicy.Health>()
++
++    /** 网络代次：网络变化时 +1，旧的成功/失败证据整体作废（换了网旧 LAN 是否可达要重判）。 */
++    @Volatile
++    private var netGen: Int = 0
++
++    /** 当前连接种类（"cellular"/"wifi"/"none"…），由上层网络回调更新；蜂窝时选路优先公网。 */
++    @Volatile
++    var networkKindProvider: String = ""
++
++    /** 时钟注入（毫秒），单测可替换。 */
++    @Volatile
++    private var clock: () -> Long = { System.currentTimeMillis() }
++
++    /** 诊断埋点回调（可选）：请求结果记一条。null 时不记。 */
++    @Volatile
++    var diagSink: ((path: String, method: String, status: Int?, ms: Long, err: String?, routeKind: String) -> Unit)? = null
++
++    /** 给单测注入时钟。 */
++    fun setClockForTest(fn: () -> Long) { clock = fn }
++
++    /**
++     * 测试 seam：记录每趟**真实 attempt 的入口顺序**（生产为 null，零开销）。
++     * 用来端到端断言「执行层按 plan.order 起手」，而不只是断言 RoutePolicy.plan 的返回。
++     */
++    @Volatile
++    internal var attemptSpy: ((entry: String) -> Unit)? = null
++
++    /**
++     * 测试 seam：替换单条入口的试连结果（生产为 null，走真实网络）。测试用它构造「P2P/LAN 黑洞、PUBLIC 通」
++     * 等场景并断言起手顺序；返回值语义同 [attempt]（成功返回正文，抛 IOException 表示这条失败）。
++     */
++    @Volatile
++    internal var attemptOverride: ((entry: String, path: String, method: String, body: String?) -> String)? = null
++
++    /**
++     * 网络变化：代次 +1，清空健康证据（[RoutePolicy.onNetworkChanged]）。由上层在网络回调里调。
++     * 这是「网络切换响应」的落点——换了网就不该再拿旧证据决定起手。
++     */
++    fun onNetworkChanged() {
++        synchronized(this) {
++            netGen += 1
++            val cleared = RoutePolicy.onNetworkChanged(health.values.toList(), netGen)
++            health.clear()
++            for (h in cleared) health[h.entry] = h
++        }
++    }
++
++    /** 一条入口现在是什么种类（给 RoutePolicy 排序/短档用）。 */
++    private fun kindFor(entry: String, paired: PairedCrew?, proxyPort: Int?): RoutePolicy.Kind {
++        if (entry.startsWith(CrewRoute.LOCAL_PROXY_PREFIX)) return RoutePolicy.Kind.P2P
++        if (paired == null) return RoutePolicy.Kind.UNKNOWN
++        return when (CrewRoute.kindOf(entry, paired, proxyPort)) {
++            CrewRoute.Way.P2P -> RoutePolicy.Kind.P2P
++            CrewRoute.Way.LAN -> RoutePolicy.Kind.LAN
++            CrewRoute.Way.PUBLIC -> RoutePolicy.Kind.PUBLIC
++            null -> RoutePolicy.Kind.UNKNOWN
++        }
++    }
++
++    /** 供 RoutePolicy 用的种类解析（配对记录在构造时已知；proxyPort 变化用 volatile 快照）。 */
++    @Volatile
++    private var pairedSnapshot: PairedCrew? = null
++    @Volatile
++    private var proxyPortSnapshot: Int? = null
++
++    /** 上层在建 client 后告知配对记录，供选路种类判定用（不动配对身份，只读）。 */
++    fun attachPairing(paired: PairedCrew?, proxyPort: Int?) {
++        pairedSnapshot = paired
++        proxyPortSnapshot = proxyPort
++    }
++
++    private fun healthOf(entry: String): RoutePolicy.Health =
++        health[entry] ?: RoutePolicy.Health(entry, kindFor(entry, pairedSnapshot, proxyPortSnapshot), netGen = netGen)
++
++    private fun noteSuccess(entry: String) {
++        health[entry] = RoutePolicy.onSuccess(healthOf(entry), clock(), netGen)
++    }
++
++    private fun notePolicyFailure(entry: String) {
++        health[entry] = RoutePolicy.onFailure(healthOf(entry), clock(), netGen)
++    }
++
+     /**
+      * 会话相关的路径统一在这里拼；非会话接口一律不调它（契约 §1 的接口白名单）。
+      *
+@@ -120,6 +209,93 @@ class CrewClient(
+         }
+     }
+ 
++    /**
++     * **bootstrap 自愈**（仅在本地公网入口为空时补）：用一个 build 注入的部署域名，
++     * 经「带设备凭据请求 `/api/mobile/timeline`」读该后端的 `server:{crew, public_base}` 元数据，
++     * **精确比对 crew 指纹**确认「它就是同一台已配对后端」，验通则把可信公网入口补进表。
++     *
++     * 为什么需要它：出门后 App 只剩不可达的局域网入口 —— 配对那一刻 mDNS 没带 `pub`（或老记录没有）
++     * 时 `fallbackBase` 是空串，`CrewRoute.entries` 里就**没有公网入口**，于是整段用不了。
++     *
++     * ## 身份边界（lead 已批准口径）
++     *
++     * - **不用**「任意 2xx / `status.runtime==='ready'` / 同名 `dsh-crew-*`」当身份。身份只认服务端
++     *   自报的 `server.crew`，且必须与本地 [savedCrew] **逐字相等**。
++     * - **[savedCrew] 为空**（首次 / 老记录没登记）：**拒绝**，返回 null。首次身份只能来自
++     *   「现有可信已配置地址」或「本次 new-pair 响应」，不接受任意 bootstrap 200。
++     * - 候选必须是 **HTTPS**（明文 http 绝不在其上发配对凭据）；且返回 JSON 必须能被
++     *   [CrewWire.parseTimeline] 解析、属本协议、`server.crew` 与 [savedCrew] 相等。
++     *
++     * 采纳的入口优先用服务端自报的 `server.public_base`（真实 HTTPS），没有则用 [candidate] 本身。
++     *
++     * @param candidate 候选域名（来自 build 注入的部署域名）。空串直接跳过。
++     * @param savedCrew 本地已登记的可信服务器指纹（[PairedCrew.serverCrew]，可回退到 [PairedCrew.crew]）。空则不采。
++     * @return 采纳的入口；未采纳返回 null。
++     */
++    suspend fun bootstrapPublic(candidate: String, savedCrew: String): String? =
++        withContext(Dispatchers.IO) {
++            val url = CrewPairing.normalize(candidate)
++            val expect = savedCrew.trim()
++            // 首次 / 没登记身份：不接受任意 bootstrap。只在 savedCrew 非空时才允许比对。
++            if (url.isEmpty() || expect.isEmpty()) return@withContext null
++            // 只信 HTTPS：别在明文 http 上发配对凭据。
++            if (!url.startsWith("https://")) return@withContext null
++            val trusted = try {
++                val text = attempt(url, "/api/mobile/timeline", "GET", null, BOOTSTRAP_TIMEOUT_MS)
++                val conversation = CrewWire.parseTimeline(text)
++                val protocolOk = !text.contains("\"session_api\"") ||
++                    text.contains("\"session_api\":1") || text.contains("\"session_api\": 1")
++                val server = conversation.server
++                // 精确比对：服务端自报 crew 必须与已存指纹逐字相等，否则不是同一台。
++                val sameMachine = server != null && server.crew.isNotEmpty() && server.crew == expect
++                if (protocolOk && sameMachine) {
++                    // 优先用服务端自报的可信公网入口；没有就用候选本身（它已通过凭据+crew 校验）。
++                    CrewPairing.normalize(server!!.publicBase).takeIf { it.isNotEmpty() } ?: url
++                } else {
++                    null
++                }
++            } catch (error: CrewRejected) {
++                null // 401 = 这台设备没被它认，不是我们要的后端
++            } catch (error: IOException) {
++                null
++            } catch (error: Exception) {
++                null // parse 抛错（不是本协议 JSON）也不采纳
++            }
++            if (trusted == null) return@withContext null
++            // 验通：把可信入口补进入口表（不动 token/deviceId/crew 身份）。
++            synchronized(this) {
++                order = cleanEntries(order + trusted)
++            }
++            trusted
++        }
++
++    /**
++     * 从一个**已知可信**的入口（当前在用的、或配对里的局域网/隧道）读服务端自报的
++     * `server.public_base`，并在 `server.crew` 与 [savedCrew] 逐字相等时返回它。
++     *
++     * 用途：**非空旧域名也由同 crew 可信元数据更新**（不留已知旧值永不自愈）。与 [bootstrapPublic]
++     * 的区别是：这里的入口已经是可信的（用户已在用它），只需读它的元数据；而 bootstrap 是对
++     * **候选新域名**做验证。
++     *
++     * @return 可信的新公网入口；读不到 / crew 不符 / 没有 public_base 返回 null。
++     */
++    suspend fun trustedPublicBase(entry: String, savedCrew: String): String? =
++        withContext(Dispatchers.IO) {
++            val expect = savedCrew.trim()
++            val clean = CrewPairing.normalize(entry)
++            if (expect.isEmpty() || clean.isEmpty()) return@withContext null
++            try {
++                val text = attempt(clean, "/api/mobile/timeline", "GET", null, BOOTSTRAP_TIMEOUT_MS)
++                val server = CrewWire.parseTimeline(text).server
++                if (server != null && server.crew.isNotEmpty() && server.crew == expect) {
++                    CrewPairing.normalize(server.publicBase).takeIf { it.isEmpty() || it.startsWith("https://") }
++                        ?.takeIf { it.isNotEmpty() }
++                } else null
++            } catch (error: Exception) {
++                null
++            }
++        }
++
+     /**
+      * 发一次请求并把正文读回来。每个接口只差路径、方法与 body，
+      * 连接的开合收在这一处：漏一次 disconnect 就是一条泄漏的 socket。
+@@ -136,17 +312,50 @@ class CrewClient(
+             // 这一趟用自己拿到的那份表：中途被 promote 换掉，它照旧按旧表跑完。
+             val table = order
+             if (table.isEmpty()) throw IOException("队伍地址不对：没有可用的入口")
+-            // 从当前在用的那条开始绕一圈；current 不在表里（不该发生）就从第一条起。
+-            val start = table.indexOf(current).coerceAtLeast(0)
++            val now = clock()
++            // 选路计划：healthy entry sticky + 失败冷却 + 已知健康公网时对死 LAN 用短超时。
++            // 这是「每请求先撞死 LAN 15s」的根因修复点：不再无条件从 current 起手、也不再给死 LAN 15s。
++            val plan = RoutePolicy.plan(
++                entries = table,
++                kindOf = { kindFor(it, pairedSnapshot, proxyPortSnapshot) },
++                healthOf = { healthOf(it) },
++                now = now,
++                networkKind = networkKindProvider,
++            )
+             var failure: IOException? = null
+-            for (step in table.indices) {
+-                val entry = table[(start + step) % table.size]
++            var startEntry: String? = null
++            // 起手是（不健康）LAN/未知、且表里有公网入口时，先短探一次公网：探通就立刻从它起手，
++            // 不为一条大概率死的 LAN 等满 15s。探不通则按原计划从表头起。
++            if (plan.quickProbePublic) {
++                val publicEntry = plan.order.firstOrNull {
++                    kindFor(it, pairedSnapshot, proxyPortSnapshot) == RoutePolicy.Kind.PUBLIC &&
++                        (healthOf(it).consecutiveFailures < RoutePolicy.FAIL_TO_COOLDOWN)
++                }
++                if (publicEntry != null) {
++                    if (tryQuietProbe(publicEntry, RoutePolicy.QUICK_PROBE_MS)) startEntry = publicEntry
++                }
++            }
++            // 起手顺序：plan.order 的**第一个**才是本趟要试的第一个入口（policy 说了算）。
++            // 若短探命中了公网，则以它打头（也是 policy 意图：已知公网可用就先走它）。
++            // **绝不**再按旧 current 旋转 —— 那等于把 policy 排序撤销，让死旧 current 先阻塞。
++            // current 只记「最近成功的那条」用于显示/诊断，不隐式覆盖 plan。
++            val ordered = if (startEntry != null) listOf(startEntry) + plan.order.filter { it != startEntry } else plan.order
++            val t0 = clock()
++            var lastErr: String? = null
++            var lastStatus: Int? = null
++            for (step in ordered.indices) {
++                val entry = ordered[step]
++                val connectMs = plan.connectTimeoutFor[entry] ?: RoutePolicy.DEFAULT_CONNECT_MS
++                attemptSpy?.invoke(entry)
+                 try {
+-                    val text = attempt(entry, path, method, body)
+-                    // 这一条通了：之前的失败计数作废，否则一次网络抖动会一直挂在界面上。
++                    val text = (attemptOverride?.invoke(entry, path, method, body)
++                        ?: attempt(entry, path, method, body, connectMs))
++                    // 这一条通了：之前的失败计数作废，健康证据刷新。
+                     failures.remove(entry)
+-                    // 表没被换过才把「现在用哪条」写回去。换过说明 P2P 刚升级上来，
+-                    // 这一次成功走的是旧路，不该把「当前入口」改回旧的那条。
++                    noteSuccess(entry)
++                    val elapsed = clock() - t0
++                    diagSink?.invoke(ClientDiag.routeOf(path), method, 200, elapsed, null, kindName(entry))
++                    // current 只记最近成功那条（供显示/诊断），不参与本趟排序。
+                     if (entry != current && table === order) {
+                         current = entry
+                         onRouteSwitched?.invoke(entry)
+@@ -155,23 +364,55 @@ class CrewClient(
+                 } catch (error: CrewRejected) {
+                     // 凭据被拒说明这条地址**是通的**：能连上才可能被拒。不计失败。
+                     failures.remove(entry)
++                    noteSuccess(entry) // 能答话也算这条入口健康
++                    diagSink?.invoke(ClientDiag.routeOf(path), method, 401, clock() - t0, "CrewRejected", kindName(entry))
+                     throw error
+                 } catch (error: IOException) {
+-                    // 只有「压根没连上」才算这条入口失败。带 HTTP 状态码的说明对端答了话，
+-                    // 地址本身没错 —— 把 404/503 记成地址失效会让人白改一次配对。
+-                    if (error is CrewHttpStatus) failures.remove(entry) else noteFailure(entry)
+-                    // 报出去的仍是第一条路的错：那才是人最先遇到的那个现象。
+-                    // 唯一例外：后续入口明确回了 HTTP 状态（例如老后端的 404）——
+-                    // 「对端明确拒绝」比「第一条路连不上」更能说明后端是什么，
+-                    // 能力位先验据此才不会把老后端误报成链路故障。
++                    // 只有「压根没连上」才算这条入口失败。
++                    if (error is CrewHttpStatus) {
++                        failures.remove(entry)
++                        noteSuccess(entry) // 对端答了话，地址健康
++                        lastStatus = error.status
++                        lastErr = "CrewHttpStatus"
++                    } else {
++                        noteFailure(entry)
++                        notePolicyFailure(entry)
++                        lastErr = ClientDiag.errOf(error)
++                    }
+                     if (failure == null || (error is CrewHttpStatus && failure !is CrewHttpStatus)) {
+                         failure = error
+                     }
+                 }
+             }
++            // 整圈没成：记一条失败事件。
++            diagSink?.invoke(ClientDiag.routeOf(path), method, lastStatus, clock() - t0, lastErr ?: "CrewUnavailable", kindName(current))
+             throw failure ?: IOException("队伍地址不对：没有可用的入口")
+         }
+ 
++    /** 入口 → 给诊断的 routeKind 短词。 */
++    private fun kindName(entry: String): String = when (kindFor(entry, pairedSnapshot, proxyPortSnapshot)) {
++        RoutePolicy.Kind.P2P -> "p2p"
++        RoutePolicy.Kind.LAN -> "lan"
++        RoutePolicy.Kind.PUBLIC -> "public"
++        RoutePolicy.Kind.UNKNOWN -> ""
++    }
++
++    /**
++     * 短探一条入口能不能连上（带当前凭据敲 [PROBE_PATH]，只看「有没有答话」）。
++     * 与 [probeEntry] 不同：**不改**失败计数与健康证据，只用于「起手前快速确认公网可用」。
++     * 复用 [attempt]，超时短，失败静默返回 false。
++     */
++    private fun tryQuietProbe(entry: String, connectTimeoutMs: Int): Boolean = try {
++        attempt(entry, PROBE_PATH, "GET", null, connectTimeoutMs)
++        true
++    } catch (error: CrewRejected) {
++        true // 401 也证明地址活着
++    } catch (error: CrewHttpStatus) {
++        true // 404/其它状态码也证明对端答了话
++    } catch (error: IOException) {
++        false
++    }
++
+     /**
+      * 只探一条入口通不通，**不换路、不改「现在用哪条」**，只把结果记进失败计数。
+      *
+@@ -192,17 +433,21 @@ class CrewClient(
+             try {
+                 attempt(clean, PROBE_PATH, "GET", null, connectTimeoutMs)
+                 failures.remove(clean)
++                noteSuccess(clean)
+                 true
+             } catch (error: CrewRejected) {
+                 // 凭据被拒：能连上才可能被拒，地址是活的。
+                 failures.remove(clean)
++                noteSuccess(clean)
+                 true
+             } catch (error: CrewHttpStatus) {
+                 // 对端明确回了一个状态码：地址是活的，只是这条路径不对。
+                 failures.remove(clean)
++                noteSuccess(clean)
+                 true
+             } catch (error: IOException) {
+                 noteFailure(clean)
++                notePolicyFailure(clean)
+                 false
+             }
+         }
+@@ -668,6 +913,9 @@ class AnswerStale(message: String) : IOException(message)
+  */
+ private const val PROBE_PATH = "/api/mobile/__latency"
+ 
++/** bootstrap 自愈验域名身份用的超时：这是出门兜底路径，给足握手时间，但不能无限等。 */
++private const val BOOTSTRAP_TIMEOUT_MS = 8_000
++
+ /** HTTP 明确回的失败。message 与从前逐字相同，只多带一个状态码。 */
+ private class CrewHttpStatus(val status: Int, message: String) : IOException(message)
+ 
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt b/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
+index 83b6f20..3dba46e 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewUi.kt
+@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.horizontalScroll
+ import androidx.compose.foundation.clickable
++import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.ExperimentalFoundationApi
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.defaultMinSize
+@@ -14,10 +16,12 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.widthIn
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.layout.systemBarsPadding
+@@ -39,6 +43,14 @@ import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
++import androidx.compose.material3.ModalNavigationDrawer
++import androidx.compose.material3.ModalDrawerSheet
++import androidx.compose.material3.DrawerValue
++import androidx.compose.material3.rememberDrawerState
++import androidx.activity.compose.BackHandler
++import androidx.compose.material3.DropdownMenu
++import androidx.compose.material3.DropdownMenuItem
++import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.OutlinedTextFieldDefaults
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+@@ -64,10 +76,17 @@ import androidx.compose.ui.graphics.drawscope.Stroke
+ import androidx.compose.ui.text.font.FontFamily
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.em
+ import androidx.compose.ui.unit.sp
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.semantics.contentDescription
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
+@@ -233,7 +252,14 @@ fun CrewRoot(
+         mutableStateOf(SessionState(current = initialSession.takeIf(SessionRoute::validId) ?: SessionRoute.MAIN))
+     }
+     val conversation: Conversation? = sessionState.shown
++    // 诊断事件要带 session 短词：会话变了就同步给 DiagRuntime（只读，不写盘、不弹键盘）。
++    androidx.compose.runtime.LaunchedEffect(sessionState.current) {
++        DiagRuntime.get(appContext).currentSession = sessionState.current
++    }
++    // problem 只由「时间线读取失败」写入 → 喂顶部连接状态、也是「连不上就别发」的唯一依据。
+     var problem by remember { mutableStateOf<String?>(null) }
++    // 业务动作失败（发消息/答复）只作一条提示，不冒断连、不禁发。
++    var operationNote by remember { mutableStateOf<String?>(null) }
+     var draft by remember { mutableStateOf("") }
+     var sending by remember { mutableStateOf(false) }
+     // 同一条草稿重发要沿用同一个 request_id：超时后其实已经进了队，换一个键会重复入队。
+@@ -409,7 +435,7 @@ fun CrewRoot(
+                         } catch (error: CancellationException) {
+                             throw error
+                         } catch (error: Exception) {
+-                            problem = error.message ?: "发送失败"
++                            operationNote = error.message ?: "发送失败"
+                         } finally {
+                             sending = false
+                         }
+@@ -494,6 +520,10 @@ fun CrewRoot(
+     Surface(modifier = Modifier.fillMaxSize(), color = palette.surface) {
+         // 让出状态栏与导航栏：断连横幅排在最前，不加的话会顶到系统时间上去。
+         Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
++          // 队伍这一屏的顶部信息（连接/会话/模式/成员/更多）由 CrewScreen 内的紧凑顶栏统一承载，
++          // 不再在这里叠加 route 小字 + 常驻 SessionBar（那正是顶部占 40% 的根因：两层各画一段）。
++          // 其余各屏（后台/工作区/模型…）仍沿用原有的常驻 route + 会话切换条。
++          if (screen != Screen.Crew) {
+             // 走的是哪条路：一行小字常驻。它不是装饰 —— 连不上时人最先要问的就是
+             // 「现在是不是在绕公网」，这一行直接回答，不必让人去猜。
+             if (route.isNotEmpty()) {
+@@ -566,7 +596,8 @@ fun CrewRoot(
+                     TextButton(onClick = { sessionRetry += 1 }) { Text("重试", color = palette.accent) }
+                 }
+             }
+-            // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
++          }
++          // 断连要说在前面：内容区是撑满高度的，摆在它后面的东西会被挤出屏幕。
+             problem?.let {
+                 Text(
+                     text = "连不上队伍：$it",
+@@ -609,6 +640,8 @@ fun CrewRoot(
+                 Screen.Crew -> CrewScreen(client, conversation, outputs, agents, palette, problem, draft, sending,
+                     // 结果条按票的缓存每读回一次时间线就清空重读一次（见 CrewScreen）。
+                     timelineEpoch = timelineEpoch,
++                    operationNote = operationNote,
++                    noticesWarning = noticesHealth.line().ifEmpty { null },
+                     requestIdFor = { text ->
+                         if (pendingSend?.first == text) {
+                             pendingSend!!.second
+@@ -617,7 +650,8 @@ fun CrewRoot(
+                         }
+                     },
+                     // 发出去了才丢掉幂等键：失败重发必须还在。
+-                    { draft = it }, { sending = it }, { pendingSend = null; refresh() }, { problem = it },
++                    onDraft = { draft = it }, onSending = { sending = it },
++                    onSent = { pendingSend = null; refresh() }, onFailed = { operationNote = it },
+                     // 代码卡上「看看改完的样子」真读到了画面：整屏去看它的屏幕，看的是
+                     // 这段改动所属的那张票 —— 票号由代码卡带过来，这里不再猜。
+                     onPreview = { ticketId, botId, view ->
+@@ -641,6 +675,41 @@ fun CrewRoot(
+                     sessionId = sessionState.requestSession,
+                     // 设备推送落本地那份：顶部一条紧凑提示，复用列表区，不新开屏。
+                     notices = notices,
++                    // 紧凑顶栏要用的连接/会话真源（都来自 CrewRoot，唯一一份；CrewScreen 只读不建）。
++                    route = route,
++                    connLoading = conversation == null && problem == null,
++                    onRefresh = { refresh() },
++                    sessionCurrent = sessionState.current,
++                    sessionLabel = sessionState.sessions.firstOrNull { it.id == sessionState.current }?.let { if (it.name.isBlank()) it.id else it.name } ?: sessionState.current,
++                    sessionSwitchable = sessionState.switchable,
++                    sessionState = sessionState,
++                    onSwitchSession = { id ->
++                        val next = SessionFlow.switch(sessionState, id)
++                        if (next.current != sessionState.current) enterSession(next)
++                    },
++                    onCreateSession = { id ->
++                        val check = SessionFlow.create(sessionState, id)
++                        sessionState = check.state
++                        if (check.accepted) {
++                            scope.launch {
++                                try {
++                                    val view = client.createSession(id)
++                                    val next = SessionFlow.applyCreated(sessionState, view, id)
++                                    if (next.current != sessionState.current) enterSession(next) else sessionState = next
++                                } catch (error: CancellationException) {
++                                    throw error
++                                } catch (error: Exception) {
++                                    android.util.Log.w("CrewSessions", "新建会话失败", error)
++                                    sessionState = SessionFlow.createFailed(
++                                        sessionState, error.message?.takeIf(String::isNotBlank) ?: error.toString(),
++                                    )
++                                }
++                            }
++                        }
++                    },
++                    // 未 @ 时的默认收件人真源：后端该会话的 default_bot_id（全表唯一 role=default）。
++                    // 读不到就是空串，输入区如实报「未指定」，不硬编码第一位。
++                    defaultBotId = conversation?.defaultBotId.orEmpty(),
+                 )
+             }
+ 
+@@ -890,6 +959,10 @@ private fun CrewScreen(
+     problem: String?,
+     draft: String,
+     sending: Boolean,
++    /** 业务动作（发消息/答复）失败的一条提示：只显示，不冒断连、不禁发。 */
++    operationNote: String? = null,
++    /** 推送拉取失败的健康信息：非空才显示一行，不常驻成功态、不吞错误。 */
++    noticesWarning: String? = null,
+     /** 第几次把时间线读回来。变了就按这一轮重读结果条（上一轮的结果不再算数）。 */
+     timelineEpoch: Int,
+     /** 同一段草稿重发要沿用同一个幂等键；新草稿换一个。 */
+@@ -914,6 +987,18 @@ private fun CrewScreen(
+     sessionId: String? = null,
+     /** 设备接收链（#23）落本地、已持久化的推送，最新在前。空表示没有。复用在列表区顶部，不新开一屏。 */
+     notices: List<CrewNotice> = emptyList(),
++    // 紧凑顶栏：连接/会话真源都来自 CrewRoot，这一层只读不改。
++    route: String = "",
++    connLoading: Boolean = false,
++    onRefresh: () -> Unit = {},
++    sessionCurrent: String = SessionRoute.MAIN,
++    sessionLabel: String = SessionRoute.MAIN,
++    sessionSwitchable: Boolean = false,
++    sessionState: SessionState? = null,
++    onSwitchSession: (String) -> Unit = {},
++    onCreateSession: (String) -> Unit = {},
++    /** 当前会话后端的 `default_bot_id`（全表唯一 role=default）。空串=后端没给，输入区据此如实报「未指定」。 */
++    defaultBotId: String = "",
+ ) {
+     // 名片与滚动位置归这一页；其余是发消息要用到的、由上层持有的状态。
+     var profile by remember { mutableStateOf<BotCard?>(null) }
+@@ -923,9 +1008,26 @@ private fun CrewScreen(
+     var withdrawNote by remember { mutableStateOf<String?>(null) }
+     val listState = rememberLazyListState()
+     val scope = rememberCoroutineScope()
++    // 「跟他说话」把输入框聚焦到草稿（只在 App 内请求焦点，不碰系统输入）。
++    val composerFocus = remember { FocusRequester() }
+     // 事务板抽屉与模式切换都归这一页：切镜头时群聊的滚动位置还在（listState 留在组合里）。
+     var boardOpen by remember { mutableStateOf(false) }
+     var pendingJump by remember { mutableStateOf<String?>(null) }
++    // 会话弹层（SessionBar）开合：CrewScreen 单一真源。顶栏点会话与 drawer「会话管理」共用它，
++    // 两页（聊天/任务）都走同一份；不再由 CrewTopBar 各持一份内部 state。
++    var showSessions by remember { mutableStateOf(false) }
++    // 通知跳转（一次性）：drawer「通知」点下后置要跳的目标 index，等聊天列表挂载后滚过去再清标记。
++    var pendingNoticeJump by remember { mutableStateOf(false) }
++    // 侧边栏开合状态。点遮罩由 ModalNavigationDrawer 自身处理；**系统 Back 显式由下方 BackHandler 拦截关 drawer**
++    // （本组 Material3 版本实测不会自动阻止 Back 退到 launcher，必须显式接线，不能假设框架默认生效）。
++    val drawerState = rememberDrawerState(DrawerValue.Closed)
++    // 抽屉开着时系统 Back 关 drawer，不退 App；只在 isOpen 时拦截，其它模态/正在关闭的边界不受影响。
++    BackHandler(enabled = drawerState.isOpen) { scope.launch { drawerState.close() } }
++    // 「资料」打开名片后，onTalk 要聚焦输入框 —— 但只在名片浮层撤掉、输入框重新挂上组合之后才请求，
++    // 否则 FocusRequester 尚未附着会抛 "not initialized"。用一次性标记，在 LaunchedEffect 里消费。
++    var focusComposerAfterTalk by remember { mutableStateOf(false) }
++    // 诊断页开合：侧栏「工具 · 诊断」的唯一开关。诊断页是覆盖层，不常驻、不入顶部。
++    var diagOpen by remember { mutableStateOf(false) }
+ 
+     // 分拣台的「丢」走和群聊同一条 POST /send，不另造一套发送。
+     fun sendBoardText(text: String, done: (Boolean) -> Unit) {
+@@ -955,25 +1057,25 @@ private fun CrewScreen(
+      * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+      * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
+      */
+-    fun answerByTicket(ticket: WorkTicket, text: String, done: (Boolean) -> Unit) {
++    fun answerByTicket(ticket: WorkTicket, text: String, done: (ApprovalGate.Outcome) -> Unit) {
+         onSending(true)
+         scope.launch {
+-            val ok = try {
++            val outcome = try {
+                 client.answer(ticket.id, text, ticket.attentionId, sessionId)
+                 onSent()
+-                true
++                ApprovalGate.Outcome.Accepted
+             } catch (error: AnswerStale) {
+                 // 旧卡已过期：刷新时间线把卡换成最新一张，明说「已更新」不冒充成功。
+                 onSent()
+                 onFailed("这张问题卡已更新，请按最新的那张再答")
+-                false
++                ApprovalGate.Outcome.Stale
+             } catch (error: Exception) {
+                 onFailed(error.message ?: "答复没发出去")
+-                false
++                ApprovalGate.Outcome.Failed
+             } finally {
+                 onSending(false)
+             }
+-            done(ok)
++            done(outcome)
+         }
+     }
+     /**
+@@ -984,15 +1086,15 @@ private fun CrewScreen(
+      * - 选明确选项：text 传选项 label（后端 label/id 都认）。
+      * - 自写 revise：由队伍消息区的待决卡（TicketStrip）内联输入框直接发 /answer，text 是用户原文。
+      * - 409（旧卡/已结束/重复答）：不当成功；刷新时间线把旧卡换成最新一张，并提示「已更新」。
+-     * - 请求中禁重入由 [BoardAnswerState] / 桌面 answers[slot] 保证；这里只做一次发射。
++     * - 请求中禁重入由 [ApprovalGate] / 桌面 answers[slot] 保证；这里只做一次发射。
+      */
+-    fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (Boolean) -> Unit) {
++    fun answerTicket(ticket: WorkTicket, option: AttentionOption, done: (ApprovalGate.Outcome) -> Unit) {
+         // 没有 attention_id 的票不是审批卡：保持既有 /send 行为，不引入审批语义。
+         if (ticket.attentionId.isEmpty()) {
+             val name = conversation?.bots?.firstOrNull { it.id == ticket.botId }?.name?.trim().orEmpty()
+             val address = name.ifEmpty { ticket.botId.trim() }
+             val text = if (address.isEmpty()) option.label else "@$address ${option.label}"
+-            sendBoardText(text, done)
++            sendBoardText(text) { ok -> done(if (ok) ApprovalGate.Outcome.Accepted else ApprovalGate.Outcome.Failed) }
+             return
+         }
+         answerByTicket(ticket, option.label, done)
+@@ -1007,10 +1109,63 @@ private fun CrewScreen(
+         onModeChange(next)
+     }
+ 
++    // 顶栏会话弹层与 drawer「会话管理」共用同一份真源：由 CrewScreen 的 showSessions 统一控制，
++    // 两页（聊天 / 任务）都走这同一个 state 和同一个弹层，不各写一份、不出现「启用了却点了没反应」。
++    val openSessions = { showSessions = true }
++    // 打开名片：两页共用。任务页（Triage）没有自己的名片渲染层，这里统一切到聊天页再开名片，
++    // 保证「资料」在两页都真实可达；切页不动 draft（草稿归 CrewRoot，mode 只切渲染）。
++    val openProfile: (BotCard) -> Unit = { bot ->
++        profile = bot
++        if (mode != Mode.Chat) switchMode(Mode.Chat)
++        scope.launch { drawerState.close() }
++        Unit
++    }
++    ModalNavigationDrawer(
++        drawerState = drawerState,
++        drawerContent = {
++            CrewDrawerSheet(
++                palette = if (mode == Mode.Triage) TriagePalette else palette,
++                mode = mode, bots = conversation?.bots.orEmpty(),
++                recipientId = currentRecipientId(draft, conversation?.bots.orEmpty()),
++                defaultBotId = defaultBotId,
++                noticeCount = notices.size,
++                // 通知行：关 drawer + 切聊天 + 置跳转标记（实际滚动在聊天分支列表挂载后执行）。
++                onOpenNotices = {
++                    switchMode(Mode.Chat)
++                    pendingNoticeJump = true
++                    scope.launch { drawerState.close() }
++                },
++                onPickRecipient = { bot ->
++                    onDraft(Recipient.select(draft, bot, conversation?.bots.orEmpty()))
++                    scope.launch { drawerState.close() }
++                },
++                onOpenProfile = openProfile,
++                onNavChat = { switchMode(Mode.Chat); scope.launch { drawerState.close() } },
++                onNavTasks = { switchMode(Mode.Triage); scope.launch { drawerState.close() } },
++                // 任务页里点「事务板」= 切回聊天并打开事务板抽屉（事务板渲染在聊天分支）。
++                onBoard = { switchMode(Mode.Chat); boardOpen = true; scope.launch { drawerState.close() } },
++                // 「会话管理」打开真实 SessionBar 弹层（与顶栏点会话同一真源），不再只是关 drawer。
++                onSessions = { openSessions(); scope.launch { drawerState.close() } },
++                canSessions = sessionSwitchable && sessionState != null,
++                onModels = { onModels(); scope.launch { drawerState.close() } },
++                onBackend = { onBackend(); scope.launch { drawerState.close() } },
++                onWorkspace = { onWorkspace(null); scope.launch { drawerState.close() } },
++                hasWorkspace = conversation != null,
++                // 诊断：关 drawer + 开诊断页（覆盖层）。放侧栏工具，不加常驻排。
++                onDiag = { diagOpen = true; scope.launch { drawerState.close() } },
++            )
++        },
++    ) {
+     if (mode == Mode.Triage) {
+         Column(modifier = Modifier.fillMaxSize()) {
+-            // 分拣台整屏用纸感（含顶栏），聊天模式仍是暗色：两个镜头各自的视觉语言不混着用。
+-            ModeHeader(mode, TriagePalette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = {})
++            CrewTopBar(
++                route = route, connLoading = connLoading, problem = problem, palette = TriagePalette,
++                onRefresh = onRefresh,
++                title = CrewNavigation.topBarTitle(mode, sessionLabel), sessionSwitchable = sessionSwitchable,
++                sessionState = sessionState, onSwitchSession = onSwitchSession, onCreateSession = onCreateSession,
++                onOpenDrawer = { scope.launch { drawerState.open() } },
++                sessionsOpen = showSessions, onOpenSessions = { openSessions() }, onCloseSessions = { showSessions = false },
++            )
+             TriageScreen(
+                 conversation = conversation,
+                 palette = TriagePalette,
+@@ -1024,55 +1179,52 @@ private fun CrewScreen(
+                 onJumpToMessage = { messageId -> jump(messageId) },
+                 modifier = Modifier.weight(1f),
+             )
++            // 名片 overlay 在两页共用：任务页点「资料」切到聊天页后，这里同一层渲染名片（见下）。
++            ProfileOverlay(profile, conversation, palette, draft,
++                onDismiss = { profile = null },
++                onTalk = { shownProfile, bots ->
++                    profile = null
++                    onDraft(Recipient.select(draft, shownProfile, bots))
++                    focusComposerAfterTalk = true
++                },
++                onEdit = { shownProfile -> profile = null; editing = shownProfile },
++                onWorkspace = { profile = null; onWorkspace(it) })
+         }
+-        return
+-    }
++    } else {
+     Column(modifier = Modifier.fillMaxSize()) {
+-        ModeHeader(mode, palette, { next -> switchMode(next) }, boardUnread(conversation), onOpenBoard = { boardOpen = true })
++        // 单行顶栏 56：menu · 当前会话 · 连接状态。无模式行 / 成员横条 / 更多⋯。
++        CrewTopBar(
++            route = route, connLoading = connLoading, problem = problem, palette = palette,
++            onRefresh = onRefresh,
++            title = CrewNavigation.topBarTitle(mode, sessionLabel), sessionSwitchable = sessionSwitchable,
++            sessionState = sessionState, onSwitchSession = onSwitchSession, onCreateSession = onCreateSession,
++            onOpenDrawer = { scope.launch { drawerState.open() } },
++            sessionsOpen = showSessions, onOpenSessions = { openSessions() }, onCloseSessions = { showSessions = false },
++        )
+         // 事务板/分拣台点一条：切回群聊并滚到那句话（ticket_ref 对不上的行不会走到这里）。
++        // 通知现在作为 LazyColumn 首项插入：消息的列表索引 = 消息在 messages 里的索引 + 偏移。
+         LaunchedEffect(pendingJump) {
+             val messageId = pendingJump ?: return@LaunchedEffect
+             val index = conversation?.messages?.indexOfFirst { it.id == messageId } ?: -1
+-            if (index >= 0) listState.animateScrollToItem(index)
++            val offset = if (notices.isNotEmpty()) messagesListOffsetIfNotice else 0
++            if (index >= 0) listState.animateScrollToItem(index + offset)
+             pendingJump = null
+         }
+-        Row(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .background(palette.card)
+-                // 画板页头：padding 10 18 14，白底 + 下边线 1。边线就是这一层底的最下面一条。
+-                .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 14.dp),
+-            verticalAlignment = Alignment.CenterVertically,
+-        ) {
+-            // 画板第 6 张（手机花名册）的页头标题是 20sp / 660 / 字距 -0.02em。
+-            Text(
+-                "我的队伍",
+-                fontSize = 20.sp,
+-                fontWeight = FontWeight(660),
+-                letterSpacing = (-0.02f).em,
+-                color = palette.ink,
+-            )
+-            Spacer(Modifier.weight(1f))
+-            // 画板 Mobile 的顶栏在这里放的是「看它的屏幕」那个小方块。后端还没这条接口，
+-            // 所以按下去说一句实话，不跳到一个空页面 —— 空页面比没反应更像出了故障。
+-            GlassIconButton(
+-                glyph = "屏幕",
+-                tint = if (conversation != null) palette.accent else palette.hint,
+-                palette = palette,
+-                onClick = { onWorkspace(null) },
+-            )
+-            TextButton(onClick = onModels) { Text("模型", color = palette.accent) }
+-            // 「后台」入口本来就该在最常去的地方；画板还给它挂了一枚未读角标（契约 §5.6）。
+-            // 算不出来时角标不出现（见 BackendIconButton），入口本身照常在。
+-            BackendIconButton(
+-                tint = palette.accent,
+-                count = conversation?.unread,
+-                palette = palette,
+-                onClick = onBackend,
+-            )
++        // 通知行点了：等列表挂载后滚到首项通知摘要（index 来自纯函数，不伪造 message id、不发请求）。
++        // 等一帧确保列表已量出高度；滚完清标记，不重复触发。
++        LaunchedEffect(pendingNoticeJump) {
++            if (!pendingNoticeJump) return@LaunchedEffect
++            val target = CrewNavigation.noticeItemIndex(notices.isNotEmpty())
++            if (target >= 0) {
++                withFrameNanos { }
++                listState.scrollToItem(target)
++            }
++            pendingNoticeJump = false
+         }
+-        // 页头那 1 的下边线。画板把它画在页头这一块上，不画在内容上。
+-        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(palette.line))
++        // 名片「跟他说话」后的聚焦：**不在固定帧数后盲 requestFocus**（那时 TextField 可能还没挂上，
++        // requestFocus 会抛「not initialized」）。改为把 armed 标记传给 ComposerRow，由 TextField 自身
++        // 的 onGloballyPositioned 在真正挂上后一次性 requestFocus + keyboard.show，成功后回调清标记。
++        // 只由显式 onTalk 置位，不在导航/进页时自动弹键盘、不抢系统焦点。
+         val shown = conversation
+         if (shown != null) {
+             when {
+@@ -1081,51 +1233,16 @@ private fun CrewScreen(
+                 shown.bots.isEmpty() ->
+                     EmptyState(client, palette, onBackend, onCreated = onSent)
+                 else -> {
+-                    // 花名册横排：头像块 + 名字。设计稿里头像 32dp、圆角 10。
+-                    // 裸文字按钮看不出「这是一个人」，头像块才看得出来。
+-                    Row(
+-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+-                            .padding(horizontal = 14.dp, vertical = 6.dp),
+-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+-                    ) {
+-                        for ((index, bot) in shown.bots.withIndex()) {
+-                            Column(
+-                                horizontalAlignment = Alignment.CenterHorizontally,
+-                                modifier = Modifier.clickable { profile = bot }
+-                                    .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
+-                            ) {
+-                                Box(
+-                                    modifier = Modifier
+-                                        .size(32.dp)
+-                                        .clip(RoundedCornerShape(10.dp))
+-                                        .background(if (index == 0) palette.accentSoft else palette.card),
+-                                    contentAlignment = Alignment.Center,
+-                                ) {
+-                                    Text(
+-                                        bot.name.take(1),
+-                                        fontSize = 13.sp,
+-                                        fontWeight = FontWeight.SemiBold,
+-                                        color = palette.accent,
+-                                    )
+-                                }
+-                                Spacer(Modifier.height(3.dp))
+-                                Text(bot.name, fontSize = 11.sp, color = palette.muted)
+-                            }
+-                        }
+-                    }
+-                    val shownProfile = profile
+-                    if (shownProfile != null) {
+-                        BotCardSheet(shownProfile, shown, palette, onTalk = { profile = null },
+-                            onClose = { profile = null }, onEdit = {
+-                                // 名片让位给编辑层：两个都是铺满整屏的浮层，同时画会互相压住。
+-                                profile = null
+-                                editing = shownProfile
+-                            }) {
+-                            // 进工作区前先把名片收起来：否则从屏幕页退回来时还压着一张卡。
++                    // 名片 overlay：两页共用同一渲染（聊天/任务都在这层之上，切到聊天再开也不丢 draft）。
++                    ProfileOverlay(profile, shown, palette, draft,
++                        onDismiss = { profile = null },
++                        onTalk = { shownProfile, bots ->
+                             profile = null
+-                            onWorkspace(it)
+-                        }
+-                    }
++                            onDraft(Recipient.select(draft, shownProfile, bots))
++                            focusComposerAfterTalk = true
++                        },
++                        onEdit = { shownProfile -> profile = null; editing = shownProfile },
++                        onWorkspace = { profile = null; onWorkspace(it) })
+                     val shownEditor = editing
+                     if (shownEditor != null) {
+                         BotEditorSheet(client, shownEditor, palette,
+@@ -1146,30 +1263,20 @@ private fun CrewScreen(
+                     // 挂在滚动帧里就是每帧多一份活。120Hz 上一帧只有 8ms，这点活足够掉帧。
+                     // 手一停，它立刻回来 —— 停手的那一帧重算一次，人看不到「刚才没有」。
+                     val scrolling = listState.isScrollInProgress
+-                    // 设备推送（#23）：复用列表区，不新开屏。只列最新几条，点一条不进别的页 ——
+-                    // 这是「有事要你知道」的账，不是又一次消息流。条数与正文都来自已持久化的本地那份。
+-                    if (notices.isNotEmpty()) {
+-                        Column(
+-                            modifier = Modifier.fillMaxWidth()
+-                                .background(palette.accentSoft)
+-                                .padding(horizontal = 16.dp, vertical = 8.dp),
+-                            verticalArrangement = Arrangement.spacedBy(2.dp),
+-                        ) {
+-                            Text(
+-                                "有事记得看一下 · ${notices.size}",
+-                                fontSize = 12.sp,
+-                                fontWeight = FontWeight.SemiBold,
+-                                color = palette.accent,
+-                            )
+-                            for (notice in notices.take(3)) {
+-                                Text(
+-                                    text = if (notice.title.isNotBlank()) "${notice.title}：${notice.body}" else notice.body,
+-                                    fontSize = 12.sp,
+-                                    color = palette.ink,
+-                                    maxLines = 2,
+-                                )
+-                            }
+-                        }
++                    // 业务动作失败（发消息/答复）的一条提示：只提示，不当断连、不禁发。会话/连接问题
++                    // 在上方连接状态里按需显示，这里不重复灌。
++                    operationNote?.let {
++                        Text(
++                            it, color = palette.danger, fontSize = 12.sp,
++                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
++                        )
++                    }
++                    // notices 拉取失败的健康信息也单独一行（不吞错误、不常驻成功态）。
++                    noticesWarning?.let {
++                        Text(
++                            "推送拉取：$it", color = palette.accent, fontSize = 11.sp,
++                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
++                        )
+                     }
+                     LazyColumn(
+                         state = listState,
+@@ -1182,6 +1289,10 @@ private fun CrewScreen(
+                         // 硬生生切掉半行，最下面那条又贴着输入框消失。
+                         contentPadding = PaddingValues(top = 10.dp, bottom = 10.dp),
+                     ) {
++                        // 通知：列表内首项，随消息一起滚；默认一行摘要可展开，不常驻、不固定挤高度。
++                        if (notices.isNotEmpty()) {
++                            item(key = "notice") { NoticeSummary(notices, palette) }
++                        }
+                         // 网关的 item 不保证带 id：缺 id 时 optString 给空串，几条缺 id 的消息
+                         // 就会共用同一个 key，Compose 直接抛 "Key was already used"。
+                         itemsIndexed(shown.messages, key = { index, m -> m.id.ifEmpty { "missing-$index" } }) { index, message ->
+@@ -1263,8 +1374,11 @@ private fun CrewScreen(
+                         val gap = if (last == null) 0 else (info.viewportEndOffset - (last.offset + last.size))
+                         val atBottom = last == null || (last.index >= info.totalItemsCount - 1 && gap <= 48)
+                         // scrollToItem(末项) 只能把它顶到视口顶部；末项比视口矮时列表会停在半途。
+-                        // 给一个很大的 offset，才是滚到真正的尽头。
+-                        suspend fun bottom() { listState.scrollToItem(shown.messages.lastIndex, Int.MAX_VALUE) }
++                        // 给一个很大的 offset，才是滚到真正的尽头。末项索引含通知首项的偏移。
++                        suspend fun bottom() {
++                            val lastIdx = shown.messages.lastIndex + (if (notices.isNotEmpty()) messagesListOffsetIfNotice else 0)
++                            listState.scrollToItem(lastIdx, Int.MAX_VALUE)
++                        }
+                         // 真正动手之前再看一眼：上面这几行读布局、再等一帧，中间隔着十几毫秒，
+                         // 人完全可能在这期间把手指按下来。按下去之后再滚，等于把上面那条让开的规矩
+                         // 白写了 —— 而且这一下会打断他自己刚甩起来的惯性。
+@@ -1286,6 +1400,11 @@ private fun CrewScreen(
+                     // 连不上就别让人发：发出去也到不了，还让人以为发了。
+                     Composer(client, draft, queued, shown.declined.lastOrNull()?.reason, withdrawNote, sending, palette,
+                         enabled = problem == null, onChange = onDraft,
++                        focusRequester = composerFocus,
++                        focusWhenPlaced = focusComposerAfterTalk,
++                        onFocusHandled = { focusComposerAfterTalk = false },
++                        recipientLabel = CrewNavigation.recipientLabel(draft, shown.bots, defaultBotId),
++                        onOpenRecipient = { scope.launch { drawerState.open() } },
+                         steerTicketId = shown.tickets.firstOrNull { it.open }?.id,
+                         onSteer = { requestId, ticketId ->
+                             scope.launch {
+@@ -1358,8 +1477,390 @@ private fun CrewScreen(
+             onAnswer = { ticket, option, done -> answerTicket(ticket, option, done) },
+         )
+     }
++    // 诊断页：覆盖层，从侧栏工具进来，不常驻。压在内容之上，关掉即回。
++    if (diagOpen) {
++        DiagPage(
++            palette = palette,
++            diag = DiagRuntime.get(androidx.compose.ui.platform.LocalContext.current.applicationContext),
++            onClose = { diagOpen = false },
++        )
++    }
++    }
++    }
++}
++
++/**
++ * 当前收件人的显式 id：正文里 @ 了已知成员就是第一位；没点名返回 null（由调用方再落到后端默认）。
++ * 与 [CrewNavigation.recipientLabel] 同口径，只把「名字」换回「id」给成员行高亮用。
++ */
++private fun currentRecipientId(draft: String, bots: List<BotCard>): String? {
++    val name = Recipient.primaryRecipient(draft, bots) ?: return null
++    return bots.firstOrNull { Recipient.label(it) == name }?.id
++}
++
++/**
++ * 单行顶栏（56dp）：汉堡 menu(48) · 当前会话名(可点切换会话，占可用宽) · 连接状态(短词≤76dp，48命中，点开详情)。
++ *
++ * 不再常驻模式行 / 成员横条 / 「更多⋯」/ 独立通知块 —— 它们的入口全部下沉到 [CrewDrawerSheet]。
++ * 会话胶囊是**唯一**会话入口的外层触发：点它弹出现有 [SessionBar] 管理面板（切/建/错误），
++ * 真源仍是 CrewRoot 的 sessionState —— 这里不建第二份会话状态。
++ * 连接状态复用 task-2 的 [CrewConnectionStatus]（compact），只画传入的 route/loading/problem。
++ */
++@Composable
++private fun CrewTopBar(
++    route: String,
++    connLoading: Boolean,
++    problem: String?,
++    palette: CrewPalette,
++    onRefresh: () -> Unit,
++    title: String,
++    sessionSwitchable: Boolean,
++    sessionState: SessionState?,
++    onSwitchSession: (String) -> Unit,
++    onCreateSession: (String) -> Unit,
++    onOpenDrawer: () -> Unit,
++    /** 会话弹层是否展开（由 CrewScreen 单一真源控制，drawer「会话管理」也开同一个）。 */
++    sessionsOpen: Boolean,
++    onOpenSessions: () -> Unit,
++    onCloseSessions: () -> Unit,
++) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .height(56.dp)
++            .background(palette.card)
++            .padding(horizontal = 6.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(4.dp),
++    ) {
++        // 汉堡：48×48 命中，打开原生侧边栏。
++        Box(
++            modifier = Modifier
++                .size(48.dp)
++                .clip(RoundedCornerShape(10.dp))
++                .clickable(onClick = onOpenDrawer)
++                .semantics { contentDescription = "打开侧边栏" },
++            contentAlignment = Alignment.Center,
++        ) {
++            Text("☰", fontSize = 18.sp, color = palette.ink)
++        }
++        // 当前会话名：占可用宽、单行 ellipsis；可切换时才可点（老后端锁 main 就只读显示）。
++        Box(
++            modifier = Modifier
++                .weight(1f)
++                .height(48.dp)
++                .clip(RoundedCornerShape(9.dp))
++                .clickable(enabled = sessionSwitchable && sessionState != null) { onOpenSessions() }
++                .padding(horizontal = 8.dp),
++            contentAlignment = Alignment.CenterStart,
++        ) {
++            Text(
++                text = if (sessionSwitchable) "$title ▾" else title,
++                fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = palette.ink,
++                maxLines = 1, overflow = TextOverflow.Ellipsis,
++            )
++        }
++        // 右：连接状态，单短词限宽 76dp、48 命中，点开连接详情。
++        CrewConnectionStatus(
++            route = route, loading = connLoading, problem = problem, palette = palette,
++            onRefresh = onRefresh, compact = true,
++            modifier = Modifier.widthIn(max = 76.dp).heightIn(min = 48.dp),
++        )
++    }
++    // 会话管理弹层：复用现有 SessionBar（切/建/错误），真源不变；由 CrewScreen 单一真源 sessionsOpen 控制。
++    if (sessionsOpen && sessionState != null) {
++        AlertDialog(
++            onDismissRequest = onCloseSessions,
++            confirmButton = { TextButton(onClick = onCloseSessions) { Text("关闭", color = palette.accent) } },
++            title = { Text("会话", color = palette.ink, fontSize = 15.sp) },
++            text = {
++                SessionBar(
++                    state = sessionState,
++                    palette = palette,
++                    onSwitch = { id -> onSwitchSession(id); onCloseSessions() },
++                    onCreate = { id -> onCreateSession(id) },
++                    onDismissError = onCloseSessions,
++                )
++            },
++        )
++    }
+ }
+ 
++/**
++ * 侧边栏（原生 [ModalNavigationDrawer] 的 sheet，约 300dp、可滚、系统 back / 点遮罩关、右圆角 16）。
++ *
++ * 三段，按冻结设计自上而下：
++ *  1. 导航：聊天 / 任务·分拣台。选中态 = 当前页（[CrewNavigation.selectedNav]）。
++ *  2. 成员·选收件人：花名册，行主体点=把该成员设为收件人（[Recipient.select] 落 @名字）；
++ *     行尾独立「资料」48 按钮 = 名片/人设/屏幕的显式入口（不再只靠长按藏起来）。
++ *     成员选中态 = 实际主收件人，与导航选中态各自独立。
++ *  3. 工具：事务板 / 会话管理 / 模型 / 后台 / 屏幕（全部落到既有入口，不新造）。
++ *
++ * 所有交互 ≥48dp 命中。成员是「收件人」选择，不是在线状态；没有在线语义、不编造数据。
++ */
++/**
++ * LazyColumn 里消息项相对列表顶部的偏移：通知存在时它占首项（key="notice"），消息从第 1 项开始；
++ * 没通知时为 0。pendingJump / 滚到底等「按消息索引定位」的地方统一加这个偏移，
++ * 避免「跳一条」落到通知项、或滚到底落错一格。
++ */
++private const val messagesListOffsetIfNotice = 1
++
++/**
++ * 通知摘要：列表内首项（可随消息滚走）。默认一行摘要，点整行（≥48 命中）展开看全部，
++ * 不删除任何一条历史、不常驻挤高度。
++ */
++@Composable
++private fun NoticeSummary(notices: List<CrewNotice>, palette: CrewPalette) {
++    var open by remember { mutableStateOf(false) }
++    val first = notices.first()
++    Column(
++        modifier = Modifier.fillMaxWidth()
++            .clip(RoundedCornerShape(10.dp))
++            .background(palette.accentSoft),
++        verticalArrangement = Arrangement.spacedBy(2.dp),
++    ) {
++        Row(
++            modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 48.dp)
++                .clickable { open = !open }
++                .padding(horizontal = 12.dp, vertical = 4.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            Text(
++                "有事记得看一下 · ${notices.size}",
++                fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accent,
++            )
++            Text(
++                if (first.title.isNotBlank()) "${first.title}：${first.body}" else first.body,
++                fontSize = 12.sp, color = palette.ink,
++                maxLines = 1, overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.weight(1f),
++            )
++            Text(if (open) "收起" else "展开", fontSize = 11.sp, color = palette.accent)
++        }
++        if (open) {
++            for (notice in notices) {
++                Text(
++                    text = if (notice.title.isNotBlank()) "${notice.title}：${notice.body}" else notice.body,
++                    fontSize = 12.sp, color = palette.ink, maxLines = 4,
++                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
++                )
++            }
++        }
++    }
++}
++
++/**
++ * 名片 overlay：聊天页与任务页共用同一份渲染与回调。
++ *
++ * profile 为 null 时什么都不画（其余时刻整屏铺开 [BotCardSheet]）。四个回调都落到 CrewScreen 的
++ * 同一套状态上：onTalk=关名片+@这位落草稿+延迟聚焦（不丢 draft）；onEdit=让位给编辑层；
++ * onWorkspace=关名片进工作区；onDismiss=关名片。两页因此不各写一份、也不出现「点了没反应」。
++ */
++@Composable
++private fun ProfileOverlay(
++    profile: BotCard?,
++    conversation: Conversation?,
++    palette: CrewPalette,
++    draft: String,
++    onDismiss: () -> Unit,
++    onTalk: (BotCard, List<BotCard>) -> Unit,
++    onEdit: (BotCard) -> Unit,
++    onWorkspace: (BotCard) -> Unit,
++) {
++    if (profile == null || conversation == null) return
++    BotCardSheet(profile, conversation, palette,
++        onTalk = { onTalk(profile, conversation.bots) },
++        onClose = onDismiss,
++        onEdit = { onEdit(profile) },
++    ) { onWorkspace(it) }
++}
++
++@Composable
++private fun CrewDrawerSheet(    palette: CrewPalette,
++    mode: Mode,
++    bots: List<BotCard>,
++    recipientId: String?,
++    defaultBotId: String,
++    noticeCount: Int,
++    onOpenNotices: () -> Unit,
++    onPickRecipient: (BotCard) -> Unit,
++    onOpenProfile: (BotCard) -> Unit,
++    onNavChat: () -> Unit,
++    onNavTasks: () -> Unit,
++    onBoard: () -> Unit,
++    onSessions: () -> Unit,
++    canSessions: Boolean,
++    onModels: () -> Unit,
++    onBackend: () -> Unit,
++    onWorkspace: () -> Unit,
++    hasWorkspace: Boolean,
++    onDiag: () -> Unit,
++) {
++    ModalDrawerSheet(
++        modifier = Modifier.widthIn(max = 300.dp),
++        drawerShape = RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp),
++        drawerContainerColor = palette.surface,
++    ) {
++        // 头：品牌 + 当前会话（示例态，不编造）。可滚内容从导航开始。
++        Column(modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 12.dp)) {
++            Text("Bot Crew", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = palette.ink)
++        }
++        Column(
++            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(bottom = 16.dp),
++        ) {
++            DrawerSectionLabel("导航", palette)
++            val nav = CrewNavigation.selectedNav(mode)
++            DrawerNavItem("聊天", selected = nav == NavEntry.Chat, palette) { onNavChat() }
++            DrawerNavItem("任务 · 分拣台", selected = nav == NavEntry.Tasks, palette) { onNavTasks() }
++            // 通知：仅有通知时才画，计数真实 noticeCount。点它回聊天并把列表滚到首项摘要（不伪造消息、不发请求）。
++            val noticeLabel = CrewNavigation.noticeRowLabel(noticeCount)
++            if (noticeLabel.isNotEmpty()) {
++                DrawerNavItem(noticeLabel, selected = false, palette) { onOpenNotices() }
++            }
++
++            DrawerSectionLabel("成员 · 选收件人", palette)
++            for (bot in bots) {
++                DrawerMemberRow(
++                    bot = bot,
++                    selected = bot.id == effectiveRecipientId(recipientId, bots, defaultBotId),
++                    palette = palette,
++                    onSelect = { onPickRecipient(bot) },
++                    onProfile = { onOpenProfile(bot) },
++                )
++            }
++
++            DrawerSectionLabel("工具", palette)
++            DrawerToolItem("事务板", palette) { onBoard() }
++            if (canSessions) DrawerToolItem("会话管理", palette) { onSessions() }
++            DrawerToolItem("模型", palette) { onModels() }
++            DrawerToolItem("后台", palette) { onBackend() }
++            DrawerToolItem("屏幕", palette = palette, enabled = hasWorkspace) { onWorkspace() }
++            // 诊断：App 自身诊断的查看/复制/导出/补传/开关。放侧栏工具，不加顶部常驻排。
++            DrawerToolItem("诊断", palette) { onDiag() }
++        }
++    }
++}
++
++/** 成员行该亮哪一格：显式收件人优先，没点名就用后端默认（与 [CrewNavigation.recipientLabel] 同口径）。 */
++private fun effectiveRecipientId(recipientId: String?, bots: List<BotCard>, defaultBotId: String): String? {
++    if (recipientId != null) return recipientId
++    val id = defaultBotId.trim()
++    return if (id.isNotEmpty() && bots.any { it.id == id }) id else null
++}
++
++@Composable
++private fun DrawerSectionLabel(text: String, palette: CrewPalette) {
++    Text(
++        text, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = palette.faint,
++        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
++    )
++}
++
++/** 导航项：48dp 命中，选中态用 accentSoft 底 + accent 字。 */
++@Composable
++private fun DrawerNavItem(label: String, selected: Boolean, palette: CrewPalette, onClick: () -> Unit) {
++    Box(
++        modifier = Modifier
++            .fillMaxWidth()
++            .heightIn(min = 48.dp)
++            .padding(horizontal = 10.dp, vertical = 2.dp)
++            .clip(RoundedCornerShape(9.dp))
++            .background(if (selected) palette.accentSoft else Color.Transparent)
++            .clickable(onClick = onClick)
++            .padding(horizontal = 12.dp),
++        contentAlignment = Alignment.CenterStart,
++    ) {
++        Text(
++            label, fontSize = 14.sp,
++            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
++            color = if (selected) palette.accent else palette.ink,
++        )
++    }
++}
++
++/** 成员行：行主体（点=选收件人）+ 行尾「资料」48 按钮（开名片）。两者命中各自 ≥48。 */
++@Composable
++private fun DrawerMemberRow(
++    bot: BotCard,
++    selected: Boolean,
++    palette: CrewPalette,
++    onSelect: () -> Unit,
++    onProfile: () -> Unit,
++) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .heightIn(min = 48.dp)
++            .padding(horizontal = 10.dp, vertical = 2.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        // 行主体：点=选收件人。48 命中高度；选中态用语义色彩，不冒充在线。
++        Row(
++            modifier = Modifier
++                .weight(1f)
++                .heightIn(min = 48.dp)
++                .clip(RoundedCornerShape(9.dp))
++                .background(if (selected) palette.accentSoft else Color.Transparent)
++                .clickable(onClick = onSelect)
++                .padding(horizontal = 12.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(10.dp),
++        ) {
++            Box(
++                modifier = Modifier.size(28.dp).clip(RoundedCornerShape(8.dp)).background(palette.accent),
++                contentAlignment = Alignment.Center,
++            ) {
++                Text(bot.name.take(1), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = palette.surface)
++            }
++            Column(modifier = Modifier.weight(1f)) {
++                Text(
++                    bot.name.ifBlank { bot.id }, fontSize = 14.sp,
++                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
++                    color = if (selected) palette.accent else palette.ink,
++                    maxLines = 1, overflow = TextOverflow.Ellipsis,
++                )
++                val roleText = CrewNavigation.roleLabel(bot.role)
++                if (roleText.isNotEmpty()) {
++                    Text(
++                        roleText, fontSize = 11.sp, color = palette.faint,
++                        maxLines = 1, overflow = TextOverflow.Ellipsis,
++                    )
++                }
++            }
++        }
++        // 行尾「资料」：独立的 48 命中按钮（名片/人设/屏幕显式入口，不藏在长按里）。
++        Box(
++            modifier = Modifier
++                .size(48.dp)
++                .clip(RoundedCornerShape(9.dp))
++                .clickable(onClick = onProfile)
++                .semantics { contentDescription = "查看${bot.name.ifBlank { bot.id }}的资料" },
++            contentAlignment = Alignment.Center,
++        ) {
++            Text("资料", fontSize = 12.sp, color = palette.accent)
++        }
++    }
++}
++
++/** 工具项：48dp 命中；不可用时灰显（如没有对话就没有「屏幕」）。 */
++@Composable
++private fun DrawerToolItem(label: String, palette: CrewPalette, enabled: Boolean = true, onClick: () -> Unit) {
++    Box(
++        modifier = Modifier
++            .fillMaxWidth()
++            .heightIn(min = 48.dp)
++            .padding(horizontal = 10.dp, vertical = 2.dp)
++            .clip(RoundedCornerShape(9.dp))
++            .clickable(enabled = enabled, onClick = onClick)
++            .padding(horizontal = 12.dp),
++        contentAlignment = Alignment.CenterStart,
++    ) {
++        Text(label, fontSize = 14.sp, color = if (enabled) palette.ink else palette.hint)
++    }
++}
++
++
+ /* 名片：照着画板「Personal Agent · 名片」做的一张卡。
+  *
+  * 画板里它不是底部抽屉，是一整页 —— 上面一行小字写这是谁的名片，
+@@ -1885,67 +2386,7 @@ private fun RowScope.WorkspaceButton(
+     }
+ }
+ 
+-/** 队伍页顶栏上的小方块按钮。画板里是 32dp、圆角 9、细边、强调色字形。 */
+-@Composable
+-private fun GlassIconButton(glyph: String, tint: Color, palette: CrewPalette, onClick: () -> Unit) {
+-    Box(
+-        modifier = Modifier
+-            .size(48.dp)
+-            .background(palette.card, RoundedCornerShape(9.dp))
+-            .border(1.dp, palette.line, RoundedCornerShape(9.dp))
+-            .clickable(onClick = onClick),
+-        contentAlignment = Alignment.Center,
+-    ) {
+-        Text(glyph, fontSize = 13.sp, color = tint)
+-    }
+-}
+-
+-/**
+- * 「后台」入口，右上角带未读角标（契约 §5.6）。
+- *
+- * 画板 Mobile.dc.html 第 39-41 行的原样：32dp、圆角 9、细边；角标是绝对定位在 `top:-4 right:-4`、
+- * 最小 15 高、圆角 8、字号 9.5、赭色底（暗色下是更亮的赭 `#E0A574` 配深字）、左右 3 的内衬。
+- * 这里按同一套数值换算成 dp/sp：15→15.dp、9.5sp、1dp 内衬，8.dp 圆角 —— 手机屏窄，
+- * 角标挂在外面也不会把页头挤开，因为它画在按钮之上而不是排进 Row。
+- *
+- * `count` 为 null 表示算不出来，这时**不画角标**。画一个 0 就是在说「都读过了」，
+- * 那是替网关说话；这一格只画有证据的数。
+- */
+-@Composable
+-private fun BackendIconButton(tint: Color, count: Int?, palette: CrewPalette, onClick: () -> Unit) {
+-    Box(modifier = Modifier.size(48.dp)) {
+-        GlassIconButton(glyph = "后台", tint = tint, palette = palette, onClick = onClick)
+-        if (count != null && count > 0) {
+-            Box(
+-                modifier = Modifier
+-                    .align(Alignment.TopEnd)
+-                    .offset(x = 4.dp, y = (-4).dp)
+-                    // 两颗角的胶囊：画板是 min-width 15 / height 15 / radius 8。
+-                    .defaultMinSize(minWidth = 15.dp, minHeight = 15.dp)
+-                    .background(palette.warn, RoundedCornerShape(8.dp))
+-                    .padding(horizontal = 3.dp, vertical = 1.dp),
+-                contentAlignment = Alignment.Center,
+-            ) {
+-                Text(
+-                    unreadBadge(count),
+-                    fontSize = 9.5.sp,
+-                    fontWeight = FontWeight(600),
+-                    // 赭色底上的字。画板亮色给的是白（#96603A 底 + #FFFFFF），暗色给的是深字
+-                    // （#E0A574 底 + #232228）：亮暗两套的赭不是一个明度档，字也不能共用一个值。
+-                    // onWarn 就是这个「压在赭色上当字」的颜色，见 CrewPalette。
+-                    color = palette.onWarn,
+-                )
+-            }
+-        }
+-    }
+-}
+-
+-/**
+- * 角标上的那点字：超过 99 说「99+」，不让徽标跟着条数一起变宽。
+- *
+- * 用 ASCII 的加号而不是中文「以上」：15dp 的胶囊里放不下三个字，
+- * 而把胶囊撑开又会顶到旁边的按钮上。
+- */
++/** 角标文字：超过 99 说「99+」，不让徽标跟着条数一起变宽（15dp 胶囊放不下三位数）。 */
+ internal fun unreadBadge(count: Int): String = if (count > 99) "99+" else count.toString()
+ 
+ @Composable
+@@ -2641,10 +3082,9 @@ private fun TicketStrip(
+     // 这一组问题就是这张卡的身份：换了问题或换了选项，下面两行状态一起作废
+     // （契约 §5：后台重新下发整组 options，旧的一组随即作废，前端不缓存旧选项）。
+     val signature = CrewWire.answerSignature(waiting)
+-    // 正在发的那几个选项，键是「票号|选项 id」：挡住连点，也让那一行在发着的时候换成 ✓。
+-    var answering by remember(waiting.id, signature) { mutableStateOf(emptySet<String>()) }
+-    // 这张卡自己的结果。答的是上一道题，就不写在新问题下面。
+-    var note by remember(waiting.id, signature) { mutableStateOf<String?>(null) }
++    // 同题互斥闸门：任一时刻这张卡只允许一个答复在途；HTTP 成功=已受理继续锁，等时间线收敛才解锁。
++    // ticketKey 含 attention_id：换票/换卡即换 holder，旧请求回来只更新旧 holder，不污染新卡。
++    val gate = rememberApprovalGate("${waiting.id}|${waiting.attentionId}", signature)
+     val scope = rememberCoroutineScope()
+     val botName = conversation.bots.firstOrNull { it.id == waiting.botId }?.name?.trim().orEmpty()
+     // 点名用名字：手机上人认的是名片上那两个字。这一位不在花名册上（或名字空着）时退回 id ——
+@@ -2654,16 +3094,34 @@ private fun TicketStrip(
+     // 这张卡是不是审批卡：后端下发了 attention_id 的才是。是就**必须**走审批通道 /answer，
+     // 拼 @label 发 /send 会让引擎起一段新活而不是回这张卡。老后端没这字段 → 退回 /send，逐字不变。
+     val isApproval = waiting.attentionId.isNotEmpty()
+-    /** 一次答复的发射：审批卡走 /answer，否则走既有 /send（普通聊天/老卡）。 */
+-    suspend fun fire(label: String) {
+-        if (isApproval) {
+-            client.answer(waiting.id, label, waiting.attentionId, sessionId)
+-        } else {
+-            val text = addressed(label)
+-            client.send(text, CrewWire.mentionsIn(text, conversation.bots),
+-                java.util.UUID.randomUUID().toString(), sessionId)
++    /** 一次答复的发射，返回结局（Accepted / Stale / Failed）。审批卡走 /answer，否则走既有 /send。 */
++    suspend fun fire(label: String): ApprovalGate.Outcome {
++        return try {
++            if (isApproval) {
++                client.answer(waiting.id, label, waiting.attentionId, sessionId)
++            } else {
++                val text = addressed(label)
++                client.send(text, CrewWire.mentionsIn(text, conversation.bots),
++                    java.util.UUID.randomUUID().toString(), sessionId)
++            }
++            gate.accepted()
++            onSent()
++            ApprovalGate.Outcome.Accepted
++        } catch (error: AnswerStale) {
++            // 旧卡已过期：锁住并刷新，明说「已更新」，不冒充成功、不重复提交。
++            gate.stale()
++            onSent()
++            ApprovalGate.Outcome.Stale
++        } catch (error: Exception) {
++            gate.failed(error.message)
++            ApprovalGate.Outcome.Failed
+         }
+     }
++    /** 点某一格：准入 → 置提交中 → 发 → 按结局落状态（同题互斥靠 gate.begin）。 */
++    fun answerOption(label: String) {
++        if (!gate.begin()) return
++        scope.launch { fire(label) }
++    }
+ 
+     // 画板：赭色细边 + 暖白底 + 圆角 10。白底会让这张最该被看见的卡
+     // 和普通工单卡长得一样，而它要的是「现在只有这一件事等你」。
+@@ -2684,53 +3142,38 @@ private fun TicketStrip(
+         // 才退回 needs_person 的人话 —— 绝不补一个空问题。
+         Text(AnswerCopy.body(waiting), color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+         // A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
++        val g = gate.state
+         waiting.options.forEachIndexed { index, option ->
+-            val slot = CrewWire.answerSlot(waiting.id, option.id)
+-            val sending = slot in answering
++            // 同题互斥：任一答复在途/已受理，所有选项一起禁用。
++            val busy = g.busy
+             Row(
+                 modifier = Modifier
+                     .fillMaxWidth()
+                     .background(palette.card, RoundedCornerShape(8.dp))
+                     .border(1.dp, palette.warnEdge, RoundedCornerShape(8.dp))
+-                    // 发着的那一格不再接第二下：按下去没反应比按了有效果更让人以为坏了，
+-                    // 所以它的样子会换成 ✓，而不是装作还能点。
+-                    .clickable(enabled = !sending) {
+-                        answering = answering + slot
+-                        note = null
+-                        scope.launch {
+-                            try {
+-                                fire(option.label)
+-                                note = AnswerCopy.ANSWER_DONE
+-                                // 重读时间线：答完之后这张卡要么消失，要么换成下一道题。
+-                                onSent()
+-                            } catch (error: AnswerStale) {
+-                                // 旧卡已过期：刷新换成最新一张，明说「已更新」，不冒充成功、不重复提交。
+-                                note = "这张问题卡已更新，请按最新的那张再答"
+-                                onSent()
+-                            } catch (error: Exception) {
+-                                // 失败写在这张卡自己的结果行里，不冒充断连横幅。
+-                                note = AnswerCopy.answerFailed(error.message)
+-                            } finally {
+-                                answering = answering - slot
+-                            }
+-                        }
+-                    }
++                    // 发着的那一格不再接第二下：提交中说「提交中…」，不画 ✓（还没答成）。
++                    .clickable(enabled = !busy) { answerOption(option.label) }
+                     .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                     .padding(horizontal = 11.dp, vertical = 9.dp),
+                 verticalAlignment = Alignment.CenterVertically,
+                 horizontalArrangement = Arrangement.spacedBy(8.dp),
+             ) {
+                 Text(
+-                    if (sending) "✓" else AnswerCopy.optionMark(index),
+-                    color = palette.accent,
++                    if (busy && g.submitting) "…" else AnswerCopy.optionMark(index),
++                    color = if (busy) palette.faint else palette.accent,
+                     fontSize = 13.sp,
+                     fontWeight = FontWeight(620),
+                 )
+-                Text(option.label, color = palette.ink, fontSize = 13.sp, lineHeight = 19.sp)
++                Text(
++                    if (busy && g.submitting) "提交中…" else option.label,
++                    color = if (busy) palette.faint else palette.ink,
++                    fontSize = 13.sp,
++                    lineHeight = 19.sp,
++                )
+             }
+         }
+-        // 只在这张卡自己答过之后说一句：两张待决的卡并排时，A 的结果不该写到 B 上。
+-        note?.let {
++        // 这张卡自己的结果：提交中/已受理/stale/失败，只有这一张卡会显示。
++        g.note?.let {
+             Text(it, color = palette.faint, fontSize = 10.5.sp, lineHeight = 16.sp)
+         }
+         // 自由输入（revise）：审批卡在本卡内就有一格，typed 原文带 attention_id 走 /answer，
+@@ -2738,8 +3181,8 @@ private fun TicketStrip(
+         // 老后端没 attention_id 的卡保持原样：点一下把在等的人带进输入框，仍走普通 /send。
+         if (isApproval) {
+             var revise by remember(waiting.id, signature) { mutableStateOf("") }
+-            var busy by remember(waiting.id, signature) { mutableStateOf(false) }
+             val trimmed = revise.trim()
++            val busy = gate.state.busy
+             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                 Box(
+                     modifier = Modifier
+@@ -2770,22 +3213,10 @@ private fun TicketStrip(
+                         .size(48.dp)
+                         .background(if (busy || trimmed.isEmpty()) palette.track else palette.warn, RoundedCornerShape(8.dp))
+                         .clickable(enabled = !busy && trimmed.isNotEmpty()) {
+-                            busy = true
+-                            note = null
++                            if (!gate.begin()) return@clickable
+                             scope.launch {
+-                                try {
+-                                    fire(trimmed)
+-                                    note = AnswerCopy.ANSWER_DONE
+-                                    revise = ""
+-                                    onSent()
+-                                } catch (error: AnswerStale) {
+-                                    note = "这张问题卡已更新，请按最新的那张再答"
+-                                    onSent()
+-                                } catch (error: Exception) {
+-                                    note = AnswerCopy.answerFailed(error.message)
+-                                } finally {
+-                                    busy = false
+-                                }
++                                val outcome = fire(trimmed)
++                                if (outcome == ApprovalGate.Outcome.Accepted) revise = ""
+                             }
+                         },
+                     contentAlignment = Alignment.Center,
+@@ -3599,6 +4030,13 @@ private fun Composer(
+     palette: CrewPalette,
+     enabled: Boolean,
+     onChange: (String) -> Unit,
++    focusRequester: FocusRequester? = null,
++    /** true = 显式 onTalk 请求聚焦，等输入框挂上后一次性聚焦+弹键盘；成功后经 onFocusHandled 清标记。 */
++    focusWhenPlaced: Boolean = false,
++    onFocusHandled: () -> Unit = {},
++    /** 输入区左侧收件人按钮的文案（如「发给 大哥（按队伍默认）」）。点它开 drawer 选成员。 */
++    recipientLabel: String,
++    onOpenRecipient: () -> Unit,
+     steerTicketId: String?,
+     onSteer: (String, String) -> Unit,
+     onWithdraw: (String) -> Unit,
+@@ -3652,7 +4090,9 @@ private fun Composer(
+             )
+         }
+         ComposerRow(client, draft, sending, palette, enabled, onChange, onSend,
+-            steerTicketId = steerTicketId, onSteerText = onSteerText)
++            focusRequester = focusRequester, steerTicketId = steerTicketId, onSteerText = onSteerText,
++            recipientLabel = recipientLabel, onOpenRecipient = onOpenRecipient,
++            focusWhenPlaced = focusWhenPlaced, onFocusHandled = onFocusHandled)
+     }
+ }
+ 
+@@ -3758,7 +4198,11 @@ private fun VoiceButton(
+ }
+ 
+ /**
+- * 输入那一行：麦克风 · 输入框 · 可选的「插队」· 发送。
++ * 输入那一行：收件人按钮 · 麦克风 · 输入框 · 可选的「插队」· 发送。
++ *
++ * 收件人在左侧一颗 48×48 按钮里（视觉像「大哥 ⌄」，最大 64dp 宽、名字单行 ellipsis），
++ * 正文 TextField 吃剩余宽（按剩余宽自适应，360dp 下窄屏也保留完整可编辑宽度，不会缩成几字）。点击按钮开 drawer 选成员；
++ * 「发给X」放 contentDescription，不占视觉宽度，也不替代正文里用户自己打的 @。
+  *
+  * 语音与发送共用同一份草稿：认出来的字先落进草稿，让人看一眼再发。
+  */
+@@ -3771,17 +4215,48 @@ private fun ComposerRow(
+     enabled: Boolean,
+     onChange: (String) -> Unit,
+     onSend: () -> Unit,
++    focusRequester: FocusRequester? = null,
+     steerTicketId: String?,
+     onSteerText: (String) -> Unit,
++    recipientLabel: String,
++    onOpenRecipient: () -> Unit,
++    focusWhenPlaced: Boolean = false,
++    onFocusHandled: () -> Unit = {},
+ ) {
+     var listening by remember { mutableStateOf(false) }
+-    // 输入区：画板里圆角 13、白底细边、上下留白。默认的 OutlinedTextField
+-    // 是直角加厚边框，和整页的圆润调子对不上，所以自己给形状和颜色。
++    // 一次性聚焦守卫：本次 armed 只处理一次，避免 onGloballyPositioned 每帧重复 requestFocus。
++    var focusFired by remember { mutableStateOf(false) }
++    if (!focusWhenPlaced) focusFired = false
++    val keyboard = LocalSoftwareKeyboardController.current
++    // 收件人短名：从「发给 X（按队伍默认）」里剥出 X，只显示 1–3 字 + ⌄，不占满一行。
++    val shortName = recipientLabel.removePrefix("发给 ")
++        .substringBefore("（").substringBefore("·").trim().ifEmpty { "未指定" }
+     Row(
+         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+         verticalAlignment = Alignment.CenterVertically,
+     ) {
+-        // 麦克风在最左边：输入框右边已经是发送键，语音再挤进去会让人按错。
++        // 收件人按钮：48×48 命中，最大 64dp 宽，视觉是短名 + ⌄。点开侧边栏选成员。
++        Box(
++            modifier = Modifier
++                .height(48.dp)
++                .widthIn(min = 48.dp, max = 64.dp)
++                .clip(RoundedCornerShape(12.dp))
++                .background(palette.accentSoft)
++                .clickable(onClick = onOpenRecipient)
++                .semantics { contentDescription = "$recipientLabel，点按换成员" }
++                .padding(horizontal = 8.dp),
++            contentAlignment = Alignment.Center,
++        ) {
++            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
++                Text(
++                    shortName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accent,
++                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
++                )
++                Text("⌄", fontSize = 11.sp, color = palette.accent)
++            }
++        }
++        Spacer(Modifier.width(6.dp))
++        // 麦克风：输入框右边已经是发送键，语音再挤进去会让人按错。
+         VoiceButton(client, palette, enabled = enabled && !sending && !listening,
+             onText = { said ->
+                 // 追加而不是替换：人可能已经打了一半，语音只补后半句。
+@@ -3814,7 +4289,22 @@ private fun ComposerRow(
+                 disabledBorderColor = Color.Transparent,
+                 cursorColor = palette.accent,
+             ),
+-            modifier = Modifier.weight(1f),
++            modifier = Modifier.weight(1f)
++                .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
++                // 显式 onTalk 请求聚焦：**输入框真正挂上后**（onGloballyPositioned 回调、isAttached）才一次性
++                // requestFocus + 弹键盘；不盲睡、不无界重试。失败写日志（不静默吞），成功后清 armed 标记。
++                .onGloballyPositioned { coords ->
++                    if (focusWhenPlaced && !focusFired && coords.isAttached && focusRequester != null) {
++                        focusFired = true
++                        try {
++                            focusRequester.requestFocus()
++                            keyboard?.show()
++                            onFocusHandled()
++                        } catch (error: Exception) {
++                            android.util.Log.w("CrewComposer", "onTalk 聚焦失败（输入框未就绪）", error)
++                        }
++                    }
++                },
+         )
+         if (steerTicketId != null && draft.isNotBlank() && enabled && !sending) {
+             // 有工单在跑时，这句可以不经排队、直接交给它的下一步。
+diff --git a/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt b/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
+index a4292a1..29c2e4e 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/CrewWire.kt
+@@ -115,8 +115,19 @@ data class Conversation(
+     val sessionId: String = SessionRoute.MAIN,
+     /** 会话显示名。S1 的名单只给 id，没有单独的名字时按 id 显示。 */
+     val name: String = SessionRoute.MAIN,
++    /**
++     * 服务器身份元数据（契约：paired timeline 顶层可选 `server:{crew, public_base}`）。
++     *
++     * 老后端 / 未加该字段时是 null：调用方据此**跳过**可信自愈，不报错、不瞎猜。
++     * `crew` 与 mDNS TXT 的 `crew` 同源（stateDir 稳定指纹），用来「精确比对是不是同一台」；
++     * `public_base` 是真实 HTTPS 公网入口（可为空）。
++     */
++    val server: ServerMeta? = null,
+ )
+ 
++/** 服务器身份元数据。两格都可空：`crew` 空表示这台后端没报指纹，`publicBase` 空表示没配公网入口。 */
++data class ServerMeta(val crew: String = "", val publicBase: String = "")
++
+ /** 一条被读过、但不打算动手的消息。 */
+ data class Declined(val requestId: String, val reason: String)
+ 
+@@ -497,8 +508,15 @@ object CrewWire {
+         // 老响应一个字段都没有：按 main 兼容，不把老数据挂到刚切过去的会话上。
+         val sessionId = root.optString("session_id").trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
+         val sessionName = root.optString("session_name").trim().takeIf(String::isNotBlank) ?: sessionId
++        // server 身份元数据：可选，缺了就是 null（老后端），不报错。
++        val serverJson = root.optJSONObject("server")
++        val server = serverJson?.let {
++            val crew = it.optString("crew").trim()
++            val publicBase = it.optString("public_base").trim()
++            if (crew.isEmpty() && publicBase.isEmpty()) null else ServerMeta(crew, publicBase)
++        }
+         return Conversation(messages, bots, root.optString("default_bot_id"), tickets, status, queued, declined,
+-            unreadOf(root, "unread"), unreadOf(root, "unread_replies"), sessionId, sessionName)
++            unreadOf(root, "unread"), unreadOf(root, "unread_replies"), sessionId, sessionName, server)
+     }
+ 
+     /**
+diff --git a/app/app/src/main/java/com/dsh/botcrew/MainActivity.kt b/app/app/src/main/java/com/dsh/botcrew/MainActivity.kt
+index f38a891..40af1a1 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/MainActivity.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/MainActivity.kt
+@@ -1,11 +1,19 @@
+ package com.dsh.botcrew
+ 
+ import android.os.Bundle
++import android.net.ConnectivityManager
++import android.net.NetworkCapabilities
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.compose.foundation.isSystemInDarkTheme
++import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+@@ -18,6 +26,7 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.lifecycle.Lifecycle
+ import androidx.lifecycle.repeatOnLifecycle
+@@ -44,6 +53,26 @@ class MainActivity : ComponentActivity() {
+         val pairing = PairingStore(this)
+         val thisDevice = deviceId(this)
+ 
++        // 诊断子系统：先拿实例、装崩溃处理器、开上报循环。release 也开（这是给用户看的 App 自身诊断），
++        // 但只记白名单字段、可关可清。版本信息从 BuildConfig 灌进去（纯逻辑层不依赖 BuildConfig）。
++        BuildInfo.VERSION_NAME = BuildConfig.VERSION_NAME
++        BuildInfo.VERSION_CODE = BuildConfig.VERSION_CODE
++        BuildInfo.BUILD_ID = BuildConfig.CREW_BUILD_ID
++        val diag = DiagRuntime.get(this)
++        diag.installCrashHandler()
++        diag.startUploadLoop()
++        // 启动先记一条配置快照（不 dump 凭据）：prefs 是否读到配对、host/routeKind、pairing 解析是否异常。
++        recordStartupSnapshot(pairing, diag)
++        // 网络回调：更新连接种类、断网/恢复、网络切换时清路由冷却。
++        val cm = getSystemService(ConnectivityManager::class.java)
++        cm?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
++            override fun onAvailable(network: android.net.Network) { diag.updateNetwork(network) }
++            override fun onLost(network: android.net.Network) { diag.updateNetwork(null) }
++            override fun onCapabilitiesChanged(network: android.net.Network, caps: NetworkCapabilities) { diag.updateNetwork(network) }
++        })
++        // 前后台事件。
++        diag.recordLifecycle(true)
++
+         // 调试口：debug 构建默认开，release 永远不开（见 CrewDebug 的注释）。
+         // 起不来只记一行日志，界面照常 —— 调试口是外挂，不是界面的一部分。
+         //
+@@ -120,6 +149,86 @@ class MainActivity : ComponentActivity() {
+                 // 但它让「有没有可判的地址」这件事在快照里一开始就有个明确的答案。
+                 lanReport = judgeLan(fresh)
+ 
++                // 诊断：给 client 挂配对快照（选路种类要用）、请求埋点、绑定上报器。
++                fresh.attachPairing(current, proxyPort)
++                fresh.networkKindProvider = diag.networkKind
++                // 上传入口只从可信来源取（serverPublicBase / HTTPS fallback / 注入且 crew 精确匹配的 DIAG_BASE）；
++                // 无有效凭据或无可信 HTTPS 入口 → 不 bind、不上报、不发 token。绝不硬编码 crew 域名。
++                fun rebindUploader(p: PairedCrew) {
++                    val savedCrew = p.serverCrew.ifBlank { p.crew }
++                    val chosen = UploadEndpoint.decide(
++                        serverPublicBase = p.serverPublicBase,
++                        fallbackBase = p.fallbackBase,
++                        savedCrew = savedCrew,
++                        diagBase = BuildConfig.CREW_DIAG_BASE,
++                        expectedCrew = BuildConfig.CREW_EXPECTED_CREW,
++                    )
++                    if (chosen.url.isNotBlank()) {
++                        diag.bindUploader(p.deviceId, p.token, chosen.url)
++                    } else {
++                        diag.unbindUploader()
++                    }
++                }
++                rebindUploader(current)
++                fresh.diagSink = { path, method, status, ms, err, routeKind ->
++                    diag.noteRouteKind(routeKind)
++                    diag.record(
++                        type = when {
++                            routeKind.isNotEmpty() && err == null && (status ?: 0) in 200..299 -> ClientDiag.EventType.OTHER
++                            err != null -> ClientDiag.EventType.NET_FAIL
++                            else -> ClientDiag.EventType.HTTP_ERROR
++                        },
++                        route = path, method = method, status = status, ms = ms, err = err,
++                        extra = mapOf("phase" to "receive", "routeKind" to routeKind),
++                    )
++                }
++                // 网络变化：清路由冷却、按新网络重判、更新连接的 networkKind（蜂窝优先公网）。
++                diag.onNetworkChanged = {
++                    fresh.onNetworkChanged()
++                    fresh.networkKindProvider = diag.networkKind
++                }
++
++                // 可信公网入口自愈（不动 token/deviceId/crew 身份，不重配对）：
++                // ① 非空旧域名也由同 crew 可信元数据更新；② 空 fallback 才 bootstrap，
++                //    且准入由纯函数 BootstrapGate 判定（空 savedCrew / 预期不符 / 配置空 → 0 请求），
++                //    bootstrap 内部再对 server.crew 做精确比对。绝不用 build 预期值伪装成已登记身份。
++                val savedCrew = current.serverCrew.ifBlank { current.crew }
++                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
++                    try {
++                        // ① 从已知可信当前入口读 server 元数据，crew 相同时更新（含非空旧 fallback）。
++                        if (current.fallbackBase.isNotBlank() || current.base.isNotBlank()) {
++                            val trusted = fresh.trustedPublicBase(
++                                current.fallbackBase.ifBlank { current.base },
++                                savedCrew,
++                            )
++                            if (!trusted.isNullOrBlank() && trusted != current.fallbackBase) {
++                                val updated = current.copy(fallbackBase = trusted)
++                                pairing.save(updated)
++                                fresh.replaceEntries(CrewRoute.entries(updated, proxyPort))
++                                rebindUploader(updated)
++                            }
++                        }
++                        // ② 空 fallback 的 bootstrap：准入纯函数判定，全绿才请求。
++                        val decision = BootstrapGate.decide(
++                            savedCrew = savedCrew,
++                            injectedBase = BuildConfig.CREW_PUBLIC_BASE,
++                            expectedCrew = BuildConfig.CREW_EXPECTED_CREW,
++                            savedFallback = current.fallbackBase,
++                        )
++                        if (decision.allowed) {
++                            val got = fresh.bootstrapPublic(decision.base, decision.expectCrew)
++                            if (!got.isNullOrBlank()) {
++                                val updated = current.copy(fallbackBase = got)
++                                pairing.save(updated)
++                                fresh.replaceEntries(CrewRoute.entries(updated, proxyPort))
++                                rebindUploader(updated)
++                            }
++                        }
++                    } catch (t: Throwable) {
++                        android.util.Log.w("CrewDiag", "公网入口自愈失败（忽略，不影响连接）", t)
++                    }
++                }
++
+                 // 句柄只建一次：start 内部先 stop 再新建隧道客户端，反复 start 等于每次探测都重建句柄。
+                 // 换网络后隧道在库内部自己重连，重试只复用这个端口去探，不再碰句柄。
+                 var ownedPort: Int? = null
+@@ -287,12 +396,67 @@ class MainActivity : ComponentActivity() {
+      * 那正是真机上「转屏后空响应到杀进程」的成因。socket 随进程一起消失，不需要谁去 close。
+      */
+     override fun onDestroy() {
++        DiagRuntime.get(this).recordLifecycle(false)
+         if (debugBridge != null) CrewDebugPorts.process.detach(debugToken)
+         debugBridge?.screen = null
+         debugBridge = null
+         super.onDestroy()
+     }
+ 
++    /**
++     * 启动配置快照：让验证员能**真实看到**旧 prefs 的状态，而不是被「读到 null 就当没配对」掩盖。
++     *
++     * 只把服务端白名单字段写进事件（phase/routeKind/version/networkKind）；**不**把 host 或 paired 布尔
++     * 塞进 extra（服务端会丢未知键，塞了反而给人「已上报」的假象）。prefs 三态用 phase 表示：
++     * `prefs_missing` / `prefs_loaded` / `prefs_parse_error`；parse_error 的 detail（键名层面）与提取出的
++     * hostname（不含 userinfo/query）只写本地 logcat + 诊断页，不进上报。
++     *
++     * parse_error 时**保留**原始损坏 prefs、不自动配对覆盖，留待人工修。
++     */
++    private fun recordStartupSnapshot(pairing: PairingStore, diag: DiagRuntime) {
++        val readState = try {
++            pairing.probeReadState()
++        } catch (t: Throwable) {
++            // 读 prefs 本身抛（极端）：如实记一条 parse_error，别伪装成 missing。
++            PairingRecord.ReadState(PairingRecord.ReadState.PARSE_ERROR, ClientDiag.errOf(t))
++        }
++        val phase = when (readState.state) {
++            PairingRecord.ReadState.MISSING -> "prefs_missing"
++            PairingRecord.ReadState.LOADED -> "prefs_loaded"
++            else -> "prefs_parse_error"
++        }
++        // 提取 hostname 仅用于本地可观测（不含 userinfo/query），绝不进上报 extra。
++        val storedHost = try {
++            pairing.stored()?.base?.let { hostnameOf(it) }.orEmpty()
++        } catch (_: Throwable) {
++            ""
++        }
++        android.util.Log.i("CrewDiag", "startup prefs=${readState.state} detail=${readState.detail} host=$storedHost")
++        // 上报：只用白名单字段。version/networkKind 由 diag 自动带；这里补 phase。
++        diag.record(
++            type = ClientDiag.EventType.OTHER,
++            route = "/app/startup",
++            extra = mapOf("phase" to phase, "version" to BuildConfig.VERSION_NAME),
++        )
++        if (readState.state == PairingRecord.ReadState.PARSE_ERROR) {
++            // 再补一条独立的 parse_error 事件（err 只放短词 errorClass 语义，不塞 message）。
++            diag.record(
++                type = ClientDiag.EventType.OTHER,
++                route = "/app/startup",
++                err = "PrefsParseError",
++                extra = mapOf("phase" to "prefs_parse_error"),
++            )
++        }
++    }
++
++    /** 从地址里提取纯 hostname（不含 scheme/userinfo/query/port）。取不到返回空串。 */
++    private fun hostnameOf(url: String): String = try {
++        val u = java.net.URI(url.trim())
++        u.host?.substringBefore(':').orEmpty()
++    } catch (_: Throwable) {
++        ""
++    }
++
+     private companion object {
+         /** 界面上那句话。它是说明，不是错误码：真正的原因看 logcat 的 CrewP2p/CrewTailcat。 */
+         const val P2P_DOWN = "P2P 没通"
+@@ -301,10 +465,44 @@ class MainActivity : ComponentActivity() {
+     }
+ }
+ 
+-/** 建连接那一瞬间看到的一句话。它不是错误提示，所以不用告警色。 */
++/**
++ * 建连接那一瞬间看到的一句话。它不是错误提示，所以不用告警色。
++ *
++ * 只在这一句下面挂一个可点的「连接/使用说明」小字：点开的是同一个
++ * [CrewConnectionStatus] 详情 Dialog（日常开机联网不睡眠、无需桌面 App、
++ * 仅服务停止时才跑 start 命令）。**不动这里的连接初始化**：仍然是在连上队伍的过程中，
++ * 所以 loading=true —— 详情里不会说「已连接」。
++ */
+ @Composable
+ private fun WaitingLine(palette: CrewPalette) {
++    var helpOpen by remember { mutableStateOf(false) }
+     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+-        Text("正在连上队伍…", fontSize = 13.sp, color = palette.muted)
++        Column(horizontalAlignment = Alignment.CenterHorizontally) {
++            Text("正在连上队伍…", fontSize = 13.sp, color = palette.muted)
++            Spacer(Modifier.height(6.dp))
++            Text(
++                "使用说明",
++                fontSize = 12.sp,
++                color = palette.accent,
++                // 可点区 >=48dp：虽是「小字」，触控命中高度仍按统一规格来，不留例外。
++                modifier = Modifier
++                    .heightIn(min = 48.dp)
++                    .clickable { helpOpen = true }
++                    .padding(horizontal = 12.dp, vertical = 12.dp),
++            )
++        }
++        if (helpOpen) {
++            // 复用连接组件的详情 Dialog（折叠成 0 高度、只借它的详情内容）：
++            // 不重做一套说明，文案/命令只有一处真理源。
++            CrewConnectionStatus(
++                route = "",
++                loading = true,
++                problem = null,
++                palette = palette,
++                onRefresh = {},
++                startExpanded = true,
++                onExpandedConsumed = { helpOpen = false },
++            )
++        }
+     }
+ }
+diff --git a/app/app/src/main/java/com/dsh/botcrew/PairingClient.kt b/app/app/src/main/java/com/dsh/botcrew/PairingClient.kt
+index 5673c01..085e398 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/PairingClient.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/PairingClient.kt
+@@ -121,4 +121,14 @@ data class PairedCrew(
+     val p2pAddr: String = "",
+     val crew: String = "",
+     val session: String = SessionRoute.MAIN,
++    /**
++     * 服务器身份指纹（来自 timeline/pair 的 `server.crew`，与 mDNS TXT `crew` 同源）。
++     *
++     * 空串表示「还没登记过可信身份」——首次配对或老记录。用来**精确比对**「这个公网入口是不是
++     * 同一台后端」，而不是拿任意 200 当身份。它和 [crew]（mDNS 广播给的指纹）语义相同，
++     * 但 [crew] 可能因为老记录/未发现而为空；这里存的是**服务端自己报的**，更可靠。
++     */
++    val serverCrew: String = "",
++    /** 服务端自报的**可信**公网入口（timeline `server.public_base`，真实 HTTPS 或空）。 */
++    val serverPublicBase: String = "",
+ )
+diff --git a/app/app/src/main/java/com/dsh/botcrew/PairingScreen.kt b/app/app/src/main/java/com/dsh/botcrew/PairingScreen.kt
+index 9350e25..f1c3bd4 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/PairingScreen.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/PairingScreen.kt
+@@ -308,6 +308,15 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
+                         }
+                         val client = PairingClient(base)
+                         val credential = client.pair(code, deviceId, deviceName(), "android")
++                        // 配对成功后立刻拉一次 timeline 读服务端自报的 `server:{crew, public_base}`，
++                        // 作为**本次 new-pair 登记的初始可信身份**（savedCrew）。读不到（旧后端/字段缺失）
++                        // 就是空串——不报错、不瞎填，之后有 trustedPublicBase 精确比对再补。
++                        val serverMeta = try {
++                            val c = CrewClient(listOf(base), credential.token, credential.deviceId)
++                            c.timeline(null).server
++                        } catch (_: Exception) {
++                            null
++                        }
+                         // 配对时顺手把「出门那条路」「隧道那条路」和队伍指纹记下来：它们和
+                         // 局域网地址是同一条 mDNS 记录给的，人不用再输第二遍。没发现到
+                         // （手填地址进来的）就是空串，那时只剩局域网这一条，也不做刷新 ——
+@@ -316,9 +325,12 @@ fun PairingScreen(palette: CrewPalette, deviceId: String, context: android.conte
+                             credential.deviceId,
+                             credential.token,
+                             base,
+-                            spot?.publicBase.orEmpty(),
++                            // 公网入口：优先服务端自报的可信 public_base，其次 mDNS 的 pub。
++                            serverMeta?.publicBase?.takeIf { it.isNotBlank() } ?: spot?.publicBase.orEmpty(),
+                             spot?.p2pAddr.orEmpty(),
+                             spot?.crew.orEmpty(),
++                            serverCrew = serverMeta?.crew.orEmpty(),
++                            serverPublicBase = serverMeta?.publicBase.orEmpty(),
+                         ))
+                     } catch (error: Exception) {
+                         trouble = error.message ?: "配对被拒绝"
+diff --git a/app/app/src/main/java/com/dsh/botcrew/PairingStore.kt b/app/app/src/main/java/com/dsh/botcrew/PairingStore.kt
+index cbdc9cd..4a7489e 100644
+--- a/app/app/src/main/java/com/dsh/botcrew/PairingStore.kt
++++ b/app/app/src/main/java/com/dsh/botcrew/PairingStore.kt
+@@ -26,6 +26,18 @@ class PairingStore(context: Context) {
+     /** 本机真的存过的那份；内置的那份不算，它在 load 里作为回落。 */
+     fun stored(): PairedCrew? = PairingRecord.read(store.all)
+ 
++    /**
++     * 启动诊断用：区分 prefs 的三种真实状态，**不**用「读到 null 就当没配对」掩盖 parse 错误。
++     *
++     * - [PairingRecord.ReadState.MISSING]：三个必填键（device/token/base）一个都没有 —— 真没存过。
++     * - [PairingRecord.ReadState.LOADED]：三键齐全且形状合法 —— 读到了一份配对。
++     * - [PairingRecord.ReadState.PARSE_ERROR]：三键有残留但形状不合法（缺 base、值不是字符串、base 归一后为空等）。
++     *
++     * 只读不改盘：parse_error 时**保留原始损坏 prefs**，绝不自动配对覆盖，留待人修。
++     * 汇报里带 [PairingRecord.ReadState.detail]（键名层面，不含凭据值）。
++     */
++    fun probeReadState(): PairingRecord.ReadState = PairingRecord.probeState(store.all)
++
+     fun save(paired: PairedCrew) {
+         // 先清再写：字段是一组固定的键，逐条 put 会把上次残留的、这次不该有的值留在盘上。
+         // SESSION 是唯一例外 —— 当前会话只有一个写入口 [saveSession]。
+@@ -129,6 +141,9 @@ object PairingRecord {
+     const val CREW = "crew"
+     /** 当前会话。老装机没有这一格：读成 main，行为与旧版逐字一致。 */
+     const val SESSION = "session"
++    /** 服务器自报身份指纹（timeline `server.crew`）与可信公网入口（`server.public_base`）。老记录没有这两格。 */
++    const val SERVER_CREW = "serverCrew"
++    const val SERVER_PUBLIC_BASE = "serverPublicBase"
+ 
+     /** 当前会话单独读：缺键、空串、形状不对都回落 main。 */
+     fun session(values: Map<String, Any?>): String {
+@@ -136,6 +151,38 @@ object PairingRecord {
+         return saved.trim().takeIf(SessionRoute::validId) ?: SessionRoute.MAIN
+     }
+ 
++    /** 启动诊断状态。detail 只描述键名层面的问题，绝不带凭据值。 */
++    data class ReadState(val state: String, val detail: String = "") {
++        companion object {
++            const val MISSING = "missing"
++            const val LOADED = "loaded"
++            const val PARSE_ERROR = "parse_error"
++        }
++    }
++
++    /**
++     * 判定盘上那份配对的真实状态（纯函数，可单测）。
++     *
++     * 区分三态是为了让「启动快照」真实可观测：旧代码读不到就一律回 null，把「prefs 损坏」伪装成
++     * 「没配对」。这里分开：三键全无=MISSING；三键齐全且形状合法=LOADED；有残留但形状不合法=PARSE_ERROR。
++     * 解析用与 [read] 同一套门槛（device/token/base 必须是非空字符串，base 归一后非空）。
++     */
++    fun probeState(values: Map<String, Any?>): ReadState {
++        val hasDevice = values.containsKey(DEVICE)
++        val hasToken = values.containsKey(TOKEN)
++        val hasBase = values.containsKey(BASE)
++        if (!hasDevice && !hasToken && !hasBase) return ReadState(ReadState.MISSING)
++        val device = values[DEVICE] as? String
++        val token = values[TOKEN] as? String
++        val base = values[BASE] as? String
++        val problems = ArrayList<String>()
++        if (device.isNullOrBlank()) problems.add("deviceId 缺失或非文本")
++        if (token.isNullOrBlank()) problems.add("token 缺失或非文本")
++        if (base.isNullOrBlank() || CrewPairing.normalize(base).isEmpty()) problems.add("base 缺失/非法")
++        return if (problems.isEmpty()) ReadState(ReadState.LOADED)
++        else ReadState(ReadState.PARSE_ERROR, problems.joinToString("；"))
++    }
++
+     /** 缺前三格就不算一份配对；其余几格缺了读成空串，那是「这台电脑没有这项」。 */
+     fun read(values: Map<String, Any?>): PairedCrew? {
+         val device = values[DEVICE] as? String ?: return null
+@@ -149,6 +196,8 @@ object PairingRecord {
+             p2pAddr = values[P2P] as? String ?: "",
+             crew = values[CREW] as? String ?: "",
+             session = session(values),
++            serverCrew = values[SERVER_CREW] as? String ?: "",
++            serverPublicBase = values[SERVER_PUBLIC_BASE] as? String ?: "",
+         )
+     }
+ 
+@@ -160,6 +209,8 @@ object PairingRecord {
+         P2P to paired.p2pAddr,
+         CREW to paired.crew,
+         SESSION to paired.session,
++        SERVER_CREW to paired.serverCrew,
++        SERVER_PUBLIC_BASE to paired.serverPublicBase,
+     )
+ 
+     /**
+diff --git a/backend/docs/007-architecture.md b/backend/docs/007-architecture.md
+index 7607208..76d8a60 100644
+--- a/backend/docs/007-architecture.md
++++ b/backend/docs/007-architecture.md
+@@ -368,6 +368,7 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `src/app/spend.ts` | 成本账：按 `model/selection` 与 `request/header` 还原每步实际路由，再把 `assistant/message.usage` 算成合计、按模型分项和最近几步；没上报的步数单独计数 |
+ | `src/app/audit.ts` | 审计账：一票一行地把谁派的、谁判的、谁干的、花了多少编成表，缺的格子写「没有记录」 |
+ | `src/app/voice.ts` | 语音输入的壳：认出宿主有没有识别能力、校验录音是不是 WAV 且不过大过长，再把字节交给宿主的 `speechToText`；认不出字与跑不起来分开说 |
++| `src/app/diagnostics.ts` | App 故障上报的落盘盒：把手机上报的一批报告过白名单（去 query/header/body/text/token，err 只收类别码，crash 只收 errorClass/栈/受限 breadcrumbs）、按客户端 id 幂等、有界保留（每设备行数+字节、全球行数+字节、7 天，均在写路径淘汰），复用项目 `Store`/KV（每设备一段，无索引、不扫全库）；ACK 只在 durable 落盘后返回 |
+ | `src/app/compact-memory.ts` | 压缩产物进账本：宿主折完会话那一段摘要值不值得记、怎么掐到上限、怎么按 compactionId 保持幂等；压缩本身归宿主 |
+ | `src/app/push.ts` | 推送投递层：在线直送、离线留件（按到期限长、同 kind 只留最新）、系统推送留了接口但没内置；送不到如实说，绝不把「没配」说成「已送达」。留件桶经注入的 `NoticeStore` 落库（Runtime 用 `storeNoticeStore` 接项目 `Store`/KV，一桶一键 `KV.notice.pending`）：先写盘成功再回 `queued`、ACK 先持久化再移内存/回 2xx，写盘失败抛出、不假成功；`peek` 不删，仅 TTL 清理同步删盘；HMR/实例重建后从 `KV.notice.pending` 读回未 ACK 的件（只保新链以后入队的，旧进程内存件无来源不假装恢复） |
+ | `src/app/notices-out.ts` | 「有事要说」的内容层：一条 notice 怎么铺成每台设备各一条、谁静音了哪类、大哥日报只写真发生过的数、什么也没发生就不发；早报（`MORNING_HOUR`、`morningDue`、`morningNotice`）的三段口径、当天只说一次的账本 `onceToday`，以及抬头按真实窗口起算的 `windowLabel`（`今日` / `自 M 月 D 日 HH:mm 起` / `上次汇报以来`，不一律说「昨夜」）。两份报告的统计窗口**不由这里现算**：下界是持久化的水位线 `KV.notices.reported`，所以停机错过的那份通知不补发，但下一次真跑到的报告覆盖所有还没报过的窗口 |
+@@ -513,6 +514,10 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `tests/crew-speech.spec.ts` | 播报：剥掉代码与网址再念、没这个声音先说没有、空文本不念、超长截断并说明、转换错误带回原文、失败也收临时目录、WAV 时长从头部读 |
+ | `tests/routines.spec.ts` | The 常规任务 ledger: the next run counted from the last one (or from creation), a passed run marked overdue instead of rolled forward, unreadable records skipped, and "nothing yet" kept apart from "could not read" |
+ | `tests/crew-verify.spec.ts` | The Bot crew roster, mention routing to one Bot or the default one, and what a worker is told about its Bot |
++| `tests/diagnostics.spec.ts` | App 故障上报的落盘盒：白名单（去 query/丢 message 型 err、crash 只留 errorClass/栈/breadcrumbs）、按 id 幂等、每设备行数与字节上限、全球行数/字节上限（含跨设备淘汰后计数不偏高）、7 天保留、按设备隔离、errorsOnly、NDJSON 导出不含凭据 |
++| `tests/diagnostics-http.spec.ts` | `POST/GET /api/mobile/diagnostics` 的真实 tmp sqlite 端到端：无 principal 401、exact route 命中、`{ok:true,acceptedIds}` 且 durable、重投同 id 只存一次、整批全坏 4xx、超大 413、速率 429+Retry-After、GET 只看自己那台、重开库后仍可查 |
++| `tests/diagnostics-review.spec.ts` | 独立差分（不改源）：读侧保留期兜底（沉默设备 GET/导出不吐过期）、route 编码 query 与裸 `sk_live_` 长密钥整条拒 `route_sensitive`、crash.stack 只留帧、extra 敏感值整条丢、管理面全设备带 server 派生 device + limit clamp、真实 apply() LAN forward 缝里伪造 `x-crew-principal`/`body.device`/`query.device` 不得越权 |
++| `tests/server-identity.spec.ts` | 已配对 timeline 顶层可选只读 `server:{crew,public_base}`：`crew` 与 mDNS `crewFingerprint` 同源一致、`public_base` 取自 `publicEntry` 且只放行 HTTPS 无 userinfo/query/fragment（坏/空给空串不推 LAN）、老 App 兼容（既有键仍在）、gate 仍 401 |
+ | `tests/crew-route.spec.ts` | The crew roster and mention routing: one default, members, the Bot a message reaches and the thread it lands in |
+ | `tests/contract-timeline.spec.ts` | The message-surface contract: the roles the gateway actually writes, and unknown fields surviving a read |
+ | `tests/crew-memory.spec.ts` | The Bot memory bridge: file naming, the daily budget, and what a record contributes to a prompt |
+diff --git a/backend/src/app/api.ts b/backend/src/app/api.ts
+index 288d520..8eefc99 100644
+--- a/backend/src/app/api.ts
++++ b/backend/src/app/api.ts
+@@ -8,6 +8,7 @@ import type { SettingsView } from './views/settings.ts'
+ import type { SourceStatusView } from './views/sources.ts'
+ import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
+ import type { TicketListView } from './views/tickets.ts'
++import type { DiagRow } from './diagnostics.ts'
+ 
+ export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
+ export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
+@@ -52,6 +53,9 @@ export interface Api {
+   'POST remote/pairing': { body: { deviceId?: string }; response: { code: string; deviceId: string } }
+   'GET remote/devices': { response: { devices: PairedDeviceView[] } }
+   'DELETE remote/devices': { body: { deviceId?: string; all?: boolean }; response: { ok: true } }
++  /** App 故障上报的只读查看（管理面看所有设备）。导出下载原样 NDJSON 文本。 */
++  'GET diagnostics': { query?: { device?: string; session?: string; since?: string; errorsOnly?: string; limit?: string }; response: { rows: DiagRow[]; devices: string[] } }
++  'GET diagnostics/export': { query?: { device?: string; session?: string; since?: string; errorsOnly?: string; limit?: string }; response: { ndjson: string } }
+ }
+ type Path<K> = K extends `${string} ${infer P}` ? P : never
+ type Params<P> = P extends `${string}:${infer Name}/${infer Rest}` ? Record<Name, string> & Params<Rest>
+diff --git a/backend/src/app/http.ts b/backend/src/app/http.ts
+index 12bdff0..ee9ad4a 100644
+--- a/backend/src/app/http.ts
++++ b/backend/src/app/http.ts
+@@ -42,6 +42,8 @@ export interface HttpHost {
+   readonly health: Record<string, Health>
+   readonly machine: Machine
+   readonly masterId: string
++  /** App 故障上报的落盘盒（只读查看用，管理面看所有设备）。宿主没接时诊断路由回 503。 */
++  readonly diagnostics?: import('./diagnostics.ts').Diagnostics
+   /** Resolves once startup finishes or setup determines what is still missing. */
+   readonly ready: Promise<void>
+   /** Resolved deployment; throws if read while waiting for setup (`!configured()`). */
+@@ -238,6 +240,20 @@ function routes(runtime: HttpHost): Routes {
+     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
+     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
+     'GET models': () => runtime.models(),
++    // App 故障上报的只读查看（管理面看所有设备，本机同源才能进）。导出下载 NDJSON。
++    'GET diagnostics': ({ query }) => {
++      const box = runtime.diagnostics
++      if (!box) throw new RouteError(400, 'Diagnostics is unavailable')
++      return box.list({ device: query.device || undefined, session: query.session || undefined,
++        since: query.since || undefined, errorsOnly: query.errorsOnly === '1', limit: query.limit ? Number(query.limit) : undefined })
++    },
++    'GET diagnostics/export': ({ query }) => {
++      const box = runtime.diagnostics
++      if (!box) throw new RouteError(400, 'Diagnostics is unavailable')
++      // 直接返回 NDJSON 文本：管理面的 json() 会把对象 JSON 化，这里用字符串原样下发。
++      return { ndjson: box.exportNdjson({ device: query.device || undefined, session: query.session || undefined,
++        since: query.since || undefined, errorsOnly: query.errorsOnly === '1', limit: query.limit ? Number(query.limit) : undefined }) }
++    },
+     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
+     'PUT prompts': async input => {
+       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
+diff --git a/backend/src/app/mobile-http.ts b/backend/src/app/mobile-http.ts
+index 82f68b3..aacf336 100644
+--- a/backend/src/app/mobile-http.ts
++++ b/backend/src/app/mobile-http.ts
+@@ -24,6 +24,9 @@ import type { MemoryLayer } from './memory-layer.ts'
+ import type { DeviceStore } from './remote.ts'
+ import { BOT_ID } from '../crew/directory.ts'
+ import { groupsOf, type GroupsView } from './groups.ts'
++import { MAX_BODY_BYTES, parseBatch, type Diagnostics } from './diagnostics.ts'
++import { crewFingerprint } from './discovery.ts'
++import { publicEntry } from './public-entry.ts'
+ 
+ // Structural contract keeps compatibility with the bundle's alpha development
+ // peers; installed rc.2 Connection supplies this authenticated exact-route API.
+@@ -90,6 +93,8 @@ type PhoneHost = Pick<HttpHost, 'ready' | 'machine' | 'store' | 'health' | 'mode
+   ackNotices?: (deviceId: string, ids: readonly string[]) => number
+   noticeSeen?: (deviceId: string) => string[]
+   markNoticeSeen?: (deviceId: string, ids: readonly string[]) => string[]
++  /** App 故障上报的落盘盒（有界 KV）。宿主没接时手机那条 POST 回 503。 */
++  diagnostics?: Diagnostics
+ }
+ /**
+  * 手机看得懂的那句人话。
+@@ -354,6 +359,36 @@ function gatewayOrigin(stateDir?: string): string {
+   return `${process.env.MOBILEGW_SECURE === '1' ? 'https' : 'http'}://${host}:${port}`
+ }
+ 
++/**
++ * 给已配对 timeline 的**可选只读** server 元数据（不新增路由、不放开 auth、旧 App 忽略即兼容）。
++ *
++ * 身份口径是「**同实例指纹**」，不是 crypto 证明：`crew` 与 mDNS TXT 同源，复用 discovery 的
++ * `crewFingerprint(stateDir)`（不是临时 masterId / dsh session id），由服务端**实际计算**得到，
++ * 绝不取自 request host 或 body 自报。`public_base` 复用 `publicEntry(stateDir)`，只接受**HTTPS、
++ * 无 userinfo/query/fragment** 的域名；不合格或没有就是空串 —— 不擅自推 LAN/明文 URL。
++ * 计算失败（读文件异常等）时整块返回 undefined：宁可不给，也不给半真。
++ */
++function serverIdentity(stateDir: string): { crew: string; public_base: string } | undefined {
++  try {
++    const crew = crewFingerprint(stateDir)
++    const raw = publicEntry(stateDir)
++    let publicBase = ''
++    if (raw) {
++      try {
++        const url = new URL(raw)
++        // 只认 HTTPS、无 userinfo/query/fragment —— 其余（含明文 http、带凭据/参数的 URL）一律视为不可信，给空串。
++        if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash) {
++          // 保留校验后的**合法 base 子路径**（如 https://host/crew-prefix 不能退化成 https://host）；
++          // 去尾斜杠；root 仍是 https://host。绝不改成另一地址。
++          const path = url.pathname.replace(/\/+$/, '')
++          publicBase = `${url.origin}${path}`
++        }
++      } catch { publicBase = '' }
++    }
++    return { crew, public_base: publicBase }
++  } catch { return undefined }
++}
++
+ /**
+  * 会话字段（S1 契约第 1、2 节 + #14 第 2 项的 header 形态）。
+  * query 优先、header 兜底；两者都给且不一致 -> 400 invalid_session，不许猜哪个算数。
+@@ -502,6 +537,8 @@ const OPERATIONS = {
+   // 审批答复：手机把「做吧/先别做」这类对 ticket.attention 选项的回答交给宿主，走与 feishu
+   // `approvalReply` 同一套审批状态机（见 runtime.answerTicket）。宿主侧直答，不转发网关。
+   answer: { methods: ['POST'] },
++  // App 故障上报：POST 收一批（白名单/幂等/有界），GET 看自己那台的最近日志。宿主侧直答，不转发网关。
++  diagnostics: { methods: ['GET', 'POST'] },
+ } as const
+ type Operation = keyof typeof OPERATIONS
+ 
+@@ -591,6 +628,43 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
+       return reply(200, { id, sessions: sessionIds(runtime.store),
+         default_session_id: DEFAULT_SESSION_ID, session_api: SESSION_API })
+     }
++    // App 故障上报（域名端接收）：宿主侧直接答，不转发网关。设备号只认入口验过凭据后注入的
++    // 内部 principal 头，不信客户端 x-crew-device / body 里的自报 device。POST 收一批、GET 看自己那台的
++    // 最近日志（不含他人设备的）。落盘白名单、幂等、有界都在 diagnostics.ts 里。
++    if (operation === 'diagnostics') {
++      await runtime.ready
++      const deviceId = principalOf(incoming)
++      if (!deviceId) return reply(401, { error: 'Not paired' })
++      const box = runtime.diagnostics
++      if (!box) return reply(503, { error: 'Diagnostics is unavailable' })
++      if (incoming.method === 'GET') {
++        const items = box.list({
++          device: deviceId,
++          session: url.searchParams.get('session') ?? undefined,
++          since: url.searchParams.get('since') ?? undefined,
++          errorsOnly: url.searchParams.get('errorsOnly') === '1',
++          limit: Number(url.searchParams.get('limit')) || undefined,
++        })
++        return reply(200, { device: deviceId, rows: items.rows })
++      }
++      // POST：batch 上报。先限大小，再限流（429 带 Retry-After），再解析白名单。
++      const raw = await incoming.text()
++      if (Buffer.byteLength(raw) > MAX_BODY_BYTES) return reply(413, { error: 'Request too large' })
++      const rate = box.rateAllowed(deviceId)
++      if (!rate.allowed) {
++        return Response.json({ error: say('Too many diagnostic batches') }, {
++          status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(rate.retryAfterSec) },
++        })
++      }
++      let parsed: unknown
++      try { parsed = JSON.parse(raw) } catch { return reply(400, { error: 'Invalid JSON' }) }
++      const batch = parseBatch(parsed)
++      if (!batch.ok) return reply(400, { error: batch.error, rejectedIds: batch.rejected?.map(r => r.id).filter(Boolean) ?? [],
++        reasonCodes: Array.from(new Set(batch.rejected?.map(r => r.reason) ?? [])) })
++      const result = box.report(deviceId, batch.app, batch.build, batch.outcome)
++      // 成功 ACK 严格 application/json + {ok:true, acceptedIds}（含幂等命中），只在报告 durable 落盘后发出。
++      return reply(200, { ok: true, acceptedIds: result.acceptedIds, rejectedIds: result.rejectedIds, reasonCodes: result.reasonCodes })
++    }
+     // 设备接收链（#23）：宿主侧直接答，不转发网关。设备号只认入口验过凭据后注入的内部 principal 头，
+     // 不信客户端 x-crew-device。GET=peek（不删），POST=ack（只删点名）+ 记 seen（device-persisted）。
+     if (operation === 'notices') {
+@@ -1211,12 +1285,17 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
+             return { groups: [], state: 'unavailable', reason: `群组投影读不出来：${String(error)}` }
+           }
+         })()
++        // 可选只读 server 元数据：算一次复用；算不出（undefined）就整块不加，保持老响应逐字兼容。
++        const serverMeta = serverIdentity(runtime.machine.stateDir)
+         return reply(200, { ...data, ...roster,
+           // 能力位（S1 契约第 2 节）：老调用也回显 session_id: "main"，内容其余部分逐字不变。
+           // 放在 ...data 之后，以消息面算出的会话为准，不让上游的字段替客户端决定它在看哪一段。
+           session_id: sessionId, session_api: SESSION_API,
+           sessions: sessionIds(runtime.store), default_session_id: DEFAULT_SESSION_ID,
+           groups,
++          // 可选只读 server 元数据（同实例指纹 + 真实 HTTPS public_base）：只增不改，老 App 忽略即兼容；
++          // 算不出就整块不出现（不编半真）。身份是「同实例指纹」非 crypto 证明。
++          ...(serverMeta ? { server: serverMeta } : {}),
+           // 消息面原样带回，只把代码卡缺的票号补齐（见 ticketRefs）：其余字段一格不改。
+           items,
+           tasks: tickets.map(ticket => {
+@@ -1420,6 +1499,9 @@ export function registerMobileHttp(ctx: Context, runtime: PhoneHost): void {
+       connection.fetch.register({ path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+       // 审批答复：把「做吧/先别做」交给与 feishu `approvalReply` 同源的审批状态机。宿主侧直答，不转发网关。
+       connection.fetch.register({ path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
++      // App 故障上报：POST 收一批、GET 看自己那台。两条 exact route，宿主侧直接答，不转发网关。
++      connection.fetch.register({ path: '/api/mobile/diagnostics', methods: ['GET'], requestBody: 'buffered', fetch: handler }),
++      connection.fetch.register({ path: '/api/mobile/diagnostics', methods: ['POST'], requestBody: 'buffered', fetch: handler }),
+     ]
+     child.effect(() => async () => { await Promise.all(disposers.map(dispose => dispose())) })
+   })
+diff --git a/backend/src/app/runtime.ts b/backend/src/app/runtime.ts
+index d239d0f..cea7714 100644
+--- a/backend/src/app/runtime.ts
++++ b/backend/src/app/runtime.ts
+@@ -27,6 +27,7 @@ import { ticketCard } from './cards.ts'
+ import { screenOf, type ScreenEvent, type ScreenSnapshot } from './screen.ts'
+ import { outputsView, type OutputEvent, type OutputsTicket, type OutputsView } from './outputs.ts'
+ import { buildRoutine, editRoutine, routinesView, routineItemOf, newRoutineId, type RoutineRecord, type RoutinesView } from './routines.ts'
++import { Diagnostics } from './diagnostics.ts'
+ import { advance, dueOf, routineMessage, TICK_MS } from './routine-runner.ts'
+ import { followupsOf, followupText, waitingWhere } from './followup.ts'
+ import { spendOf, spendSteps, type Spend, type SpendEvent } from './spend.ts'
+@@ -144,6 +145,8 @@ function stableJson(value: unknown): string {
+  */
+ export class Runtime extends Service implements SourceHost {
+   readonly store: Store
++  /** App 故障上报的落盘盒（在 store 就绪后构造）。手机面收、管理面读共用一份。 */
++  diagnostics!: Diagnostics
+   readonly setup: Setup
+   readonly prompts: Prompts
+   readonly effects: Effects
+@@ -237,6 +240,8 @@ export class Runtime extends Service implements SourceHost {
+     try {
+       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
+       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
++      // App 故障上报的落盘盒：与 store 同生命周期，手机面收、管理面读共用一个实例。
++      this.diagnostics = new Diagnostics(store)
+       // 待发件箱接真实持久层：Store 就绪后再建，明确依赖顺序，不靠字段初始化去猜 store 何时可用。
+       // 一桶一键（KV.notice.pending），HMR/实例重建后靠这一族读回、不丢未 ACK 的件。只用新链以后
+       // 入队的件才有来源；更早只活在旧进程内存里的件不在此列，不假装恢复。
+@@ -1805,6 +1810,7 @@ export class Runtime extends Service implements SourceHost {
+     const runtime = this
+     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
+     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
++      diagnostics: this.diagnostics,
+       get deployment() { return setup.deployment },
+       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
+       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
+diff --git a/backend/tests/fixtures/panel-server.ts b/backend/tests/fixtures/panel-server.ts
+index d11d966..2b72e50 100644
+--- a/backend/tests/fixtures/panel-server.ts
++++ b/backend/tests/fixtures/panel-server.ts
+@@ -312,6 +312,8 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
+   'GET records/export': { answer: async () => ({ kind: 'dsh-bot-crew-records', version: 11, exportedAt: '', stateDir: '',
+     settings: { paused: false, policy: {}, eval: {}, executor: {} }, team: {}, tickets: [] }) },
+   'DELETE remote/devices': { body: true, answer: async () => ({ ok: true as const }) },
++  'GET diagnostics': { query: ['device', 'session', 'since', 'errorsOnly', 'limit'], answer: async () => ({ rows: [], devices: [] }) },
++  'GET diagnostics/export': { query: ['device', 'session', 'since', 'errorsOnly', 'limit'], answer: async () => ({ ndjson: '' }) },
+   'GET state': { answer: stateView },
+   'GET overview': { answer: overviewView },
+   'GET search': { query: ['q'], answer: async ({ query }) => {
+diff --git a/backend/tests/mobile-http.spec.ts b/backend/tests/mobile-http.spec.ts
+index 6755ed8..b2202c3 100644
+--- a/backend/tests/mobile-http.spec.ts
++++ b/backend/tests/mobile-http.spec.ts
+@@ -69,6 +69,8 @@ it('uses Connection authenticated exact routes, never raw public web routes', ()
+     { path: '/api/mobile/notices', methods: ['GET'], requestBody: 'buffered' },
+     { path: '/api/mobile/notices', methods: ['POST'], requestBody: 'buffered' },
+     { path: '/api/mobile/answer', methods: ['POST'], requestBody: 'buffered' },
++    { path: '/api/mobile/diagnostics', methods: ['GET'], requestBody: 'buffered' },
++    { path: '/api/mobile/diagnostics', methods: ['POST'], requestBody: 'buffered' },
+   ])
+ })
+ it('injects only the server credential and refuses malformed sends before enqueue', async () => {
+@@ -973,9 +975,10 @@ it('echoes the session capability bits and keeps a legacy timeline unchanged', a
+   const legacy = await (await handler(new Request('http://dsh/api/mobile/timeline'))).json() as Record<string, unknown>
+   expect(legacy).toMatchObject({ session_id: 'main', session_api: 1, sessions: ['main'], default_session_id: 'main' })
+   // 除这四个能力位字段外，老响应逐字不变。groups 是 S4 加的只读投影（增量字段，
+-  // 与会话无关），同样按白名单剔除后单独断言形状。
++  // 与会话无关），同样按白名单剔除后单独断言形状。server 是本批新增的可选只读元数据（增量字段，老 App 忽略），
++  // 一并剔除后断言其余逐字不变（见 tests/server-identity.spec.ts 单测其形状与同源）。
+   const { session_id: _sid, session_api: _api, sessions: _list, default_session_id: _def,
+-    groups, ...rest } = legacy
++    groups, server: _server, ...rest } = legacy
+   expect(rest).toEqual({ items: [], tasks: [], queued: [], declined: [], bots: [], default_bot_id: '',
+     unread: { count: 0, state: 'live' },
+     unread_replies: { count: null, state: 'unknown', reason: expect.any(String) },
+diff --git a/docs/00-contract.md b/docs/00-contract.md
+index cf6dcdc..9aa83f8 100644
+--- a/docs/00-contract.md
++++ b/docs/00-contract.md
+@@ -141,10 +141,20 @@
+   "declined": [                    // 后台看过并决定不动手的消息，带一句理由
+     { "request_id": "...", "reason": "..." }
+   ],
+-  "status": { "runtime": "observe|auto|off", "mobile": "on|off", "paused": false }
++  "status": { "runtime": "observe|auto|off", "mobile": "on|off", "paused": false },
++  // 可选只读 server 元数据（本批新增，增量字段；旧 App 忽略即兼容）。算不出就整块不出现。
++  // 身份口径是「同实例指纹」不是 crypto 证明；由服务端实际计算，绝不取自 request host/body。
++  "server": {
++    "crew": "<与 mDNS TXT 完全同源的稳定 crewFingerprint，如 7 位 36 进制>",
++    "public_base": "https://crew.kentonnie.top"  // 真实 HTTPS 域名；无/不合格（明文、带 userinfo/query/fragment）时为空串 ""
++  }
+ }
+ ```
+ 
++- `server.crew` 与 mDNS 广播的 TXT `crew` **同一实现、同一来源**（`crewFingerprint(stateDir)`），**不是** 临时 masterId / dsh session id 之类会变的值。
++- `server.public_base` 复用 `publicEntry(stateDir)`，只放行 **HTTPS 且无 userinfo/query/fragment**；**保留校验后的合法 base 子路径**（如 `https://host/crew-prefix` 不退化成 `https://host`，去尾斜杠，root 仍 `https://host`，绝不改成另一地址）；无/不合格给 `""`，**不擅自推局域网/明文地址**。
++- 客户端只有在 `saved crew` 与 `server.crew` **精确相等**、且 TLS 校验通过时，才允许据此更新**持久候选**配置；空/新装无 saved crew 时，只从既有可信配置地址的响应登记，**不从任意 bootstrap 200 接受**。字段只随已配对 timeline 下发，gate 不变（匿名仍 401）。
++
+ - 页面 `stop` 时不轮询；不强制每条更新滚到底；未知字段必须保留、不得丢弃。
+ - **未实现的审批能力不得虚构按钮或审批状态**。
+ - 被撤回的消息不出现在 `items`，也不出现在 `queued`。
+@@ -830,6 +840,109 @@
+ 结论：即使手机没连、或 App 系统推送停着，超时这件事也一定出现在**看门狗账本 + timeline** 上，
+ 桌面右栏与管理面能看到。这就不留「说不清的链」——每一条都能指到具体落点与读它的地方。
+ 
++## 5.9 App 故障上报：`POST / GET /api/mobile/diagnostics`
++
++手机把结构化、有界的诊断日志批量上报到域名端；管理面只读查看/导出。**只存白名单字段**，绝不存
++token / query / headers / body / text / 聊天正文。设备身份只认入口验过的设备凭据（`x-crew-device`
+++ `x-crew-credential`），**body 里不带 device**，服务端用已验 principal 覆盖、不可伪造。
++
++### 上报：`POST /api/mobile/diagnostics`
++
++认证与其余 `/api/mobile/*` 相同（局域网直连与 `crew.kentonnie.top` 公网主域名走同一道设备凭据门）。
++
++请求体（JSON 对象，**不是**双重字符串化；整批 ≤64KiB、≤50 条）：
++
++```json
++{
++  "app": "BotCrew",
++  "build": "0.1.0(1)",
++  "batch": [
++    {
++      "id": "客户端生成的唯一串（=reportId，幂等键）",
++      "kind": "event",
++      "at": "2026-11-15T10:00:00+08:00",
++      "event": "http_error",
++      "route": "/api/mobile/timeline",
++      "method": "GET",
++      "status": 502,
++      "ms": 1800,
++      "err": "CrewUnavailable",
++      "session": "main",
++      "appVersion": "0.1.0",
++      "versionCode": 1,
++      "extra": { "phase": "connect", "networkKind": "cellular", "routeKind": "public" }
++    }
++  ]
++}
++```
++
++`kind: "crash"` 时，单条 ≤16KiB，可另带（普通 event 单条 ≤1KiB）：
++
++```json
++{ "kind": "crash", "errorClass": "NullPointerException", "stack": "…≤8KiB…",
++  "breadcrumbs": [ { "at": "…", "event": "tap", "route": "/m", "method": "POST", "status": 200, "ms": 12, "err": "" } ] }
++```
++
++字段白名单（**其余字段一律丢弃，不落库**）：
++
++| 字段 | 约束 |
++| --- | --- |
++| `id` | 必填，`[A-Za-z0-9._/-]{1,128}`；幂等键 |
++| `kind` | `event`（缺省）或 `crash` |
++| `at` | 必填，可解析的 ISO 时间；服务端另记 `receivedAt`（不信任客户端，自动生成） |
++| `event` | 必填，短词 `[A-Za-z0-9._/-]{1,64}` |
++| `route` | 必填，**客户端传不带 query/hash 的 pathname**（以 `/` 开头）；服务端**拒收**含 query/hash、多重/歧义百分号编码（如 `%3Ftoken%3D`、`%253F…`）或敏感路径的 route（`route_sensitive` / `route_bad_encoding`），不静默 strip 后落库 |
++| `method` | 可选，短词，转大写 |
++| `status` | 可选，0–999 整数 |
++| `ms` | 可选，≥0，封顶一天 |
++| `err` | 可选，**只收类别/码短词**（`[A-Za-z0-9._/-]{1,128}`）；带空格标点的异常 message 会被丢弃（防夹凭据） |
++| `session` | 可选，短词 |
++| `appVersion` / `versionCode` | 可选，版本短词 / 非负整数 |
++| `extra` | 可选，**只放行** `phase`/`networkKind`/`model`/`version`/`routeKind`，值短串 |
++| `errorClass` / `stack` / `breadcrumbs` | 仅 `kind:crash`；`errorClass` 短词；`stack` **只保留结构帧**（`at pkg.C.m(File.java:123)` / `File.kt:12` / `NativeMethod`），异常 message、带 token 的 URL、聊天原文等非帧行整条丢弃，≤8KiB；`breadcrumbs`≤50 条，逐项同事件白名单 |
++
++**脱敏兜底（在字段白名单之上再剥一层）**：`extra` 任一值命中「token/query/`password=`/`bearer …`/私钥/长 base64」等敏感形态
++→ 该值整条丢弃；`route` 含 query/hash、歧义编码或敏感形态（如路径里塞 `Bearer …`、`sk_live_…`）→ 该记录 `rejected`（`route_sensitive` / `route_bad_encoding`）。
++`err` / `errorClass` 本就只收 `[A-Za-z0-9._/-]` 短词，天然拒掉带空格标点的异常 message。
++
++**成功响应**（HTTP 200，`Content-Type: application/json`，body 顶层有键位置 `"ok": true`）：
++
++```json
++{ "ok": true, "acceptedIds": ["id1", "id2"], "rejectedIds": [], "reasonCodes": [] }
++```
++
++- `acceptedIds` = 新落库 + **幂等命中（同 id 重投）**的 id；客户端只删命中项，以它为幂等依据，**不仅看 2xx**。
++- **ACK 只在报告已 durable 落库后发出**（`store.set` 同步写 sqlite/WAL，返回即已落盘）。
++- `rejectedIds` + `reasonCodes` 是**不被 ACK** 的坏记录（如 `row_too_large`/`event_too_large`/`bad_at`/
++  `id_required`/`route_required`）；客户端不删这些，自行修正后再报。
++- 整批全坏 → **HTTP 400**（`{ "error": "all records rejected", "rejectedIds": [...], "reasonCodes": [...] }`），不静默 200。
++- **空批 `batch: []` → HTTP 400**（`batch must not be empty`）：无意义的空批不返回空 ACK。
++
++**大小/速率边界**：整批 >64KiB → `413`；单条按 kind 超限 → 该条 rejected；每设备每窗口批次超限 → `429`
++并带 `Retry-After`（秒），客户端按它退避。**无匿名**：没有验过的设备凭据 → `401`。
++
++**存/取契约**（给日后查看/取证）：
++- 复用项目唯一 `Store`（sqlite KV），**每设备一段**（`diagnostics:dev:<device>`），无 idx 多键、不扫全库。
++- **每行都带 server 派生的 `device` / `app` / `build`**（批级 `app`/`build` 落到每一行，客户端一般只在批级带 build，避免丢 APK 版本）。
++- 有界：每设备 ≤5000 行 / ≤2MiB / 保留 7 天；全球 ≤50000 行 / ≤24MiB。**行数与字节都封顶**。
++- **保留期双向执行**：写路径上对被写设备、**以及其它沉默设备**都做 7 天淘汰；**读路径（GET/导出）也按 7 天过滤**，
++  即使某设备自上次写后一直沉默、没有新 POST，也绝不返回已过期报告（时钟推进后 GET/导出无过期行）。
++- 淘汰后全球字节计数随实际剩余行同步扣减（不偏高），重开库后一致。
++- 幂等：同 `id` 重投 ACK 但不重存。
++
++### 查看（消息面）：`GET /api/mobile/diagnostics`
++
++同一设备凭据，**只返回本设备自己的**报告（`device` 恒为入口验过的本设备，绝不跨设备、不泄漏设备表）。
++query：`session` / `since` / `errorsOnly=1` / `limit`。返回 `{ device, rows: [...] }`，每行都带 server 派生的
++`device` / `app` / `build`。**消息面不提供导出**（导出只在管理面）。
++
++### 查看（管理面）：`GET /orchestrator/api/diagnostics` 与 `GET /orchestrator/api/diagnostics/export`
++
++只本机同源（Host=`127.0.0.1:<port>` + `x-orchestrator-request: 1`，与其余管理面一致，**不为它放开**）。
++前者看**所有设备**（合并数组，**每行带 server 派生的 `device` 字段**以便归属），可按
++`device`/`session`/`since`/`errorsOnly` 过滤；后者**返回 JSON 对象 `{ "ndjson": "<string>" }`**（与外层管理面统一 JSON 序列化，**不是** raw NDJSON 流），调用方取 `ndjson` 字段内容保存为 `.jsonl`（每行一条，已脱敏）。
++本期**仅管理面可导出，手机 export 未做**；不做前端页面、不做元数据/publicBase 新路线。
++
+ ## 6. 错误码
+ 
+ | code | HTTP | 含义 |
+diff --git a/docs/review/README.md b/docs/review/README.md
+index 10d3538..b413691 100644
+--- a/docs/review/README.md
++++ b/docs/review/README.md
+@@ -9,6 +9,10 @@
+ | [`../../开发进度.md`](../../开发进度.md) | 开发进度**唯一事实来源**，含 2026-11-15 最终收口现状头 |
+ | [`2026-11-15-completeness-assessment.md`](2026-11-15-completeness-assessment.md) | 完整性评估。评估对象为 `feat/four-blocks @ b2f305e` 的**历史静态快照**，代表该时点，不作最新源码断言 |
+ | [`../00-contract.md`](../00-contract.md) | 消息面契约（当前版本） |
++| [`ux-mobile-20261115/`](ux-mobile-20261115/) | **2026-11-15 手机端 UX 优化（紧凑首屏）**：过程 review 与独立验收入口。最终（OPPO `55c86317`）：debug/release 各 458 全绿、assemble 通过、同签 install -r Success（sha256 `ed5972a3…5dc0`、firstInstallTime 保留），真机 UI 六项通过 + 健康点色修复。**148dp = 52+48+48 代码布局值，非容器精测**。报告 [`2026-11-15-ux-delivery.md`](ux-mobile-20261115/2026-11-15-ux-delivery.md) |
++| [`ux-sidebar-20261115/`](ux-sidebar-20261115/) | **2026-11-15 本批手机端 UX · 单行顶栏 + 侧边栏（drawer）**：过程 review / 两轮独立源码 review / 真机验收。设计终稿同 [`../../designs/crew-mobile-ux/project`](../../designs/crew-mobile-ux/project)（Main/Drawer/Tasks 三画板 + IMPLEMENTATION.md）。最终（OPPO PEDM00/`55c86317`）：compileDebugKotlin + **DrawerNavigationTest 20/20** + assembleRelease 通过（472×2 为上一 checkpoint 全量，本批跑焦点/Back/通知/role 专项 20 不重跑全量），同签 install -r Success（**final sha256 `e6450ee3…822ed2`**、cert `ad0e4480…af7eb`、firstInstallTime 保留），真机全项通过（单行 56dp 代码值/系统栏另计、drawer 300dp、back/遮罩关、通知导航可展开、资料→名片、onTalk focused+IME、会话管理）。报告 [`2026-11-15-sidebar-delivery.md`](ux-sidebar-20261115/2026-11-15-sidebar-delivery.md) |
++| [`cellular-20261115/`](cellular-20261115/) | **2026-11-15 客户端 r2 蜂窝真机验收（当前）**：交付包 `cellular-20261115-r2-signed.apk`（sha256 `0eb388ba…436569`，同签、firstInstall 保留）；debug/release 各 575/0/0/0；同签覆盖+force-stop+WiFi↔Cell 均免配自动回 main、server pairedAt 全程不变；CELLULAR VALIDATED+NOT_VPN 无 USB 代理、r2 **PUBLIC 业务 25 条全 200**（capture-at 15:10:43–15:12:15Z）；手动补传实际发送。验收报告 [`verification.md`](cellular-20261115/verification.md)，服务端同口径 [`server-received.md`](cellular-20261115/server-received.md)。（本目录早期 `device-baseline.md`/`01/04 等过程图` 为过程留痕，非当前口径） |
++| [`external-diagnostics-20261115/`](external-diagnostics-20261115/) | **2026-11-15 域名端 App 故障上报 API（已发布 A）**：`POST/GET /api/mobile/diagnostics` + 管理面只读 `/orchestrator/api/diagnostics`、`/export`，真主域名 `crew.kentonnie.top` 同 paired 凭据；车 App 机制（reportId 幂等/typed crash/breadcrumbs/全白名单脱敏/行数+字节有界）。发布经 DSH profile 重组 HMR，pid 89699 不变、health ready、发布入口 `backend/lib/index.js` 文件 SHA256 `9d485c90…fa57f2`（整目录 tree-hash `32bb3987…e11c28` 另记勿混同）。实施+发布证据 [`api-implementation.md`](external-diagnostics-20261115/api-implementation.md)；外网链路只读根因 [`network-findings.md`](external-diagnostics-20261115/network-findings.md)。**客户端/红米重装/蜂窝外网复测延期未做；API 上线≠App 已自动上报**。最终独立验收（3 spec 53 + tsc）见验证员 task12 报告 |
+ 
+ ## 二、历史交接文档定位（留档，不进现行口径）
+ 
+@@ -25,6 +29,8 @@
+ ## 三、本目录的组织
+ 
+ - `2026-11-1x-*.md`：分主题的过程 review 与验收报告（配对屏、桌面生命周期、issue19/20/21/23/24/25/26、workspace 等）。
++- `ux-mobile-20261115/`：**2026-11-15 手机端 UX 优化（紧凑首屏）** 的独立 review / 验证准备 / 真机验收报告；设计终稿在 `designs/crew-mobile-ux/project`。
++- `ux-sidebar-20261115/`：**2026-11-15 本批手机端 UX · 单行顶栏 + 侧边栏（drawer）** 的独立 review / 两轮源码 review / 真机验收报告与交付 APK；设计终稿在 `designs/crew-mobile-ux/project`（三画板 + IMPLEMENTATION.md）。
+ - `phase2-*/`、`phase3-*/`：按批次归档的证据（integration / network / receive / transport / worker / client-answer / desktop / device）。
+ - `shots-*/`、`desktop-gui-accept-*/`、`final-android/`：真机 / 桌面 / 配对的截图与 XML 证据（对应各报告结论）。
+ - `incident/`：工程事故记录（mobilegw 重启等）。
+diff --git a/开发进度.md b/开发进度.md
+index 60066a5..97789bb 100644
+--- a/开发进度.md
++++ b/开发进度.md
+@@ -13,6 +13,29 @@
+ 
+ ---
+ 
++> **【2026-11-15 追加 · 域名端 App 故障上报 API 已发布上线】**
++> 用户当前诉求「出门后 App 用不了 → 走域名加 log 输入／实时诊断」。本轮**仅服务端**：
++> `POST /api/mobile/diagnostics`（+ `GET` 看自己那台；管理面 `GET /orchestrator/api/diagnostics` 与 `/export`）
++> 已发布到真公网主域名 `https://crew.kentonnie.top`（cloudflared → lan-server 43499，走同 paired 设备凭据；
++> **不是** NAS relay 子路径）。机制参照汽车音乐 App（reportId 幂等、客户端生成 id、服务端 receivedAt、
++> typed crash/errorClass/stack-only frames/breadcrumbs、全白名单脱敏、行数+字节有界保留）。
++> - **发布事实**：DSH profile 重组 HMR，**pid 89699 不变**、health 全 ready；发布运行入口 `backend/lib/index.js` 文件 SHA256 `9d485c90…fa57f2`（lead 独立复核一致；整目录 tree-hash `32bb3987…e11c28` 另记、勿混同）；
++>   隔离 selftest 身份（非真实手机）真域名 `{ok:true,acceptedIds}`/重投去重/只读本设备 均通过，测后吊销并清行；
++>   真实手机/配对未动。（`ctx.fiber.restart` 不换码，真实触发是 build 后向 `superagent/cordis.patch.yml` 追加一次发布注释。）
++> - **验收口径**：2228 全量是 checkpoint；最终独立验收 = 3 spec 53 例 + tsc（由验证员写 task12 报告，本头不改其报告）。
++> - **未做/不宣称**：客户端埋点、红米重装、蜂窝现场外网复测按用户请求**延期未做**；API 上线 ≠ App 已自动上报，
++>   ≠ 出门后 App 故障已修复。详见 [`docs/review/external-diagnostics-20261115/`](docs/review/external-diagnostics-20261115/)。
++
++> **【2026-11-15 追加 · 客户端 r2 蜂窝真机验收通过】**
++> 现状头：客户端红米 r2 已在真机蜂窝下通过验收。交付包 `cellular-20261115-r2-signed.apk`，sha256 `0eb388ba…436569`，与既有同签、`install -r` 保 firstInstallTime。
++> - 门禁：debug/release 各 **575/0/0/0**；assembleRelease 通过。
++> - 免配：同签覆盖 + `force-stop` 重启均**直接进 main（不落配对页、不生成码）**；服务端 Redmi `d0219887…` **pairedAt 全程不变**、device 数恒 3。
++> - 蜂窝：CELLULAR **VALIDATED + NOT_VPN**、无 USB 代理；r2 **PUBLIC 业务 25 条全 200**（capture-at 15:10:43–15:12:15Z）；切回 WiFi 读取正常。
++> - 诊断：页面构建标记 r2；手动补传**实际发送**（本地环 2→1 + 服务端事件增长，无网络异常）。
++> - 验收报告见 [`docs/review/cellular-20261115/verification.md`](docs/review/cellular-20261115/verification.md)（服务端同口径交叉 [`server-received.md`](docs/review/cellular-20261115/server-received.md)）。
++
++---
++
+ ## 一、这是什么
+ 
+ 给 DeepSeek Harness 原型（`deepseek-ai/dsh-superagent-prototype`，一个 DSH 插件）
+@@ -72,6 +95,29 @@
+ >   并加归档状态回链（完整隔离归档、默认 none 不变）。
+ > - **未做 git add/commit/push**；未动生产进程（89697/89699/gateway 67367 lstart 不变）；未读外部私人数据/secret。
+ >
++> **【2026-11-15 本批 UX 优化 · 手机端单行顶栏 + 侧边栏（drawer）（最终收口：源码/画布/真机全项通过，独立验证完成）】**
++>
++> - **用户目标**：成员不常驻顶部，常用入口进侧边栏；顶部只留必要单行；输入区显示实际收件人。在既有 Claude Design 画布上修订（`designs/crew-mobile-ux/project`，终稿：Main/Drawer/Tasks 三画板 + IMPLEMENTATION.md），**原生 ModalNavigationDrawer 收纳成员与常用导航**。lead 只决策，实施由 owner（CrewUi/BoardUi/CrewNavigation）完成，本段为独立验证员写入。
++> - **改动**：顶部常驻收成 **单行 56dp**（☰ 菜单 · 当前会话名[任务页前缀「任务 ·」区分所在页，elloipsis] · 连接状态短词≤76dp）；移除常驻 模式行/成员横条/「更多⋯」/独立通知块；入口下沉 drawer 三段（导航：聊天/任务·分拣台/**通知·N** → 成员·选收件人[行主体选收件人、行尾独立「资料」48dp] → 工具：事务板/会话管理/模型/后台/屏幕）；输入区单行 64dp（左收件人短名按钮 48×48~64 + 正文 weight + 发送）。**新文件 `CrewNavigation.kt`**（纯派生：recipientLabel 默认走后端 `default_bot_id` 非硬编码第一位、topBarTitle、selectedNav、roleLabel 中文映射、noticeRowLabel/noticeItemIndex）+ `DrawerNavigationTest`（20 用例）。
++> - **交互语义保留**：会话唯一真源（单一 sessionState + 单一 showSessions）；收件人来自 `Recipient.primaryRecipient`/`mentionsIn` 真实语义（未指定→后端 default→未指定，不造 default）；草稿保留（`Recipient.select` 保正文不叠 @）；通知进 LazyColumn 首项，pendingJump/bottom 逐处 `messagesListOffsetIfNotice` 偏移正确；审批 `ApprovalGate` 同题互斥/受理/stale/换票隔离不回退；系统 back 显式 BackHandler（本组 M3 实测不自动阻止 back，owner 补 `BackHandler(isOpen){close}`，不退 App）；onTalk 焦点改 `onGloballyPositioned+isAttached` 一次性 requestFocus+keyboard.show（非盲睡、失败 Log 不吞）。
++> - **独立验证（`wb-drawer-verify`，交付机 OPPO PEDM00 / `55c86317`）**：compileDebugKotlin exit0；`DrawerNavigationTest` **20/20**；`assembleRelease` BUILD SUCCESSFUL（未复跑 472 全量，按 lead 指示跑焦点/Back/通知/role 专项最小复验）。同签（cert SHA-256 `ad0e4480…af7eb` = 设备）`adb install -r` **Success**，firstInstallTime **2026-11-11 22:27:11 未变**（保配对/历史），lastUpdateTime 17:00:47。**final APK sha256 `e6450ee395a3a86f55f294e5b6fb4ab13702585aa4ea30206fc0161275822ed2`**，交付：[`deliver/dsh-botcrew-sidebar-20261115-signed.apk`](docs/review/ux-sidebar-20261115/deliver/dsh-botcrew-sidebar-20261115-signed.apk)。
++> - **真机 UI 全项实测通过**：单行首屏；drawer 300dp 可滚/分组/遮罩压暗；**系统 back 关 drawer 不退 App**（焦点仍 MainActivity）；遮罩点击关；**drawer「通知·N」→滚到首条摘要并可展开/收起**；成员选人不发送；任务页顶「任务·main」区分页、资料→切 Chat 显示名片、「跟他说话」→EditText focused=true 且 IME 弹出；drawer「会话管理」→真实 SessionBar；最终态 main 空草稿 + drawer 关。实测 touch bounds：☰/会话/连接/收件人/发送（74.5×48）均 ≥48，正文宽 136dp 自适应。**顶栏 56dp 为代码布局值，系统栏另计、不作整体容器精测**（不以语义子节点 bounds 冒充容器）。
++> - **最终报告**：[`docs/review/ux-sidebar-20261115/2026-11-15-sidebar-delivery.md`](docs/review/ux-sidebar-20261115/2026-11-15-sidebar-delivery.md)（验证员写入，本文只链接不改其目录）。
++> - **未做 git add/commit/push**；未发业务消息/审批、未删通知、未改系统设置/网络/通知、未碰其它 App、未卸载未清数据、Mac 无输入。
++>
++> **【2026-11-15 本批 UX 优化 · 手机端紧凑首屏（最终收口：源码/画布/真机 UI 六项均通过，独立验证完成）】**
++>
++> - **范围**：本人手机端（Android `com.dsh.botcrew`）首屏体验。真机问题：顶部控制区约占 40%，信息不足、挤压消息区。
++>   本批首批改动：① **连接 / 会话 / 更多合并为一行顶栏**（各命中 ≥48dp）；② **模式行 / 成员行紧凑化**；③ **notice 折叠摘要**；④ **已办默认折叠**；⑤ **收件人（跟他说话未指定成员）修复**；⑥ **审批同题互斥**（pending / accepted / stale 分态，未决串行，答 A 不锁 B）；⑦ **连接错误与操作错误区分**（非连接动作失败不冒充连接假红）。默认配对数据不动、不恢复归档功能、不改协议/后端。
++> - **设计（Claude Design 可编辑画布）**：终稿在 [`designs/crew-mobile-ux/project`](designs/crew-mobile-ux/project)。**控制区 148dp = 52+48+48 的代码布局值**（连接/会话/更多一行 52 + 模式 48 + 成员 48）；消息/任务占 390×844 画布整屏 69.4%（画布目标值，非容器精测）。**测量口径已修正：148dp 仅代码布局值，具体容器未独立测量；此前 `122dp/73%` 系语义子节点 bounds 所得，lead 已否决，不作为容器精测结论。** 最终以截图 + 代码尺寸为准。保留现有暖白绿色品牌。
++> - **源码（本批已在工作树，未提交）**：`app/.../CrewConnectionStatus.kt`（独立 Compose 连接状态组件：折叠一行摘要 + 点开 Dialog 详情；`loading` 时绝不显示绿色「已连接」，`problem` 非空为红「连不上」；命令块默认折叠 + `SelectionContainer` + ≥48dp「复制命令」写剪贴板）、`Recipient.kt`（多 mention + `@id` 显式切换保正文）、`ApprovalGate.kt`（审批互斥状态机）、`CrewUi.kt` / `BoardUi.kt`（顶栏合并、模式/成员紧凑、notice 折叠、已办折叠、连接/操作错误分流的集成）、`MainActivity.kt`（`WaitingLine` 挂「使用说明」可点、复用同一 Dialog，连接初始化未动）。测试：`ConnectionStatusTest` / `RecipientSelectionTest` / `ApprovalFeedbackTest` / `BoardUiTest`。
++> - **成员路由**：本批成员为真实 WorkBuddy 路由 `magpie / workbuddy/deepseek-v4.1-flash-500k`。
++> - **独立验证（`wb-ux-verify`，最终交付机 OPPO PEDM00 / `55c86317`，用户明确选该机）**：**debug / release 两变体各 458 全绿**，`assembleRelease` / `assembleDebug` 通过；色修复后 `ConnectionStatusTest` **15 用例全绿**（13+新2：`healthyDotGreenIsFixedPerThemeNotPaletteAccent`/`greenForIsStableRegardlessOfCallerPalette`，纯 JVM 可跑 Compose `Color`/`luminance()`）。同 debug key 重签（cert SHA-256 `ad0e4480…af7eb` = 设备原证书）、`adb install -r` **Success**；base hash 与签包一致 `ed5972a3d0fec373ffe90590ecc92ad3edfc96e4f162e5da02e99bcd26a75dc0`；`firstInstallTime` 2026-11-11 22:27:11 **保留**（保数据），lastUpdateTime 16:27:42（仅保留性证据，以当前 device 读取为准）。交付签包：[`docs/review/ux-mobile-20261115/deliver/dsh-botcrew-ux-compact-20261115-signed.apk`](docs/review/ux-mobile-20261115/deliver/dsh-botcrew-ux-compact-20261115-signed.apk)（sha256 **`ed5972a3d0fec373ffe90590ecc92ad3edfc96e4f162e5da02e99bcd26a75dc0`**）。
++> - **真机 UI 六项全部通过（OPPO 实测）**：主屏紧凑、notice 展开/收回、成员切换保 Test 正文且不发送、work→main 空草稿、办完默认折叠→展开→收回、更多全入口 / Triage 事务板可达。主图 `oppo-08-session-main.png`（main 空草稿）与 `oppo-01-main.png`（work）。**Redmi 9f 仅部分证据独立记录，不与该机结果混记。**
++> - **连接健康点颜色修复（lead 视觉验收发现）**：此前健康点复用 `palette.accent`，分拣台 accent 为红棕 → 任务页健康隧道显红被误读断连。改为稳定语义绿 `connectionGreen(surface)`（按 surface 亮度取 Light/DarkPalette 固定绿，不复用 accent），WAIT 灰 / PROBLEM 红保持、布局零变。OPPO 复验：**聊天页与分拣台健康点均为绿**（`oppo-09-main-green.png` / `oppo-10-triage-green.png`）。
++> - **最终报告**：[`docs/review/ux-mobile-20261115/2026-11-15-ux-delivery.md`](docs/review/ux-mobile-20261115/2026-11-15-ux-delivery.md)（验证员写入，本文只链接不改其目录）。
++> - **未做 git add/commit/push**；未在生产发布任务/审批；未重启服务；未改全局设置；未碰 Mac 输入/焦点。
++>
+ > **2026-11-14 21:40 CST 收尾账（历史，下面正文是 11-13/11-14 早段快照）**
+ >
+ > 本段是收尾账的文档侧，**持续更新，直到 owner 真正结束**——不是"最终已收口"。逐项核对后重写。

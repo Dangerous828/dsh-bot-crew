@@ -1,0 +1,2 @@
+  Window #13 Window{30d7bd3 u0 com.dsh.botcrew/com.dsh.botcrew.MainActivity}:
+    mAttrs={(0,0)(fillxfill) sim={adjust=resize forwardNavigation} layoutInDisplayCutoutMode=always pkg = com.dsh.botcrew adpkg = null ty=BASE_APPLICATION wanim=0x103030e

@@ -5,6 +5,9 @@
 #   <backend-dir> 本仓库 backend/ 的绝对路径
 #
 # 其余内容一般不用动。字段含义见 backend/docs/006-deployment.md。
+# 无 Web profile：运行 ./dsh-bridge/up.sh --profile <profile> --no-web；脚本会关闭
+# webserver、web-runtime、modules、client-hmr、open-in-app、directory-picker、harness-dev-context。
+# 已有 profile 迁移时加 --restart。no-Web 保留 host 服务、回环 health API、移动端 LAN API、provider/MCP、scheduler 与 worker。
 
 - id: webserver
   config:

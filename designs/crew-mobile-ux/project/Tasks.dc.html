@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>任务 / 审批（单行顶栏）</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#3E6B62}a:hover{color:#2E5D52}
+.crew *{box-sizing:border-box}
+</style>
+</helmet>
+
+<!-- 任务/审批页（静态布局画板，原生控件语义、无假 onClick）。单行顶栏 56（menu · 任务 · 连接），无模式行、无更多⋯；分拣台＝本页，入口在 drawer。顺序：待你处理 → 进行中 → 办完（折叠一行）。交互命中 ≥48×48。示例数据。 -->
+<div class="crew" style="width:390px;height:844px;display:flex;flex-direction:column;background:#FBF9F6;font-family:'Noto Sans SC',system-ui,sans-serif;color:#1F1D1A;overflow:hidden">
+
+  <!-- 系统安全区占位 24 -->
+  <div style="height:24px;flex:none" aria-hidden="true"></div>
+
+  <!-- 单行顶栏 56：menu · 当前页(任务/分拣台) · 连接状态 -->
+  <div style="height:56px;padding:0 6px;display:flex;align-items:center;gap:4px;flex:none">
+    <button aria-label="打开侧边栏" style="width:48px;height:48px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:10px;cursor:pointer;flex:none">
+      <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="#1F1D1A" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+    <!-- 中间：当前页=任务，显示「任务 · 会话名」单行省略，切页后仍知所在页 -->
+    <div style="height:48px;min-width:0;flex:1;padding:0 8px;display:flex;align-items:center;gap:6px">
+      <span style="min-width:0;font-size:15px;color:#1F1D1A;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">任务 · main</span>
+    </div>
+    <!-- 右：连接状态，单短词限宽，48 命中 -->
+    <button aria-label="连接状态：局域网，点击查看详情" style="height:48px;max-width:76px;padding:0 8px;display:flex;align-items:center;gap:5px;background:transparent;border:none;border-radius:9px;cursor:pointer;flex:none">
+      <span style="width:8px;height:8px;border-radius:50%;background:#3E6B62;flex:none"></span>
+      <span style="font-size:12.5px;color:#3E6B62;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">局域网</span>
+    </button>
+  </div>
+
+  <!-- 内容区（弹性，示例数据） -->
+  <div style="border-top:1px solid #EDE8E1;flex:none;height:1px" aria-hidden="true"></div>
+  <div style="flex:1;overflow:hidden;padding:12px 14px 0;display:flex;flex-direction:column;gap:10px">
+
+    <!-- 待你处理 -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:2px">
+      <span style="font-size:13px;font-weight:600;color:#96603A">待你处理 · 1</span>
+      <span style="font-size:11px;color:#57524A">示例</span>
+    </div>
+
+    <!-- 审批卡 · submitting 显示「提交中」，同题禁双点（示例工单） -->
+    <div style="background:#F6EEE6;border:1px solid #E9D9C9;border-radius:10px;padding:12px">
+      <div style="font-size:13.5px;line-height:1.5;color:#1F1D1A;font-weight:550">在桌面写 ok.txt（内容 done）—— 需你拍板才执行</div>
+      <div style="font-size:11.5px;color:#57524A;margin-top:4px">大哥发起 · 示例工单</div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button disabled style="flex:1;height:48px;border:none;border-radius:9px;background:#B8B1A5;color:#FBF9F6;font-size:13.5px;font-weight:600;cursor:default;display:flex;align-items:center;justify-content:center;gap:6px">
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="5.2" fill="none" stroke="#FBF9F6" stroke-width="1.6" stroke-dasharray="20 8" stroke-linecap="round"/></svg>
+          提交中…
+        </button>
+        <button disabled style="flex:1;height:48px;border:1px solid #E9D9C9;border-radius:9px;background:transparent;color:#B8B1A5;font-size:13.5px;font-weight:500;cursor:default">先别做</button>
+        <button disabled aria-label="换个做法" style="width:48px;height:48px;border:1px solid #E9D9C9;border-radius:9px;background:transparent;color:#B8B1A5;font-size:16px;cursor:default;flex:none">⋯</button>
+      </div>
+      <div style="font-size:11px;color:#57524A;margin-top:7px">答复已受理，等待状态更新 · 同一题不可重复点击</div>
+    </div>
+
+    <!-- 进行中 -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px">
+      <span style="font-size:13px;font-weight:600;color:#3E6B62">进行中 · 2</span>
+    </div>
+
+    <div style="background:#FFFFFF;border:1px solid #EDE8E1;border-radius:10px;padding:11px 12px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="width:22px;height:22px;border-radius:6px;background:#3E6B62;color:#FBF9F6;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex:none">码</span>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:550">跑 12 分钟长活探针</span>
+        <span style="font-size:11.5px;color:#57524A;flex:none">03:12 / 12:00</span>
+      </div>
+      <div style="height:4px;border-radius:2px;background:#EFEBE5;margin-top:9px;overflow:hidden">
+        <div style="width:27%;height:100%;background:#3E6B62;border-radius:2px"></div>
+      </div>
+    </div>
+
+    <div style="background:#FFFFFF;border:1px solid #EDE8E1;border-radius:10px;padding:11px 12px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="width:22px;height:22px;border-radius:6px;background:#3E6B62;color:#FBF9F6;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex:none">写</span>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:550">整理本周复盘要点成三句</span>
+        <span style="font-size:11.5px;color:#57524A;flex:none">起稿中</span>
+      </div>
+      <div style="height:4px;border-radius:2px;background:#EFEBE5;margin-top:9px;overflow:hidden">
+        <div style="width:12%;height:100%;background:#3E6B62;border-radius:2px"></div>
+      </div>
+    </div>
+
+    <!-- 办完 · 折叠为一行（48 命中） -->
+    <div style="margin-top:6px">
+      <button aria-expanded="false" style="width:100%;height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#F8F5F1;border:1px solid #EDE8E1;border-radius:10px;cursor:pointer">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 8.5l2.5 2.5L12 5.5" fill="none" stroke="#8A8377" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span style="font-size:13px;color:#57524A;flex:1;text-align:left">办完 · 22（示例）</span>
+        <span style="font-size:12px;color:#57524A">展开</span>
+        <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M4 8.5l3-3 3 3" fill="none" stroke="#57524A" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+  </div>
+
+  <!-- 底部操作条：丢一件进来（48 命中） -->
+  <div style="padding:0 14px 8px;background:#FBF9F6;flex:none">
+    <button style="width:100%;height:48px;border:1px dashed #8A8377;border-radius:11px;background:#FDFCFA;color:#57524A;font-size:13.5px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px">
+      <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9" stroke="#57524A" stroke-width="1.6" stroke-linecap="round"/></svg>
+      丢一件进来
+    </button>
+  </div>
+
+  <div style="height:22px;flex:none" aria-hidden="true"></div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

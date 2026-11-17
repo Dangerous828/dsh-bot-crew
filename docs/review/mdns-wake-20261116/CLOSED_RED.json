@@ -1,0 +1,6 @@
+{
+  "at": "2026-11-16T18:24:14.281905+08:00",
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "node:dgram:966\n    throw new ERR_SOCKET_DGRAM_NOT_RUNNING();\n    ^\n\nError [ERR_SOCKET_DGRAM_NOT_RUNNING]: Not running\n    at healthCheck (node:dgram:966:11)\n    at Socket.send (node:dgram:686:3)\n    at socket.send (file:///Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/mdns-wake-20261116/TRANSPORT_PROBE.mjs:37:54)\n    at onbind (/Users/cpuser/Code/dsh-bot-crew/backend/node_modules/.pnpm/multicast-dns@7.2.5/node_modules/multicast-dns/index.js:88:14)\n    at apply (/Users/cpuser/Code/dsh-bot-crew/backend/node_modules/.pnpm/thunky@1.1.0/node_modules/thunky/index.js:44:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:89:21) {\n  code: 'ERR_SOCKET_DGRAM_NOT_RUNNING'\n}\n\nNode.js v24.11.1\n"
+}

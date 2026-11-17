@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>侧边栏打开</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#3E6B62}a:hover{color:#2E5D52}
+.crew *{box-sizing:border-box}
+</style>
+</helmet>
+
+<!-- 侧边栏打开态（原生 ModalNavigationDrawer 语义）。宽 300dp，适配 360dp OPPO；内容可滚动；系统 back / 点遮罩关闭。分组：上半部常用导航 → 成员 → 工具。全部为示例/花名册数据。 -->
+<div class="crew" style="position:relative;width:390px;height:844px;background:#FBF9F6;font-family:'Noto Sans SC',system-ui,sans-serif;color:#1F1D1A;overflow:hidden">
+
+  <!-- 背后页面（首屏，降饱和由遮罩压暗表达，不重复绘制细节） -->
+  <div style="position:absolute;inset:0;display:flex;flex-direction:column">
+    <div style="height:24px;flex:none" aria-hidden="true"></div>
+    <div style="height:56px;padding:0 6px;display:flex;align-items:center;gap:4px;flex:none">
+      <span style="width:48px;height:48px;display:flex;align-items:center;justify-content:center">
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="#1F1D1A" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </span>
+      <span style="font-size:15px;font-weight:600;">main</span>
+      <div style="flex:1"></div>
+      <span style="display:flex;align-items:center;gap:6px;padding-right:10px"><span style="width:8px;height:8px;border-radius:50%;background:#3E6B62"></span><span style="font-size:12.5px;color:#3E6B62;font-weight:600">局域网</span></span>
+    </div>
+    <div style="flex:1"></div>
+    <div style="height:64px;border-top:1px solid #EDE8E1"></div>
+    <div style="height:22px" aria-hidden="true"></div>
+  </div>
+
+  <!-- 遮罩（点遮罩关闭）。整块为可点关闭区域，原生 button -->
+  <button aria-label="关闭侧边栏" style="position:absolute;inset:0;background:rgba(31,29,26,0.32);border:none;padding:0;cursor:pointer;z-index:1"></button>
+
+  <!-- 抽屉面板：宽 300dp，右侧圆角，可滚动 -->
+  <div style="position:absolute;top:0;bottom:0;left:0;width:300px;background:#FBF9F6;border-radius:0 16px 16px 0;box-shadow:2px 0 18px rgba(31,29,26,0.14);z-index:2;display:flex;flex-direction:column;overflow:hidden">
+
+    <!-- Drawer 头部 单行，与主顶栏一致的会话身份 -->
+    <div style="height:56px;padding:0 8px 0 16px;display:flex;align-items:center;gap:10px;flex:none;border-bottom:1px solid #EDE8E1">
+      <span class="crew" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;background:#3E6B62;color:#FBF9F6;font-size:13px;font-weight:700;flex:none">C</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:14px;font-weight:600;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Bot Crew</div>
+        <div style="font-size:11px;color:#57524A;line-height:1.3">会话 main · 示例</div>
+      </div>
+      <button aria-label="关闭侧边栏" style="width:44px;height:44px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:10px;cursor:pointer;flex:none">
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M5 5l8 8M13 5l-8 8" stroke="#57524A" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <!-- 可滚动内容 -->
+    <div style="flex:1;overflow:auto;padding:8px 10px 16px">
+
+      <!-- ── 分区1：常用导航（drawer 上半部） ── -->
+      <div style="font-size:11px;color:#57524A;font-weight:600;letter-spacing:.04em;padding:6px 8px 4px">导航</div>
+
+      <!-- 聊天（当前选中） -->
+      <button aria-current="page" style="width:100%;min-height:52px;padding:0 12px;display:flex;align-items:center;gap:12px;background:#EAF1EC;border:none;border-radius:11px;cursor:pointer;margin-bottom:2px">
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><path d="M3 5.5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H8l-3.2 2.6V13.5H5a2 2 0 0 1-2-2z" fill="none" stroke="#2E5D52" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        <span style="font-size:14px;font-weight:600;color:#2E5D52;flex:1;text-align:left">聊天</span>
+        <span style="width:8px;height:8px;border-radius:50%;background:#3E6B62;flex:none"></span>
+      </button>
+
+      <!-- 任务（分拣台） -->
+      <button style="width:100%;min-height:52px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer;margin-bottom:2px">
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><path d="M4 5.5h12M4 10h12M4 14.5h8" stroke="#57524A" stroke-width="1.5" stroke-linecap="round"/><circle cx="15.5" cy="14.5" r="1.6" fill="#96603A"/></svg>
+        <span style="font-size:14px;font-weight:500;color:#1F1D1A;flex:1;text-align:left">任务 · 分拣台</span>
+        <span style="font-size:11px;color:#96603A;font-weight:600;background:#F6EEE6;border:1px solid #E9D9C9;border-radius:20px;padding:1px 8px;flex:none">待处理 1</span>
+      </button>
+
+      <!-- 分割 -->
+      <div style="height:1px;background:#EDE8E1;margin:8px 8px"></div>
+
+      <!-- ── 分区2：成员（真实花名册，选=设当前收件人） ── -->
+      <div style="font-size:11px;color:#57524A;font-weight:600;letter-spacing:.04em;padding:6px 8px 4px">成员 · 选收件人</div>
+
+      <!-- 成员行：行主体=选收件人（aria-pressed=是否当前主收件人）；行尾「资料」48 按钮=显式可发现的名片/人设/屏幕入口，不靠长按。 -->
+      <!-- 大哥（当前收件人 = 后端该会话 default 角色，示例；不硬编码第一位） -->
+      <div style="display:flex;align-items:center;gap:2px;background:#F3F0EA;border-radius:11px;margin-bottom:2px">
+        <button aria-pressed="true" style="flex:1;min-width:0;min-height:52px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer;text-align:left">
+          <span style="width:30px;height:30px;border-radius:8px;background:#3E6B62;color:#FBF9F6;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex:none">大</span>
+          <span style="flex:1;min-width:0">
+            <span style="display:block;font-size:14px;font-weight:600;color:#1F1D1A">大哥</span>
+            <span style="display:block;font-size:11px;color:#57524A;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">主执行 · 当前收件人（示例）</span>
+          </span>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" style="flex:none"><path d="M3.5 8.5l2.7 2.7L12.5 5" fill="none" stroke="#3E6B62" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button aria-label="查看大哥的资料" style="width:48px;height:48px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:10px;cursor:pointer;flex:none">
+          <span style="font-size:11.5px;color:#3E6B62;font-weight:600">资料</span>
+        </button>
+      </div>
+
+      <!-- 写手 -->
+      <div style="display:flex;align-items:center;gap:2px;border-radius:11px;margin-bottom:2px">
+        <button aria-pressed="false" style="flex:1;min-width:0;min-height:52px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer;text-align:left">
+          <span style="width:30px;height:30px;border-radius:8px;background:#F3F0EA;color:#57524A;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex:none">写</span>
+          <span style="flex:1;min-width:0">
+            <span style="display:block;font-size:14px;font-weight:500;color:#1F1D1A">写手</span>
+            <span style="display:block;font-size:11px;color:#57524A;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">文案与稿件</span>
+          </span>
+        </button>
+        <button aria-label="查看写手的资料" style="width:48px;height:48px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:10px;cursor:pointer;flex:none">
+          <span style="font-size:11.5px;color:#57524A;font-weight:600">资料</span>
+        </button>
+      </div>
+
+      <!-- 码农 -->
+      <div style="display:flex;align-items:center;gap:2px;border-radius:11px;margin-bottom:2px">
+        <button aria-pressed="false" style="flex:1;min-width:0;min-height:52px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer;text-align:left">
+          <span style="width:30px;height:30px;border-radius:8px;background:#F3F0EA;color:#57524A;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex:none">码</span>
+          <span style="flex:1;min-width:0">
+            <span style="display:block;font-size:14px;font-weight:500;color:#1F1D1A">码农</span>
+            <span style="display:block;font-size:11px;color:#57524A;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">写码与执行</span>
+          </span>
+        </button>
+        <button aria-label="查看码农的资料" style="width:48px;height:48px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;border-radius:10px;cursor:pointer;flex:none">
+          <span style="font-size:11.5px;color:#57524A;font-weight:600">资料</span>
+        </button>
+      </div>
+
+      <!-- 分割 -->
+      <div style="height:1px;background:#EDE8E1;margin:8px 8px"></div>
+
+      <!-- ── 分区3：工具（下面，不堆成 24 项） ── -->
+      <div style="font-size:11px;color:#57524A;font-weight:600;letter-spacing:.04em;padding:6px 8px 4px">工具</div>
+
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><rect x="3" y="4" width="14" height="12" rx="2" fill="none" stroke="#57524A" stroke-width="1.5"/><path d="M3 8h14M7 4v12" stroke="#57524A" stroke-width="1.5"/></svg>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;text-align:left">事务板</span>
+      </button>
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><path d="M4 5h12M4 10h12M4 15h8" stroke="#57524A" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;text-align:left">会话管理</span>
+      </button>
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><circle cx="10" cy="10" r="6.2" fill="none" stroke="#57524A" stroke-width="1.5"/><path d="M10 6.5v4l2.5 1.5" stroke="#57524A" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;text-align:left">模型</span>
+      </button>
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><rect x="3" y="4.5" width="14" height="9" rx="1.6" fill="none" stroke="#57524A" stroke-width="1.5"/><path d="M7 16.5h6" stroke="#57524A" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;text-align:left">后台</span>
+      </button>
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:12px;background:transparent;border:none;border-radius:11px;cursor:pointer">
+        <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true" style="flex:none"><rect x="3" y="4.5" width="14" height="9.5" rx="1.6" fill="none" stroke="#57524A" stroke-width="1.5"/><path d="M8 16.5h4" stroke="#57524A" stroke-width="1.5" stroke-linecap="round"/><path d="M6.5 7.5h7" stroke="#57524A" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <span style="font-size:13.5px;color:#1F1D1A;flex:1;text-align:left">屏幕</span>
+      </button>
+
+    </div>
+
+    <!-- Drawer 底部：连接状态一行（可点详情），与主顶栏同一语义 -->
+    <div style="flex:none;border-top:1px solid #EDE8E1;padding:4px">
+      <button style="width:100%;min-height:48px;padding:0 12px;display:flex;align-items:center;gap:10px;background:transparent;border:none;border-radius:10px;cursor:pointer">
+        <span style="width:8px;height:8px;border-radius:50%;background:#3E6B62;flex:none"></span>
+        <span style="font-size:12.5px;color:#3E6B62;font-weight:600;flex:1;text-align:left">局域网 · 已连接（示例）</span>
+        <span style="font-size:11px;color:#57524A">详情</span>
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3l3 3-3 3" fill="none" stroke="#57524A" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

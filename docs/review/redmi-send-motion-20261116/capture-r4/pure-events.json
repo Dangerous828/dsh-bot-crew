@@ -1,0 +1,24 @@
+[
+  {
+    "seconds": 0.003,
+    "event": "record_start"
+  },
+  {
+    "seconds": 1.096,
+    "event": "send_tap"
+  },
+  {
+    "seconds": 5.915,
+    "event": "reply_in_database",
+    "messageId": 80,
+    "replyId": 66
+  },
+  {
+    "seconds": 24.268,
+    "event": "hide_keyboard"
+  },
+  {
+    "seconds": 35.956,
+    "event": "record_complete"
+  }
+]

@@ -445,3 +445,64 @@ backend `pnpm check` 78 个 spec 文件全绿（67 `.spec.ts` + 11 `.spec.tsx`�
 
 **未确认、原样保留**：11-10 深夜段落写的「当前两处角色模型均指向 `deepseek-account/deepseek-flash`，
 待一次真实评估确认」，在 11-11 三轮记录里没有更新结论，此处不代填。
+
+---
+
+# 交接追加：2026-11-13 消息永远排队 / 主 Session 被归档（已根治）
+
+> 接上一段「两处角色模型均指向 deepseek-account/deepseek-flash，待确认真实评估」——本轮把它查到底并根治。
+> 分支 `feat/four-blocks`，远端 HEAD `fa3ffe0`。工作区干净（仅 `scripts/crew-watch/` 是他人未跟踪，别动）。
+
+## 现象与真凶
+
+**现象**：App 发消息一直「排队中」，eval 一直 `evaluating` 到超时（decision=`unavailable/timeout`），队伍从不回话；「模型选了 workbuddy，重启又回默认」。
+
+**真凶（一路挖到底层）**：**主 Session（masterId `orchestrator-bbbb4bafe8b5e5afe49748149f93df3d`）被写进了 workspace 的归档集合 `archivedSessionIds`。**
+DSH 的 `ArchivedSessionGate`（`@deepseek-ai/dsh-api-session-controller` 的 `archived-session-gate.js`）在 `agent/pre-step` 对已归档会话直接返回 `{kind:'reject'}` → 每个 turn 以 `blocked` 收口、**连一次模型请求都不发** → candidate 卡全被拒 → eval 等不到判定 → 超时 → 消息卡排队。**与模型/余额/权限/双实例无关**，所以换模型、改权限、重启都治不好；重启从 `workspace.json` 恢复归档状态，所以「重启又回旧状态」。
+
+**排查中被证伪的几个假设**（留给后来人省时间）：
+- 不是 openconsole 欠费/模型死：那些确实存在（openconsole 402、`deepseek-account` 无 `DEEPSEEK_API_KEY` 靠 bundled catalog 假列表骗过 `listModels`），但只是「模型该切对」的一层，不是 blocked 的直接原因。
+- 不是双实例：`Service name is already in use` 是 bonjour/mDNS 同名广播，良性；实际只有一个 dsh 后端。
+- 不是 session 损坏：删重建新 session 一样 blocked（因为新 masterId 又被归档列表命中/或被同样逻辑波及）。
+
+## 本轮三处改动（都已提交推送）
+
+1. **`backend/src/app/role-models.ts`**（commit `34269a19`）——模型根治：
+   `initializeRoleModel` 原来「有 selection 就跳过」，导致主 Session 永远绑死失效 provider。改为 `selectionInConfigFamily` 确定性判据（provider 须与配置一致 + 模型仍在目录），脱管时用 `sessionController.selectModel` **真正切换**（不是 append，append 对已发过请求的老会话不生效）。测试在 `backend/tests/role-models.spec.ts`。
+
+2. **`backend/src/app/runtime.ts`**（commit `fa3ffe0`）——归档根治：
+   启动收尾 `finishSetup` 里 `ensure()` 之后新增 `ensureMasterActive()`：主 Session 永远不该被归档，若在 `archivedSessionIds` 里就调正规的 `workspaceRegistry.unarchiveSession()` 解出并 `logger.warn`，杜绝静默瘫队；组合缺归档能力时安全跳过。测试在 `backend/tests/runtime.spec.ts`「unarchives the main Session on startup…」。
+
+3. **`AGENTS.md`**——写入「开发期有问题就根治，不留小修小补」原则。
+
+## 验证（端到端，已实测）
+
+- 解除归档后主 Session 正常 turn：`request/header model=workbuddy → orchestrator_route → worker 执行 → assistant/message → turn/end completed`（不再 blocked）。
+- App 端到端：「帮我算 12 乘以 8」→ 回「**12 × 8 = 96。**」，`queued: []`。
+- 全量 backend：**1774 例通过**（tsc 0 错）；health 12 项全 `ready`（`evals` 也已 `ready`）。
+
+## 当前运行态快照（2026-11-13 09:33）
+
+- dsh 后端 pid **30419**，3082 正常；最新日志 `backend/.artifacts/dsh-superagent-superagent-20261113-080315-30409.log`。
+- 主 Session **不在** `archivedSessionIds`；`ensureMasterActive` 保证以后即使再被写入也会启动时自动解出。
+- 我从 `~/.dsh/storages/workspace.json` 手剔了 4 个误归档的 `orchestrator-*` id（含 bbbb）；备份在 `~/.dsh/storages/workspace.json.bak-*`。
+- 我误把 session 备份放进 `sessions/` 目录曾致 workspace 报 corrupt（已修）：备份现移到 `~/.dsh/session-backups/`。
+
+## 下一步 / 遗留
+
+- **Step 4「一直在线」未做**（原计划）：dsh 仍需 tmux 手动起（`scripts/dsh-superagent`），无 launchd 自启；desktop 客户端也没有捆绑起停（关桌面应关 dsh）。这是用户之前提的 (b)。
+- 别碰别人未提交/未跟踪的东西：`scripts/crew-watch/`、`designs/crew-design-system/`、`designs/crew-personal-agent`、app 的 `BoardUi.kt`/`CrewUi.kt`、`desktop/*.go`（nav/icon/main/ui/debug）。
+- 推送踩坑：`git push` 偶发 TLS/非快进失败，改用 `gh api` blobs→trees(base_tree)→commits→PATCH refs 推送，逐文件核对 blob SHA。
+- **排查心法（重要）**：遇到「重启又回旧状态 / 消息永远排队 / eval 一直 evaluating」，**优先查 `~/.dsh/storages/workspace.json` 的 `archivedSessionIds` 是否含主 Session**，别被模型/余额/权限带偏。
+
+## 2026-11-17 收尾
+
+八项产品问题的修复（审批可读、真实执行状态、发送恢复、草稿、多待决、暂停范围、失败归属）
+已出包 `0.2.1(4)` 并推到线上 OTA，后台同批已部署。完整交付说明、
+验证矩阵、已知限制与回滚路径都在 **`docs/review/product-fixes-20261117/DELIVERY.md`**；
+过程状态与踩坑在 `docs/review/product-fixes-20261117/STATE.md`。
+
+三条仍未解决的，别当已完成：
+1. 工作区**未 push**。
+2. 默认模型 `magpie:workbuddy/deepseek-v4.1-flash-500k` 在编码子代理里不被识别，派子代理会直接失败。
+3. 生产 29 张票里 b27 仍等人（业务状态）；手机跑完验收停在 PIN 锁屏。

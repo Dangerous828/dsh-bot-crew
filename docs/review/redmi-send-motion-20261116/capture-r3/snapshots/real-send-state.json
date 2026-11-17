@@ -1,0 +1,55 @@
+{
+  "at": "2026-11-16T12:29:55.076468+08:00",
+  "message": {
+    "id": 79,
+    "text": "hi",
+    "conversation": "main"
+  },
+  "reply": {
+    "id": 65,
+    "text": "hi，有什么事直接说。",
+    "to_msg": 79
+  },
+  "ticketCountBefore": 28,
+  "ticketCount": 28,
+  "openTicketIds": [],
+  "explicitlyViewedHistoricalTicket": null,
+  "expectedSubagentCard": false,
+  "recentDecisions": [
+    {
+      "kind": "ignore",
+      "threadKey": "team:main:79",
+      "reasonCodes": [
+        "answeredDirectly"
+      ]
+    },
+    {
+      "kind": "ignore",
+      "threadKey": "team:main:78",
+      "reasonCodes": [
+        "answeredDirectly"
+      ]
+    },
+    {
+      "kind": "ignore",
+      "threadKey": "team:main:77",
+      "reasonCodes": [
+        "answeredDirectly"
+      ]
+    },
+    {
+      "kind": "ignore",
+      "threadKey": "team:main:76",
+      "reasonCodes": [
+        "answeredDirectly"
+      ]
+    },
+    {
+      "kind": "ignore",
+      "threadKey": "team:main:75",
+      "reasonCodes": [
+        "answeredDirectly"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,176 @@
+[
+  {
+    "seconds": 0.004,
+    "event": "record_start"
+  },
+  {
+    "seconds": 3.203,
+    "event": "snapshot",
+    "label": "record-initial",
+    "texts": [
+      "hi",
+      "Reply with OK",
+      "已回复",
+      "大",
+      "大哥",
+      "OK",
+      "你是谁",
+      "已回复",
+      "大",
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "大哥",
+      "⌄",
+      "hi",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 3.336,
+    "event": "send_tap"
+  },
+  {
+    "seconds": 5.848,
+    "event": "snapshot",
+    "label": "record-after-send-0",
+    "texts": [
+      "hi",
+      "Reply with OK",
+      "已回复",
+      "大",
+      "大哥",
+      "OK",
+      "你是谁",
+      "已回复",
+      "大",
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 9.164,
+    "event": "snapshot",
+    "label": "record-after-send-1",
+    "texts": [
+      "OK",
+      "你是谁",
+      "已回复",
+      "大",
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "hi",
+      "⑂",
+      "子代理",
+      "点开看",
+      "›",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 9.285,
+    "event": "tap_subagent"
+  },
+  {
+    "seconds": 11.59,
+    "event": "snapshot",
+    "label": "record-expanded",
+    "texts": [
+      "你是谁",
+      "已回复",
+      "大",
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "hi",
+      "⑂",
+      "子代理",
+      "读着…",
+      "‹",
+      "· 读着…",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 14.345,
+    "event": "snapshot",
+    "label": "record-after-send-2",
+    "texts": [
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "hi",
+      "已回复",
+      "大",
+      "大哥",
+      "hi，有什么需要我做的？",
+      "⑂",
+      "子代理",
+      "点开看",
+      "›",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 17.199,
+    "event": "snapshot",
+    "label": "record-after-send-3",
+    "texts": [
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "hi",
+      "已回复",
+      "大",
+      "大哥",
+      "hi，有什么需要我做的？",
+      "⑂",
+      "子代理",
+      "点开看",
+      "›",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 25.837,
+    "event": "system_back_hide_ime"
+  },
+  {
+    "seconds": 28.531,
+    "event": "snapshot",
+    "label": "record-after-ime",
+    "texts": [
+      "OK",
+      "你是谁",
+      "已回复",
+      "大",
+      "大哥",
+      "我是部署在 Dangerous828/dsh-bot-crew 仓库上的自动代理（lead），负责在飞书会话里接需求、派工与回报结果，不是真人。",
+      "hi",
+      "已回复",
+      "大",
+      "大哥",
+      "hi，有什么需要我做的？",
+      "大哥",
+      "⌄",
+      "跟队伍说点什么",
+      "发送"
+    ]
+  },
+  {
+    "seconds": 35.771,
+    "event": "record_complete"
+  }
+]

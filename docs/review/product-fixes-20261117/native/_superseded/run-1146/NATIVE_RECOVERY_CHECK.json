@@ -1,0 +1,37 @@
+{
+  "at": "2026-11-17T11:46:13.631544+08:00",
+  "syntheticOnly": true,
+  "serial": "9f9cc3db",
+  "checks": [
+    {
+      "name": "failure-stays-with-original-request-after-edited-send-succeeds",
+      "passed": true,
+      "failedRequest": "705cd62e-4f58-4822-b689-191e205d85b9",
+      "successfulRequest": "20b65005-568f-46f3-88ac-3a53290d376a"
+    },
+    {
+      "name": "unconfirmed-envelope-visible-after-process-death",
+      "passed": true,
+      "requestId": "705cd62e-4f58-4822-b689-191e205d85b9"
+    },
+    {
+      "name": "retry-keeps-original-uuid-and-payload",
+      "passed": true,
+      "requestId": "705cd62e-4f58-4822-b689-191e205d85b9"
+    },
+    {
+      "name": "accepted-request-reconciles-after-restart-without-duplicate",
+      "passed": true,
+      "requestId": "32e9f891-e08c-4316-99e3-314cbec4b700",
+      "evidence": "carrier saw no resend after restart; single timeline row; prefs unreadable without root"
+    },
+    {
+      "name": "readable-approval-preserves-literal-percent-encoding",
+      "passed": true
+    },
+    {
+      "name": "multiple-attention-entry-opens-board",
+      "passed": true
+    }
+  ]
+}

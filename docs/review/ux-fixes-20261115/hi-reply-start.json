@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "id": 19,
+      "conversation": "main",
+      "text": "你好",
+      "at": "2026-11-13T03:00:42+0800",
+      "read_at": "2026-11-13T03:03:33+0800"
+    },
+    {
+      "id": 71,
+      "conversation": "main",
+      "text": "只回复嗨",
+      "at": "2026-11-15T23:38:41+0800",
+      "read_at": "2026-11-15T23:38:43+0800"
+    }
+  ],
+  "replies": [
+    {
+      "id": 55,
+      "conversation": "main",
+      "to_msg": 71,
+      "rkey": "b278362c7bdc24db5ba0c7ddd9072bcd",
+      "text": "嗨！",
+      "at": "2026-11-15T23:38:46+0800",
+      "bot_id": "lead"
+    }
+  ]
+}

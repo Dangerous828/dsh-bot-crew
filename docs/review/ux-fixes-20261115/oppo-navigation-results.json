@@ -1,0 +1,40 @@
+{
+  "chat_workspace_system_back_preserves_draft": true,
+  "tasks_workspace_ui_back_preserves_draft": true,
+  "tasks_visible_before": [
+    "☰",
+    "任务 · main ▾",
+    "公网",
+    "等你拍板 · 1",
+    "只回复一句「嗨」",
+    "大哥",
+    "要通过消息做改动（send_message），先问你一声。要「mcp__messages__send_message（{\"channel\":\"main\",\"to\":\"m19\",\"text\":\"嗨\"}）」吗？",
+    "做吧",
+    "先别做",
+    "换个做法",
+    "✓",
+    "办完 · 22",
+    "展开",
+    "丢 →",
+    "UX_DRAFT_RETURN",
+    "↑"
+  ],
+  "tasks_visible_after": [
+    "☰",
+    "任务 · main ▾",
+    "公网",
+    "等你拍板 · 1",
+    "只回复一句「嗨」",
+    "大哥",
+    "要通过消息做改动（send_message），先问你一声。要「mcp__messages__send_message（{\"channel\":\"main\",\"to\":\"m19\",\"text\":\"嗨\"}）」吗？",
+    "做吧",
+    "先别做",
+    "换个做法",
+    "✓",
+    "办完 · 22",
+    "展开",
+    "丢 →",
+    "UX_DRAFT_RETURN",
+    "↑"
+  ]
+}

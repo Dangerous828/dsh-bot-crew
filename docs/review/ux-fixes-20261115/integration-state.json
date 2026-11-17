@@ -1,0 +1,54 @@
+{
+  "phase": "completed",
+  "updatedAt": "2026-11-16T07:46:55+08:00",
+  "production": {
+    "profile": "superagent",
+    "mode": "no-web",
+    "pid": 16534,
+    "health": "all ready",
+    "healthDiscovery": "backend/scripts/dsh-superagent --profile superagent status",
+    "web3082and9082": "no listener",
+    "phoneLanPort": 43499,
+    "mobileGatewayPid": 67367,
+    "mobileGatewayPort": 8788,
+    "desktopGuiPid": 54111,
+    "desktopGuiPort": 64333,
+    "identityAndNonWebConfigPreserved": true
+  },
+  "android": {
+    "device": "OPPO PEDM00 / 55c86317",
+    "apk": "deliver/dsh-botcrew-ux-fixes-20261116-r1-signed.apk",
+    "sha256": "60c1fe57e8ce200275a462c05bffadedb29d2ddeac5178216e906dc5b7471516",
+    "sameSignatureInstall": true,
+    "firstInstallTime": "2026-11-11 22:27:11",
+    "pairedDataKept": true,
+    "screenRestoredOff": true
+  },
+  "liveChat": {
+    "messageId": 73,
+    "replyId": 59,
+    "request": "Reply with OK",
+    "reply": "OK",
+    "messages": 71,
+    "replies": 54,
+    "tickets": 28,
+    "createdTicket": false,
+    "latestUserAndReplyVisible": true,
+    "emptySubagentCardAbsent": true,
+    "badTicketStopped": "19467b31071433bf3e5e5c552602765c"
+  },
+  "pending": [],
+  "cleanup": {
+    "allRootBashJobsCollected": true,
+    "temporaryPhoneWakeTaskFinished": true,
+    "scheduledWakeReceipts": [
+      "schedule-cf951962-ce94-4838-bc7a-b4e5605b3be3",
+      "schedule-751e4ba2-ecfd-4d09-acff-f5900b379b3f"
+    ],
+    "scheduledWakeState": "both inactive; history retained",
+    "futureFallbackWakes": 0,
+    "goalId": "goal-eb162aed-df0b-4473-a1cc-0f46973c79d4",
+    "goalMetadata": "work completed; goal remains active/disarmed because scheduled turns may not complete it outside a goal round; close on the next direct human turn",
+    "noCommitOrPush": true
+  }
+}

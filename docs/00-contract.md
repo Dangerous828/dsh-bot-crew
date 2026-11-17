@@ -141,9 +141,19 @@
   "declined": [                    // 后台看过并决定不动手的消息，带一句理由
     { "request_id": "...", "reason": "..." }
   ],
-  "status": { "runtime": "observe|auto|off", "mobile": "on|off", "paused": false }
+  "status": { "runtime": "observe|auto|off", "mobile": "on|off", "paused": false },
+  // 可选只读 server 元数据（本批新增，增量字段；旧 App 忽略即兼容）。算不出就整块不出现。
+  // 身份口径是「同实例指纹」不是 crypto 证明；由服务端实际计算，绝不取自 request host/body。
+  "server": {
+    "crew": "<与 mDNS TXT 完全同源的稳定 crewFingerprint，如 7 位 36 进制>",
+    "public_base": "https://crew.kentonnie.top"  // 真实 HTTPS 域名；无/不合格（明文、带 userinfo/query/fragment）时为空串 ""
+  }
 }
 ```
+
+- `server.crew` 与 mDNS 广播的 TXT `crew` **同一实现、同一来源**（`crewFingerprint(stateDir)`），**不是** 临时 masterId / dsh session id 之类会变的值。
+- `server.public_base` 复用 `publicEntry(stateDir)`，只放行 **HTTPS 且无 userinfo/query/fragment**；**保留校验后的合法 base 子路径**（如 `https://host/crew-prefix` 不退化成 `https://host`，去尾斜杠，root 仍 `https://host`，绝不改成另一地址）；无/不合格给 `""`，**不擅自推局域网/明文地址**。
+- 客户端只有在 `saved crew` 与 `server.crew` **精确相等**、且 TLS 校验通过时，才允许据此更新**持久候选**配置；空/新装无 saved crew 时，只从既有可信配置地址的响应登记，**不从任意 bootstrap 200 接受**。字段只随已配对 timeline 下发，gate 不变（匿名仍 401）。
 
 - 页面 `stop` 时不轮询；不强制每条更新滚到底；未知字段必须保留、不得丢弃。
 - **未实现的审批能力不得虚构按钮或审批状态**。
@@ -829,6 +839,109 @@
 
 结论：即使手机没连、或 App 系统推送停着，超时这件事也一定出现在**看门狗账本 + timeline** 上，
 桌面右栏与管理面能看到。这就不留「说不清的链」——每一条都能指到具体落点与读它的地方。
+
+## 5.9 App 故障上报：`POST / GET /api/mobile/diagnostics`
+
+手机把结构化、有界的诊断日志批量上报到域名端；管理面只读查看/导出。**只存白名单字段**，绝不存
+token / query / headers / body / text / 聊天正文。设备身份只认入口验过的设备凭据（`x-crew-device`
++ `x-crew-credential`），**body 里不带 device**，服务端用已验 principal 覆盖、不可伪造。
+
+### 上报：`POST /api/mobile/diagnostics`
+
+认证与其余 `/api/mobile/*` 相同（局域网直连与 `crew.kentonnie.top` 公网主域名走同一道设备凭据门）。
+
+请求体（JSON 对象，**不是**双重字符串化；整批 ≤64KiB、≤50 条）：
+
+```json
+{
+  "app": "BotCrew",
+  "build": "0.1.0(1)",
+  "batch": [
+    {
+      "id": "客户端生成的唯一串（=reportId，幂等键）",
+      "kind": "event",
+      "at": "2026-11-15T10:00:00+08:00",
+      "event": "http_error",
+      "route": "/api/mobile/timeline",
+      "method": "GET",
+      "status": 502,
+      "ms": 1800,
+      "err": "CrewUnavailable",
+      "session": "main",
+      "appVersion": "0.1.0",
+      "versionCode": 1,
+      "extra": { "phase": "connect", "networkKind": "cellular", "routeKind": "public" }
+    }
+  ]
+}
+```
+
+`kind: "crash"` 时，单条 ≤16KiB，可另带（普通 event 单条 ≤1KiB）：
+
+```json
+{ "kind": "crash", "errorClass": "NullPointerException", "stack": "…≤8KiB…",
+  "breadcrumbs": [ { "at": "…", "event": "tap", "route": "/m", "method": "POST", "status": 200, "ms": 12, "err": "" } ] }
+```
+
+字段白名单（**其余字段一律丢弃，不落库**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `id` | 必填，`[A-Za-z0-9._/-]{1,128}`；幂等键 |
+| `kind` | `event`（缺省）或 `crash` |
+| `at` | 必填，可解析的 ISO 时间；服务端另记 `receivedAt`（不信任客户端，自动生成） |
+| `event` | 必填，短词 `[A-Za-z0-9._/-]{1,64}` |
+| `route` | 必填，**客户端传不带 query/hash 的 pathname**（以 `/` 开头）；服务端**拒收**含 query/hash、多重/歧义百分号编码（如 `%3Ftoken%3D`、`%253F…`）或敏感路径的 route（`route_sensitive` / `route_bad_encoding`），不静默 strip 后落库 |
+| `method` | 可选，短词，转大写 |
+| `status` | 可选，0–999 整数 |
+| `ms` | 可选，≥0，封顶一天 |
+| `err` | 可选，**只收类别/码短词**（`[A-Za-z0-9._/-]{1,128}`）；带空格标点的异常 message 会被丢弃（防夹凭据） |
+| `session` | 可选，短词 |
+| `appVersion` / `versionCode` | 可选，版本短词 / 非负整数 |
+| `extra` | 可选，**只放行** `phase`/`networkKind`/`model`/`version`/`routeKind`，值短串 |
+| `errorClass` / `stack` / `breadcrumbs` | 仅 `kind:crash`；`errorClass` 短词；`stack` **只保留结构帧**（`at pkg.C.m(File.java:123)` / `File.kt:12` / `NativeMethod`），异常 message、带 token 的 URL、聊天原文等非帧行整条丢弃，≤8KiB；`breadcrumbs`≤50 条，逐项同事件白名单 |
+
+**脱敏兜底（在字段白名单之上再剥一层）**：`extra` 任一值命中「token/query/`password=`/`bearer …`/私钥/长 base64」等敏感形态
+→ 该值整条丢弃；`route` 含 query/hash、歧义编码或敏感形态（如路径里塞 `Bearer …`、`sk_live_…`）→ 该记录 `rejected`（`route_sensitive` / `route_bad_encoding`）。
+`err` / `errorClass` 本就只收 `[A-Za-z0-9._/-]` 短词，天然拒掉带空格标点的异常 message。
+
+**成功响应**（HTTP 200，`Content-Type: application/json`，body 顶层有键位置 `"ok": true`）：
+
+```json
+{ "ok": true, "acceptedIds": ["id1", "id2"], "rejectedIds": [], "reasonCodes": [] }
+```
+
+- `acceptedIds` = 新落库 + **幂等命中（同 id 重投）**的 id；客户端只删命中项，以它为幂等依据，**不仅看 2xx**。
+- **ACK 只在报告已 durable 落库后发出**（`store.set` 同步写 sqlite/WAL，返回即已落盘）。
+- `rejectedIds` + `reasonCodes` 是**不被 ACK** 的坏记录（如 `row_too_large`/`event_too_large`/`bad_at`/
+  `id_required`/`route_required`）；客户端不删这些，自行修正后再报。
+- 整批全坏 → **HTTP 400**（`{ "error": "all records rejected", "rejectedIds": [...], "reasonCodes": [...] }`），不静默 200。
+- **空批 `batch: []` → HTTP 400**（`batch must not be empty`）：无意义的空批不返回空 ACK。
+
+**大小/速率边界**：整批 >64KiB → `413`；单条按 kind 超限 → 该条 rejected；每设备每窗口批次超限 → `429`
+并带 `Retry-After`（秒），客户端按它退避。**无匿名**：没有验过的设备凭据 → `401`。
+
+**存/取契约**（给日后查看/取证）：
+- 复用项目唯一 `Store`（sqlite KV），**每设备一段**（`diagnostics:dev:<device>`），无 idx 多键、不扫全库。
+- **每行都带 server 派生的 `device` / `app` / `build`**（批级 `app`/`build` 落到每一行，客户端一般只在批级带 build，避免丢 APK 版本）。
+- 有界：每设备 ≤5000 行 / ≤2MiB / 保留 7 天；全球 ≤50000 行 / ≤24MiB。**行数与字节都封顶**。
+- **保留期双向执行**：写路径上对被写设备、**以及其它沉默设备**都做 7 天淘汰；**读路径（GET/导出）也按 7 天过滤**，
+  即使某设备自上次写后一直沉默、没有新 POST，也绝不返回已过期报告（时钟推进后 GET/导出无过期行）。
+- 淘汰后全球字节计数随实际剩余行同步扣减（不偏高），重开库后一致。
+- 幂等：同 `id` 重投 ACK 但不重存。
+
+### 查看（消息面）：`GET /api/mobile/diagnostics`
+
+同一设备凭据，**只返回本设备自己的**报告（`device` 恒为入口验过的本设备，绝不跨设备、不泄漏设备表）。
+query：`session` / `since` / `errorsOnly=1` / `limit`。返回 `{ device, rows: [...] }`，每行都带 server 派生的
+`device` / `app` / `build`。**消息面不提供导出**（导出只在管理面）。
+
+### 查看（管理面）：`GET /orchestrator/api/diagnostics` 与 `GET /orchestrator/api/diagnostics/export`
+
+只本机同源（Host=`127.0.0.1:<port>` + `x-orchestrator-request: 1`，与其余管理面一致，**不为它放开**）。
+前者看**所有设备**（合并数组，**每行带 server 派生的 `device` 字段**以便归属），可按
+`device`/`session`/`since`/`errorsOnly` 过滤；后者**返回 JSON 对象 `{ "ndjson": "<string>" }`**（与外层管理面统一 JSON 序列化，**不是** raw NDJSON 流），调用方取 `ndjson` 字段内容保存为 `.jsonl`（每行一条，已脱敏）。
+本期**仅管理面可导出，手机 export 未做**；不做前端页面、不做元数据/publicBase 新路线。
 
 ## 6. 错误码
 

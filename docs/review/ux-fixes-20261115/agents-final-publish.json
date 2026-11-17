@@ -1,0 +1,29 @@
+{
+  "method": "HMR",
+  "pids": [
+    16534
+  ],
+  "health": {
+    "runtime": "ready",
+    "relay": "ready",
+    "notice": "ready",
+    "memory": "ready",
+    "launch": "ready",
+    "delivery": "ready",
+    "assessment": "ready",
+    "reply": "ready",
+    "evals": "ready",
+    "models": "ready",
+    "p2p": "ready",
+    "github": "ready",
+    "team": "ready"
+  },
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "url": "http://127.0.0.1:49911",
+  "backup": "/Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/ux-agents-publish-20261116-074336",
+  "build": "passed"
+}

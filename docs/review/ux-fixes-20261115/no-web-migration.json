@@ -1,0 +1,15 @@
+{
+  "backup": "/Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/ux-publish-20261116-033325",
+  "identityHashes": {
+    "remote-devices.json": "c734b78fc2f3f0d717cf2c4666dd9a765da612abb944117d18868fad9f58f5de",
+    "mobilegw.token": "448de273ca0ae787eabb55b4ab8b9ab5fa712cdf2852333ece261a518dcf59b9"
+  },
+  "loadBefore": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "startedAt": "2026-11-16T03:33:25.568335+08:00",
+  "rollbackLib": "/Users/cpuser/Code/dsh-bot-crew/backend/.artifacts/ux-prepublish-20261116-025554/lib",
+  "exitCode": 0
+}

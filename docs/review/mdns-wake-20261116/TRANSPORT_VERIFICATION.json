@@ -1,0 +1,23 @@
+{
+  "at": "2026-11-16T19:05:31.234110+08:00",
+  "results": [
+    {
+      "mode": "query",
+      "returncode": 0,
+      "stdout": "{\"phase\":\"recovery\",\"sockets\":2,\"closes\":1,\"sends\":9,\"faulted\":1,\"errors\":[\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\"],\"published\":43497}\n{\"passed\":true,\"faulted\":1,\"sends\":10,\"sockets\":2,\"closes\":1,\"errors\":[\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\"]}\n",
+      "stderr": ""
+    },
+    {
+      "mode": "outage",
+      "returncode": 0,
+      "stdout": "{\"phase\":\"offline\",\"errors\":2,\"faulted\":2}\n{\"phase\":\"recovery\",\"sockets\":3,\"closes\":2,\"sends\":6,\"faulted\":2,\"errors\":[\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\",\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\"],\"published\":43497}\n{\"passed\":true,\"faulted\":2,\"sends\":7,\"sockets\":3,\"closes\":2,\"errors\":[\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\",\"Error: send EADDRNOTAVAIL 224.0.0.251:5353\"]}\n",
+      "stderr": ""
+    },
+    {
+      "mode": "closed",
+      "returncode": 0,
+      "stdout": "{\"phase\":\"recovery\",\"sockets\":2,\"closes\":1,\"sends\":9,\"faulted\":1,\"errors\":[\"Error [ERR_SOCKET_DGRAM_NOT_RUNNING]: Not running\",\"Error [ERR_SOCKET_DGRAM_NOT_RUNNING]: Not running\"],\"published\":43497}\n{\"passed\":true,\"faulted\":1,\"sends\":10,\"sockets\":2,\"closes\":1,\"errors\":[\"Error [ERR_SOCKET_DGRAM_NOT_RUNNING]: Not running\",\"Error [ERR_SOCKET_DGRAM_NOT_RUNNING]: Not running\"]}\n",
+      "stderr": ""
+    }
+  ]
+}

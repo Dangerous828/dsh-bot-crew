@@ -1,0 +1,20 @@
+{
+  "observedAt": "2026-11-16T09:50:23+08:00",
+  "exitLogLastModified": "2026-11-16T08:22:12+08:00",
+  "failure": "fatal uncaught exception: send EADDRNOTAVAIL 224.0.0.251:5353",
+  "precedingEvent": "selfheal detected 328635ms of host suspension and resumed scanning",
+  "affected": "superagent backend and phone LAN API 43499",
+  "unaffectedAtObservation": { "mobileGateway8788Pid": 67367, "desktopGui64333Pid": 54111 },
+  "recovery": {
+    "at": "2026-11-16T09:53:14+08:00",
+    "command": "backend/scripts/dsh-superagent --profile superagent start",
+    "pid": 12345,
+    "mode": "no-web",
+    "health": "all ready",
+    "load": { "running": 0, "queued": 0 }
+  },
+  "codeFixApplied": true,
+  "resolution": "Published to the existing no-web superagent on 2026-11-16; owned UDP send error boundary, bounded fresh-socket recovery, actual announcement readiness and cancellable shutdown. Real dependency query/outage/closed-socket probes and live multicast discovery passed.",
+  "acceptanceRecord": "docs/review/mdns-wake-20261116/LEAD_ACCEPTANCE.md",
+  "remaining": "Physical whole-host sleep/wake and connected-phone acceptance were not rerun; current USB device list is empty. Isolated transport recovery, live discovery, phone authentication gate and persisted data preservation passed."
+}

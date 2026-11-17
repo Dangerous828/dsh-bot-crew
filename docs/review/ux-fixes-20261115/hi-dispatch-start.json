@@ -1,0 +1,42 @@
+{
+  "trigger": {
+    "id": "5e7e28cae34233e2d287983be5d2da67",
+    "source": "team",
+    "threads": [
+      {
+        "source": "team",
+        "id": "main:71"
+      }
+    ],
+    "at": "2026-11-15T15:38:41.000Z",
+    "channel": {
+      "source": "team",
+      "thread": "team:main:71",
+      "address": {
+        "conversation": "main",
+        "message": "71",
+        "bot_id": "lead",
+        "registeredSessions": "[\"work\"]"
+      }
+    }
+  },
+  "disposition": {
+    "fanout": [],
+    "at": "2026-11-15T15:38:43.020Z",
+    "decisionId": "ebfb85fd8933c3029ed8bc0bdcc1a37f"
+  },
+  "decisions": [
+    {
+      "id": "ebfb85fd8933c3029ed8bc0bdcc1a37f",
+      "triggerIds": [
+        "5e7e28cae34233e2d287983be5d2da67"
+      ],
+      "at": "2026-11-15T15:38:46.414Z",
+      "reason": [
+        {
+          "code": "explicitRouted"
+        }
+      ]
+    }
+  ]
+}

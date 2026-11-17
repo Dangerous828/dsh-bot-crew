@@ -1,0 +1,39 @@
+{
+  "at": "2026-11-17T10:23:53.810955+08:00",
+  "syntheticOnly": true,
+  "serial": "emulator-5586",
+  "checks": [
+    {
+      "name": "native-evaluating",
+      "passed": true,
+      "requestId": "ea7b3952-222d-45fc-8a2e-6c80016e8bfb"
+    },
+    {
+      "name": "native-model",
+      "passed": true,
+      "requestId": "ea7b3952-222d-45fc-8a2e-6c80016e8bfb"
+    },
+    {
+      "name": "native-tool",
+      "passed": true,
+      "requestId": "ea7b3952-222d-45fc-8a2e-6c80016e8bfb"
+    },
+    {
+      "name": "native-retrying",
+      "passed": true,
+      "requestId": "ea7b3952-222d-45fc-8a2e-6c80016e8bfb"
+    },
+    {
+      "name": "ack-does-not-complete-request",
+      "passed": true
+    },
+    {
+      "name": "typed-reply-visible",
+      "passed": true
+    },
+    {
+      "name": "drafts-survive-session-switch-and-process-death",
+      "passed": true
+    }
+  ]
+}

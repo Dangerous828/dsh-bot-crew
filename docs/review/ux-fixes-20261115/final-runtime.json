@@ -1,0 +1,42 @@
+{
+  "finishedAt": "2026-11-15T23:46:55.764Z",
+  "mode": "no-web",
+  "pids": [
+    16534
+  ],
+  "health": {
+    "runtime": "ready",
+    "relay": "ready",
+    "notice": "ready",
+    "memory": "ready",
+    "launch": "ready",
+    "delivery": "ready",
+    "assessment": "ready",
+    "reply": "ready",
+    "evals": "ready",
+    "models": "ready",
+    "p2p": "ready",
+    "github": "ready",
+    "team": "ready"
+  },
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "webListenersAbsent": true,
+  "futureFallbackWakes": 0,
+  "wakeReceiptsRetained": [
+    {
+      "id": "schedule-751e4ba2-ecfd-4d09-acff-f5900b379b3f",
+      "scheduledAt": "2026-11-15T23:30:52.000Z",
+      "state": "inactive"
+    },
+    {
+      "id": "schedule-cf951962-ce94-4838-bc7a-b4e5605b3be3",
+      "scheduledAt": "2026-11-15T18:29:40.000Z",
+      "state": "inactive"
+    }
+  ],
+  "diffCheck": "passed"
+}

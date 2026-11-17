@@ -1,0 +1,46 @@
+{
+  "issues": [
+    [
+      "P1-01",
+      "消息被读走后的模型评估阶段没有投影，状态会退回「已发送」"
+    ],
+    [
+      "P1-02",
+      "「已回复」只表示有过关联回话，缺少后续执行状态"
+    ],
+    [
+      "P1-03",
+      "草稿切换会话即清空，重建后也没有恢复来源"
+    ],
+    [
+      "P1-04",
+      "发送结果不确定时，重启会丢掉防重复的 request_id"
+    ],
+    [
+      "P1-05",
+      "在某个 Bot 的工作区点「让它停一下」，实际影响整队调度和投递"
+    ],
+    [
+      "P1-06",
+      "审批卡显示内部工具协议，当前对话的正常回报还被误送审批"
+    ],
+    [
+      "P1-07",
+      "发送失败提示没有清晰的请求归属，改字重发成功仍会显示失败"
+    ],
+    [
+      "P2-08",
+      "聊天只展示第一张待决定任务，其余缺少就地数量提示"
+    ]
+  ],
+  "localEvidenceLinks": 35,
+  "missingLinks": [],
+  "productionCodeChanged": false,
+  "newOtaPublished": false,
+  "evidenceKinds": [
+    "current-source",
+    "isolated-pure-projection",
+    "user-provided-device-screenshot",
+    "read-only-approval-metadata"
+  ]
+}

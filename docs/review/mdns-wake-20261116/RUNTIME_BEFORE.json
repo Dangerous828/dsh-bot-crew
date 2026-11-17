@@ -1,0 +1,86 @@
+{
+  "at": "2026-11-16T18:05:59.027428+08:00",
+  "backup": "/Users/cpuser/.dsh/backups/botcrew-mdns-20261116-180558",
+  "kind": "running-candidate-before-final-integration",
+  "headless": {
+    "profile": "superagent",
+    "pid": 12345,
+    "stateDir": "/Users/cpuser/.dsh/state/superagent",
+    "port": 53283
+  },
+  "health": {
+    "runtime": {
+      "state": "ready",
+      "detail": "Orchestrator is ready",
+      "at": "2026-11-16T08:40:31.138Z"
+    },
+    "relay": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.406Z"
+    },
+    "notice": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.406Z"
+    },
+    "memory": {
+      "state": "ready",
+      "detail": "中枢凭据来自凭据文件"
+    },
+    "launch": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.433Z"
+    },
+    "delivery": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.433Z"
+    },
+    "assessment": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.433Z"
+    },
+    "reply": {
+      "state": "ready",
+      "detail": "Nothing waiting",
+      "at": "2026-11-16T08:40:29.433Z"
+    },
+    "evals": {
+      "state": "ready",
+      "detail": "No unavailable Eval in the last hour"
+    },
+    "models": {
+      "state": "ready",
+      "detail": "No managed Session is waiting on a model budget retry"
+    },
+    "discovery": {
+      "state": "ready",
+      "detail": "Announcing on port 43499",
+      "at": "2026-11-16T08:40:32.481Z"
+    },
+    "p2p": {
+      "state": "ready",
+      "detail": "direct tunnel at tcpGFwWCDQf-…",
+      "at": "2026-11-16T08:40:32.480Z"
+    },
+    "github": {
+      "state": "ready",
+      "detail": "0 notifications; next poll ≥ 60s",
+      "at": "2026-11-16T10:05:56.430Z"
+    },
+    "team": {
+      "state": "ready",
+      "detail": "0 messages, 0 unreadable",
+      "at": "2026-11-16T10:05:57.109Z"
+    }
+  },
+  "load": {
+    "running": 0,
+    "queued": 0,
+    "maxWorkers": 3
+  },
+  "paused": false
+}

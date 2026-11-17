@@ -69,7 +69,7 @@ class ApprovalProjectionTest {
     }
 
     @Test
-    fun aJsonShapedQuestionIsFoldedInsteadOfPastedIntoTheCard() {
+    fun aJsonShapedQuestionIsDecodedOnceInsteadOfPastedIntoTheCard() {
         val raw = "mcp_messages_send_message({\"channel\":\"main\",\"to\":\"m82\",\"text\":\"第一行\\n第二行\"})"
         val conversation = timeline(
             """
@@ -81,8 +81,9 @@ class ApprovalProjectionTest {
         val ticket = conversation.tickets.single()
         assertTrue(ApiQuestionCopy.looksStructured(ticket.question))
         assertTrue(ApiQuestionCopy.folds(ticket.question))
-        // 正文换成一句人话，原文进折叠。
-        assertEquals("这条要你确认（原文已折叠，展开可看）", AnswerCopy.body(ticket))
+        // 认得出工具参数就只解那一段 JSON：取 text 字段，字面 \n 变成真换行；
+        // 工具名与 channel/to 不进正文，原文完整留在「看详情」里。
+        assertEquals("第一行\n第二行", AnswerCopy.body(ticket))
         assertEquals(ticket.question, AnswerCopy.details(ticket))
     }
 

@@ -210,8 +210,10 @@ export function presentCall(input: {
  * 长消息被切断。这不能再当主正文显示，但它记录的是**当时到底批了什么**，所以不丢：整段移进折叠的
  * `details`，并标明它是否被截断。
  *
- * 正文若能从这段 JSON 里**完整**取出来（有 `text` 字段且没被切在半句上），就当 `preview` 给；
+ * 正文若能从这段 JSON 里**完整**取出来（JSON 解析得开、有正文类字段、没有切在半句上），就当 `preview` 给；
  * 取不全就**不捏造**：没有 `preview`，`details` 里写明内容不全，`hint` 让人选「修改内容」重新确认一次。
+ *
+ * 只读：这里一个字都不写回 `attention`，旧 `question` 原样留着给折叠区用。
  */
 export function legacyConnectionCard(attention: { question: string; options?: readonly { id: string; label: string }[] },
   context: { kindName?: string } = {}): ApprovalPrompt {
@@ -220,23 +222,41 @@ export function legacyConnectionCard(attention: { question: string; options?: re
   // 三个 id 照旧映射到新文案：服务端本来就按 id 分派，改的只是人看到的那几个字。
   const options = (attention.options?.length ? attention.options : [{ id: 'go', label: '做吧' }, { id: 'stop', label: '先别做' }, { id: 'revise', label: '换个做法' }])
     .map(option => ({ id: option.id, label: CONNECTION_LABELS[option.id] ?? option.label }))
-  const action = mined?.tool === 'send_message' ? '发送这条消息'
-    : mined?.tool ? `用${context.kindName ?? '外部连接'}做这次改动（${mined.tool}）` : '做一次外部改动'
-  const target = mined?.target
-  const details = [
-    mined?.tool ? `工具：${mined.tool}` : undefined,
-    ...mined?.others.map(field => `${field.name}：${SECRET_FIELD.test(field.name) ? '[已隐藏]' : field.value}`) ?? [],
-    '',
-    mined?.complete ? '这条审批原样记录：' : '这张卡当时记录的内容不完整（旧版把参数截断过），下面只是原始片段：',
-    raw,
-    ...mined?.complete ? [] : ['', '要根据这段片段直接确认，请选「修改内容」让我重新问一次。'],
-  ].filter(line => line !== undefined).join('\n')
+  const action = actionOf(mined?.tool, context.kindName)
+  // 收件人只从参数里读；读不出就不给这个字段，不拿问题正文去猜一个出来。
+  const target = recipientOf(mined?.args)
+  const details = legacyDetails(raw, mined)
+  // 解析完整且有正文才给 preview；没有这个键，客户端就退回只看 question（老行为）。
+  const preview = mined && !mined.cut ? bodyOf(mined.args) : undefined
   return {
-    question: target ? `要${action}给「${target}」吗？` : `要${action}吗？`,
+    question: questionOf(action, target),
     options,
     presentation: { kind: 'connection', action, ...(target ? { target } : {}),
-      ...(mined?.complete && mined.preview ? { preview: mined.preview } : {}), details },
+      ...(preview ? { preview } : {}), details },
   }
+}
+
+/**
+ * 折叠区：工具名、除正文/收件人之外的脱敏参数、然后是**原始问题**（截断到合理长度）。
+ *
+ * 旧问题不丢 —— 它记录的是当时到底批了什么；它只是不再当主正文。取不全时把话说在前面，
+ * 并让人选「修改内容」重问一次，而不是拿半句话当真。
+ */
+function legacyDetails(raw: string, mined: MinedCall | undefined): string {
+  const others = mined?.args
+    ? Object.entries(mined.args)
+      .filter(([name]) => !(LEGACY_BODY_FIELDS as readonly string[]).includes(name) && name !== 'channel' && name !== 'to')
+      .map(([name, value]) => `${name}：${SECRET_FIELD.test(name) ? '[已隐藏]' : shown(value)}`)
+    : []
+  const lines = [...mined?.tool ? [`工具：${mined.tool}`] : [], ...others]
+  // 有工具/参数时留一个空行再贴原文；都没有就直接贴，不先空一行。
+  const head = lines.length ? [...lines, ''] : []
+  const tail = mined && !mined.cut
+    ? ['这条审批原样记录：', truncated(raw)]
+    : ['这张卡当时记录的内容不完整（旧版把参数截断过），下面只是原始片段：', truncated(raw),
+        '', '要根据这段片段直接确认，请选「修改内容」让我重新问一次。']
+  if (!mined) return ['这张卡旧版没记录工具参数，下面只是当时的问题原文：', truncated(raw)].join('\n')
+  return [...head, ...tail].join('\n')
 }
 
 /** 新卡的三个按钮文案，按 id 索引；旧卡投影也用它，人看到的字才一致。 */
@@ -244,43 +264,120 @@ const CONNECTION_LABELS: Readonly<Record<string, string>> = {
   go: '确认执行这一次', stop: '取消这一次（任务继续）', revise: '修改内容',
 }
 
-/**
- * 从旧卡那段字符串里尽量取出「当时批的是什么」。
- *
- * 只在能**确定**的时候说 `complete`：JSON 解析得开、有 `text` 字段、且原文没有被截断的痕迹
- * （长度不足旧的 500 上限，或原文本来就短）。判不准就是判不准 —— 宁可让人重问一次，
- * 也不拿半句话去当「他要发的正文」。
- */
-/** 把序列化留下的字面 `\n` 还原成真换行：只影响这两个字符，不动别的字节。 */
-function escapedBackslashes(text: string): string { return text.replace(/\\n/g, '\n') }
+/** 折叠区里原始问题最多留这么多字：够看清当时批的是什么，又不至于把整段参数灌进一屏。 */
+const LEGACY_DETAILS_LIMIT = 2000
 
-function mineCall(raw: string): { tool?: string; target?: string; preview?: string; complete: boolean
-  others: { name: string; value: string }[] } | undefined {
-  const start = raw.indexOf('{')
-  if (start < 0) return undefined
-  // 只取 JSON 本体：旧问题可能是 `工具名({...})`，也可能就是 `{...}`。
-  const end = raw.lastIndexOf('}')
-  const body = end > start ? raw.slice(start, end + 1) : raw.slice(start)
-  // 旧格式里有字面 `\n`（序列化留下的），解析前换回真换行只影响这两个字符，不改别的。
-  const attempt = (text: string): Record<string, unknown> | undefined => {
-    try { const parsed = JSON.parse(text); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined } catch { return undefined }
+/** 旧卡里承载人话的字段，按优先级：`text` 是正文，其余是别的连接用过的同义名。 */
+const LEGACY_BODY_FIELDS = ['text', 'message', 'question', 'content', 'body', 'note', 'description'] as const
+
+/**
+ * 工具调用形态：`name({...})`，括号也认全角 —— 旧卡里工具名常和人话混在一句里（`…要「mcp__…（{…}）」吗？`），
+ * 所以形态**不必在开头**。这里只认「名字 + 括号 + 紧跟 JSON 对象」，普通问句里的 `发送消息（send_message）` 不算。
+ */
+const CALL_HEAD = /([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[（(][ \t]*(?=\{)/g
+
+/** 从 `start` 的 `{` 起按字符串/转义状态配对 `}`；配不上（旧版截断）就是 undefined。 */
+function objectAt(text: string, start: number): string | undefined {
+  let depth = 0, quoted = false, escaped = false
+  for (let index = start; index < text.length; index++) {
+    const char = text[index]
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') quoted = false
+      continue
+    }
+    if (char === '"') quoted = true
+    else if (char === '{') depth++
+    else if (char === '}' && --depth === 0) return text.slice(start, index + 1)
   }
-  const parsed = attempt(body) ?? attempt(body.replace(/\\n/g, '\n')) ?? attempt(escapedBackslashes(body))
-  const tool = /([A-Za-z0-9_]+)\s*\(/.exec(raw)?.[1]
-  if (!parsed) return tool ? { tool, complete: false, others: [] } : undefined
-  const channel = typeof parsed.channel === 'string' ? parsed.channel : undefined
-  const previewField = TEXT_FIELDS.find(field => typeof parsed[field] === 'string' && parsed[field] !== '')
-  const preview = previewField ? String(parsed[previewField]) : undefined
-  // 截断判据：解析成功但结尾不像一个完整字符串（旧格式以 `}` 收尾；被切的原串一定不以它结尾）。
-  // 旧格式是一整段 `JSON.stringify` 的结果，末尾一定是 `}`；被 `slice(0, 500)` 切过的不会。
-  // 解析得开只说明这一段还成句，不足以证明它就是全部，所以两条都要看。
-  const truncated = !body.trimEnd().endsWith('}') || (preview === undefined && body.length >= 499)
-  return {
-    ...(tool ? { tool } : {}),
-    ...(channel ? { target: channel === 'current' ? '当前对话' : channel } : {}),
-    ...(preview && !truncated ? { preview } : {}),
-    complete: !truncated && preview !== undefined,
-    others: Object.entries(parsed).filter(([name]) => name !== previewField && name !== 'channel')
-      .map(([name, value]) => ({ name, value: shown(value) })),
-  }
+  return undefined
 }
+
+/** 没有函数名、只有「（{…}）」包着的 JSON：旧卡里也见过这种写法。 */
+const WRAP_HEAD = /[（(][ \t]*(?=\{)/g
+
+/** 旧卡里认出来的一次工具调用。`cut` 表示形态在、JSON 不完整 —— 旧版把参数截断过。 */
+interface MinedCall { tool?: string; args?: Record<string, unknown>; cut: boolean }
+
+/**
+ * 从旧 question 里认出工具调用形状，并把参数**真正解析一次**。
+ *
+ * 解析（`JSON.parse` 的转义解码）是取出人话正文的唯一正路：序列化时真换行变成了 `\n` 两个字符，
+ * 只有按 JSON 语法解码才能还原本来的换行。**不做** `%XX` 解码、不 `unescape`、不动 Markdown 记号 ——
+ * `**`、反引号、`%2F` 都是内容，怎么显示交给客户端。
+ */
+function mineCall(raw: string): MinedCall | undefined {
+  for (const head of raw.matchAll(CALL_HEAD)) {
+    return readCall(raw, head[1], (head.index ?? 0) + head[0].length)
+  }
+  // 没有函数名时只认「括号里就是 JSON 对象」这一种：普通人话里的括号不构成调用。
+  for (const head of raw.matchAll(WRAP_HEAD)) {
+    return readCall(raw, undefined, (head.index ?? 0) + head[0].length)
+  }
+  // 最早的旧卡整段就是 `{...}`：首个非空字符是 `{` 才认，免得把人话里的 JSON 例子当参数。
+  const first = raw.search(/\S/)
+  if (first >= 0 && raw[first] === '{') return readCall(raw, undefined, first)
+  return undefined
+}
+
+/** 在 `start` 的 `{` 处读一次调用；JSON 不完整（被截断）也记下工具名，好把话说清楚。 */
+function readCall(raw: string, tool: string | undefined, start: number): MinedCall {
+  const named = tool ? { tool } : {}
+  const body = objectAt(raw, start)
+  if (!body) return { ...named, cut: true }
+  try {
+    const parsed: unknown = JSON.parse(body)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { ...named, args: parsed as Record<string, unknown>, cut: false }
+  } catch { /* 不是 JSON 就不当调用看：宁可退回旧行为，也不把一段乱码当正文 */ }
+  return { ...named, cut: true }
+}
+
+/** 正文类字段里第一个有值的，原样返回（换行来自解析结果，不再做任何替换）。 */
+function bodyOf(args: Record<string, unknown> | undefined): string | undefined {
+  const field = LEGACY_BODY_FIELDS.find(name => typeof args?.[name] === 'string' && args[name] !== '')
+  return field ? String(args![field]) : undefined
+}
+
+/** 人读的收件人：`main → m82`。只有一半就说那一半；都没有就不给 —— 不编一个出来。 */
+function recipientOf(args: Record<string, unknown> | undefined): string | undefined {
+  const channel = typeof args?.channel === 'string' && args.channel ? args.channel : undefined
+  const to = typeof args?.to === 'string' && args.to ? args.to : undefined
+  const place = channel === 'current' ? '当前对话' : channel
+  if (place && to) return `${place} → ${to}`
+  return to ?? place
+}
+
+/** 工具名翻成人话；认不出的工具只说「用外部连接做这次改动」，不假装知道它在干什么。 */
+function actionOf(tool: string | undefined, kindName?: string): string {
+  if (!tool) return '做一次外部改动'
+  const leaf = tool.split(/__|\./).at(-1) ?? tool
+  if (leaf === 'send_message') return '发送这条消息'
+  return `用${kindName ?? '外部连接'}做这次改动（${tool}）`
+}
+
+function questionOf(action: string, target: string | undefined): string {
+  return target ? `要${action}给「${target}」吗？` : `要${action}吗？`
+}
+
+/** 折叠区里的原始问题：截断到合理长度，截了就说截了（原文在库里一格没动）。 */
+function truncated(raw: string): string {
+  return raw.length > LEGACY_DETAILS_LIMIT ? `${raw.slice(0, LEGACY_DETAILS_LIMIT)}…（已截断）` : raw
+}
+
+/**
+ * 任意客户端的只读投影：`presentation` 缺失的旧卡，若 `question` 里能认出工具调用形状，就补一份人读投影 ——
+ * `question` 换成一句人话，`presentation` 带上真实换行的 `preview`、人读的 `target` 与折叠的 `details`。
+ * 别的卡**原样返回同一个对象** —— 有 `presentation` 的路径一律不走这里；认不出形状的普通人话也不硬套。
+ *
+ * 只读：返回的是新对象，存储里的 `attention`（含原 `question`）一个字都不改；`id`、`options`、`triggerId`
+ * 也照旧带过去，答卡时仍然对得上。
+ */
+export function attentionForDisplay<T extends { question: string; presentation?: ApprovalPresentation }>(
+  attention: T): T & { presentation?: ApprovalPresentation } {
+  if (attention.presentation) return attention
+  if (!mineCall(attention.question)) return attention
+  const card = legacyConnectionCard({ question: attention.question })
+  return { ...attention, question: card.question, presentation: card.presentation }
+}
+

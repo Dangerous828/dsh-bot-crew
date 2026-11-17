@@ -744,8 +744,13 @@ private fun BoardTicketRow(
         }
         if (showOptions) {
             // 有 question 读 question，没有就只说清「为什么在等」；question 不拆成选项。
-            Text(AnswerCopy.body(ticket), color = palette.warn, fontSize = 11.sp,
-                modifier = Modifier.padding(top = 6.dp))
+            // 看板卡只有一行高：摘要 + 省略，长路径不把卡片撑破。
+            Text(
+                AnswerCopy.compact(ticket),
+                color = palette.warn, fontSize = 11.sp,
+                maxLines = 3, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
+            )
             // 后端没给 options 就一个按钮都不画（契约 §5 禁止前端编 A/B）。
             if (ticket.options.isNotEmpty()) {
                 Row(

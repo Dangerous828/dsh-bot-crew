@@ -2,6 +2,7 @@ package com.dsh.botcrew
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
@@ -1096,6 +1097,44 @@ object AnswerCopy {
     }
 
     /**
+     * 卡片正文的可渲染投影：段落、加粗、行内代码、超长折叠。
+     *
+     * 与 [body] 同一条取数顺序（approval 预览 → question → 一句原因），只是把
+     * 「怎么排版」交给纯函数（见 [QuestionBodyCopy]），Composable 只负责画。
+     * `preview` 是字段解码后的正文，这里**不**再认工具调用、不二次解码。
+     */
+    fun bodyView(ticket: WorkTicket): QuestionBody {
+        val preview = ticket.approval?.preview?.trim().orEmpty()
+        if (preview.isNotEmpty()) return QuestionBodyCopy.present(preview)
+        if (ticket.question.isNotBlank()) return ApiQuestionCopy.present(ticket.question)
+        return QuestionBodyCopy.present("这张票卡在等你，原因：" + waitingWord(ticket.needsPerson))
+    }
+
+    /**
+     * 单行摘要：工单列表那种一行高的位置用。
+     *
+     * 只做「压平 + 截断」，不改写内容：换行变空格、连续空白合一，超出 [COMPACT_CHARS]
+     * 才加省略号。结构化/工具参数照旧走 [body] 的人读投影，不把 JSON 露出来。
+     */
+    fun compact(ticket: WorkTicket): String {
+        val preview = ticket.approval?.preview?.trim().orEmpty()
+        // 与 [body] 同一条取数顺序：preview 是为此卡专门做的人读投影，question 只是兜底。
+        val text = when {
+            preview.isNotEmpty() -> preview
+            ticket.question.isNotBlank() -> body(ticket)
+            else -> waitingWord(ticket.needsPerson)
+        }
+        // 列表里只有一行高，Markdown 记号（`**`、反引号）在这里没有样式可落：
+        // 先按 [QuestionBodyCopy] 剥掉记号，再把换行与连续空白压成一个空格。
+        val flat = QuestionBodyCopy.plain(QuestionBodyCopy.paragraphs(text))
+            .split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ")
+        return if (flat.length <= COMPACT_CHARS) flat else flat.take(COMPACT_CHARS).trimEnd() + "…"
+    }
+
+    /** 一行摘要最多这么多字；再多就是列表里的噪音。 */
+    private const val COMPACT_CHARS = 80
+
+    /**
      * 折叠区里的原文：tools 细节（脱敏后）优先，其次是 question 全文。
      * 只在比正文多东西时才值得展开 —— 否则返回 null，那一行「详情」不画。
      */
@@ -1126,6 +1165,275 @@ object AnswerCopy {
     /** 「详情」那一行展开/收起的字。 */
     const val DETAILS_SHOW = "看详情"
     const val DETAILS_HIDE = "收起详情"
+
+    /** 正文过长时那一行展开/收起的字。 */
+    const val BODY_SHOW = "展开全文"
+    const val BODY_HIDE = "收起"
+}
+
+/** 正文里一段可渲染的片段。样式只有三种：普通、加粗、行内代码。 */
+enum class InlineKind { Plain, Bold, Code }
+
+data class InlineSpan(val text: String, val kind: InlineKind = InlineKind.Plain)
+
+/**
+ * 一个段落。段内的单换行原样保留；段与段之间由界面给行距 —— 一整块文字读不动。
+ */
+data class BodyParagraph(val spans: List<InlineSpan>) {
+    /** 去掉标记后的纯文本：折叠行数统计与字符串投影都用它。 */
+    val text: String get() = spans.joinToString("") { it.text }
+}
+
+/**
+ * 一张卡正文的可渲染投影。
+ *
+ * [brief] 是默认露出的部分，[full] 是展开后的全文；[folds] 为真才画展开/收起。
+ * [fallbackTitle] 表示正文只剩一句固定标题 —— 原文一个字都没丢，它在「看详情」里。
+ */
+data class QuestionBody(
+    val brief: List<BodyParagraph>,
+    val full: List<BodyParagraph>,
+    val folds: Boolean,
+    val fallbackTitle: Boolean = false,
+) {
+    /**
+     * 画不画「展开全文」。
+     *
+     * 只剩一句固定标题时 [brief] 与 [full] 是同一段，点了也不会变 —— 原文在「看详情」里，
+     * 这里不能再给一个点不动的按钮。
+     */
+    val expandable: Boolean get() = folds && !fallbackTitle
+}
+
+/**
+ * 正文排版：分段、`**加粗**` / `` `行内代码` `` 的轻量解析、超长 token 折行、按行折叠。
+ *
+ * 全是纯函数，Composable 只把 [InlineKind] 翻成字体与底色。这里**不碰**编码：
+ * `%2F`、`\n` 这类内容原样保留 —— 唯一一次转义解码发生在 [ApiQuestionCopy.decode]
+ * 里，且只作用于认出来的那段 JSON 字面量。
+ */
+object QuestionBodyCopy {
+    /** 默认露出几行；再多就折叠。 */
+    const val BRIEF_LINES = 6
+
+    /**
+     * 默认露出多少字；再多也折叠。
+     *
+     * 行数管不住「一整段没有换行的长文」—— 那种正文按行算只有一行，会整段铺满卡片。
+     * 这个上限只做封顶，不影响正常分段的短正文（实机那张 438 字的卡仍在阈值内，不折）。
+     */
+    const val BRIEF_CHARS = 600
+
+    /** 一个 token 连续这么多字符还没有折行机会，就插一个零宽空格。 */
+    const val TOKEN_RUN = 32
+
+    private const val ZWSP = '\u200B'
+
+    /** 空行（可以夹空格/全角空格）才是段落的边界。 */
+    private val BLANK_LINE = Regex("""\n[ \t　]*\n""")
+
+    /** 拆成段落。单个换行留在段内，空行才分段。 */
+    fun paragraphs(text: String): List<BodyParagraph> {
+        val normalized = text.replace("\r\n", "\n").replace('\r', '\n').trim()
+        if (normalized.isEmpty()) return emptyList()
+        return normalized.split(BLANK_LINE)
+            .map { it.trim('\n') }
+            .filter { it.isNotBlank() }
+            // 先剥标记再折行：不这么做，`` ` `` 和 `**` 会被当成 token 的一部分，
+            // 零宽空格就插到了代码片段的第一个字符前面。
+            .map { line -> BodyParagraph(spansOf(line).map { InlineSpan(soften(it.text), it.kind) }) }
+    }
+
+    /**
+     * 一行/一段里的轻量 Markdown：`**加粗**` 与 `` `行内代码` ``。
+     *
+     * 只认成对且不跨行的标记；落单的 `*`、半个 `` ` `` 都是用户原文，原样画出来。
+     * 不做嵌套：代码里的星号就是代码。
+     */
+    fun spansOf(text: String): List<InlineSpan> {
+        val spans = mutableListOf<InlineSpan>()
+        val plain = StringBuilder()
+        fun flush() {
+            if (plain.isNotEmpty()) {
+                spans.add(InlineSpan(plain.toString()))
+                plain.clear()
+            }
+        }
+        var i = 0
+        while (i < text.length) {
+            if (text.startsWith("**", i)) {
+                val end = text.indexOf("**", i + 2)
+                if (end > i + 2 && !text.substring(i + 2, end).contains('\n')) {
+                    flush()
+                    spans.add(InlineSpan(text.substring(i + 2, end), InlineKind.Bold))
+                    i = end + 2
+                    continue
+                }
+            }
+            if (text[i] == '`') {
+                val end = text.indexOf('`', i + 1)
+                if (end > i + 1 && !text.substring(i + 1, end).contains('\n')) {
+                    flush()
+                    spans.add(InlineSpan(text.substring(i + 1, end), InlineKind.Code))
+                    i = end + 1
+                    continue
+                }
+            }
+            plain.append(text[i])
+            i++
+        }
+        flush()
+        return spans
+    }
+
+    /**
+     * 段落们压回一段纯文本（段间一个空行）。
+     *
+     * 零宽空格只是渲染层的折行点，纯文本投影里必须去掉 —— 摘要、比较、通知都拿它当原文。
+     */
+    fun plain(all: List<BodyParagraph>): String =
+        all.joinToString("\n\n") { it.text }.replace("\u200B", "")
+
+    /** 一共几行（段内的换行也算）。 */
+    fun lineCount(all: List<BodyParagraph>): Int =
+        all.sumOf { paragraph -> paragraph.text.lines().size }
+
+    /** 只留前 [maxLines] 行；被切断的那一段按字符截断，样式跟着保留。 */
+    fun brief(all: List<BodyParagraph>, maxLines: Int = BRIEF_LINES): List<BodyParagraph> {
+        val out = mutableListOf<BodyParagraph>()
+        var left = maxLines
+        for (paragraph in all) {
+            if (left <= 0) break
+            val lines = paragraph.text.lines().size
+            if (lines <= left) {
+                out.add(paragraph)
+                left -= lines
+            } else {
+                out.add(takeLines(paragraph, left))
+                left = 0
+            }
+        }
+        return out
+    }
+
+    /**
+     * 只留前 [budget] 个字；样式跟着保留。
+     *
+     * 行数管不住一整块没有换行的长文（一段 2000 字的正文只有「一行」），
+     * 卡片高度得有个字符上限 —— 否则「前几行」这条规则对单段长文完全失效。
+     */
+    fun takeChars(all: List<BodyParagraph>, budget: Int = BRIEF_CHARS): List<BodyParagraph> {
+        val out = mutableListOf<BodyParagraph>()
+        var left = budget
+        for (paragraph in all) {
+            if (left <= 0) break
+            if (paragraph.text.length <= left) {
+                out.add(paragraph)
+                left -= paragraph.text.length
+                continue
+            }
+            val spans = mutableListOf<InlineSpan>()
+            var rest = left
+            for (span in paragraph.spans) {
+                if (rest <= 0) break
+                if (span.text.length <= rest) {
+                    spans.add(span)
+                    rest -= span.text.length
+                } else {
+                    spans.add(InlineSpan(span.text.take(rest), span.kind))
+                    rest = 0
+                }
+            }
+            if (spans.isNotEmpty()) out.add(BodyParagraph(spans))
+            left = 0
+        }
+        return out
+    }
+
+    private fun takeLines(paragraph: BodyParagraph, count: Int): BodyParagraph {
+        val spans = mutableListOf<InlineSpan>()
+        var lines = 1
+        var done = false
+        for (span in paragraph.spans) {
+            if (done) break
+            val kept = StringBuilder()
+            for (ch in span.text) {
+                if (ch == '\n') {
+                    if (lines >= count) {
+                        done = true
+                        break
+                    }
+                    lines++
+                }
+                kept.append(ch)
+            }
+            // 截断点了也要把这一段已经收到的字收进去，否则正文会整段消失。
+            if (kept.isNotEmpty()) spans.add(InlineSpan(kept.toString(), span.kind))
+        }
+        return BodyParagraph(spans)
+    }
+
+    /** 天然折行点：路径/URL/标识符里的分隔符。 */
+    private fun isBreakPoint(ch: Char): Boolean =
+        ch == '/' || ch == '\\' || ch == '.' || ch == '_' || ch == '-' || ch == ':'
+
+    /**
+     * 超长无空格的 token（本地路径、URL、Base64）插零宽空格，保证任何一行都有折行机会。
+     *
+     * 只在 token 本身超过 [TOKEN_RUN] 时动手，并按 `/ \ . _ - :` 这些天然断点先折；
+     * 没有断点就硬切。零宽空格不可见，去掉之后仍是原文。
+     */
+    fun soften(text: String): String {
+        if (text.length <= TOKEN_RUN) return text
+        val out = StringBuilder(text.length + text.length / 8)
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            if (c.isWhitespace()) {
+                out.append(c)
+                i++
+                continue
+            }
+            var end = i
+            while (end < text.length && !text[end].isWhitespace()) end++
+            val token = text.substring(i, end)
+            if (token.length <= TOKEN_RUN) {
+                out.append(token)
+            } else {
+                var run = 0
+                for (ch in token) {
+                    out.append(ch)
+                    if (isBreakPoint(ch)) {
+                        // 分隔符本身就是天然的折行机会：`/Users/.../CrewUi.kt` 在斜杠后断开，
+                        // 不必等到 32 个字符。连续分隔符只算一次。
+                        if (run > 0) {
+                            out.append(ZWSP)
+                            run = 0
+                        }
+                    } else {
+                        run++
+                        if (run >= TOKEN_RUN) {
+                            out.append(ZWSP)
+                            run = 0
+                        }
+                    }
+                }
+            }
+            i = end
+        }
+        return out.toString()
+    }
+
+    /** 一段人话 → 可渲染投影。不认工具调用（那是 [ApiQuestionCopy] 的事）。 */
+    fun present(text: String): QuestionBody {
+        val all = paragraphs(text)
+        if (all.isEmpty()) return QuestionBody(emptyList(), emptyList(), folds = false)
+        // 两道闸：行数（正常分段正文）与字数（一整块没有换行的长文）。先按行切，再按字数封顶。
+        val byLine = brief(all)
+        val brief = if (plain(all).length > BRIEF_CHARS) takeChars(byLine) else byLine
+        val folds = lineCount(brief) < lineCount(all) || plain(brief).length < plain(all).length
+        return QuestionBody(brief, all, folds = folds)
+    }
 }
 
 /**
@@ -1137,14 +1445,66 @@ object AnswerCopy {
  * 字面量 `\n`、Markdown 星号、被截断的 JSON、本地路径全在屏幕上。那不是一个问题，是一段协议。
  *
  * 后端会改成人读整句；Android 这边仍要**兜住老/新两种形状**：
- * - 整段就是一个 JSON 对象/数组 → 不铺开，给一句标题 + 可展开原文；
- * - 长文本 → 正文只留前几行，其余进折叠；
- * - **不做任何反转义**：不加 `\n`→换行，不做 %XX 解码。用户原文里的 `\n`、`%2F`、
- *   代码里的引号都是内容本身。真的换行由后端在 `preview` 里给。
+ * - 句首或句子中段出现 `name({…})` / `（{…}）` → 把那一段 JSON **解析一次**，取承载人话的
+ *   字段（`text` → `message` → `question` → `content`）当正文，前后的中文原样留在正文里；
+ * - 整段就是一个 JSON 对象/数组但认不出人话 → 不铺开，给一句标题 + 可展开原文；
+ * - 长文本 → 正文只留前几行，其余折叠。
+ *
+ * ## 什么不碰
+ *
+ * **只解 JSON 字面量里的转义**（`\n` → 换行、`\"` → 引号）。这不是「全局反转义」：
+ * 用户原文里的 `%2F`、URL、代码里的 `\n` 在 JSON 之外，一个字符都不动；
+ * 认不出来或解析失败时逐字退回原行为，绝不正则硬抠半个字符串。
  */
 object ApiQuestionCopy {
     /** 正文最多显示几行；再多就折叠。 */
-    const val HEADLINE_LINES = 6
+    const val HEADLINE_LINES = QuestionBodyCopy.BRIEF_LINES
+
+    /** 结构化但认不出人话时，正文只剩这一句。 */
+    const val FALLBACK_TITLE = "这条要你确认（原文已折叠，展开可看）"
+
+    /** 工具调用形状：函数名 + 括号，括号里立刻是 JSON。句子中段也认。 */
+    private val CALL_HEAD = Regex("""[A-Za-z_][A-Za-z0-9_.]*\s*[（(]\s*(?=[\{\[])""")
+
+    /** 没有函数名、只有「（{…}）」包着的 JSON。 */
+    private val WRAP_HEAD = Regex("""[（(]\s*(?=[\{\[])""")
+
+    /** 工具参数里承载人话的字段，按优先级。 */
+    private val HUMAN_FIELDS = listOf("text", "message", "question", "content")
+
+    /** 正文前面的中文交代里，末尾这些标点属于句式，不属于内容。 */
+    private val LEAD_TRIM = charArrayOf('：', ':', '，', ',', '；', ';', '—', '-', '（', '(', '「')
+
+    /** JSON 后面通常跟着收尾的括号，剥掉再判断有没有剩人话。 */
+    private val TAIL_TRIM = charArrayOf(')', '）', '」')
+
+    private class CallAt(val headStart: Int, val jsonStart: Int)
+
+    /**
+     * 认出「工具调用参数被塞进 question」的形状，返回解出的人话；认不出返回 null。
+     *
+     * 成功时正文 = 调用前的中文 + 人话字段 + 调用后残留的中文（各段之间空一行）。
+     * 解析不了就 null —— 调用方退回原文，不猜。
+     */
+    fun decode(text: String): String? {
+        if (text.isBlank()) return null
+        val at = callAt(text) ?: return null
+        val json = balancedJson(text, at.jsonStart) ?: return null
+        val value = try {
+            JSONTokener(json).nextValue()
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val human = humanText(value)?.trim().orEmpty()
+        if (human.isEmpty()) return null
+        val lead = leadOf(text.substring(0, at.headStart))
+        val tail = tailOf(text.substring(at.jsonStart + json.length))
+        val parts = mutableListOf<String>()
+        if (lead.isNotEmpty() && lead != human) parts.add(lead)
+        parts.add(human)
+        if (tail.isNotEmpty() && tail != human) parts.add(tail)
+        return parts.joinToString("\n\n")
+    }
 
     /** 整段像一段序列化 JSON（工具调用/参数）—— 那不是给人读的问题。 */
     fun looksStructured(text: String): Boolean {
@@ -1153,22 +1513,141 @@ object ApiQuestionCopy {
         val jsonish = (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
             (trimmed.startsWith("[") && trimmed.endsWith("]"))
         if (jsonish) return true
-        // 工具调用形状：`name({...})` —— 名字里不带空格，括号里立刻是 {。
-        return Regex("""^[A-Za-z_][A-Za-z0-9_.]*\(\{""").containsMatchIn(trimmed)
+        // 有工具调用形状且真解得出人话才算结构化；「[紧急] 这份要不要发？」这类中文
+        // 只是恰好以方括号开头，不能因此被打成折叠标题。
+        if (decode(trimmed) != null) return true
+        return CALL_HEAD.containsMatchIn(trimmed) || WRAP_HEAD.containsMatchIn(trimmed)
     }
 
-    /** 折叠后的正文：结构化的一律换成一句标题；长文本只留前 [HEADLINE_LINES] 行。 */
+    /** 折叠后的正文：解得出人话就用人话（只留前几行）；解不出按老规矩办。 */
     fun headline(text: String): String {
-        if (looksStructured(text)) return "这条要你确认（原文已折叠，展开可看）"
+        val human = decode(text)
+        if (human != null) {
+            val all = QuestionBodyCopy.paragraphs(human)
+            val brief = QuestionBodyCopy.brief(all)
+            val flat = QuestionBodyCopy.plain(brief)
+            val cut = QuestionBodyCopy.lineCount(brief) < QuestionBodyCopy.lineCount(all)
+            return if (cut) flat + "\n…" else flat
+        }
+        return legacyHeadline(text)
+    }
+
+    /** 是否有被折叠掉的部分。 */
+    fun folds(text: String): Boolean {
+        val human = decode(text)
+        if (human != null) {
+            // 正文是解出来的人话、原文留在「看详情」：只要两者不同、或人话本身被截断，就值得展开。
+            return QuestionBodyCopy.lineCount(QuestionBodyCopy.paragraphs(human)) > HEADLINE_LINES ||
+                human.trim() != text.trim() || text.length > LONG_CHARS
+        }
+        if (looksStructured(text)) return true
+        return text.trimEnd().lines().size > HEADLINE_LINES || text.length > LONG_CHARS
+    }
+
+    /** 完整投影：正文段落 + 是否还能展开。 */
+    fun present(text: String): QuestionBody {
+        val human = decode(text)
+        if (human != null) return QuestionBodyCopy.present(human)
+        if (looksStructured(text)) {
+            val title = BodyParagraph(listOf(InlineSpan(FALLBACK_TITLE)))
+            return QuestionBody(listOf(title), listOf(title), folds = true, fallbackTitle = true)
+        }
+        return QuestionBodyCopy.present(text.trimEnd())
+    }
+
+    private fun legacyHeadline(text: String): String {
+        if (looksStructured(text)) return FALLBACK_TITLE
         val lines = text.trimEnd().lines()
         if (lines.size <= HEADLINE_LINES) return text.trimEnd()
         return lines.take(HEADLINE_LINES).joinToString("\n").trimEnd() + "\n…"
     }
 
-    /** 是否有被折叠掉的部分（决定要不要画「看详情」）。 */
-    fun folds(text: String): Boolean {
-        if (looksStructured(text)) return true
-        return text.trimEnd().lines().size > HEADLINE_LINES || text.length > LONG_CHARS
+    /** 句首的裸 JSON、句中段的调用、全角括号包着的 JSON：取最早出现的那一处。 */
+    private fun callAt(text: String): CallAt? {
+        val start = text.indexOfFirst { !it.isWhitespace() }
+        if (start < 0) return null
+        var best: CallAt? = if (text[start] == '{' || text[start] == '[') CallAt(start, start) else null
+        val call = CALL_HEAD.find(text)
+        val wrap = WRAP_HEAD.find(text)
+        val head = when {
+            call == null -> wrap
+            wrap == null -> call
+            call.range.first <= wrap.range.first -> call
+            else -> wrap
+        } ?: return best
+        val at = CallAt(head.range.first, head.range.last + 1)
+        if (best == null || at.headStart < best.headStart) best = at
+        return best
+    }
+
+    /** 从左括号起配对到右括号，字符串里的括号不算。半截 JSON 返回 null。 */
+    private fun balancedJson(text: String, open: Int): String? {
+        if (open >= text.length) return null
+        val opener = text[open]
+        val closer = when (opener) {
+            '{' -> '}'
+            '[' -> ']'
+            else -> return null
+        }
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in open until text.length) {
+            val c = text[i]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == '"' -> inString = false
+                }
+                continue
+            }
+            when (c) {
+                '"' -> inString = true
+                opener -> depth++
+                closer -> {
+                    depth--
+                    if (depth == 0) return text.substring(open, i + 1)
+                }
+            }
+        }
+        return null
+    }
+
+    /** 只从对象（或对象数组）的顶层取字符串字段；取不到就是取不到，不递归猜。 */
+    private fun humanText(value: Any?, depth: Int = 0): String? {
+        if (depth > 1) return null
+        when (value) {
+            is JSONObject -> {
+                for (field in HUMAN_FIELDS) {
+                    val text = value.opt(field) as? String
+                    if (!text.isNullOrBlank()) return text
+                }
+                return null
+            }
+            is JSONArray -> {
+                for (i in 0 until value.length()) {
+                    val text = humanText(value.opt(i), depth + 1)
+                    if (text != null) return text
+                }
+                return null
+            }
+            else -> return null
+        }
+    }
+
+    private fun leadOf(before: String): String {
+        var text = before.trim()
+        while (text.isNotEmpty() && text.last() in LEAD_TRIM) text = text.dropLast(1).trimEnd()
+        return text
+    }
+
+    private fun tailOf(after: String): String {
+        var text = after.trim()
+        while (text.isNotEmpty() && text.first() in TAIL_TRIM) text = text.drop(1).trimStart()
+        // 一段太长的尾巴（或又一段 JSON）不当人话读：宁可少显示，也不把协议当正文。
+        if (text.length > 200 || text.contains('{')) return ""
+        return text
     }
 
     private const val LONG_CHARS = 400

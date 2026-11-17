@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import type { HttpHost } from './http.ts'
 import { canRetry, latestAssignment, liveTicket, ticketStage, type Ticket } from '../core/index.ts'
 import { SettingsConflict } from './settings.ts'
-import { legacyConnectionCard } from './approval.ts'
+import { attentionForDisplay, legacyConnectionCard } from './approval.ts'
 import type { Settings } from '../policy.ts'
 import type { Decision } from '../core/index.ts'
 import { workerSessionId } from '../executor/dsh.ts'
@@ -1456,7 +1456,8 @@ export function phoneHandler(runtime: PhoneHost, gateway = gatewayOrigin(runtime
               // 旧问题移进折叠的 details；**id 与选项 id 一字不改**，客户端答 `/answer` 时照旧能对上。
               const legacy = !card.presentation && ticket.pendingApproval?.kind === 'connection'
                 ? legacyConnectionCard(card) : undefined
-              const attention = legacy ?? card
+              // 剩下的无投影旧卡（例如重启后丢了 pendingApproval）：认得出工具形状才补人读正文，普通人话原样。
+              const attention = legacy ?? attentionForDisplay(card)
               return { question: attention.question,
                 // 问题卡 id：客户端答 `/answer` 时原样带回，防「旧卡批新请求」（见 §3）。
                 attention_id: card.id,

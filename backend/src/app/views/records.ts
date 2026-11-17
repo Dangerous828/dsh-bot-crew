@@ -6,6 +6,7 @@ import { allowedSender, listedBot } from '../../policy.ts'
 import type { ChannelLink, Localized } from '../../sources/kind.ts'
 import type { SourceRegistry } from '../../sources/registry.ts'
 import { workerSessionId } from '../../executor/dsh.ts'
+import { attentionForDisplay } from '../approval.ts'
 import type { Store } from '../store.ts'
 import { attribute, markdown, plain, preview, readable } from './text.ts'
 
@@ -109,7 +110,9 @@ export type TriggerView = ReturnType<typeof triggerView>
 /** Single-line summary of why a ticket in the `person` stage is waiting on human action (omitted once answered and back with the Executor). */
 function ticketNote(ticket: Ticket, stage: TicketStage): { text: string; error: boolean } | undefined {
   if (stage.stage !== 'person') return undefined
-  if (stage.action === 'answer' && ticket.attention) return { text: preview(ticket.attention.question), error: false }
+  // 旧卡（没有 presentation）的主正文同样换成人话：桌面端不该看到一段序列化参数（只读投影，存储不动）。
+  const attention = ticket.attention && attentionForDisplay(ticket.attention)
+  if (stage.action === 'answer' && attention) return { text: preview(attention.question), error: false }
   if (stage.action === 'delivery' && ticket.delivery) return { text: preview(ticket.delivery.error), error: true }
   const summary = latestReport(ticket)?.summary
   if ((stage.action !== 'blocked' && stage.action !== 'failed') || !summary) return undefined
@@ -118,10 +121,11 @@ function ticketNote(ticket: Ticket, stage: TicketStage): { text: string; error: 
 export function ticketSummary(ticket: Ticket) {
   const stage = ticketStage(ticket)
   const note = ticketNote(ticket, stage)
+  const attention = ticket.attention && attentionForDisplay(ticket.attention)
   const state = liveTicket(ticket) ? 'open' as const : 'ended' as const
   return { id: ticket.id, title: ticket.title, state, ...stage, ...note ? { note } : {},
     actions: { retry: canRetry(ticket), stop: liveTicket(ticket) }, strength: ticket.mandate.strength, ended: ticket.ended,
-    attention: ticket.attention && { ...ticket.attention, question: markdown(ticket.attention.question) },
+    attention: attention && { ...attention, question: markdown(attention.question) },
       assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
     // Every started Assignment of a Ticket runs in its one shared worker Session.
     deliveryError: attribute(ticket.delivery?.error), sessionId: ticket.assignments.some(item => item.startedAt)

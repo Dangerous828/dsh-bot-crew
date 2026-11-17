@@ -78,8 +78,11 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.focus.FocusRequester
@@ -3486,8 +3489,8 @@ private fun TicketStrip(
             Text("等你决定", color = palette.warn, fontSize = 11.sp, fontWeight = FontWeight(620))
         }
         // 有 approval 用它的预览（真实换行）；没有就读 question；都没有才退回 needs_person 的人话。
-        // 结构化/超长的原文不进正文，见 ApiQuestionCopy 与下面的「详情」折叠。
-        Text(AnswerCopy.body(waiting), color = palette.ink, fontSize = 13.sp, lineHeight = 20.sp)
+        // 段落、加粗/行内代码、超长折叠都在纯函数里定，这里只画（见 AnswerBody）。
+        AnswerBody(waiting, palette)
         // 这张卡要做什么、对谁做。没有就整行不画。
         AnswerCopy.actionLine(waiting)?.let {
             Text(it, color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp)
@@ -3503,7 +3506,13 @@ private fun TicketStrip(
                 )
             }
             if (openDetails) {
-                Text(folded, color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp)
+                // 原文照录：字面 \n、JSON、路径都在这里，一个字符不改；只保证长路径能折行。
+                Text(
+                    folded,
+                    color = palette.muted, fontSize = 11.sp, lineHeight = 16.sp,
+                    softWrap = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         }
         // A/B：每个选项一行，左边一个序号，点一下直接答。没有选项时这一整段不画。
@@ -3636,6 +3645,61 @@ private fun TicketStrip(
     }
 }
 
+/**
+ * 「等你决定」卡的正文：按段落画，段间留行距；`**加粗**` 与 `` `行内代码` `` 轻量渲染；
+ * 超过 [QuestionBodyCopy.BRIEF_LINES] 行先折叠，点「展开全文」再看完整正文。
+ *
+ * 排版与解析全在 AnswerCopy / QuestionBodyCopy 里（纯函数、有单测），
+ * 这里只把 [InlineKind] 翻成字体与底色 —— 不在 Composable 里解释文本。
+ */
+@Composable
+private fun AnswerBody(ticket: WorkTicket, palette: CrewPalette) {
+    val body = remember(ticket.id, CrewWire.answerSignature(ticket)) { AnswerCopy.bodyView(ticket) }
+    // 展开状态跟着这张卡的一组问题走：换了问题/选项，回到折叠（与「详情」同一个键）。
+    var expanded by remember(ticket.id, CrewWire.answerSignature(ticket)) { mutableStateOf(false) }
+    val shown = if (expanded) body.full else body.brief
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        for (paragraph in shown) {
+            Text(
+                text = bodySpans(paragraph, palette),
+                color = palette.ink,
+                fontSize = 13.sp,
+                lineHeight = 20.sp,
+                softWrap = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        // 只剩一句固定标题时正文没有可展开的东西（原文在「看详情」里），不画这个按钮。
+        if (body.expandable) {
+            TextButton(
+                onClick = { expanded = !expanded },
+                contentPadding = PaddingValues(0.dp),
+            ) {
+                Text(
+                    if (expanded) AnswerCopy.BODY_HIDE else AnswerCopy.BODY_SHOW,
+                    color = palette.accent, fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
+
+/** 一个段落 → AnnotatedString。只有三种样式，别的字符原样画。 */
+private fun bodySpans(paragraph: BodyParagraph, palette: CrewPalette) = buildAnnotatedString {
+    for (span in paragraph.spans) {
+        when (span.kind) {
+            InlineKind.Plain -> append(span.text)
+            InlineKind.Bold -> withStyle(SpanStyle(fontWeight = FontWeight(650))) { append(span.text) }
+            InlineKind.Code -> withStyle(
+                SpanStyle(fontFamily = FontFamily.Monospace, background = palette.field, color = palette.ink),
+            ) { append(span.text) }
+        }
+    }
+}
+
 @Composable
 private fun TaskRow(ticket: WorkTicket, conversation: Conversation?, palette: CrewPalette) {
     val tint = when {
@@ -3678,11 +3742,13 @@ private fun TaskRow(ticket: WorkTicket, conversation: Conversation?, palette: Cr
             }
         }
         if (ticket.needsPerson.isNotEmpty()) {
-            // needs_person 存的是类别（answer / review / …），直接画出来是个英文单词。
+            // 列表里只有一行高：压平成一句摘要（工具参数不铺开），放不下就省略。
             Text(
-                ticket.question.ifBlank { AnswerCopy.waitingWord(ticket.needsPerson) },
+                AnswerCopy.compact(ticket),
                 color = palette.warn,
                 fontSize = 11.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
